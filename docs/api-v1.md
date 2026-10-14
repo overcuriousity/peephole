@@ -103,7 +103,7 @@ Every non-2xx response is JSON:
 | 403    | `forbidden`    | token lacks the required scope                    |
 | 404    | `not_found`    | address not in the dataset, unknown `/api/v1` path, a job not this device's |
 | 409    | see below      | a scan is not sold, or a quote cannot be spent    |
-| 422    | `refused`      | the probe gate refuses the address (reason in `message`) |
+| 422    | `refused`      | the probe gate refuses the address, or the scan guard an address not in the dataset (reason in `message`) |
 | 429    | `rate_limited` | per-IP limit hit (`Retry-After` header is set)    |
 | 500    | `internal`     | storage failure; message is generic, never a leak |
 
@@ -141,7 +141,8 @@ IPs page shows.
       "last_seen": "2026-10-10T08:41:57Z",
       "request_count": 1284,
       "max_severity": 4,
-      "abuse_score": 87
+      "abuse_score": 87,
+      "unseen": false
     }
   ],
   "next_cursor": "eyJ…"
@@ -149,7 +150,13 @@ IPs page shows.
 ```
 
 `next_cursor` is `null` on the last page. `abuse_score` is the newest stored
-AbuseIPDB score, `null` when none.
+AbuseIPDB score, `null` when none. `unseen` is `true` for an address no
+listener recorded that is in the dataset only because an operator bought a
+counter-scan of it (MIK-329): `request_count` is 0, and its `first_seen` is
+when it was added. Its first request makes it `false`, `first_seen` then.
+Show it as unseen ("added by an operator for a counter-scan, no traffic
+recorded"), never as an attacker. Servers before 0.15.0 omit the field;
+read a missing `unseen` as `false`.
 
 ### `GET /api/v1/ips/{addr}`
 
@@ -168,6 +175,7 @@ in the dataset (a lookup that asks providers is an
   "first_seen": "2026-10-03T14:02:11Z",
   "last_seen": "2026-10-10T08:41:57Z",
   "request_count": 1284,
+  "unseen": false,
   "labels": ["scanner", "credential-stuffing"],
   "families": [{ "name": "web-scan", "count": 41 }],
   "intel": {
@@ -432,8 +440,11 @@ creates no quote and writes no audit entry.
 - Show `{credits}–{credits_max} credits`, or `{credits} credits` when
   both strings are equal; the web shows the same.
 - Standalone every level is free (`"0.00"`). `levels` is empty when no
-  live scanner announces a price. `404` when the address is not in the
-  dataset.
+  live scanner announces a price.
+- An address not in the dataset is priced too, and nothing is written for
+  it (0.15.0; before, `404`). `422 refused` when it must never be scanned:
+  a non-global address, `never_scan`, this node's or a member's address,
+  the operator's lists.
 
 ### `GET /api/v1/ips/{addr}/scan/quote?level=1..5`
 
@@ -459,6 +470,8 @@ creates no quote and writes no audit entry.
   lies between `credits` and `credits_max` (the dearest live scanner's
   price × the same factor). Show the range.
 - A bad `level` is `400`.
+- An address not in the dataset is quoted like one in it, without adding
+  it; `422 refused` as for the prices.
 
 When there is nothing to buy, `409` and no quote, with one of these codes:
 
@@ -475,6 +488,11 @@ Body: `{ "quote_id": "q_…" }`. The quote is spent first (atomically,
 once), then the checks of the quote run again.
 
 `202`: `{ "job_id": "s_…", "credits": "1.28", "credits_mc": 1280 }`
+
+An address not in the dataset is added with the job, `"unseen": true`
+(no country or ASN until a lookup finds them), in the same write: a buy
+that is refused adds nothing. `422 refused` (as for the quote; the quote
+is spent) queues nothing and adds nothing.
 
 Each of these is `409` and **queues nothing and charges nothing** (a scan
 is charged when a scanner runs its job):

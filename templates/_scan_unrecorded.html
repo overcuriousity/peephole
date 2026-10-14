@@ -1,0 +1,21 @@
+{# The Counter-scan card of an address the dataset does not hold (`s`: admin::lookup::UnrecordedScan, result `r`), MIK-329: a buy adds the address, unseen. #}
+<section class="card actions-card"{% if first %} id="actions"{% endif %} data-section="actions">
+  <div class="card-head"><h2>Counter-scan</h2></div>
+  {% if let Some(why) = s.refused %}
+  <p class="text-warning small" data-guard>No scan: {{ why }}</p>
+  {% else %}
+  <p class="muted small">Not in the dataset. Buying a scan adds the address, marked {% include "_unseen.html" %}: added by an operator for a counter-scan, no traffic recorded.</p>
+  <form class="action-block" method="post" action="/admin/lookup/scan">
+    <input type="hidden" name="ip" value="{{ r.ip }}">
+    <div class="level-grid">
+      {% for o in s.offers %}
+      {% if o.price.is_empty() %}
+      <button class="btn level-btn" type="button" disabled title="L{{ o.level }}: {{ o.about }}. No live scanner announces a price"><b>L{{ o.level }}</b><span>no scanner</span></button>
+      {% else %}
+      <button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>
+      {% endif %}
+      {% endfor %}
+    </div>
+  </form>
+  {% endif %}
+</section>

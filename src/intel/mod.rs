@@ -411,8 +411,8 @@ async fn provider_loop(
 /// (protocol 9): a provider traded in the market. RDAP and the rest are
 /// fetched by the able nodes in turns and shared for free.
 pub fn bought_by_recorder(name: &str) -> bool {
-    use crate::credits::price::{MARKET_GOODS, NOT_TRADED};
-    provider_info(name).is_some() && MARKET_GOODS.contains(&name) && !NOT_TRADED.contains(&name)
+    use crate::credits::price::{MARKET_GOODS, is_free};
+    provider_info(name).is_some() && MARKET_GOODS.contains(&name) && !is_free(name)
 }
 
 /// How often the recorder's buyer runs.

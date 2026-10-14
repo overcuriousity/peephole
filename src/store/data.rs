@@ -248,7 +248,9 @@ fn row_ms(ms: i64) -> i64 {
 /// The IP's row id, creating the row if needed (None: not an address). The
 /// address is stored in its canonical text, so a peer's `::ffff:a.b.c.d` or
 /// upper-case IPv6 finds the same row. `seen` widens the first/last-seen
-/// window; scan records pass None (a scan is not a visit).
+/// window; scan records pass None (a scan is not a visit). A row created
+/// without a visit is unseen (MIK-329) until the first one, whose time
+/// becomes its first sighting.
 pub(crate) async fn ensure_ip(
     conn: &mut SqliteConnection,
     ip: &str,
@@ -267,10 +269,11 @@ pub(crate) async fn ensure_ip(
         Some(id) => {
             if let Some(ts) = seen {
                 sqlx::query(
-                    "UPDATE ips SET first_seen = MIN(first_seen, ?), last_seen = MAX(last_seen, ?)
-                     WHERE id = ?",
+                    "UPDATE ips SET first_seen = CASE unseen WHEN 1 THEN ?1 ELSE MIN(first_seen, ?1) END,
+                                    last_seen = CASE unseen WHEN 1 THEN ?1 ELSE MAX(last_seen, ?1) END,
+                                    unseen = 0
+                     WHERE id = ?2",
                 )
-                .bind(ts)
                 .bind(ts)
                 .bind(id)
                 .execute(&mut *conn)
@@ -278,16 +281,17 @@ pub(crate) async fn ensure_ip(
             }
             return Ok(Some(id));
         }
-        None => {
-            sqlx::query("INSERT INTO ips (ip, ip_key, first_seen, last_seen) VALUES (?, ?, ?, ?)")
-                .bind(ip)
-                .bind(super::ip_key_of(ip).unwrap_or_default())
-                .bind(&ts)
-                .bind(&ts)
-                .execute(&mut *conn)
-                .await?
-                .last_insert_rowid()
-        }
+        None => sqlx::query(
+            "INSERT INTO ips (ip, ip_key, first_seen, last_seen, unseen) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ip)
+        .bind(super::ip_key_of(ip).unwrap_or_default())
+        .bind(&ts)
+        .bind(&ts)
+        .bind(seen.is_none())
+        .execute(&mut *conn)
+        .await?
+        .last_insert_rowid(),
     };
     refresh_ip_view(conn, ip).await?;
     Ok(Some(id))
@@ -1985,6 +1989,89 @@ mod tests {
         .execute(&mut *conn)
         .await
         .unwrap();
+    }
+
+    /// MIK-329: a scan job is not a visit. On a peer the job of an
+    /// address no listener recorded makes its row unseen, as on the node
+    /// that sold it; the first request makes it seen, first seen then.
+    #[tokio::test]
+    async fn a_replicated_scan_job_makes_an_unseen_row_until_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let seller = Identity::generate().unwrap().id;
+        let ctx = |hlc| Ctx {
+            origin: Some(&seller),
+            hlc,
+        };
+        let job = Record::ScanJob(ScanJobRec {
+            uid: "job".into(),
+            ip: "203.0.113.7".into(),
+            level: 2,
+            queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
+            manual: true,
+        });
+        assert_eq!(
+            apply(&mut conn, ctx(1), &job).await.unwrap(),
+            Effect::Applied
+        );
+        let row: (bool, i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT unseen, request_count, country, asn FROM ips WHERE ip = '203.0.113.7'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(row, (true, 0, None, None));
+
+        let Record::Request(mut r) = request("req", "/") else {
+            unreachable!()
+        };
+        let visit = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        r.ts = visit.clone();
+        apply(&mut conn, ctx(2), &Record::Request(r)).await.unwrap();
+        let (unseen, first, last, n): (bool, String, String, i64) = sqlx::query_as(
+            "SELECT unseen, first_seen, last_seen, request_count FROM ips WHERE ip = '203.0.113.7'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert!(!unseen);
+        // The visit, though earlier than the job made the row.
+        assert_eq!(first, visit);
+        assert_eq!(last, visit);
+        assert_eq!(n, 1);
+    }
+
+    /// A row a request made stays seen when a scan job of it comes in.
+    #[tokio::test]
+    async fn a_scan_job_leaves_a_seen_row_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+        let ctx = |hlc| Ctx { origin: None, hlc };
+        apply(&mut conn, ctx(1), &request("req", "/"))
+            .await
+            .unwrap();
+        let job = Record::ScanJob(ScanJobRec {
+            uid: "job".into(),
+            ip: "203.0.113.7".into(),
+            level: 2,
+            queued_at: now_ts(),
+            retry_of: None,
+            retry_at: None,
+            failed_by: None,
+            manual: true,
+        });
+        apply(&mut conn, ctx(2), &job).await.unwrap();
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) FROM ips WHERE unseen = 1").await,
+            0
+        );
     }
 
     async fn count(conn: &mut SqliteConnection, sql: &str) -> i64 {

@@ -666,7 +666,7 @@ pub async fn actions_for(state: &AdminState, ip: &IpAddr) -> ActionsView {
             .then(|| "no live scanner announces a probe price".to_string())
     });
     let scans = match state.store.ip_by_addr(&ip.to_string()).await {
-        Ok(Some(row)) => crate::admin::scan_buy::offers_for(state, row.id).await,
+        Ok(Some(row)) => crate::admin::scan_buy::offers_for(state, Some(row.id)).await,
         _ => vec![],
     };
     ActionsView {
