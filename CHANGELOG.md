@@ -5,6 +5,36 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-14
+
+Counter-scans of addresses no listener recorded (MIK-329). Database
+migration 0038; no protocol change.
+
+### Added
+
+- The lookup page offers a counter-scan of an address that is not in the
+  dataset, and `POST /admin/lookup/scan` and the device API's
+  `/api/v1/ips/{addr}/scan` sell one. The buy adds the address to the
+  dataset, marked unseen (no traffic recorded, no country or ASN made up),
+  in the same write as the job; a refused buy adds nothing. The scan
+  prices and quote of the device API answer for such an address without
+  adding it.
+- Unseen addresses are labelled wherever an address is shown: the lookup
+  result, the IP page and the IP lists carry an "unseen" badge, and
+  `/api/v1/ips` and `/api/v1/ips/{addr}` an `"unseen"` field (docs/api-v1.md).
+  The first request from the address makes it seen, first seen then.
+- Unseen addresses feed no attacker data: never on `/api/blocklist`, not
+  counted in the dashboard and stats.
+
+### Changed
+
+- An address not in the dataset gets a scan only past the checks a probe
+  obeys first: never a non-global address, `never_scan`, this node's or a
+  member's address, or one on the operator's lists (`422 refused` on the
+  device API, before `404`). Recorded addresses keep their checks.
+- A peer stores the row of a scan job for an address it has no request
+  from as unseen too, until a request comes.
+
 ## [0.14.0] - 2026-10-13
 
 Protocol 9: a free market. Every node must upgrade to 0.14.0 to trade on
