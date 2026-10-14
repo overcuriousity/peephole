@@ -136,7 +136,7 @@ pub async fn supervise(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiv
             loops.entry(id).or_insert_with(|| {
                 let sync = peer_loop(node.clone(), id, name, addr.clone(), shutdown.clone());
                 let inbox = super::msg::inbox_loop(node.clone(), id, addr.clone());
-                let h = tokio::spawn(async move {
+                let h = crate::supervise::spawn_supervised("cluster peer sync", async move {
                     tokio::select! {
                         _ = sync => {}
                         _ = inbox => {}
