@@ -151,6 +151,7 @@ fn summary_json(s: &IpSummary) -> Value {
         "request_count": s.request_count,
         "max_severity": s.max_severity,
         "abuse_score": s.abuse_score,
+        "unseen": s.unseen,
     })
 }
 
@@ -493,6 +494,7 @@ async fn ip_detail(
             "first_seen": rfc3339(ov.ip.first_seen),
             "last_seen": rfc3339(ov.ip.last_seen),
             "request_count": ov.request_count,
+            "unseen": ip.unseen,
             "labels": ov.labels.iter().map(|l| &l.name).collect::<Vec<_>>(),
             "families": ov.families.iter().map(|f| json!({"name": f.name, "count": f.count})).collect::<Vec<_>>(),
             "intel": Value::Object(intel),
@@ -660,6 +662,30 @@ async fn row_of(state: &AdminState, addr: &str) -> Result<(IpAddr, i64), Box<Res
             StatusCode::NOT_FOUND,
             "not_found",
             "no such address in the dataset",
+        ))),
+        Err(e) => Err(Box::new(internal(e))),
+    }
+}
+
+/// A path address for a scan and its dataset row id, None when the
+/// dataset does not hold it and a buy makes the row, unseen (MIK-329):
+/// 400 when it is not an address, 422 `refused` when an unrecorded
+/// address must not be scanned (`scan_buy::scan_target`).
+async fn scan_row(state: &AdminState, addr: &str) -> Result<(IpAddr, Option<i64>), Box<Response>> {
+    let Ok(ip) = addr.trim().parse::<IpAddr>() else {
+        return Err(Box::new(err(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "not an IP address",
+        )));
+    };
+    let ip = crate::net::canonical(ip);
+    match crate::admin::scan_buy::scan_target(state, ip).await {
+        Ok(Ok(row)) => Ok((ip, row)),
+        Ok(Err(why)) => Err(Box::new(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "refused",
+            &why,
         ))),
         Err(e) => Err(Box::new(internal(e))),
     }
@@ -837,7 +863,7 @@ async fn scan_prices(
     State(state): State<Arc<AdminState>>,
     Path(addr): Path<String>,
 ) -> Response {
-    if let Err(r) = row_of(&state, &addr).await {
+    if let Err(r) = scan_row(&state, &addr).await {
         return *r;
     }
     let table = state.recorder.node().map(|n| n.price_table());
@@ -882,7 +908,7 @@ async fn scan_quote(
         Ok(l) => l,
         Err(r) => return *r,
     };
-    let (ip, ip_id) = match row_of(&state, &addr).await {
+    let (ip, ip_id) = match scan_row(&state, &addr).await {
         Ok(r) => r,
         Err(r) => return *r,
     };
@@ -959,7 +985,7 @@ async fn scan_buy(
             "the quote is unreadable",
         );
     };
-    let (_, ip_id) = match row_of(&state, &ip).await {
+    let (addr, ip_id) = match scan_row(&state, &ip).await {
         Ok(r) => r,
         Err(r) => return *r,
     };
@@ -975,7 +1001,7 @@ async fn scan_buy(
         Ok(Err(n)) => return not_sold(n),
         Err(e) => return internal(e),
     }
-    let id = match crate::admin::scan_buy::enqueue(&state, ip_id, level).await {
+    let id = match crate::admin::scan_buy::enqueue(&state, addr, level).await {
         Ok(Ok(id)) => id,
         Ok(Err(Some(n))) => return not_sold(n),
         Ok(Err(None)) => {
@@ -2156,12 +2182,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(quotes, 0, "no quote");
+        // Not in the dataset (MIK-329): priced all the same, no row made.
         let (st, v) = send(
             &app,
             authed("GET", "/api/v1/ips/198.51.100.77/scan/prices", &token),
         )
         .await;
-        assert_eq!(st, 404, "{v}");
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["levels"].as_array().unwrap().len(), 5, "{v}");
+        assert!(
+            state
+                .store
+                .ip_by_addr("198.51.100.77")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Never scanned: refused.
+        let (st, v) = send(
+            &app,
+            authed("GET", "/api/v1/ips/10.0.0.1/scan/prices", &token),
+        )
+        .await;
+        assert_eq!(st, 422, "{v}");
+        assert_eq!(v["error"]["code"], "refused", "{v}");
+    }
+
+    /// MIK-329: an address no listener recorded is quoted without a row;
+    /// the buy makes it, unseen, and the API says so.
+    #[tokio::test]
+    async fn a_scan_of_an_unrecorded_address_adds_it_unseen() {
+        let (state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let ip = crate::admin::scan_buy::tests::UNRECORDED;
+        let (st, q) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{ip}/scan/quote?level=2"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        assert!(
+            state.store.ip_by_addr(ip).await.unwrap().is_none(),
+            "a quote makes no row"
+        );
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{ip}/scan"),
+                &token,
+                serde_json::json!({"quote_id": q["quote_id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(st, 202, "{v}");
+        let row = state.store.ip_by_addr(ip).await.unwrap().unwrap();
+        assert!(row.unseen);
+        assert_eq!(row.request_count, 0);
+        assert_eq!(jobs_and_actions(&state).await, (1, 1));
+        let (st, v) = send(&app, authed("GET", &format!("/api/v1/ips/{ip}"), &token)).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["unseen"], true, "{v}");
+        assert_eq!(v["request_count"], 0, "{v}");
+        let (st, v) = send(&app, authed("GET", "/api/v1/ips", &token)).await;
+        assert_eq!(st, 200, "{v}");
+        let items = v["items"].as_array().unwrap();
+        let unseen = |a: &str| {
+            items
+                .iter()
+                .find(|i| i["ip"] == a)
+                .map(|i| i["unseen"].clone())
+        };
+        assert_eq!(unseen(ip), Some(serde_json::json!(true)), "{v}");
+        assert_eq!(unseen(SCAN_IP), Some(serde_json::json!(false)), "{v}");
+    }
+
+    /// A refused address is not quoted and gets no row.
+    #[tokio::test]
+    async fn a_refused_unrecorded_address_is_not_quoted() {
+        let (state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        for ip in ["10.0.0.1", "127.0.0.1", "fe80::1"] {
+            let (st, v) = send(
+                &app,
+                authed(
+                    "GET",
+                    &format!("/api/v1/ips/{ip}/scan/quote?level=2"),
+                    &token,
+                ),
+            )
+            .await;
+            assert_eq!(st, 422, "{ip}: {v}");
+            assert_eq!(v["error"]["code"], "refused", "{ip}: {v}");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ips")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "only the recorded address");
+        assert_eq!(jobs_and_actions(&state).await, (0, 0));
     }
 
     #[tokio::test]

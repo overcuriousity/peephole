@@ -579,16 +579,25 @@ impl Recorder {
     /// purchases arriving together (two quotes, the API and the form)
     /// would otherwise each queue, and each be charged.
     pub async fn enqueue_manual(&self, ip_id: i64, level: u8) -> Result<EnqueueOutcome> {
+        let ip = self.ip_of(ip_id).await?;
+        self.enqueue_manual_addr(&ip, level).await
+    }
+
+    /// [`Self::enqueue_manual`] by canonical address text. For an address
+    /// the dataset does not hold, the job record makes its row, unseen
+    /// (`data::ensure_ip`, MIK-329), in the transaction that stores the
+    /// job: no job, no row. The caller has checked the address first.
+    pub async fn enqueue_manual_addr(&self, ip: &str, level: u8) -> Result<EnqueueOutcome> {
         if !(1..=5).contains(&level) {
             return Ok(EnqueueOutcome::Suppressed);
         }
         let _one = self.store().enqueue.lock().await;
         let pending: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM scan_jobs WHERE ip_id = ? AND level = ?
-               AND status IN ('queued','running')
-             ORDER BY status = 'running' DESC LIMIT 1",
+            "SELECT j.status FROM scan_jobs j JOIN ips i ON i.id = j.ip_id
+             WHERE i.ip = ? AND j.level = ? AND j.status IN ('queued','running')
+             ORDER BY j.status = 'running' DESC LIMIT 1",
         )
-        .bind(ip_id)
+        .bind(ip)
         .bind(level as i64)
         .fetch_optional(&self.store().pool)
         .await?;
@@ -599,11 +608,10 @@ impl Recorder {
                 "queued"
             }));
         }
-        let ip_text = self.ip_of(ip_id).await?;
         let uid = self.uid();
         self.write(vec![Record::ScanJob(ScanJobRec {
             uid: uid.clone(),
-            ip: ip_text,
+            ip: ip.to_string(),
             level: level as i64,
             queued_at: now_ts(),
             retry_of: None,
@@ -1427,6 +1435,43 @@ pub struct Deleted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MIK-329: a manual job of an address the dataset does not hold makes
+    /// its row, unseen; the trap's first request from it makes it seen,
+    /// first seen at that request.
+    #[tokio::test]
+    async fn a_manual_job_adds_an_unseen_row_a_request_makes_it_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let rec = store.local();
+        let first = rec.enqueue_manual_addr("203.0.113.61", 2).await.unwrap();
+        assert!(matches!(first, EnqueueOutcome::Queued(_)));
+        let dup = rec.enqueue_manual_addr("203.0.113.61", 2).await.unwrap();
+        assert!(matches!(dup, EnqueueOutcome::OnItsWay("queued")));
+        let row = store.ip_by_addr("203.0.113.61").await.unwrap().unwrap();
+        assert!(row.unseen);
+        assert_eq!(row.request_count, 0);
+        let at = (chrono::Utc::now() - chrono::Duration::minutes(5))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        rec.insert_request_from(
+            "203.0.113.61",
+            &NewRequest {
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ts: Some(at.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = store.ip_by_addr("203.0.113.61").await.unwrap().unwrap();
+        assert!(!row.unseen);
+        assert_eq!(row.request_count, 1);
+        assert_eq!(row.first_seen.format("%Y-%m-%d %H:%M:%S").to_string(), at);
+    }
 
     #[tokio::test]
     async fn a_manual_job_ignores_the_cooldown_and_is_marked() {
