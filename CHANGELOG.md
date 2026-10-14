@@ -35,6 +35,10 @@ migration 0038; no protocol change.
 - A peer stores the row of a scan job for an address it has no request
   from as unseen too, until a request comes.
 
+### Security
+
+- rustls 0.23.45 → 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349.
+
 ## [0.14.0] - 2026-10-13
 
 Protocol 9: a free market. Every node must upgrade to 0.14.0 to trade on
