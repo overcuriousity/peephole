@@ -94,6 +94,10 @@ impl Offer {
             else {
                 continue;
             };
+            // A free good is no market: only this node's own answer counts.
+            if crate::credits::price::is_free(info.name) && q.server != me {
+                continue;
+            }
             let view = QuoteView {
                 provider: info.name.to_string(),
                 label: info.label.to_string(),
@@ -1037,6 +1041,21 @@ secure_cookies = false
         assert_eq!(offer.price_of(crate::intel::ABUSEIPDB), "0.10 credits");
         assert_eq!(offer.price_of(crate::intel::TOR), "free");
         assert_eq!(offer.price_of("nope"), "");
+        // A free good is no market: a member's (older node's) zero price
+        // for it is no "free" row under "Ask for more".
+        let mut all = all;
+        all.insert(
+            crate::intel::RDAP.to_string(),
+            vec![Quote {
+                provider: crate::intel::RDAP.into(),
+                server: member,
+                server_name: "n1".into(),
+                price_mc: 0,
+            }],
+        );
+        let offer = Offer::from_quotes(node, &all);
+        assert_eq!(offer.paid.len(), 2);
+        assert_eq!(offer.price_of(crate::intel::RDAP), "");
         let f = IpForm::parse(b"ip=203.0.113.9&ask=abuseipdb&ask=shodan");
         assert_eq!(f.asked(), ["abuseipdb", "shodan"]);
         // Every known provider, those this node answers itself included

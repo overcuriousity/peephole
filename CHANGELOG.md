@@ -34,6 +34,11 @@ migration 0038; no protocol change.
   device API, before `404`). Recorded addresses keep their checks.
 - A peer stores the row of a scan job for an address it has no request
   from as unseen too, until a request comes.
+- RDAP, Shodan's InternetDB and the Tor exit list are free goods, not a
+  market: no node prices, keeps, records or announces a price for them, and
+  `peephole credits market`, the Credits page and the lookup page no longer
+  list them. Their results show as before, a request for one (also from a
+  0.14.0 member) is served at 0, and their on-demand share still applies.
 
 ### Security
 

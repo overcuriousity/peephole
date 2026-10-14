@@ -1083,6 +1083,10 @@ fn priced(
             let q = all
                 .get(info.name)
                 .and_then(|l| l.iter().find(|q| q.server == me).or(l.first()))?;
+            // A free good is no market: only this node's own answer counts.
+            if crate::credits::price::is_free(info.name) && q.server != me {
+                return None;
+            }
             Some(Priced {
                 provider: info.name.to_string(),
                 node: q.server_name.clone(),
@@ -2837,6 +2841,24 @@ mod tests {
         assert_eq!(
             super::pick(&offered, &[crate::intel::RDAP.into()]),
             Err(super::Unpicked::NotOffered(crate::intel::RDAP.into()))
+        );
+        // A free good is no market: a member's (older node's) zero price
+        // for it is not offered, this node's own answer is.
+        let mut all = all;
+        all.insert(
+            crate::intel::RDAP.to_string(),
+            vec![q(crate::intel::RDAP, bob, "bob", 0)],
+        );
+        all.insert(
+            crate::intel::TOR.to_string(),
+            vec![q(crate::intel::TOR, me, "this node", 0)],
+        );
+        let offered = super::priced(me, &all);
+        assert!(!offered.iter().any(|p| p.provider == crate::intel::RDAP));
+        assert!(
+            offered
+                .iter()
+                .any(|p| p.provider == crate::intel::TOR && p.own && p.mc == 0)
         );
     }
 

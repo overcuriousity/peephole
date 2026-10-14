@@ -303,8 +303,6 @@ struct CreditsPage {
     market_json: String,
     /// Every traded good: this node's ask and bid, its trades.
     trades: Vec<TradeRow>,
-    /// Goods no node sells (`credits::price::NOT_TRADED`), by label.
-    not_traded: Vec<String>,
     /// This node's last 7 days of income and spending, oldest first.
     flow_json: String,
 }
@@ -533,7 +531,13 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     // The market over 7 days, from the hourly snapshots.
     let since = credits::history::hour_of(book.now_ms) - 7 * 24;
     let mut by_good: BTreeMap<String, Vec<credits::history::Point>> = BTreeMap::new();
-    for p in credits::history::all_since(&st.store.read, since).await? {
+    // A free good (`price::FREE_GOODS`) is no market, also in the hours
+    // an earlier version recorded it.
+    for p in credits::history::all_since(&st.store.read, since)
+        .await?
+        .into_iter()
+        .filter(|p| !credits::price::is_free(&p.good))
+    {
         by_good.entry(p.good.clone()).or_default().push(p);
     }
     let rank = |g: &str| match g {
@@ -666,7 +670,6 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         scan_change,
         market_json,
         trades,
-        not_traded: credits::price::NOT_TRADED.map(good_label).to_vec(),
         flow_json,
     })
 }
@@ -855,7 +858,6 @@ mod tests {
                 bought: 2,
                 over_bid: 3,
             }],
-            not_traded: vec!["RDAP registry".into()],
             flow_json: "[]".into(),
         };
         // The template states these in words.
@@ -880,10 +882,10 @@ mod tests {
             "A relay lease (an hour) costs <b>0.01</b>",
             "checks 5 % of other nodes' fresh scans unpaid",
             "<td>Reverse names</td><td class=\"num\">37.00</td><td class=\"num\">0.50</td><td class=\"num\">0</td><td class=\"num\">2</td><td class=\"num\">3</td>",
-            "<td>RDAP registry</td><td colspan=\"5\" class=\"muted\">not traded</td>",
         ] {
             assert!(html.contains(want), "{want} missing");
         }
+        assert!(!html.contains("not traded"), "free goods are no market");
         assert!(!html.contains("destroyed"));
         assert!(html.contains("node-bravo") && html.contains("30 / 36"));
         assert!(html.contains("<b>0.05</b>"), "cheapest at L1 in bold");
