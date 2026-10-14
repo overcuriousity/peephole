@@ -73,10 +73,16 @@ fn fresh_enough(ts: &str) -> bool {
     ts > cutoff.as_str()
 }
 
-/// The five levels' offers for `ip_id`.
-pub async fn offers_for(state: &AdminState, ip_id: i64) -> Vec<ScanOffer> {
-    let scans = state.store.scans_for_ip(ip_id).await.unwrap_or_default();
-    let jobs = state.store.jobs_for_ip(ip_id, 20).await.unwrap_or_default();
+/// The five levels' offers for `ip_id` (None: an address the dataset does
+/// not hold, with nothing scanned or on its way).
+pub async fn offers_for(state: &AdminState, ip_id: Option<i64>) -> Vec<ScanOffer> {
+    let (scans, jobs) = match ip_id {
+        Some(id) => (
+            state.store.scans_for_ip(id).await.unwrap_or_default(),
+            state.store.jobs_for_ip(id, 20).await.unwrap_or_default(),
+        ),
+        None => (vec![], vec![]),
+    };
     let node = state.recorder.node();
     let table = node.map(|n| n.price_table());
     (1u8..=5)
@@ -193,37 +199,55 @@ pub fn price_range(scanners: &[crate::credits::price::ScannerPrice], level: u8) 
     })
 }
 
-/// Whether a level-`level` scan of `ip_id` is sold now, and at what price:
-/// the checks of the Actions card's buy button (`POST /admin/lookup/scan`)
-/// and of the machine API's quote and buy alike. A job of the level on its
-/// way or a fresh result of it sells nothing; in a cluster the scan budget
-/// must cover the floor price, otherwise the job would silently wait in
-/// the queue.
+/// Where a scan of `ip` goes: its dataset row, or None when the dataset
+/// does not hold it and a sale makes the row, unseen (MIK-329). Err: why
+/// an unrecorded address gets neither row nor scan: the checks a probe
+/// obeys before it reaches out (non-global, `never_scan`, this node's or
+/// a member's address, the operator's lists). A recorded address keeps
+/// the checks it always had, at the scanner.
+pub async fn scan_target(
+    state: &AdminState,
+    ip: IpAddr,
+) -> anyhow::Result<Result<Option<i64>, String>> {
+    let ip = crate::net::canonical(ip);
+    if let Some(row) = state.store.ip_by_addr(&ip.to_string()).await? {
+        return Ok(Ok(Some(row.id)));
+    }
+    if let Some(r) = crate::scan::locally_refused(&ip, &state.cfg.scan.never_scan) {
+        return Ok(Err(r.reason().to_string()));
+    }
+    let mut s = state.safety.lock().await;
+    s.refresh(&state.cfg, state.recorder.node().map(|n| &**n))
+        .await;
+    // Fail closed: what the lists cover is not known.
+    Ok(
+        match s
+            .refuses(&ip)
+            .or_else(|| s.unavailable())
+            .or_else(|| s.listed(&ip))
+        {
+            Some(why) => Err(why),
+            None => Ok(None),
+        },
+    )
+}
+
+/// Whether a level-`level` scan of `ip_id` (None: an address the dataset
+/// does not hold yet) is sold now, and at what price: the checks of the
+/// Actions card's buy button (`POST /admin/lookup/scan`) and of the
+/// machine API's quote and buy alike. A job of the level on its way or a
+/// fresh result of it sells nothing; in a cluster the scan budget must
+/// cover the floor price, otherwise the job would silently wait in the
+/// queue.
 pub async fn sale(
     state: &AdminState,
-    ip_id: i64,
+    ip_id: Option<i64>,
     level: u8,
 ) -> anyhow::Result<Result<Price, NotSold>> {
-    let jobs = state.store.jobs_for_ip(ip_id, 20).await?;
-    if let Some(j) = jobs
-        .iter()
-        .filter(|j| j.level == level as i64)
-        .find(|j| matches!(j.status.as_str(), "queued" | "running"))
+    if let Some(ip_id) = ip_id
+        && let Some(n) = held(state, ip_id, level).await?
     {
-        let waiting = if j.status == "running" {
-            "running"
-        } else {
-            "queued"
-        };
-        return Ok(Err(NotSold::OnItsWay(waiting)));
-    }
-    let fresh = offers_for(state, ip_id)
-        .await
-        .into_iter()
-        .find(|o| o.level == level)
-        .and_then(|o| Some((o.fresh?, o.fresh_id?)));
-    if let Some((at, id)) = fresh {
-        return Ok(Err(NotSold::Fresh(at, id)));
+        return Ok(Err(n));
     }
     let Some(node) = state.recorder.node() else {
         return Ok(Ok(Price {
@@ -243,16 +267,45 @@ pub async fn sale(
     Ok(Ok(price))
 }
 
-/// Queue a marked level-`level` job for `ip_id` and tell the queue view.
-/// Its id; otherwise why not: [`NotSold::OnItsWay`] when a job of the
-/// level got there first (the check of [`sale`] again, under the queue's
-/// lock), None when the queue did not take it for another reason.
+/// Why `ip_id` gets no level-`level` scan now: one on its way, or fresh.
+async fn held(state: &AdminState, ip_id: i64, level: u8) -> anyhow::Result<Option<NotSold>> {
+    let jobs = state.store.jobs_for_ip(ip_id, 20).await?;
+    if let Some(j) = jobs
+        .iter()
+        .filter(|j| j.level == level as i64)
+        .find(|j| matches!(j.status.as_str(), "queued" | "running"))
+    {
+        let waiting = if j.status == "running" {
+            "running"
+        } else {
+            "queued"
+        };
+        return Ok(Some(NotSold::OnItsWay(waiting)));
+    }
+    let fresh = offers_for(state, Some(ip_id))
+        .await
+        .into_iter()
+        .find(|o| o.level == level)
+        .and_then(|o| Some((o.fresh?, o.fresh_id?)));
+    Ok(fresh.map(|(at, id)| NotSold::Fresh(at, id)))
+}
+
+/// Queue a marked level-`level` job for `ip` (canonical) and tell the
+/// queue view; an address the dataset does not hold gets its unseen row
+/// with the job. Its id; otherwise why not: [`NotSold::OnItsWay`] when a
+/// job of the level got there first (the check of [`sale`] again, under
+/// the queue's lock), None when the queue did not take it for another
+/// reason.
 pub async fn enqueue(
     state: &AdminState,
-    ip_id: i64,
+    ip: IpAddr,
     level: u8,
 ) -> anyhow::Result<Result<i64, Option<NotSold>>> {
-    match state.recorder.enqueue_manual(ip_id, level).await? {
+    match state
+        .recorder
+        .enqueue_manual_addr(&ip.to_string(), level)
+        .await?
+    {
         EnqueueOutcome::Queued(id) => {
             if let Ok(Some(job)) = state.store.queue_job(id).await {
                 state.notifier.publish(job);
@@ -277,17 +330,20 @@ async fn buy(
         return Ok(redirect_with_error("/admin/lookup", "Not an IP address."));
     };
     let ip = crate::net::canonical(ip);
-    let back = format!("/ip/{ip}#actions");
+    let lookup = format!("/admin/lookup?ip={ip}");
+    let row = match scan_target(&state, ip).await? {
+        Ok(row) => row,
+        Err(why) => return Ok(redirect_with_error(&lookup, &format!("No scan: {why}."))),
+    };
+    // An unrecorded address has no page until the job makes its row.
+    let back = match row {
+        Some(_) => format!("/ip/{ip}#actions"),
+        None => lookup,
+    };
     let Some(level) = form.level.parse::<i64>().ok().and_then(valid_level) else {
         return Ok(redirect_with_error(&back, "No scan: not a scan level."));
     };
-    let Some(row) = state.store.ip_by_addr(&ip.to_string()).await? else {
-        return Ok(redirect_with_error(
-            &format!("/admin/lookup?ip={ip}"),
-            "No scan: the address is not in the dataset.",
-        ));
-    };
-    match sale(&state, row.id, level).await? {
+    match sale(&state, row, level).await? {
         Err(NotSold::OnItsWay(_)) => {
             return Ok(redirect_with_notice(
                 &back,
@@ -314,10 +370,18 @@ async fn buy(
         }
         Ok(_) => {}
     }
-    match enqueue(&state, row.id, level).await? {
+    match enqueue(&state, ip, level).await? {
         Ok(_) => Ok(redirect_with_notice(
-            &back,
-            &format!("Level {level} scan queued; the result appears below when it is in."),
+            &format!("/ip/{ip}#actions"),
+            &match row {
+                Some(_) => {
+                    format!("Level {level} scan queued; the result appears below when it is in.")
+                }
+                None => format!(
+                    "Level {level} scan queued. The address is now in the dataset, marked unseen: \
+                     no traffic recorded. The result appears below when it is in."
+                ),
+            },
         )),
         Err(Some(NotSold::OnItsWay(_))) => Ok(redirect_with_notice(
             &back,
@@ -399,6 +463,13 @@ pub(crate) mod tests {
 
     /// A standalone admin; `IP` is in the dataset.
     pub(crate) async fn state() -> (Arc<AdminState>, String, i64, tempfile::TempDir) {
+        state_with("").await
+    }
+
+    /// [`state`] with more `[scan]` settings.
+    pub(crate) async fn state_with(
+        scan: &str,
+    ) -> (Arc<AdminState>, String, i64, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -411,6 +482,7 @@ scanner = false
 [scan]
 tor_unknown = "scan"
 verify_crawlers = false
+{scan}
 [webauthn]
 rp_id = "localhost"
 origin = "https://localhost"
@@ -495,7 +567,7 @@ secure_cookies = false
     #[tokio::test]
     async fn standalone_offers_are_free_and_a_fresh_result_stands() {
         let (state, _c, ip_id, _d) = state().await;
-        let offers = offers_for(&state, ip_id).await;
+        let offers = offers_for(&state, Some(ip_id)).await;
         assert_eq!(offers.len(), 5);
         assert!(
             offers
@@ -503,7 +575,7 @@ secure_cookies = false
                 .all(|o| o.price == "free" && o.fresh.is_none())
         );
         scanned(&state.store, IP, &[(80, "open", Some("http"))]).await;
-        let offers = offers_for(&state, ip_id).await;
+        let offers = offers_for(&state, Some(ip_id)).await;
         let l2 = offers.iter().find(|o| o.level == 2).unwrap();
         assert!(l2.fresh.is_some(), "the level-2 scan just finished");
         let scan_id: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE ip_id = ?")
@@ -526,7 +598,7 @@ secure_cookies = false
     async fn an_offer_shows_its_job_on_the_way() {
         let (state, _c, ip_id, _d) = state().await;
         assert!(
-            offers_for(&state, ip_id)
+            offers_for(&state, Some(ip_id))
                 .await
                 .iter()
                 .all(|o| o.waiting.is_none())
@@ -535,7 +607,7 @@ secure_cookies = false
         let waiting = |offers: &[ScanOffer]| -> Vec<(u8, Option<&'static str>)> {
             offers.iter().map(|o| (o.level, o.waiting)).collect()
         };
-        let offers = offers_for(&state, ip_id).await;
+        let offers = offers_for(&state, Some(ip_id)).await;
         assert_eq!(
             waiting(&offers),
             vec![
@@ -551,7 +623,7 @@ secure_cookies = false
             .execute(&state.store.pool)
             .await
             .unwrap();
-        let offers = offers_for(&state, ip_id).await;
+        let offers = offers_for(&state, Some(ip_id)).await;
         assert_eq!(offers[2].waiting, Some("running"));
         assert_eq!(offers[2].about, about(3));
     }
@@ -603,6 +675,105 @@ secure_cookies = false
                 .await
                 .unwrap();
         assert_eq!(n, 0, "no job at a level that is not offered");
+    }
+
+    /// Not in the dataset, global, nobody's: the job makes its row, unseen.
+    pub(crate) const UNRECORDED: &str = "198.51.100.200";
+
+    #[tokio::test]
+    async fn buying_a_scan_of_an_unrecorded_address_adds_it_unseen() {
+        let (state, cookie, _, _d) = state().await;
+        let app = crate::admin::full_router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(post(&cookie, &format!("ip={UNRECORDED}&level=2")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 303);
+        assert_eq!(
+            r.headers()["location"],
+            format!("/ip/{UNRECORDED}#actions").as_str()
+        );
+        let row = state.store.ip_by_addr(UNRECORDED).await.unwrap().unwrap();
+        assert!(row.unseen);
+        assert_eq!(row.request_count, 0);
+        assert_eq!((row.country, row.asn, row.asn_org), (None, None, None));
+        let jobs: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT level, manual FROM scan_jobs WHERE ip_id = ?")
+                .bind(row.id)
+                .fetch_all(&state.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, vec![(2, 1)]);
+        // Labelled wherever it is shown.
+        for page in [format!("/ip/{UNRECORDED}"), "/ips".to_string()] {
+            let r = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(&page)
+                        .header("cookie", &cookie)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{page}");
+            let html = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&html);
+            assert!(
+                html.contains(r#"class="badge badge-unseen""#),
+                "{page}: {html}"
+            );
+        }
+    }
+
+    /// What the guard refuses gets neither a row nor a job: non-global,
+    /// this node's own, `never_scan`, a member's address.
+    #[tokio::test]
+    async fn a_refused_unrecorded_address_gets_no_row_and_no_scan() {
+        let (state, cookie, _, _d) =
+            state_with("own_addresses = [\"198.51.100.5\"]\nnever_scan = [\"198.51.100.64/26\"]")
+                .await;
+        state
+            .safety
+            .lock()
+            .await
+            .saw_member("198.51.100.9".parse().unwrap(), "peer");
+        let app = crate::admin::full_router(state.clone());
+        for (ip, why) in [
+            ("10.0.0.1", "private"),
+            ("127.0.0.1", "loopback"),
+            ("169.254.169.254", "link-local"),
+            ("::1", "IPv6 loopback"),
+            ("198.51.100.5", "own address"),
+            ("198.51.100.70", "never_scan"),
+            ("198.51.100.9", "member"),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(post(&cookie, &format!("ip={ip}&level=2")))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 303, "{why}");
+            assert_eq!(
+                r.headers()["location"],
+                format!("/admin/lookup?ip={ip}").as_str(),
+                "{why}"
+            );
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ips WHERE ip != ?")
+            .bind(IP)
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no row for a refused address");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no scan of a refused address");
     }
 
     #[tokio::test]

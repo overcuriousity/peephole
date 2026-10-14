@@ -6851,7 +6851,13 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
         "{unknown}"
     );
-    assert!(sections(&unknown).is_empty());
+    // Only the Counter-scan card, whose buy adds the address unseen
+    // (MIK-329).
+    assert_eq!(sections(&unknown), ["actions"], "{unknown}");
+    assert!(
+        unknown.contains("Buying a scan adds the address"),
+        "{unknown}"
+    );
 }
 
 /// The Credits page: where credits come from, what this node holds, what

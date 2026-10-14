@@ -240,6 +240,13 @@ impl Safety {
         self.names_at = Some(Instant::now());
     }
 
+    /// Count `ip` as an address member `who` connected from, as a
+    /// refresh with a node does.
+    #[cfg(test)]
+    pub(crate) fn saw_member(&mut self, ip: IpAddr, who: &str) {
+        self.observed.insert(ip, (who.into(), Instant::now()));
+    }
+
     /// Count `addrs` (this node's peer-observed public addresses) as its own.
     pub fn add_public(&mut self, addrs: &[IpAddr]) {
         self.own

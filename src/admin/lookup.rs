@@ -269,6 +269,16 @@ pub struct LookupResult {
     pub declined: Vec<(String, String, String)>,
     /// A serving node kept the answers in the dataset.
     pub kept: bool,
+    /// For an address the dataset does not hold: the counter-scans on
+    /// offer, whose buy adds it unseen (MIK-329), or why none is.
+    pub scan: Option<UnrecordedScan>,
+}
+
+/// The Counter-scan card of an address the dataset does not hold.
+pub struct UnrecordedScan {
+    pub offers: Vec<crate::admin::scan_buy::ScanOffer>,
+    /// Why the address gets no scan (`scan_buy::scan_target`).
+    pub refused: Option<String>,
 }
 
 impl LookupResult {
@@ -649,6 +659,25 @@ pub async fn run(
         .as_mut()
         .map(|t| std::mem::take(&mut t.intel))
         .unwrap_or_default();
+    let scan = match &target {
+        Some(_) => None,
+        None => match crate::admin::scan_buy::scan_target(state, ip).await {
+            Ok(Ok(None)) => Some(UnrecordedScan {
+                offers: crate::admin::scan_buy::offers_for(state, None).await,
+                refused: None,
+            }),
+            Ok(Err(why)) => Some(UnrecordedScan {
+                offers: vec![],
+                refused: Some(why),
+            }),
+            // Recorded meanwhile, or not readable: no card.
+            Ok(Ok(Some(_))) => None,
+            Err(e) => {
+                tracing::warn!(?e, %ip, "lookup: scan offer not read");
+                None
+            }
+        },
+    };
     Ok(LookupResult {
         ip: ip.to_string(),
         target,
@@ -658,6 +687,7 @@ pub async fn run(
         charges,
         declined,
         kept: out.kept,
+        scan,
     })
 }
 
@@ -942,6 +972,14 @@ secure_cookies = false
 
         let (_, html) = send(&app, post(), "ip=2001:DB8::1").await;
         assert!(html.contains("2001:db8::1") && html.contains("not in the dataset"));
+        // MIK-329: a counter-scan is on offer all the same; its buy adds
+        // the address, unseen.
+        assert!(html.contains(r#"action="/admin/lookup/scan""#), "{html}");
+        assert!(html.contains("Buying a scan adds the address") && html.contains(">unseen<"));
+        // A non-global address is not offered one.
+        let (_, html) = send(&app, post(), "ip=10.0.0.1").await;
+        assert!(!html.contains(r#"action="/admin/lookup/scan""#), "{html}");
+        assert!(html.contains("No scan: non-global address"), "{html}");
 
         // A URL is looked up as its host; its userinfo is not shown.
         let (_, html) = send(
