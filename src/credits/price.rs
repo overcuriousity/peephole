@@ -464,9 +464,18 @@ pub const MARKET_GOODS: [&str; 8] = [
     intel::SHODAN,
     intel::MAXMIND,
 ];
-/// Listed after [`MARKET_GOODS`]: no automatic buyer buys RDAP; the able
-/// nodes fetch it in turns and share the answer.
-pub const NOT_TRADED: [&str; 1] = [intel::RDAP];
+/// Public data every node answers from its own copy, free: RDAP (fetched
+/// in turns and shared), Shodan's InternetDB (no key) and the Tor exit
+/// list (replicated). Nobody buys them from a member, so they are no
+/// market: no price is stepped, kept, recorded or announced for them, and
+/// a request for one is served at 0 ([`Table::price_of`] is None). Their
+/// on-demand share (`credits::share`) still applies.
+pub const FREE_GOODS: [&str; 3] = [intel::RDAP, intel::INTERNETDB, intel::TOR];
+
+/// Whether `good` is one of [`FREE_GOODS`].
+pub fn is_free(good: &str) -> bool {
+    FREE_GOODS.contains(&good)
+}
 
 /// Kept across restarts: the asks for `good` this node refused as above
 /// its bid ([`Demand::over_bid`]).
@@ -754,7 +763,7 @@ pub async fn load_kept(node: &Node) -> Result<()> {
         .lookup_providers()
         .into_iter()
         .flatten()
-        .filter(|p| p.ready())
+        .filter(|p| p.ready() && !is_free(p.name()))
     {
         if let Some(mc) = kept_price(node, p.name()).await? {
             t.offers.push(Offer {
@@ -841,7 +850,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .lookup_shares()
         .map_or(crate::config::DEFAULT_OFFER_PER_DAY, |s| s.offer_per_day());
     let mut offers = vec![];
-    for p in providers.iter().filter(|p| p.ready()) {
+    for p in providers.iter().filter(|p| p.ready() && !is_free(p.name())) {
         let on_demand = node
             .lookup_shares()
             .map_or(offer_per_day, |s| s.allowance(p.as_ref()));
@@ -916,6 +925,10 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             .intel_set(&price_key(good), &mc.to_string())
             .await?;
     }
+    // What an earlier version kept for a free good is no price any more.
+    for good in FREE_GOODS {
+        node.store.intel_delete(&price_key(good)).await?;
+    }
     // The hour's snapshot for the Credits page: demand and supply per hour.
     let per_hour = |n: f64| if hours > 0.0 { n / hours } else { 0.0 };
     let mut goods: Vec<(&str, Option<u32>, f64, f64)> = offers
@@ -964,8 +977,9 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
             node.cfg.relay_slots as f64,
         ));
     }
-    // Goods only members announce (a provider this node does not serve).
-    for g in announced.keys() {
+    // Goods only members announce (a provider this node does not serve);
+    // a free good an older member still prices is no market here.
+    for g in announced.keys().filter(|g| !is_free(g)) {
         if !goods.iter().any(|(x, ..)| x == g) {
             goods.push((g.as_str(), None, 0.0, 0.0));
         }
@@ -1255,7 +1269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_market_lists_every_good_and_rdap_as_not_traded() {
+    async fn the_market_lists_every_traded_good_and_no_free_one() {
         let (_dir, node) = test_node().await;
         node.store
             .intel_set(&price_key(RDNS), "37000")
@@ -1293,10 +1307,9 @@ mod tests {
                 "abuseipdb",
                 "shodan",
                 "maxmind-geolite2",
-                "rdap"
             ]
         );
-        assert!(lines.last().unwrap().ends_with("not traded"));
+        assert!(!lines.iter().any(|l| l.contains("not traded")));
         assert!(
             lines[4].contains("37.00") && lines[4].contains("0.50"),
             "{}",
@@ -1491,6 +1504,91 @@ mod tests {
             (66, 1.0),
             "the last copy here, an hour ago"
         );
+    }
+
+    /// A provider that answers every address.
+    struct Answers(&'static str);
+    impl crate::intel::provider::Provider for Answers {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn lookup<'a>(
+            &'a self,
+            ips: &'a [String],
+        ) -> futures::future::BoxFuture<'a, Vec<crate::intel::provider::Finding>> {
+            Box::pin(async move {
+                ips.iter()
+                    .map(|ip| crate::intel::provider::Finding {
+                        ip: ip.clone(),
+                        source_version: None,
+                        data: serde_json::json!({}),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// The free goods are no market: no price is stepped, kept, recorded
+    /// or announced for them, and a member of an earlier version that
+    /// asks for one (with no offer, or a zero one) is served at 0.
+    #[tokio::test]
+    async fn free_goods_are_no_market_and_still_served_at_zero() {
+        let (_dir, node) = test_node().await;
+        let providers: crate::intel::Providers = vec![
+            Arc::new(Answers(intel::RDAP)),
+            Arc::new(Answers(intel::INTERNETDB)),
+            Arc::new(Answers(intel::TOR)),
+            Arc::new(Answers(intel::ABUSEIPDB)),
+        ];
+        node.set_lookup_providers(providers.clone());
+        // What 0.14.0 kept.
+        for good in FREE_GOODS {
+            node.store.intel_set(&price_key(good), "0").await.unwrap();
+        }
+        node.store
+            .intel_set(&price_key(intel::ABUSEIPDB), "200")
+            .await
+            .unwrap();
+        load_kept(&node).await.unwrap();
+        let t = node.price_table();
+        assert_eq!(t.price_of(intel::ABUSEIPDB), Some(200));
+        assert!(FREE_GOODS.iter().all(|g| t.price_of(g).is_none()));
+        let t = refresh(&node).await.unwrap();
+        let offered: Vec<&str> = t.offers.iter().map(|o| o.provider.as_str()).collect();
+        assert_eq!(offered, [intel::ABUSEIPDB]);
+        let (on_demand, prices) = t.announced();
+        assert!(!on_demand.iter().chain(&prices).any(|(g, _)| is_free(g)));
+        for good in FREE_GOODS {
+            assert_eq!(node.store.intel_get(&price_key(good)).await.unwrap(), None);
+        }
+        let recorded: Vec<String> = sqlx::query_scalar("SELECT good FROM price_history")
+            .fetch_all(&node.store.pool)
+            .await
+            .unwrap();
+        assert!(
+            recorded.iter().any(|g| g == intel::ABUSEIPDB),
+            "{recorded:?}"
+        );
+        assert!(!recorded.iter().any(|g| is_free(g)), "{recorded:?}");
+        // A zero offer for them covers what they cost here.
+        assert!(FREE_GOODS.iter().all(|g| t.price_of(g).unwrap_or(0) == 0));
+        // A request without an offer is answered, not declined.
+        let resp = crate::credits::pay::serve_free(
+            &node,
+            &providers,
+            NodeId([9; 32]),
+            "203.0.113.5".parse().unwrap(),
+            FREE_GOODS.map(String::from).to_vec(),
+        )
+        .await;
+        assert!(resp.declined.is_empty(), "{:?}", resp.declined);
+        assert_eq!(resp.price_mc, None);
+        let answered: Vec<&str> = resp.findings.iter().map(|f| f.provider.as_str()).collect();
+        assert_eq!(answered.len(), 3);
+        assert!(answered.iter().all(|g| is_free(g)));
     }
 
     #[tokio::test]

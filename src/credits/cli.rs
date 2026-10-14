@@ -204,8 +204,8 @@ pub fn rdap_lines(rows: &[(String, i64, i64)]) -> Vec<String> {
     out
 }
 
-/// `peephole credits market`: one row per traded good, then the goods
-/// that are not traded. Sold and bought count the book's window
+/// `peephole credits market`: one row per traded good (the free goods,
+/// `price::FREE_GOODS`, are no market and not listed). Sold and bought count the book's window
 /// (`LOT_DAYS`); ask and bid are as of the last hourly price refresh.
 pub fn market_lines(rows: &[super::price::MarketRow]) -> Vec<String> {
     let mut out = vec![format!(
@@ -222,9 +222,6 @@ pub fn market_lines(rows: &[super::price::MarketRow]) -> Vec<String> {
             r.tally.bought,
             r.tally.over_bid
         ));
-    }
-    for good in super::price::NOT_TRADED {
-        out.push(format!("{good:<18} not traded"));
     }
     out
 }

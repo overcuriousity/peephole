@@ -5,6 +5,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Changed
+
+- RDAP, Shodan's InternetDB and the Tor exit list are free goods, not a
+  market: no node prices, keeps, records or announces a price for them, and
+  `peephole credits market`, the Credits page and the lookup page no longer
+  list them. Their results show as before, a request for one (also from a
+  0.14.0 member) is served at 0, and their on-demand share still applies.
+
 ## [0.14.0] - 2026-10-13
 
 Protocol 9: a free market. Every node must upgrade to 0.14.0 to trade on

@@ -235,8 +235,12 @@ bid is at least the seller's ask. Nothing a member announces, answers or
 refuses moves another node's bid. `peephole credits market` and the
 Credits page list, per good, this node's ask and bid, what it sold and
 bought over the last 7 days, and how many asks above its bid it refused
-(`over bid`). RDAP is not traded by automatic buyers: the able nodes
-fetch it in turns and share the answer.
+(`over bid`). RDAP, Shodan's InternetDB and the Tor exit list are free
+goods, not a market: every node answers them from its own copy (the able
+nodes fetch RDAP in turns and share the answer, the exit list is
+replicated, InternetDB needs no key), so no node prices, keeps or
+announces a price for them, and a request for one is served at 0. Their
+on-demand share still applies.
 
 **RDAP spot-checks (local).** Each node asks the registry again for 10 %
 of the IPs whose RDAP row another member wrote in the last 7 days. Which
