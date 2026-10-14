@@ -402,4 +402,204 @@ mod tests {
         assert!(anonymous.contains("Admin login"), "{anonymous}");
         assert!(!anonymous.contains("Log out"));
     }
+
+    /// What a refused write must leave as is: scan jobs and spent quotes.
+    async fn jobs_and_spent(state: &AdminState) -> (i64, i64) {
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        let spent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_actions")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        (jobs, spent)
+    }
+
+    /// `req` with the browser headers of `site`: pairs of header and value.
+    fn with(
+        mut req: axum::http::request::Builder,
+        site: &[(&str, &str)],
+    ) -> axum::http::request::Builder {
+        req = req.header(axum::http::header::HOST, "localhost");
+        for (k, v) in site {
+            req = req.header(*k, *v);
+        }
+        req
+    }
+
+    /// Headers a cross-site or sandboxed page sends with a write. Each is
+    /// refused (MIK-372 T1).
+    const FOREIGN: &[&[(&str, &str)]] = &[
+        &[("origin", "https://evil.example")],
+        // Same host name, other port: another origin.
+        &[("origin", "https://localhost:8443")],
+        // A sandboxed iframe or a redirect chain.
+        &[("origin", "null")],
+        &[("sec-fetch-site", "cross-site")],
+        // A sibling vhost behind the same proxy.
+        &[("sec-fetch-site", "same-site")],
+        // Fetch metadata wins over a matching Origin.
+        &[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://localhost"),
+        ],
+    ];
+
+    /// Headers of the admin's own pages: allowed.
+    const OWN: &[&[(&str, &str)]] = &[
+        &[("origin", "https://localhost")],
+        &[("sec-fetch-site", "same-origin")],
+        &[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://localhost"),
+        ],
+        // Typed into the address bar / a bookmark.
+        &[("sec-fetch-site", "none")],
+    ];
+
+    #[tokio::test]
+    async fn a_cross_site_form_post_is_refused_and_queues_nothing() {
+        use crate::admin::scan_buy::tests::{IP, state};
+        let (state, cookie, _ip, _d) = state().await;
+        let app = full_router(state.clone());
+        let form = |site: &[(&str, &str)]| {
+            with(axum::http::Request::post("/admin/lookup/scan"), site)
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(axum::body::Body::from(format!("ip={IP}&level=2")))
+                .unwrap()
+        };
+        for site in FOREIGN {
+            let r = app.clone().oneshot(form(site)).await.unwrap();
+            assert_eq!(r.status(), 403, "{site:?}");
+            let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&b[..], b"cross-site request refused", "{site:?}");
+            assert_eq!(jobs_and_spent(&state).await, (0, 0), "{site:?}");
+        }
+        // The same post from the admin's own page goes through.
+        let r = app.clone().oneshot(form(OWN[0])).await.unwrap();
+        assert_eq!(r.status(), 303);
+        assert_eq!(jobs_and_spent(&state).await, (1, 0));
+        // Reading a page from anywhere is not a write.
+        let r = app
+            .oneshot(
+                with(axum::http::Request::get("/admin/lookup"), FOREIGN[0])
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn every_own_origin_form_post_goes_through() {
+        use crate::admin::scan_buy::tests::{IP, state};
+        for (level, site) in OWN.iter().enumerate() {
+            let (state, cookie, _ip, _d) = state().await;
+            let r = full_router(state.clone())
+                .oneshot(
+                    with(axum::http::Request::post("/admin/lookup/scan"), site)
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(axum::body::Body::from(format!(
+                            "ip={IP}&level={}",
+                            level + 1
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 303, "{site:?}");
+            assert_eq!(jobs_and_spent(&state).await, (1, 0), "{site:?}");
+        }
+    }
+
+    /// The guard sits in front of the JSON API too: a cross-site buy is
+    /// refused before the quote is spent; the same buy from the own origin
+    /// spends it.
+    #[tokio::test]
+    async fn a_cross_site_json_buy_is_refused_and_spends_no_quote() {
+        use crate::admin::scan_buy::tests::{IP, state};
+        let (state, _cookie, _ip, _d) = state().await;
+        let app = full_router(state.clone());
+        let code = state
+            .store
+            .mint_pairing_code("read,act", "admin")
+            .await
+            .unwrap();
+        let (_, token) = state
+            .store
+            .redeem_pairing_code(&code, "Pixel 8")
+            .await
+            .unwrap()
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+        // The quote is a read: no Origin check.
+        let r = app
+            .clone()
+            .oneshot(
+                with(
+                    axum::http::Request::get(format!("/api/v1/ips/{IP}/scan/quote?level=2")),
+                    FOREIGN[0],
+                )
+                .header("authorization", &bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let q: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let body = serde_json::json!({"quote_id": q["quote_id"]}).to_string();
+        let buy = |site: &[(&str, &str)]| {
+            with(
+                axum::http::Request::post(format!("/api/v1/ips/{IP}/scan")),
+                site,
+            )
+            .header("authorization", &bearer)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap()
+        };
+        for site in FOREIGN {
+            let r = app.clone().oneshot(buy(site)).await.unwrap();
+            assert_eq!(r.status(), 403, "{site:?}");
+            assert_eq!(jobs_and_spent(&state).await, (0, 0), "{site:?}");
+        }
+        // The quote was not spent by the refusals: it buys now.
+        let r = app.oneshot(buy(OWN[0])).await.unwrap();
+        assert_eq!(r.status(), 202);
+        assert_eq!(jobs_and_spent(&state).await, (1, 1));
+    }
+
+    /// No Origin and no Sec-Fetch-Site (curl, the test suite): allowed
+    /// today; the session cookie is SameSite=Strict. MIK-372 S2 proposes
+    /// to require one of them when a session cookie is present; this test
+    /// changes with it.
+    #[tokio::test]
+    async fn a_write_without_origin_or_fetch_metadata_is_allowed() {
+        use crate::admin::scan_buy::tests::{IP, post, state};
+        let (state, cookie, _ip, _d) = state().await;
+        let r = full_router(state.clone())
+            .oneshot(post(&cookie, &format!("ip={IP}&level=2")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 303);
+        assert_eq!(jobs_and_spent(&state).await, (1, 0));
+        // An Origin without a Host to compare it to is refused.
+        let mut req = post(&cookie, &format!("ip={IP}&level=3"));
+        req.headers_mut()
+            .insert("origin", "https://localhost".parse().unwrap());
+        let r = full_router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(r.status(), 403);
+        assert_eq!(jobs_and_spent(&state).await, (1, 0));
+    }
 }

@@ -669,4 +669,211 @@ mod tests {
                 .unwrap();
         assert_eq!(pending, 0);
     }
+
+    /// A raw pool on `path` (no migrations): an older build's database.
+    async fn raw_pool(path: &Path) -> sqlx::SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        SqlitePoolOptions::new().connect_with(opts).await.unwrap()
+    }
+
+    async fn exec(pool: &sqlx::SqlitePool, sql: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// A database of the first release, holding data, written again by the
+    /// build of migration 0017 (just before 0018 rebuilds `host_keys`),
+    /// opens with the current build: every row survives, the schema reaches
+    /// the latest version, and the migrations that drop data drop only
+    /// theirs (MIK-372 T3).
+    #[tokio::test]
+    async fn an_old_database_with_data_migrates_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let pool = raw_pool(&path).await;
+            check_application_id(&pool).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..1]).await.unwrap();
+            for sql in [
+                "INSERT INTO ips (id, ip, first_seen, last_seen, country, notes)
+                 VALUES (1, '203.0.113.9', '2025-06-01 00:00:00', '2025-06-02 00:00:00',
+                         'DE', 'kept')",
+                "INSERT INTO requests (id, uid, ts, ip_id, method, path, headers_json,
+                                       labels_json, severity)
+                 VALUES (1, 'r-old', '2025-06-02 00:00:00', 1, 'GET', '/.env', '[]',
+                         '[\"env\"]', 3)",
+                "INSERT INTO scan_jobs (id, uid, ip_id, level, status, queued_at, finished_at)
+                 VALUES (1, 'j-old', 1, 2, 'done', '2025-06-02 00:00:00',
+                         '2025-06-02 00:05:00')",
+                "INSERT INTO scans (id, uid, job_id, ip_id, level, started_at, finished_at, os_guess)
+                 VALUES (1, 's-old', 1, 1, 2, '2025-06-02 00:01:00', '2025-06-02 00:05:00',
+                         'Linux 5.x')",
+                "INSERT INTO ports (scan_id, port, proto, state, service)
+                 VALUES (1, 22, 'tcp', 'open', 'ssh')",
+                "INSERT INTO settings (key, value) VALUES ('scan.max_workers', '3')",
+                // Dropped on purpose by 0011 and 0024.
+                "INSERT INTO settings (key, value) VALUES ('cluster.config_key', 'x')",
+                "INSERT INTO settings (key, value) VALUES ('credits.collect_to', 'y')",
+            ] {
+                exec(&pool, sql).await;
+            }
+            migrate(&pool, &MIGRATIONS[..17]).await.unwrap();
+            // A host key of the scan (0002), already parsed: 0018 copies it
+            // into the rebuilt table.
+            exec(
+                &pool,
+                "INSERT INTO host_keys (scan_id, ip_id, port, kind, fingerprint)
+                 VALUES (1, 1, 22, 'ssh-ed25519', 'SHA256:kept')",
+            )
+            .await;
+            exec(&pool, "UPDATE scans SET keys_parsed = 1").await;
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+        let ip: (String, String, String, i64, i64, String) = sqlx::query_as(
+            "SELECT ip, country, notes, request_count, max_severity, ip_key
+             FROM ips WHERE id = 1",
+        )
+        .fetch_one(&s.read)
+        .await
+        .unwrap();
+        assert_eq!(ip.0, "203.0.113.9");
+        assert_eq!((ip.1.as_str(), ip.2.as_str()), ("DE", "kept"));
+        assert_eq!((ip.3, ip.4), (1, 3), "the aggregates stand");
+        assert!(!ip.5.is_empty(), "the range key is backfilled");
+        let req: (String, String, String, i64) =
+            sqlx::query_as("SELECT uid, path, labels_json, severity FROM requests WHERE id = 1")
+                .fetch_one(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(req, ("r-old".into(), "/.env".into(), "[\"env\"]".into(), 3));
+        let scan: (String, String, i64) = sqlx::query_as(
+            "SELECT s.uid, s.os_guess, j.level FROM scans s JOIN scan_jobs j ON j.id = s.job_id
+             WHERE s.id = 1",
+        )
+        .fetch_one(&s.read)
+        .await
+        .unwrap();
+        assert_eq!(scan, ("s-old".into(), "Linux 5.x".into(), 2));
+        let port: (i64, String) =
+            sqlx::query_as("SELECT port, service FROM ports WHERE scan_id = 1")
+                .fetch_one(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(port, (22, "ssh".into()));
+        let key: (Option<i64>, Option<i64>, String) =
+            sqlx::query_as("SELECT scan_id, probe_id, fingerprint FROM host_keys WHERE port = 22")
+                .fetch_one(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(key, (Some(1), None, "SHA256:kept".into()));
+        let settings: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM settings ORDER BY key")
+                .fetch_all(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(settings, vec![("scan.max_workers".into(), "3".into())]);
+        // Reopening changes nothing.
+        drop(s);
+        let s = Store::connect(&path).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&s.read)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Every intermediate version upgrades: a database left at schema `v`
+    /// by any older build, with a row, reaches the latest version.
+    #[tokio::test]
+    async fn every_older_schema_version_upgrades_with_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for v in 1..MIGRATIONS.len() {
+            let path = dir.path().join(format!("v{v}.db"));
+            {
+                let pool = raw_pool(&path).await;
+                check_application_id(&pool).await.unwrap();
+                migrate(&pool, &MIGRATIONS[..v]).await.unwrap();
+                exec(
+                    &pool,
+                    "INSERT INTO ips (ip, first_seen, last_seen)
+                     VALUES ('198.51.100.3', '2025-01-01 00:00:00', '2025-01-01 00:00:00')",
+                )
+                .await;
+                pool.close().await;
+            }
+            let s = Store::connect(&path)
+                .await
+                .unwrap_or_else(|e| panic!("from schema {v}: {e:#}"));
+            assert_eq!(
+                s.schema_version().await.unwrap(),
+                MIGRATIONS.len() as i64,
+                "from schema {v}"
+            );
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ips WHERE ip = '198.51.100.3'")
+                .fetch_one(&s.read)
+                .await
+                .unwrap();
+            assert_eq!(n, 1, "from schema {v}");
+        }
+    }
+
+    /// A database a newer build migrated (an installer rollback) is opened
+    /// as it is: no migration runs, its version is not lowered and its
+    /// schema and rows are untouched. Not refused: the build only warns,
+    /// as migrations are additive (see the end of [`migrate`]).
+    #[tokio::test]
+    async fn a_database_newer_than_the_build_opens_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let newer = MIGRATIONS.len() as i64 + 3;
+        {
+            let s = Store::connect(&path).await.unwrap();
+            exec(
+                &s.pool,
+                "INSERT INTO ips (ip, ip_key, first_seen, last_seen)
+                 VALUES ('192.0.2.1', '', '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            )
+            .await;
+            // What the newer build's migrations added.
+            exec(&s.pool, "CREATE TABLE from_the_future (x INTEGER)").await;
+            exec(&s.pool, "INSERT INTO from_the_future VALUES (42)").await;
+            exec(&s.pool, &format!("PRAGMA user_version = {newer}")).await;
+            s.pool.close().await;
+            s.read.close().await;
+        }
+        let schema = |pool: sqlx::SqlitePool| async move {
+            let v: Vec<(String, String, Option<String>)> =
+                sqlx::query_as("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            v
+        };
+        let before = {
+            let pool = raw_pool(&path).await;
+            let v = schema(pool.clone()).await;
+            pool.close().await;
+            v
+        };
+        let s = Store::connect(&path).await.expect("a newer schema opens");
+        assert_eq!(s.schema_version().await.unwrap(), newer, "not lowered");
+        assert_eq!(schema(s.pool.clone()).await, before, "schema untouched");
+        let x: i64 = sqlx::query_scalar("SELECT x FROM from_the_future")
+            .fetch_one(&s.read)
+            .await
+            .unwrap();
+        assert_eq!(x, 42);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ips WHERE ip = '192.0.2.1'")
+            .fetch_one(&s.read)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 }

@@ -2656,6 +2656,12 @@ async fn a_blocked_peer_does_not_hold_up_enrichment() {
 /// The admin router of `n` (cluster recorder) on an ephemeral port, with an
 /// enrolled soft passkey. Returns the logged-in client and base URL.
 async fn admin_on(n: &TestNode) -> (reqwest::Client, String) {
+    let (client, base, _) = admin_on_jar(n).await;
+    (client, base)
+}
+
+/// [`admin_on`], with the client's cookie jar (to read a flash message).
+async fn admin_on_jar(n: &TestNode) -> (reqwest::Client, String, Arc<reqwest::cookie::Jar>) {
     use webauthn_authenticator_rs::AuthenticatorBackend;
     use webauthn_authenticator_rs::prelude::Url;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -2691,8 +2697,9 @@ secure_cookies = false
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
+    let jar = Arc::new(reqwest::cookie::Jar::default());
     let client = reqwest::Client::builder()
-        .cookie_store(true)
+        .cookie_provider(jar.clone())
         .build()
         .unwrap();
     let mut soft = SoftPasskey::new(true);
@@ -2717,7 +2724,7 @@ secure_cookies = false
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    (client, base)
+    (client, base, jar)
 }
 
 /// The Members page and every node page it links to, as one string.
@@ -8530,4 +8537,176 @@ async fn offers_written_at_once_are_each_covered() {
     }
     let o = book.ledger.offer(&a.id, job_seq.unwrap()).unwrap();
     assert_eq!((o.offered, o.covered), (4, 4), "{o:?}");
+}
+
+/// A scan the node cannot pay for is refused on both buy paths, the
+/// Actions card's form and the machine API (quote and buy), and nothing
+/// is queued or spent (MIK-372 T2): no live scanner announces a price
+/// (`no_price`), or the scan budget does not cover the floor price
+/// (`no_budget`).
+#[tokio::test]
+async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
+    use peephole::credits::price::{ScannerPrice, Table};
+    let (ia, a) = new_node("a");
+    let na = boot(ia, &a, &[], DEFAULT).await;
+    let ip = "203.0.113.51";
+    na.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    let (admin, base, jar) = admin_on_jar(&na).await;
+    let code = na
+        .store
+        .mint_pairing_code("read,act", "admin")
+        .await
+        .unwrap();
+    let (_, token) = na
+        .store
+        .redeem_pairing_code(&code, "Pixel 8")
+        .await
+        .unwrap()
+        .unwrap();
+    let api = reqwest::Client::new();
+    // Set right before each call: the credits loop refreshes the table.
+    let price = |mc: Option<u32>| {
+        na.node.set_price_table(Arc::new(Table {
+            scanners: mc
+                .map(|price_mc| ScannerPrice {
+                    node: na.id(),
+                    price_mc,
+                    paid: 0.0,
+                    supply: 0.0,
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }))
+    };
+    let balance = || async {
+        peephole::credits::book_fresh(&na.node)
+            .await
+            .unwrap()
+            .balance(&na.id())
+    };
+    let before = (
+        balance().await,
+        count(&na, "SELECT COUNT(*) FROM credit_entries").await,
+    );
+    // Far above any budget a fresh node holds.
+    const DEAR: u32 = 1_000_000_000;
+    assert!((balance().await as u64) < DEAR as u64);
+    // The Actions card's buy button: where it lands and the error it
+    // flashes there (a cookie the page's script shows).
+    let form = |level: u8| {
+        let admin = admin.clone();
+        let base = base.clone();
+        let jar = jar.clone();
+        async move {
+            use reqwest::cookie::CookieStore;
+            let r = admin
+                .post(format!("{base}/admin/lookup/scan"))
+                .form(&[("ip", ip.to_string()), ("level", level.to_string())])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), reqwest::StatusCode::OK);
+            assert_eq!(r.url().path(), format!("/ip/{ip}"));
+            let cookies = jar.cookies(&base.parse().unwrap()).unwrap();
+            let flash = cookies
+                .to_str()
+                .unwrap()
+                .split("; ")
+                .find_map(|c| c.strip_prefix("peephole_flash_error="))
+                .unwrap_or_default();
+            let mut m: Vec<(String, String)> =
+                serde_urlencoded::from_str(&format!("m={flash}")).unwrap();
+            m.pop().unwrap().1
+        }
+    };
+    let quote = |level: u8| {
+        let api = api.clone();
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            let r = api
+                .get(format!("{base}/api/v1/ips/{ip}/scan/quote?level={level}"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            (r.status(), r.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+    let buy = |quote_id: serde_json::Value| {
+        let api = api.clone();
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            let r = api
+                .post(format!("{base}/api/v1/ips/{ip}/scan"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({"quote_id": quote_id}))
+                .send()
+                .await
+                .unwrap();
+            (r.status(), r.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+    let conflict = reqwest::StatusCode::CONFLICT;
+
+    // No live scanner announces a price.
+    price(None);
+    assert_eq!(form(2).await, "No scan: no live scanner announces a price.");
+    price(None);
+    let (st, v) = quote(2).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (conflict, &"no_price".into()),
+        "{v}"
+    );
+
+    // A price, but the budget does not cover it.
+    price(Some(DEAR));
+    assert_eq!(
+        form(2).await,
+        "No scan: the scan budget does not cover this."
+    );
+    price(Some(DEAR));
+    let (st, v) = quote(2).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (conflict, &"no_budget".into()),
+        "{v}"
+    );
+
+    // A quote taken while the scan was free, bought after the scanners
+    // went away or the price rose past the budget: the buy checks again.
+    price(Some(0));
+    let (st, q) = quote(2).await;
+    assert_eq!(st, reqwest::StatusCode::OK, "{q}");
+    price(None);
+    let (st, v) = buy(q["quote_id"].clone()).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (conflict, &"no_price".into()),
+        "{v}"
+    );
+    price(Some(0));
+    let (st, q) = quote(2).await;
+    assert_eq!(st, reqwest::StatusCode::OK, "{q}");
+    price(Some(DEAR));
+    let (st, v) = buy(q["quote_id"].clone()).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (conflict, &"no_budget".into()),
+        "{v}"
+    );
+
+    // Nothing queued, audited or spent.
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM scan_jobs").await, 0);
+    assert_eq!(count(&na, "SELECT COUNT(*) FROM device_actions").await, 0);
+    assert_eq!(
+        (
+            balance().await,
+            count(&na, "SELECT COUNT(*) FROM credit_entries").await
+        ),
+        before
+    );
 }
