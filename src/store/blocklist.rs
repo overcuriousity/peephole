@@ -24,12 +24,13 @@ impl Store {
     /// IPs with at least one request of `min_severity` or above since
     /// `since` (as released: the publication delay is allowed for), newest
     /// first. Tor exits never qualify (they are not the
-    /// scanner), nor do addresses a scanner refused as a verified crawler.
+    /// scanner), nor do addresses a scanner refused as a verified crawler,
+    /// nor unseen rows (MIK-329: added for a counter-scan, no traffic).
     pub async fn blocklist_ips(&self, q: &BlocklistQuery) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             "SELECT i.ip FROM ips i
              WHERE i.pub_last_seen >= datetime(?1, '-' || (SELECT delay_s + jitter_s FROM publish_cfg WHERE id = 1) || ' seconds')
-               AND i.pub_max_severity >= ?2 AND i.is_tor_exit = 0
+               AND i.pub_max_severity >= ?2 AND i.is_tor_exit = 0 AND i.unseen = 0
                AND EXISTS (SELECT 1 FROM requests r
                            WHERE r.ip_id = i.id AND r.severity >= ?2
                              AND r.ts >= datetime(?1, '-' || (SELECT delay_s + jitter_s FROM publish_cfg WHERE id = 1) || ' seconds')
@@ -103,6 +104,62 @@ mod tests {
             .unwrap();
         s.release_due().await.unwrap();
         assert_eq!(s.blocklist_ips(&q).await.unwrap(), ["203.0.113.5"]);
+    }
+
+    /// MIK-329: a row made for a counter-scan is no attacker: never on the
+    /// blocklist, whatever the severity, and not counted in the stats.
+    #[tokio::test]
+    async fn unseen_rows_feed_no_attacker_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        s.set_publish_delay(std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let ip = s.upsert_ip("203.0.113.5".parse().unwrap()).await.unwrap();
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/x".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            severity: 4,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        crate::store::data::ensure_ip(&mut conn, "198.51.100.200", None)
+            .await
+            .unwrap();
+        drop(conn);
+        assert!(
+            s.ip_by_addr("198.51.100.200")
+                .await
+                .unwrap()
+                .unwrap()
+                .unseen
+        );
+        sqlx::query("UPDATE requests SET public_at = datetime('now', '-1 seconds')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        s.release_due().await.unwrap();
+        for min_severity in 0..=5 {
+            let q = BlocklistQuery {
+                since: "2000-01-01 00:00:00".into(),
+                min_severity,
+                limit: 100,
+            };
+            let ips = s.blocklist_ips(&q).await.unwrap();
+            assert!(
+                !ips.contains(&"198.51.100.200".to_string()),
+                "{min_severity}: {ips:?}"
+            );
+        }
+        for r in crate::store::stats::Range::ALL {
+            let st = s.stats(r).await.unwrap();
+            assert_eq!(st.unique_ips, 1, "{r:?}");
+        }
     }
 
     #[tokio::test]
