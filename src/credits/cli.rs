@@ -1,8 +1,7 @@
 //! `peephole credits …`: this node's credits from the shell. Like
 //! `peephole cluster`, it works on the node's database, also while the
 //! daemon runs; every figure is this node's own count.
-use super::{Book, show};
-use crate::admin::credits::{date_of, when};
+use super::{Book, date_of, show, when};
 use crate::cluster::cli::{open, resolve};
 use crate::cluster::members;
 use crate::credits::ledger::OfferState;

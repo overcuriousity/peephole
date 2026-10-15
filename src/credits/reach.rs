@@ -268,9 +268,9 @@ impl Tracker {
 /// without an advertised address writes none: its reports would never
 /// count ([`reporters`]).
 pub async fn report_due(node: &Arc<Node>, now_ms: u64) -> Result<usize> {
-    node.reach.note_alive(now_ms);
+    node.credits.reach.note_alive(now_ms);
     let now = hour_of(now_ms);
-    let taken = node.reach.take_due(now_ms);
+    let taken = node.credits.reach.take_due(now_ms);
     if node.cfg.advertise.is_none() {
         return Ok(0);
     }
@@ -288,7 +288,7 @@ pub async fn report_due(node: &Arc<Node>, now_ms: u64) -> Result<usize> {
         return Ok(0);
     }
     if let Err(e) = crate::cluster::repl::append(node, &records).await {
-        node.reach.restore(taken);
+        node.credits.reach.restore(taken);
         return Err(e);
     }
     Ok(records.len())
@@ -621,8 +621,8 @@ mod tests {
         let now = crate::cluster::hlc::wall_ms();
         let hour = hour_of(now) - 1;
         let before = (hour as u64) * HOUR_MS + 5;
-        node.reach.note_alive(before);
-        node.reach.note(id(7), before);
+        node.credits.reach.note_alive(before);
+        node.credits.reach.note(id(7), before);
         assert_eq!(report_due(&node, now).await.unwrap(), 1);
         assert_eq!(report_due(&node, now).await.unwrap(), 0, "once");
         let rows = since(&node.store.pool, 0).await.unwrap();
@@ -647,11 +647,14 @@ mod tests {
         let (_dir, node) = test_node(None).await;
         let now = crate::cluster::hlc::wall_ms();
         let before = (hour_of(now) as u64 - 1) * HOUR_MS + 5;
-        node.reach.note_alive(before);
-        node.reach.note(id(7), before);
+        node.credits.reach.note_alive(before);
+        node.credits.reach.note(id(7), before);
         assert_eq!(report_due(&node, now).await.unwrap(), 0);
         assert!(since(&node.store.pool, 0).await.unwrap().is_empty());
-        assert!(node.reach.take_due(now).is_empty(), "nothing piles up");
+        assert!(
+            node.credits.reach.take_due(now).is_empty(),
+            "nothing piles up"
+        );
     }
 
     #[test]

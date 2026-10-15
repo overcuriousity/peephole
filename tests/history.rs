@@ -524,7 +524,8 @@ async fn own_history_stays_until_a_peer_holds_it() {
     assert_eq!(history::prune(&x).await.unwrap(), 0);
     assert_eq!(count(&x, "SELECT COUNT(*) FROM requests").await, 2);
     // A peer holds all but our newest entry.
-    x.own_acked
+    x.peers
+        .own_acked
         .store(head - 1, std::sync::atomic::Ordering::Relaxed);
     assert!(history::prune(&x).await.unwrap() > 0);
     assert_eq!(floor(&x, me).await, head);

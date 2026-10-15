@@ -182,7 +182,12 @@ struct Serving(Arc<Node>, (NodeId, u64));
 
 impl Drop for Serving {
     fn drop(&mut self) {
-        self.0.serving_offers.lock().unwrap().remove(&self.1);
+        self.0
+            .credits
+            .serving_offers
+            .lock()
+            .unwrap()
+            .remove(&self.1);
     }
 }
 
@@ -264,6 +269,7 @@ pub async fn accept_offer(
         }
     }
     if !node
+        .credits
         .serving_offers
         .lock()
         .unwrap()
@@ -334,7 +340,7 @@ const SPENDING_KEPT: Duration = Duration::from_secs(3600);
 /// This node's own offers and transfers written lately, with the parts
 /// they named. A book computed before one was written still shows those
 /// credits in the lots; [`Spending::lots`] leaves them out. Kept in
-/// [`Node::spending`], which every writer of an offer or a transfer holds
+/// `node.credits.spending`, which every writer of an offer or a transfer holds
 /// from reading its lots until the entry is written and noted, so two
 /// never name the same credits.
 #[derive(Default)]
@@ -421,7 +427,7 @@ pub async fn make_offer_for(
     let mut drew = false;
     loop {
         let have = {
-            let mut spending = node.spending.lock().await;
+            let mut spending = node.credits.spending.lock().await;
             let book = super::book_fresh(node).await.map_err(books)?;
             let lots = spending.lots(&book, &me);
             if let Some(parts) = super::ledger::parts_from(&lots, total_mc, first_day) {
@@ -462,9 +468,9 @@ pub async fn make_offer_for(
         drew = true;
         // Draw what is missing from the siblings, the richest first. An
         // offer that waited for another's draw may need none any more.
-        let _one = node.drawing.lock().await;
+        let _one = node.credits.drawing.lock().await;
         let have = {
-            let spending = node.spending.lock().await;
+            let spending = node.credits.spending.lock().await;
             let book = super::book_fresh(node).await.map_err(books)?;
             available(&spending.lots(&book, &me), first_day)
         };
@@ -575,7 +581,7 @@ pub async fn serve(
     let accepted = accept_offer(node, peer, offer_seq, total, "lookup", SERVE_MARGIN_MS).await;
     if counts_as_demand(&accepted) {
         for name in &all {
-            node.market.note(name, 1);
+            node.credits.market.note(name, 1);
         }
     }
     let acc = match accepted {
@@ -701,7 +707,7 @@ pub async fn serve_free(
             ));
             continue;
         }
-        node.market.note(&name, 1);
+        node.credits.market.note(&name, 1);
         let taken = match (shares, provider(&name)) {
             (Some(s), Some(p)) => s.take(p.as_ref()).await.unwrap_or(false),
             _ => true,
@@ -981,7 +987,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.price_mc, Some(5));
-        let counts = node.market.peek().counts;
+        let counts = node.credits.market.peek().counts;
         assert_eq!(counts.get("abuseipdb"), None, "priced, no offer");
         assert_eq!(counts.get("rdap"), Some(&1.0), "free");
     }

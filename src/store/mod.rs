@@ -12,6 +12,7 @@ pub mod devices;
 pub mod export;
 pub mod facts;
 pub mod fingerprints;
+pub mod guard;
 pub mod hostkeys;
 pub mod inspect;
 pub mod ja4h;

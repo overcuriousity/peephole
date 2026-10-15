@@ -276,7 +276,7 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
     let seq = match req.offer_seq {
         Some(seq) => Some(seq),
         None if cost == 0 => {
-            node.market.note(price::RESOLVE, 1);
+            node.credits.market.note(price::RESOLVE, 1);
             None
         }
         None => {
@@ -300,7 +300,7 @@ pub async fn serve_resolve(node: &Arc<Node>, peer: NodeId, req: &ResolveReq) -> 
         )
         .await;
         if pay::counts_as_demand(&accepted) {
-            node.market.note(price::RESOLVE, 1);
+            node.credits.market.note(price::RESOLVE, 1);
         }
         match accepted {
             Ok(_) => {}
@@ -654,7 +654,7 @@ pub async fn lookup_with(
 /// and counted.
 fn above_bid(node: &Node, good: &str, ask: u64, bid: u64) -> String {
     use crate::credits::show;
-    node.market.over_bid(good);
+    node.credits.market.over_bid(good);
     tracing::info!(good, ask, bid, "market: ask above bid, not bought");
     format!(
         "asks {} credits, above this node's bid of {}",
@@ -733,7 +733,8 @@ pub async fn refresh_pass(node: &Arc<Node>, geo: &SharedGeo) -> anyhow::Result<u
         .store
         .names_due_refresh(WANTED_AT_MOST, &me, REFRESH_DAYS)
         .await?;
-    node.wants
+    node.credits
+        .wants
         .lock()
         .unwrap()
         .set(price::RESOLVE, due.len() as u32);
@@ -875,7 +876,8 @@ mod tests {
         }));
         let before = head();
         let demand = || {
-            node.market
+            node.credits
+                .market
                 .peek()
                 .counts
                 .get(price::RESOLVE)

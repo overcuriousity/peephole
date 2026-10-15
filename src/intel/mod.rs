@@ -465,7 +465,7 @@ pub async fn buy_pass(
     {
         let name = info.name;
         if own.iter().any(|p| p.name() == name && p.ready()) {
-            node.wants.lock().unwrap().set(name, 0);
+            node.credits.wants.lock().unwrap().set(name, 0);
             continue;
         }
         let members = node.members();
@@ -483,7 +483,7 @@ pub async fn buy_pass(
         else {
             // No member of the market sells it: it takes no share of the
             // budget from goods that can be bought.
-            node.wants.lock().unwrap().set(name, 0);
+            node.credits.wants.lock().unwrap().set(name, 0);
             continue;
         };
         let skip = asked.skip(name);
@@ -501,7 +501,11 @@ pub async fn buy_pass(
                 limit: api::BATCH * BUYS_PER_HOUR,
             })
             .await?;
-        node.wants.lock().unwrap().set(name, due.len() as u32);
+        node.credits
+            .wants
+            .lock()
+            .unwrap()
+            .set(name, due.len() as u32);
         if due.is_empty() {
             continue;
         }
@@ -514,7 +518,7 @@ pub async fn buy_pass(
             }
         };
         if ask > bid {
-            node.market.over_bid(name);
+            node.credits.market.over_bid(name);
             info!(good = name, ask, bid, "market: ask above bid, not bought");
             continue;
         }

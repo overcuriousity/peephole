@@ -1,16 +1,16 @@
 pub mod arbiter;
 pub mod crawler;
-pub mod facts;
+pub use crate::model::facts;
 pub mod guard;
 pub mod handout;
-pub mod hostkeys;
-pub mod nmap_xml;
+pub use crate::model::hostkeys;
+pub use crate::model::nmap_xml;
 pub mod order;
 pub mod pace;
 pub mod probe;
 pub mod profiles;
 pub mod rank;
-pub mod retry;
+pub use crate::model::retry;
 pub mod safety;
 pub mod scrub;
 pub mod weight;
@@ -517,13 +517,13 @@ impl Source {
         picker.poll(&node.store.pool, &node.id()).await?;
         let (mut busy, mut found, mut failed) = (vec![], None, None);
         loop {
-            let bought = node.audit_queue.lock().unwrap().take(exclude);
+            let bought = node.credits.audit_queue.lock().unwrap().take(exclude);
             let Some(t) = bought.or_else(|| picker.take(exclude)) else {
                 break;
             };
             let end = |t: &crate::credits::audit::Task| {
                 if let Some((p, q, _)) = t.offer {
-                    node.audit_queue.lock().unwrap().end((p, q));
+                    node.credits.audit_queue.lock().unwrap().end((p, q));
                 }
             };
             let Ok(ip) = t.ip.parse::<IpAddr>() else {
@@ -562,7 +562,7 @@ impl Source {
             break;
         }
         {
-            let mut q = node.audit_queue.lock().unwrap();
+            let mut q = node.credits.audit_queue.lock().unwrap();
             for t in busy.into_iter().rev() {
                 q.put_back(t);
             }
@@ -1047,7 +1047,7 @@ impl Source {
                 // Charged, or (failed, abandoned) left for `credits::audit`
                 // to release.
                 if let (Some((payer, seq, _)), Some(node)) = (offer, node) {
-                    node.audit_queue.lock().unwrap().end((*payer, *seq));
+                    node.credits.audit_queue.lock().unwrap().end((*payer, *seq));
                 }
             }
             (
@@ -1408,7 +1408,7 @@ pub async fn run_workers(
                 }
             })
         });
-        *node.audit_check.lock().unwrap() = Some(check);
+        *node.credits.audit_check.lock().unwrap() = Some(check);
     }
     // Heavy scans (levels 4 and 5) running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));

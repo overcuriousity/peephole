@@ -1652,7 +1652,7 @@ mod tests {
         let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
         s.enqueue_scan(ip.id, 2, 0).await.unwrap();
         let job = s.next_queued_job().await.unwrap().unwrap();
-        let port = |port, state: &str, product: Option<&str>| crate::scan::nmap_xml::PortResult {
+        let port = |port, state: &str, product: Option<&str>| crate::model::nmap_xml::PortResult {
             port,
             proto: "tcp".into(),
             state: state.into(),
@@ -1662,7 +1662,7 @@ mod tests {
         };
         s.finish_job(
             job.id,
-            Some(&crate::scan::nmap_xml::ScanResult {
+            Some(&crate::model::nmap_xml::ScanResult {
                 scrubbed: 0,
                 os_guess: Some("Linux 5.X".into()),
                 raw_xml: vec![],
@@ -1839,7 +1839,7 @@ mod tests {
             .unwrap();
         }
         let f = RequestFilter {
-            ja4h: crate::trap::ja4h::ja4h(head),
+            ja4h: crate::model::ja4h::ja4h(head),
             ..Default::default()
         };
         let found = s.search_requests(&f, Audience::Admin).await.unwrap().items;

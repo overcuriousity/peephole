@@ -3,7 +3,7 @@
 //! stored XML on every node like host keys, and read back per scan.
 use super::Store;
 use super::inspect::{MAX_RAW_XML, PortRow, zstd_decode_capped};
-use crate::scan::facts::{FACTS_V, Facts, extract, kind_label};
+use crate::model::facts::{FACTS_V, Facts, extract, kind_label};
 use anyhow::Result;
 use sqlx::SqliteConnection;
 use std::collections::HashMap;
@@ -215,8 +215,8 @@ pub fn serves(ports: &[PortRow]) -> String {
     let mut out: Vec<String> = vec![];
     for p in ports {
         for f in &p.facts {
-            if (f.kind == crate::scan::facts::HTTP_TITLE
-                || f.kind == crate::scan::facts::HTTP_SERVER)
+            if (f.kind == crate::model::facts::HTTP_TITLE
+                || f.kind == crate::model::facts::HTTP_SERVER)
                 && !seen.contains(&f.value.as_str())
             {
                 seen.push(&f.value);
@@ -233,7 +233,7 @@ pub fn serves(ports: &[PortRow]) -> String {
 /// The Windows computer name and domain, when known: from the SMB host
 /// script first, else from RDP's NTLM reply.
 pub fn windows_names(host: &[FactRow], ports: &[PortRow]) -> String {
-    use crate::scan::facts::{NTLM_NETBIOS_COMPUTER, NTLM_NETBIOS_DOMAIN, SMB_DOMAIN, SMB_SERVER};
+    use crate::model::facts::{NTLM_NETBIOS_COMPUTER, NTLM_NETBIOS_DOMAIN, SMB_DOMAIN, SMB_SERVER};
     let first = |kind: &str| -> Option<&str> {
         host.iter()
             .chain(ports.iter().flat_map(|p| p.facts.iter()))
@@ -252,7 +252,7 @@ pub fn windows_names(host: &[FactRow], ports: &[PortRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::nmap_xml::parse_nmap_xml;
+    use crate::model::nmap_xml::parse_nmap_xml;
     use crate::store::Store;
 
     const FACTS: &[u8] = include_bytes!("../../tests/fixtures/nmap-facts.xml");

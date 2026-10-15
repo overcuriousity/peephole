@@ -256,7 +256,7 @@ pub async fn fund(
         return Some((None, price));
     }
     let first_day = first_day_for_job(crate::cluster::hlc::wall_ms());
-    let mut spending = node.spending.lock().await;
+    let mut spending = node.credits.spending.lock().await;
     let lots = spending.lots(funding.book.as_ref()?, &me);
     let parts = ledger::parts_from(&lots, price as Mc, first_day)?;
     let job = Some(job_uid.to_string());
@@ -353,18 +353,19 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
         .iter()
         .map(|s| s.can_do)
         .sum();
-    node.wants
+    node.credits
+        .wants
         .lock()
         .unwrap()
         .set(price::SCAN, scan_wants(grantable.max(0) as u64, can_do));
     let book = super::book(node).await?;
     let self_mc = self_committed(&node.store.pool, &node.id()).await?;
     let left = budget(&book.ledger, &node.id(), self_mc);
-    node.scan_budget_mc.store(
+    node.credits.scan_budget_mc.store(
         left.min(u32::MAX as Mc) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
-    node.scan_queued.store(
+    node.credits.scan_queued.store(
         queued.clamp(0, u32::MAX as i64) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );

@@ -9,6 +9,10 @@ use crate::store::Store;
 use anyhow::Result;
 use std::sync::{Arc, RwLock};
 
+pub use crate::store::scans::{
+    DRAIN_WINDOW_HOURS, MAX_RUN_SECS, QueueMetrics, STALE_RUNNING_HOURS,
+};
+
 /// Upper bound for workers settable from the admin UI (nmap -sS/-O is heavy).
 pub const MAX_WORKERS: usize = 16;
 /// Fewest workers a scanning node runs: one may run a level-4 scan while
@@ -26,9 +30,6 @@ pub fn level4_cap(workers: usize, share: f64) -> usize {
 
 /// Assumed scan duration until enough scans have finished to measure it.
 pub const DEFAULT_SCAN_SECS: f64 = 180.0;
-/// Window over which the queue's actual inflow and outflow are measured
-/// for the drain estimate: recent enough to follow a pace change.
-pub const DRAIN_WINDOW_HOURS: i64 = 6;
 
 /// Wall-clock limit of one scan of levels 1 to 3.
 pub const SCAN_TIMEOUT_SECS: u64 = 1800;
@@ -40,11 +41,6 @@ pub const COOLDOWN_HOURS: i64 = 24;
 /// The hourly start cap announced to nodes of earlier versions, which still
 /// read one: as many as an hour has seconds, so the workers alone bind.
 pub const ANNOUNCED_PER_HOUR: i64 = 3600;
-/// Longest any one scan may run: the level-4 limit is capped here.
-pub const MAX_RUN_SECS: u64 = 12 * 3600;
-/// A job marked running for longer than this is dead (no scan runs past
-/// [`MAX_RUN_SECS`]): it neither shields its IP nor blocks a takeover.
-pub const STALE_RUNNING_HOURS: u64 = MAX_RUN_SECS / 3600 + 1;
 
 /// Wall-clock limit of one scan at `level`: levels 4 and 5 get
 /// [`LEVEL4_TIMEOUT_FACTOR`] times `base`, capped at [`MAX_RUN_SECS`].
@@ -150,36 +146,6 @@ impl SharedPace {
         *self.0.write().unwrap() = p;
         Ok(Ok(()))
     }
-}
-
-/// Raw queue measurements (see `Store::queue_metrics`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct QueueMetrics {
-    pub backlog: i64,
-    pub running: i64,
-    pub arrivals_1h: i64,
-    pub arrivals_24h: i64,
-    pub completed_1h: i64,
-    pub completed_24h: i64,
-    /// Failed / timed-out jobs among `completed_24h`.
-    pub failed_24h: i64,
-    /// Jobs refused in the last 24 h (never_scan, Tor exit, verified
-    /// crawler, …); the reason is on each job.
-    pub refused_24h: i64,
-    pub timeouts_24h: i64,
-    /// Jobs queued within the last [`DRAIN_WINDOW_HOURS`].
-    pub arrivals_recent: i64,
-    /// Jobs that left the queue for good (done, failed, refused,
-    /// superseded) within the last [`DRAIN_WINDOW_HOURS`].
-    pub left_recent: i64,
-    /// Hours the 24h window actually covers (a fresh install has less), >= 1.
-    pub observed_hours: f64,
-    /// Mean seconds a job held a worker (done, failed or timed out), last 7 days.
-    pub avg_scan_secs: Option<f64>,
-    pub oldest_queued_secs: Option<i64>,
-    /// Per hour, oldest first, 24 entries.
-    pub hourly_arrivals: Vec<i64>,
-    pub hourly_completions: Vec<i64>,
 }
 
 /// How the queue keeps up, measured.

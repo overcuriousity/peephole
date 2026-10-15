@@ -178,7 +178,10 @@ async fn prune_origin(node: &Node, origin: &NodeId, since: u64) -> Result<u64> {
     let mut new_floor = cut(&mut conn, origin, floor, since).await?;
     if *origin == node.id() {
         // Our own entries go only once a peer is known to hold them.
-        let acked = node.own_acked.load(std::sync::atomic::Ordering::Relaxed);
+        let acked = node
+            .peers
+            .own_acked
+            .load(std::sync::atomic::Ordering::Relaxed);
         new_floor = new_floor.min(acked.saturating_add(1));
     }
     let new_floor = new_floor.max(floor);

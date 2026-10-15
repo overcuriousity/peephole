@@ -3,6 +3,7 @@
 //! log (and so replicated) in a cluster. Reads go to the [`Store`].
 use super::Store;
 use super::data::{self, Ctx, new_uid, now_ts};
+use super::guard::{self, EnqueuePolicy};
 use super::requests::NewRequest;
 use super::scans::{EnqueueOutcome, ScanJobRow};
 use super::uploads;
@@ -13,8 +14,7 @@ use crate::cluster::record::{
     FingerprintRec, FpClaimRec, IpIntelRec, JobStatusRec, PortRec, Record, RequestRec, ScanJobRec,
     ScanResultRec, TombstoneRec, UploadRec,
 };
-use crate::scan::guard::{self, EnqueuePolicy};
-use crate::scan::nmap_xml::ScanResult;
+use crate::model::nmap_xml::ScanResult;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -443,7 +443,7 @@ impl Recorder {
     /// exactly once.
     /// Checked against every job in the (replicated) database.
     ///
-    /// With `policy.safety` (the trap's policy, see [`crate::scan::guard`]):
+    /// With `policy.safety` (the trap's policy, see [`crate::store::guard`]):
     /// thin evidence caps the level; a new job must fit the /24-/64 and ASN
     /// budgets; a full queue drops its oldest lowest-level job for a
     /// higher-level one, and otherwise refuses the new one.
@@ -506,7 +506,7 @@ impl Recorder {
                    AND started_at <= datetime('now', '+10 minutes')))",
         )
         .bind(ip_id)
-        .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
+        .bind(format!("-{} hours", super::scans::STALE_RUNNING_HOURS))
         .fetch_one(pool)
         .await?;
         if let Some(max_pending) = max_pending {
@@ -884,7 +884,7 @@ impl Recorder {
     }
 
     /// Queue a retry of the failed job `job_uid` this node arbitrates (see
-    /// [`crate::scan::retry`]), `failed_by` the scanner that ran it. Returns
+    /// [`crate::model::retry`]), `failed_by` the scanner that ran it. Returns
     /// the retry's uid; None when the failure is not retried: the error rules
     /// it out, the window is over, or a pending job or a scan done since the
     /// first failure covers the IP at this level.
@@ -893,7 +893,7 @@ impl Recorder {
         job_uid: &str,
         failed_by: Option<NodeId>,
     ) -> Result<Option<String>> {
-        use crate::scan::retry;
+        use crate::model::retry;
         let pool = &self.store().pool;
         type Job = (
             i64,

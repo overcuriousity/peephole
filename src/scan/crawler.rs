@@ -184,8 +184,7 @@ impl Crawlers {
     }
 }
 
-/// Most PTR names of one address checked forward.
-pub(crate) const MAX_NAMES: usize = 4;
+pub(crate) use crate::store::rdns::MAX_NAMES;
 
 /// Special-use and local zones (RFC 6761, 6762, 7686, 8375, ICANN's
 /// `internal`): a forward lookup there asks this host's own network, not

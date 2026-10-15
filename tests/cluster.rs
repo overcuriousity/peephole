@@ -2567,6 +2567,7 @@ async fn geo_results_come_from_a_node_that_has_the_database() {
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     nb.node
+        .credits
         .wants
         .lock()
         .unwrap()
@@ -3268,7 +3269,11 @@ async fn quiet_rounds(nodes: &[&Node]) -> u64 {
     let total = || {
         nodes
             .iter()
-            .map(|n| n.sync_rounds.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|n| {
+                n.peers
+                    .sync_rounds
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
             .sum::<u64>()
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -5247,7 +5252,7 @@ async fn wants_scans(n: &TestNode) {
 /// far above its supply before each refresh; returns the price.
 async fn priced(n: &TestNode, good: &str, at_least: u32) -> u32 {
     for _ in 0..50 {
-        n.node.market.note(good, 10_000);
+        n.node.credits.market.note(good, 10_000);
         let p = peephole::credits::price::refresh(&n.node)
             .await
             .unwrap()
@@ -5657,8 +5662,8 @@ async fn announced_prices_follow_demand_and_supply() {
     // Prices have no floor: what sold nothing is free, what sold leaves 0.
     let t = price::refresh(&na.node).await.unwrap();
     assert_eq!(t.price_of("abuseipdb"), Some(0));
-    na.node.market.note("abuseipdb", 10);
-    na.node.market.note("maxmind-geolite2", 10);
+    na.node.credits.market.note("abuseipdb", 10);
+    na.node.credits.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let first = t.price_of("abuseipdb").unwrap();
     assert!(first > 0);
@@ -5678,8 +5683,8 @@ async fn announced_prices_follow_demand_and_supply() {
     })
     .await;
     // Sold again: the price rises.
-    na.node.market.note("abuseipdb", 10);
-    na.node.market.note("maxmind-geolite2", 10);
+    na.node.credits.market.note("abuseipdb", 10);
+    na.node.credits.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let risen = t.price_of("abuseipdb").unwrap();
     assert!(risen > first, "{first} then {risen}");
@@ -7766,7 +7771,7 @@ async fn rdns_asks(n: &TestNode, on: &TestNode, mc: u32) {
 /// `n`'s rDNS bid for one wanted source, as its buyer computes it.
 async fn rdns_bid_for_one(n: &TestNode) -> u64 {
     use peephole::credits::price;
-    n.node.wants.lock().unwrap().set(price::RDNS, 1);
+    n.node.credits.wants.lock().unwrap().set(price::RDNS, 1);
     let bid = price::own_bid(&n.node, price::RDNS).await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     bid
@@ -7806,7 +7811,10 @@ async fn the_reverse_name_buyer_pays_at_most_its_bid() {
             .unwrap(),
         1
     );
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     assert_eq!(
         count(&na, OFFERS).await,
         offers,
@@ -7825,7 +7833,10 @@ async fn the_reverse_name_buyer_pays_at_most_its_bid() {
         1
     );
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     eventually("b's answer was bought", || async {
         count(&na, &q("198.51.100.92")).await == 1
     })
@@ -7873,7 +7884,10 @@ async fn reverse_names_trade_between_protocol_eight_and_nine() {
             .unwrap(),
         1
     );
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     assert_eq!(
         count(&na, OFFERS).await,
         offers,
@@ -7951,7 +7965,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
     let ip = "198.51.100.95";
     record(&na, ip, "/x").await;
     holds_source(&nb, ip).await;
-    na.node.wants.lock().unwrap().set("shodan", 1);
+    na.node.credits.wants.lock().unwrap().set("shodan", 1);
     let bid = price::own_bid(&na.node, "shodan").await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     let none: peephole::intel::Providers = vec![];
@@ -7987,7 +8001,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
         .await
         .unwrap();
     assert_eq!(n, 0);
-    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    assert_eq!(na.node.credits.market.over_bids().get("shodan"), Some(&1));
     assert_eq!(count(&na, OFFERS).await, offers, "no offer");
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
 
@@ -7998,7 +8012,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
         .unwrap();
     assert_eq!(n, 1);
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    assert_eq!(na.node.credits.market.over_bids().get("shodan"), Some(&1));
     eventually("the answer is in both datasets", || async {
         count(&na, &kept).await == 1 && count(&nb, &kept).await == 1
     })
@@ -8118,7 +8132,7 @@ async fn resolve_asks(n: &TestNode, on: &TestNode, mc: u32) {
 /// `n`'s resolve bid for one wanted name, as its refresh computes it.
 async fn resolve_bid_for_one(n: &TestNode) -> u64 {
     use peephole::credits::price;
-    n.node.wants.lock().unwrap().set(price::RESOLVE, 1);
+    n.node.credits.wants.lock().unwrap().set(price::RESOLVE, 1);
     let bid = price::own_bid(&n.node, price::RESOLVE).await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     bid
@@ -8171,7 +8185,10 @@ async fn the_resolve_refresh_reconfirms_old_names_within_its_bid() {
     old_name(&na, "198.51.100.95", "1.0x1", 10).await;
     let offers = count(&na, OFFERS).await;
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RESOLVE),
+        Some(&1)
+    );
     assert_eq!(count(&na, OFFERS).await, offers, "no offer above the bid");
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.ledger.held(&a.id), 0);
@@ -8186,7 +8203,10 @@ async fn the_resolve_refresh_reconfirms_old_names_within_its_bid() {
     old_name(&na, "198.51.100.96", "1.0x2", 10).await;
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RESOLVE),
+        Some(&1)
+    );
     assert_eq!(count(&na, &confirmed_by("1.0x2", 2)).await, 1, "a and b");
     assert!(
         na.store
@@ -8233,7 +8253,7 @@ async fn the_resolve_refresh_between_protocol_eight_and_nine() {
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
     assert_eq!(count(&na, OFFERS).await, offers);
     assert_eq!(count(&na, &confirmed_by("1.0x3", 1)).await, 1, "a alone");
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), None);
+    assert_eq!(na.node.credits.market.over_bids().get(price::RESOLVE), None);
 
     // 8 buys from 9 as before: an offer at 9's ask is served and charged.
     resolve_asks(&na, &nb, 5).await;
@@ -8416,7 +8436,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
             .is_err_and(|w| w.contains("do not back a scan")),
         "{declined:?}"
     );
-    assert!(nx.node.audit_queue.lock().unwrap().is_empty());
+    assert!(nx.node.credits.audit_queue.lock().unwrap().is_empty());
     backed(&nx, ip).await;
     // x takes more now than its heartbeat says: it declines naming its
     // price, and s offers that once.
@@ -8449,7 +8469,11 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     .await
     .unwrap();
     assert_eq!(last, least as i64, "at the price x named");
-    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
+    assert_eq!(
+        nx.node.credits.audit_queue.lock().unwrap().len(),
+        1,
+        "x queued it"
+    );
     // Asked again with the queued offer: refused, and nothing released.
     let seq: i64 = sqlx::query_scalar(
         "SELECT MAX(seq) FROM credit_entries WHERE origin = ? AND audit_uid = 'scan-d'",
@@ -8482,7 +8506,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     .await
     .unwrap();
     assert_eq!(receipts, 0, "the queued offer is not released");
-    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1);
+    assert_eq!(nx.node.credits.audit_queue.lock().unwrap().len(), 1);
     // a is no scanner, so no auditor of it.
     let req = Msg::AuditReq {
         scan_uid: "scan-d".into(),
@@ -8555,7 +8579,7 @@ async fn a_bought_audit_is_run_charged_and_counted_everywhere() {
             == Some(&(1, 1))
     })
     .await;
-    assert!(nx.node.audit_queue.lock().unwrap().is_empty());
+    assert!(nx.node.credits.audit_queue.lock().unwrap().is_empty());
 }
 
 /// A scanner that buys no audits of its designated scans of paid jobs owes
@@ -8720,7 +8744,7 @@ async fn offers_written_at_once_are_each_covered() {
         .await
         .unwrap();
     // One scan job wanted: the whole hour's budget is its bid.
-    na.node.wants.lock().unwrap().set("scan", 1);
+    na.node.credits.wants.lock().unwrap().set("scan", 1);
     // A round of handing out jobs reads its book now.
     let mut funding = jobs::Funding::default();
     assert_eq!(
