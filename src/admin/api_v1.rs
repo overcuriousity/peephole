@@ -1527,6 +1527,7 @@ mod tests {
             .oneshot(
                 Request::post("/admin/devices/pair")
                     .header("cookie", cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::empty())
                     .unwrap(),
@@ -1674,6 +1675,7 @@ mod tests {
             .oneshot(
                 Request::post("/admin/devices/revoke")
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!("id={device_id}")))
                     .unwrap(),
@@ -1773,6 +1775,7 @@ mod tests {
             .oneshot(
                 Request::post("/admin/devices/revoke")
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!("id={device_id}")))
                     .unwrap(),
@@ -1791,6 +1794,7 @@ mod tests {
                 &app,
                 Request::get(path)
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1811,6 +1815,7 @@ mod tests {
             &app,
             Request::get("/api/v1/ips")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2415,6 +2420,7 @@ mod tests {
             .oneshot(
                 Request::get("/admin/devices")
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())
                     .unwrap(),
             )

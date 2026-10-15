@@ -1327,6 +1327,7 @@ secure_cookies = false
             .oneshot(
                 axum::http::Request::get(format!("/admin/api/probes?ip={IP}"))
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1566,6 +1567,7 @@ secure_cookies = false
             &app,
             axum::http::Request::post("/admin/lookup/probe")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded"),
             &format!("ip={IP}"),
         )
@@ -1576,7 +1578,9 @@ secure_cookies = false
         for _ in 0..100 {
             (_, _, html) = send(
                 &app,
-                axum::http::Request::get(format!("/ip/{IP}")).header("cookie", &cookie),
+                axum::http::Request::get(format!("/ip/{IP}"))
+                    .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin"),
                 "",
             )
             .await;
@@ -1637,7 +1641,9 @@ secure_cookies = false
         // The admin sees both.
         let (_, _, html) = send(
             &app,
-            axum::http::Request::get(format!("/ip/{IP}")).header("cookie", &cookie),
+            axum::http::Request::get(format!("/ip/{IP}"))
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin"),
             "",
         )
         .await;

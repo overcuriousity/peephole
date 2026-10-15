@@ -710,7 +710,9 @@ secure_cookies = {secure}
             .extension(ConnectInfo(peer))
             .header("content-type", "application/x-www-form-urlencoded");
         if let Some(t) = cookie {
-            b = b.header("cookie", format!("peephole_session={t}"));
+            b = b
+                .header("cookie", format!("peephole_session={t}"))
+                .header("sec-fetch-site", "same-origin");
         }
         let r = app
             .clone()
