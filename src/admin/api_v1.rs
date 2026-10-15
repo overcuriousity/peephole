@@ -714,6 +714,41 @@ async fn audit(
         .map_err(|e| Box::new(internal(e)))
 }
 
+/// Held by an act call from its spend-cap check to its audit entry, so
+/// two calls at once cannot both pass under the cap.
+static SPEND: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Refuse a call that would take `device` past its 24-hour spend cap
+/// (`[credits] device_daily_cap`), before anything is spent. The guard
+/// is to be held until the call's audit entry is written.
+async fn within_cap(
+    state: &AdminState,
+    device: &Device,
+    cost_mc: u64,
+) -> Result<tokio::sync::MutexGuard<'static, ()>, Box<Response>> {
+    let guard = SPEND.lock().await;
+    let Some(cap) = state.cfg.credits.device_daily_cap_mc() else {
+        return Ok(guard);
+    };
+    let spent = match state.store.device_spent_last_day(&device.id).await {
+        Ok(mc) => mc,
+        Err(e) => return Err(Box::new(internal(e))),
+    };
+    if spent.saturating_add(cost_mc) > cap {
+        return Err(Box::new(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "spend_cap",
+            format!(
+                "this device committed {} of its {} credits in the last 24 hours; this costs {}",
+                crate::credits::show(spent),
+                crate::credits::show(cap),
+                crate::credits::show(cost_mc),
+            ),
+        )));
+    }
+    Ok(guard)
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct ProbeBody {
     vantages: Option<Vec<String>>,
@@ -736,6 +771,11 @@ async fn probe(
     };
     let (ip, ip_id) = match row_of(&state, &addr).await {
         Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let cost = crate::admin::probes::price_mc(&state, b.vantages.as_deref());
+    let _spend = match within_cap(&state, &device, cost).await {
+        Ok(g) => g,
         Err(r) => return *r,
     };
     let started = match crate::admin::probes::start(&state, ip, ip_id, b.vantages.as_deref()).await
@@ -960,6 +1000,15 @@ async fn scan_buy(
         return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
     };
     let ip = crate::net::canonical(ip).to_string();
+    // Unknown quotes cost nothing here; spending them says what is wrong.
+    let cost = match state.store.quote_credits(&b.quote_id, &device.id).await {
+        Ok(mc) => mc.unwrap_or(0),
+        Err(e) => return internal(e),
+    };
+    let _spend = match within_cap(&state, &device, cost).await {
+        Ok(g) => g,
+        Err(r) => return *r,
+    };
     let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
         Ok(Some(q)) => q,
         Ok(None) => {
@@ -1255,6 +1304,14 @@ async fn lookup_buy(
         return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
     };
     let ip = crate::net::canonical(ip);
+    let cost = match state.store.quote_credits(&b.quote_id, &device.id).await {
+        Ok(mc) => mc.unwrap_or(0),
+        Err(e) => return internal(e),
+    };
+    let spend = match within_cap(&state, &device, cost).await {
+        Ok(g) => g,
+        Err(r) => return *r,
+    };
     let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
         Ok(Some(q)) => q,
         Ok(None) => {
@@ -1301,6 +1358,8 @@ async fn lookup_buy(
     {
         return *r;
     }
+    // Counted from here on: the providers are not asked under the lock.
+    drop(spend);
     let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, &bought, &[]).await;
     let now_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut intel = serde_json::Map::new();
@@ -2124,6 +2183,142 @@ mod tests {
     }
 
     const SCAN_IP: &str = crate::admin::scan_buy::tests::IP;
+
+    /// A device commits credits up to `[credits] device_daily_cap` over
+    /// 24 hours and no further; over it a buy is refused before its quote
+    /// is spent, and other devices are unaffected (MIK-372 S7).
+    #[tokio::test]
+    async fn a_device_spends_up_to_its_daily_cap_and_no_further() {
+        use super::within_cap;
+        let (state, _c, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        let app = crate::admin::full_router(state.clone());
+        let a = device(&state, "read,act", "a").await;
+        let b = device(&state, "read,act", "b").await;
+        let dev = |t: String| {
+            let state = state.clone();
+            async move {
+                state
+                    .store
+                    .validate_device_token(&t)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let (dev_a, dev_b) = (dev(a.clone()).await, dev(b.clone()).await);
+        // On by default: 100 credits.
+        let cap = state.cfg.credits.device_daily_cap_mc().unwrap();
+        assert_eq!(cap, 100_000);
+        // What was committed more than 24 hours ago no longer counts.
+        state
+            .store
+            .record_device_action(&dev_a, "scan", SCAN_IP, cap, "t_old")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE device_actions SET at = datetime('now', '-25 hours')")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        // Spends up to the cap pass.
+        for i in 0..4 {
+            let spend = within_cap(&state, &dev_a, cap / 4)
+                .await
+                .expect("under the cap");
+            state
+                .store
+                .record_device_action(&dev_a, "scan", SCAN_IP, cap / 4, &format!("t_{i}"))
+                .await
+                .unwrap();
+            drop(spend);
+        }
+        // The next one does not, however small; a free one still does.
+        let r = within_cap(&state, &dev_a, 1).await.unwrap_err();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(within_cap(&state, &dev_a, 0).await.expect("free"));
+        // Another device has its own cap.
+        drop(within_cap(&state, &dev_b, cap).await.expect("other device"));
+        // Over the cap, a scan or lookup buy is refused as `spend_cap`: the
+        // quote stays unspent, nothing is queued or logged.
+        let before = jobs_and_actions(&state).await;
+        let scan = state
+            .store
+            .create_quote(&dev_a.id, SCAN_IP, 2, 1000)
+            .await
+            .unwrap();
+        let lookup = state
+            .store
+            .create_quote_at(&dev_a.id, SCAN_IP, -1, 500)
+            .await
+            .unwrap();
+        for (what, quote) in [("scan", &scan), ("lookup", &lookup)] {
+            let (st, v) = send(
+                &app,
+                authed_json(
+                    "POST",
+                    &format!("/api/v1/ips/{SCAN_IP}/{what}"),
+                    &a,
+                    serde_json::json!({"quote_id": quote.id}),
+                ),
+            )
+            .await;
+            assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{what}: {v}");
+            assert_eq!(v["error"]["code"], "spend_cap", "{v}");
+            assert_eq!(
+                state
+                    .store
+                    .quote_credits(&quote.id, &dev_a.id)
+                    .await
+                    .unwrap(),
+                Some(quote.credits_mc as u64),
+                "{what}: the quote is not spent"
+            );
+        }
+        assert_eq!(jobs_and_actions(&state).await, before);
+        // Device b's priced buy is not held by a's cap (standalone, the
+        // floor is 0, so the price moved).
+        let q = state
+            .store
+            .create_quote(&dev_b.id, SCAN_IP, 2, 1000)
+            .await
+            .unwrap();
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &b,
+                serde_json::json!({"quote_id": q.id}),
+            ),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "price_changed", "{st}: {v}");
+        // A free scan still goes through for a capped device.
+        let (st, q) = send(
+            &app,
+            authed(
+                "GET",
+                &format!("/api/v1/ips/{SCAN_IP}/scan/quote?level=2"),
+                &a,
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, q["credits_mc"].as_u64()),
+            (StatusCode::OK, Some(0)),
+            "{q}"
+        );
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &a,
+                serde_json::json!({"quote_id": q["quote_id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    }
 
     #[tokio::test]
     async fn act_endpoints_need_the_act_scope() {

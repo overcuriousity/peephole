@@ -174,6 +174,14 @@ pub struct CreditsConfig {
     /// ([`Config::obsolete_notes`]).
     #[serde(default)]
     pub scan_share: Option<toml::Value>,
+    /// Most credits one paired device may commit through the `act` scope
+    /// of /api/v1 in any 24 hours (probes, scans, lookups); 0: no cap.
+    #[serde(default = "default_device_daily_cap")]
+    pub device_daily_cap: f64,
+}
+
+fn default_device_daily_cap() -> f64 {
+    100.0
 }
 
 fn default_audit_share() -> f64 {
@@ -185,6 +193,7 @@ impl Default for CreditsConfig {
         Self {
             audit_share: default_audit_share(),
             scan_share: None,
+            device_daily_cap: default_device_daily_cap(),
         }
     }
 }
@@ -194,7 +203,16 @@ impl CreditsConfig {
         if !(0.0..=1.0).contains(&self.audit_share) {
             anyhow::bail!("credits.audit_share must be between 0 and 1");
         }
+        if !(0.0..=1_000_000.0).contains(&self.device_daily_cap) {
+            anyhow::bail!("credits.device_daily_cap must be between 0 (no cap) and 1000000");
+        }
         Ok(())
+    }
+
+    /// [`Self::device_daily_cap`] in millicredits; `None`: no cap.
+    pub fn device_daily_cap_mc(&self) -> Option<u64> {
+        let mc = (self.device_daily_cap * crate::credits::CREDIT as f64).round() as u64;
+        (mc > 0).then_some(mc)
     }
 }
 
@@ -1836,6 +1854,22 @@ data_dir = "/tmp"
         assert!(cfg.abuseipdb.is_none() && cfg.shodan.is_none());
         assert!(cfg.internetdb.is_none());
         assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
+    }
+
+    /// `[credits] device_daily_cap`: 100 credits by default, 0 turns the
+    /// cap off, a negative one is refused (MIK-372 S7).
+    #[test]
+    fn the_device_spend_cap_defaults_on_and_can_be_turned_off() {
+        let with = |extra: &str| {
+            parse(&format!(
+                "{BASE}[roles]\nlistener = false\nweb = false\n{extra}"
+            ))
+        };
+        let cap = |extra: &str| with(extra).unwrap().credits.device_daily_cap_mc();
+        assert_eq!(cap(""), Some(100_000));
+        assert_eq!(cap("[credits]\ndevice_daily_cap = 2.5\n"), Some(2_500));
+        assert_eq!(cap("[credits]\ndevice_daily_cap = 0\n"), None);
+        assert!(with("[credits]\ndevice_daily_cap = -1\n").is_err());
     }
 
     /// Keys parse from the same config text as before and never show in
