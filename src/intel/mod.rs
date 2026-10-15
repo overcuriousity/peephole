@@ -766,7 +766,12 @@ const RDAP_BACKOFF: Backoff = Backoff::new(Duration::from_secs(60), Duration::fr
 async fn refresh_rdap(cfg: &Config, rdap: &SharedRdap, backoff: &mut Backoff) -> Duration {
     match rdap::Bootstrap::refresh(&cfg.data_dir).await {
         Ok(()) => {
-            *rdap.write_or_recover() = rdap::Bootstrap::load(&cfg.data_dir);
+            // Reads and parses both files: off the async workers.
+            let dir = cfg.data_dir.clone();
+            match tokio::task::spawn_blocking(move || rdap::Bootstrap::load(&dir)).await {
+                Ok(b) => *rdap.write_or_recover() = b,
+                Err(e) => warn!(?e, "loading the rdap bootstrap failed"),
+            }
             info!("rdap bootstrap refreshed");
             backoff.reset();
             rdap::BOOTSTRAP_MAX_AGE
@@ -841,9 +846,12 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
     }
     if fetched > 0 {
         // Both databases are current: what the admin pages show.
-        let _ = store
+        if let Err(e) = store
             .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-            .await;
+            .await
+        {
+            warn!(?e, "recording the MaxMind fetch time failed");
+        }
     }
     Ok(())
 }
@@ -919,9 +927,12 @@ pub async fn run_scheduler(
                         Ok(l) => *tor.write_or_recover() = l,
                         Err(e) => warn!(?e, "tor exit list reload failed"),
                     }
-                    let _ = store
+                    if let Err(e) = store
                         .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
-                        .await;
+                        .await
+                    {
+                        warn!(?e, "recording the tor exit list fetch time failed");
+                    }
                     tor_backoff.reset();
                     // 24h ± up to 1h deterministic-ish jitter from nanos.
                     let jitter = Duration::from_secs(

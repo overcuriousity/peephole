@@ -188,7 +188,9 @@ impl Store {
         replacing: Option<&str>,
     ) -> Result<Option<String>> {
         // Opportunistic cleanup of stale rows; cheap and keeps the tables bounded.
-        let _ = self.prune_expired_auth().await;
+        if let Err(e) = self.prune_expired_auth().await {
+            tracing::warn!(?e, "pruning expired sessions failed");
+        }
         let token = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),

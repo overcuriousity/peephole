@@ -456,14 +456,17 @@ async fn handle(
         async move {
             if verified || may_log(seen, from) {
                 tracing::info!(by = %from.short(), command = %what, "owner command refused: {why}");
-                let _ = log(
+                if let Err(e) = log(
                     &node.store,
                     &from,
                     &what,
                     &format!("refused: {why}"),
                     verified,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(?e, "writing the owner command log failed");
+                }
             }
             why
         }
@@ -480,14 +483,17 @@ async fn handle(
         if may_log(seen, from) {
             tracing::warn!(by = %from.short(), "owner command with a wrong ownership key refused");
             let what = decode(cmd).map_or_else(|| "unreadable command".into(), |c| c.describe());
-            let _ = log(
+            if let Err(e) = log(
                 &node.store,
                 &from,
                 &what,
                 "refused: the ownership key was not accepted",
                 false,
             )
-            .await;
+            .await
+            {
+                tracing::error!(?e, "writing the owner command log failed");
+            }
         }
         return refuse(0, "the ownership key was not accepted".into());
     }
@@ -516,14 +522,17 @@ async fn handle(
         Ok(false) => {
             let why = "the node changed meanwhile; reload and try again";
             tracing::info!(by = %from.short(), command = %cmd.describe(), "owner command refused: {why}");
-            let _ = log(
+            if let Err(e) = log(
                 &node.store,
                 &from,
                 &cmd.describe(),
                 &format!("refused: {why}"),
                 true,
             )
-            .await;
+            .await
+            {
+                tracing::error!(?e, "writing the owner command log failed");
+            }
             return refuse(current, why.into());
         }
         Err(e) => return refuse(current, refused(format!("{e:#}"), true).await),
@@ -535,6 +544,7 @@ async fn handle(
     // list must say for what also when the node stops halfway.
     let row = log(&node.store, &from, &cmd.describe(), STARTED, true)
         .await
+        .inspect_err(|e| tracing::error!(?e, "writing the owner command log failed"))
         .ok();
     let result = execute(node, settings, from, &cmd).await;
     drop(turn);
@@ -543,8 +553,10 @@ async fn handle(
         Err(e) => format!("refused: {e}"),
     };
     tracing::info!(by = %from.short(), command = %cmd.describe(), result = %text, "owner command");
-    if let Some(row) = row {
-        let _ = log_result(&node.store, row, &text).await;
+    if let Some(row) = row
+        && let Err(e) = log_result(&node.store, row, &text).await
+    {
+        tracing::error!(?e, "writing the owner command result failed");
     }
     match result {
         Ok(note) => Msg::OwnerReply {

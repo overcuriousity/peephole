@@ -667,7 +667,9 @@ impl RoleRunner {
                 }
                 _ = shutdown.changed() => break,
             }
-            let _ = self.reconcile(&mut running, false).await;
+            if let Err(e) = self.reconcile(&mut running, false).await {
+                warn!(?e, "applying the role settings failed");
+            }
         }
         let mut tasks = vec![];
         for slot in [running.trap, running.scanner, running.web] {
@@ -784,7 +786,9 @@ impl RoleRunner {
             anyhow::bail!("admin_listen is required");
         };
         // First-run admin setup token (spec §8.4).
-        let _ = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await;
+        if let Err(e) = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await {
+            warn!(?e, "writing the first-run setup token failed");
+        }
         let (stop, mut rx) = tokio::sync::watch::channel(false);
         let app = admin::full_router(Arc::new(
             admin::AdminState::new(

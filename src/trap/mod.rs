@@ -1567,10 +1567,13 @@ async fn claim_handler(
         };
         if let Ok(rec) = record(&state, capture).await {
             let email = form.email.filter(|e| !e.trim().is_empty());
-            let _ = state
+            if let Err(e) = state
                 .recorder
                 .insert_fp_claim(rec.ip_id, rec.request_id, email.as_deref(), &ua)
-                .await;
+                .await
+            {
+                debug!(?e, "recording a fingerprint claim failed");
+            }
         }
     });
     Html(pages::claim_confirmation()).into_response()
@@ -1641,7 +1644,7 @@ async fn collect_handler(
             // Unknown token (the page view was not recorded in full, or not
             // yet): stored against the connection IP, whose row the record
             // creates, and never escalated.
-            let _ = state
+            if let Err(e) = state
                 .recorder
                 .insert_fingerprint_from(
                     &ip.to_string(),
@@ -1652,10 +1655,13 @@ async fn collect_handler(
                     &behavior,
                     events.as_bytes(),
                 )
-                .await;
+                .await
+            {
+                debug!(?e, "recording a fingerprint failed");
+            }
             return;
         };
-        let _ = state
+        if let Err(e) = state
             .recorder
             .insert_fingerprint(
                 Some(request_id),
@@ -1666,7 +1672,10 @@ async fn collect_handler(
                 &behavior,
                 events.as_bytes(),
             )
-            .await;
+            .await
+        {
+            debug!(?e, "recording a fingerprint failed");
+        }
 
         // The fingerprint arrives after the page view that triggered it, so it
         // cannot influence that request's own verdict. When it reveals a bot
@@ -1684,7 +1693,9 @@ async fn collect_handler(
             && may_scan(&state, target)
         {
             let level = if tells.inhuman_fill { 3 } else { 2 };
-            let _ = enqueue(&state, ip_id, level).await;
+            if let Err(e) = enqueue(&state, ip_id, level).await {
+                warn!(?e, "queueing a counter-scan for a fingerprinted bot failed");
+            }
         }
     });
     axum::Json(serde_json::json!({"ok": true})).into_response() // opaque ack (spec §8.3)

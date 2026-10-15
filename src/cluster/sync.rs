@@ -209,8 +209,9 @@ async fn peer_loop(
                     if super::set_detached(&node.store, Some(super::Detached::Pruned))
                         .await
                         .is_ok()
+                        && let Err(e) = node.reload_members().await
                     {
-                        let _ = node.reload_members().await;
+                        tracing::warn!(?e, "reloading the members after a prune failed");
                     }
                     return;
                 }
