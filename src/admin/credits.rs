@@ -7,7 +7,7 @@ use crate::admin::error::{AppResult, render};
 use crate::admin::views::Chrome;
 use crate::cluster::identity::NodeId;
 use crate::credits::ledger::{Earned, OfferState};
-use crate::credits::{self, Mc, show};
+use crate::credits::{self, Mc, date_of, show, when};
 use askama::Template;
 use axum::{
     Router,
@@ -26,20 +26,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
         .route("/admin/cluster/credits/send", post(send))
-}
-
-/// The date of a lot's day.
-pub fn date_of(day: u32) -> String {
-    chrono::DateTime::from_timestamp(day as i64 * 86_400, 0)
-        .map(|t| t.format("%Y-%m-%d").to_string())
-        .unwrap_or_default()
-}
-
-/// The minute an entry is dated (UTC).
-pub fn when(hlc: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(crate::cluster::hlc::physical_ms(hlc) as i64)
-        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_default()
 }
 
 /// When a lot of `day` is gone, seen from `today`.

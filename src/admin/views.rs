@@ -291,6 +291,16 @@ pub fn link_href(kind: &str, value: &str) -> String {
         crate::admin::public::urlencode(value)
     )
 }
+
+impl crate::store::hostkeys::HostKeyRow {
+    /// Its page under Links.
+    pub fn link_href(&self) -> String {
+        let kind =
+            crate::store::links::LinkKind::of_host_kind(&self.kind).map_or("ssh", |k| k.key());
+        link_href(kind, &self.fingerprint)
+    }
+}
+
 pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),

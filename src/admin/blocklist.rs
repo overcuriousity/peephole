@@ -30,8 +30,6 @@ pub const MAX_ENTRIES: i64 = 50_000;
 pub const NET_MIN_IPS: usize = 3;
 /// The response is recomputed at most this often per parameter set.
 pub const TTL: Duration = Duration::from_secs(60);
-/// Distinct parameter sets cached.
-pub const CACHE_MAX: usize = 32;
 
 /// Raw query parameters: every value is lenient, an unusable one means
 /// its default (a wrong value must not make a firewall script fail open).

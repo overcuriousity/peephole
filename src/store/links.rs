@@ -5,7 +5,7 @@
 //! time, by a node. Admin-only.
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, lenient_i64, like_escape, nonempty, offset, ts_bound};
-use crate::scan::hostkeys::{
+use crate::model::hostkeys::{
     FAVICON, HASSH, HTTP_404, HTTP_BODY, HTTP_ETAG, JA4X, JARM, SSH_HOSTKEY, TLS_CERT,
 };
 use anyhow::Result;
@@ -847,7 +847,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::nmap_xml::parse_nmap_xml;
+    use crate::model::nmap_xml::parse_nmap_xml;
     use crate::store::requests::NewRequest;
 
     /// a, b, c, d: fp "F" on a and b, fp "G" on c; JA4 "J" on a, b, c and
@@ -937,19 +937,19 @@ mod tests {
         }
         assert_eq!(
             LinkKind::Ssh.host_kind(),
-            Some(crate::scan::hostkeys::SSH_HOSTKEY)
+            Some(crate::model::hostkeys::SSH_HOSTKEY)
         );
         assert_eq!(
             LinkKind::Tls.host_kind(),
-            Some(crate::scan::hostkeys::TLS_CERT)
+            Some(crate::model::hostkeys::TLS_CERT)
         );
         assert_eq!(
             LinkKind::Hassh.host_kind(),
-            Some(crate::scan::hostkeys::HASSH)
+            Some(crate::model::hostkeys::HASSH)
         );
         assert_eq!(
             LinkKind::Ja4x.host_kind(),
-            Some(crate::scan::hostkeys::JA4X)
+            Some(crate::model::hostkeys::JA4X)
         );
         assert_eq!(LinkKind::parse("ip"), None);
     }
@@ -1165,7 +1165,7 @@ mod tests {
         let ssh = s.links_list(&filter("ssh")).await.unwrap().items[0]
             .value
             .clone();
-        let a = crate::store::hostkeys::anchor(crate::scan::hostkeys::SSH_HOSTKEY, &ssh);
+        let a = crate::store::hostkeys::anchor(crate::model::hostkeys::SSH_HOSTKEY, &ssh);
         assert_eq!(
             s.resolve_anchor(&a).await.unwrap(),
             Some((LinkKind::Ssh, ssh))

@@ -46,6 +46,20 @@ pub fn show(mc: Mc) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
 }
 
+/// The date of a lot's day.
+pub fn date_of(day: u32) -> String {
+    chrono::DateTime::from_timestamp(day as i64 * 86_400, 0)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// The minute an entry is dated (UTC).
+pub fn when(hlc: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(crate::cluster::hlc::physical_ms(hlc) as i64)
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// An amount typed by an operator ("1", "0.25"): more than nothing, at
 /// most three decimals.
 pub fn parse_amount(s: &str) -> Option<Mc> {

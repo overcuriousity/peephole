@@ -1,8 +1,47 @@
 use super::Store;
 use crate::events::QueueJob;
-use crate::scan::nmap_xml::ScanResult;
+use crate::model::nmap_xml::ScanResult;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+
+/// Window over which the queue's actual inflow and outflow are measured
+/// for the drain estimate: recent enough to follow a pace change.
+pub const DRAIN_WINDOW_HOURS: i64 = 6;
+/// Longest any one scan may run: the level-4 limit is capped here.
+pub const MAX_RUN_SECS: u64 = 12 * 3600;
+/// A job marked running for longer than this is dead (no scan runs past
+/// [`MAX_RUN_SECS`]): it neither shields its IP nor blocks a takeover.
+pub const STALE_RUNNING_HOURS: u64 = MAX_RUN_SECS / 3600 + 1;
+
+/// Raw queue measurements (see `Store::queue_metrics`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueueMetrics {
+    pub backlog: i64,
+    pub running: i64,
+    pub arrivals_1h: i64,
+    pub arrivals_24h: i64,
+    pub completed_1h: i64,
+    pub completed_24h: i64,
+    /// Failed / timed-out jobs among `completed_24h`.
+    pub failed_24h: i64,
+    /// Jobs refused in the last 24 h (never_scan, Tor exit, verified
+    /// crawler, …); the reason is on each job.
+    pub refused_24h: i64,
+    pub timeouts_24h: i64,
+    /// Jobs queued within the last [`DRAIN_WINDOW_HOURS`].
+    pub arrivals_recent: i64,
+    /// Jobs that left the queue for good (done, failed, refused,
+    /// superseded) within the last [`DRAIN_WINDOW_HOURS`].
+    pub left_recent: i64,
+    /// Hours the 24h window actually covers (a fresh install has less), >= 1.
+    pub observed_hours: f64,
+    /// Mean seconds a job held a worker (done, failed or timed out), last 7 days.
+    pub avg_scan_secs: Option<f64>,
+    pub oldest_queued_secs: Option<i64>,
+    /// Per hour, oldest first, 24 entries.
+    pub hourly_arrivals: Vec<i64>,
+    pub hourly_completions: Vec<i64>,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum EnqueueOutcome {
@@ -88,8 +127,8 @@ impl Store {
     }
 
     /// Queue growth measurements for the pacing recommendation.
-    pub async fn queue_metrics(&self) -> Result<crate::scan::pace::QueueMetrics> {
-        let recent = format!("-{} hours", crate::scan::pace::DRAIN_WINDOW_HOURS);
+    pub async fn queue_metrics(&self) -> Result<QueueMetrics> {
+        let recent = format!("-{} hours", DRAIN_WINDOW_HOURS);
         // SUM over zero rows is NULL.
         type Sums = (
             Option<i64>,
@@ -121,7 +160,7 @@ impl Store {
                     SUM(status = 'refused' AND finished_at > datetime('now','-24 hours'))
              FROM scan_jobs",
         )
-        .bind(format!("-{} hours", crate::scan::pace::STALE_RUNNING_HOURS))
+        .bind(format!("-{} hours", STALE_RUNNING_HOURS))
         .bind(&recent)
         .bind(&recent)
         .fetch_one(&self.pool)
@@ -170,7 +209,7 @@ impl Store {
                 }
             }
         }
-        Ok(crate::scan::pace::QueueMetrics {
+        Ok(QueueMetrics {
             backlog: backlog.unwrap_or(0),
             running: running.unwrap_or(0),
             arrivals_1h: a1.unwrap_or(0),

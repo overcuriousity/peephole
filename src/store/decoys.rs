@@ -148,7 +148,7 @@ impl Store {
         }
         let mut rows = q.bind(limit).fetch_all(&self.read).await?;
         for s in &mut rows {
-            s.id = crate::trap::decoy::mcp::session_id(&s.id);
+            s.id = crate::model::mcp::session_id(&s.id);
         }
         Ok(rows)
     }
@@ -218,10 +218,7 @@ impl Store {
                 "chat" | "generate" | "chat-completions" | "completions" | "responses"
                 | "messages" | "complete" => {
                     s.calls += n;
-                    if model
-                        .as_deref()
-                        .is_some_and(crate::trap::decoy::llm::listed)
-                    {
+                    if model.as_deref().is_some_and(crate::model::llm::listed) {
                         s.listed += n
                     } else {
                         s.unlisted += n
@@ -566,7 +563,7 @@ mod tests {
             .fetch_one(&s.pool)
             .await
             .unwrap();
-        let sid = crate::trap::decoy::mcp::session_id(&tok);
+        let sid = crate::model::mcp::session_id(&tok);
         let h = [("mcp-session-id", sid.as_str())];
         req(
             &s,

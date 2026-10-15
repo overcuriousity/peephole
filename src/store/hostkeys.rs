@@ -4,7 +4,7 @@
 
 use super::Store;
 use super::inspect::{MAX_RAW_XML, zstd_decode_capped};
-use crate::scan::hostkeys::{
+use crate::model::hostkeys::{
     FAVICON, HASSH, HOSTKEYS_V, HTTP_404, HTTP_BODY, HTTP_ETAG, HostKey, JA4X, JARM, SSH_HOSTKEY,
     TLS_CERT, extract,
 };
@@ -35,13 +35,6 @@ impl HostKeyRow {
 
     pub fn kind_name(&self) -> &'static str {
         kind_name(&self.kind)
-    }
-
-    /// Its page under Links.
-    pub fn link_href(&self) -> String {
-        let kind =
-            crate::store::links::LinkKind::of_host_kind(&self.kind).map_or("ssh", |k| k.key());
-        crate::admin::views::link_href(kind, &self.fingerprint)
     }
 }
 
@@ -85,7 +78,7 @@ type Read = (Vec<HostKey>, Vec<String>);
 /// The identifiers and PTR names in a stored scan's XML (no database).
 fn read(scan_id: i64, raw_xml: Option<&[u8]>) -> Read {
     match raw_xml.map(|b| zstd_decode_capped(b, MAX_RAW_XML)) {
-        Some(Ok(xml)) => (extract(&xml), crate::scan::hostkeys::ptr_names(&xml)),
+        Some(Ok(xml)) => (extract(&xml), crate::model::hostkeys::ptr_names(&xml)),
         Some(Err(e)) => {
             tracing::debug!(scan_id, "host keys: scan XML unreadable: {e:#}");
             (vec![], vec![])
@@ -262,7 +255,7 @@ pub fn anchor(kind: &str, fingerprint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::nmap_xml::parse_nmap_xml;
+    use crate::model::nmap_xml::parse_nmap_xml;
 
     /// A scan stored for `ip` (as the scanner stores it), and its id.
     async fn scan(s: &Store, ip: &str, xml: &[u8]) -> i64 {

@@ -22,7 +22,7 @@ pub(crate) fn derive(
     if transport == Some("http") && via_proxy == Some(true) {
         return None;
     }
-    raw_head.and_then(crate::trap::ja4h::ja4h)
+    raw_head.and_then(crate::model::ja4h::ja4h)
 }
 
 /// Rows read per write transaction by [`backfill`] (heads are up to 64 KiB).
@@ -117,7 +117,7 @@ mod tests {
         let s = store().await;
         let with = insert(&s, Some(HEAD)).await;
         let without = insert(&s, None).await;
-        assert_eq!(ja4h_of(&s, with).await, crate::trap::ja4h::ja4h(HEAD));
+        assert_eq!(ja4h_of(&s, with).await, crate::model::ja4h::ja4h(HEAD));
         assert!(ja4h_of(&s, with).await.is_some());
         assert_eq!(ja4h_of(&s, without).await, None);
     }
@@ -133,7 +133,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(backfill(&s.pool).await.unwrap(), 2);
-        assert_eq!(ja4h_of(&s, id).await, crate::trap::ja4h::ja4h(HEAD));
+        assert_eq!(ja4h_of(&s, id).await, crate::model::ja4h::ja4h(HEAD));
         assert_eq!(backfill(&s.pool).await.unwrap(), 0, "each row once");
     }
 

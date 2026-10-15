@@ -12,6 +12,7 @@ pub mod events;
 pub mod export;
 pub mod fingerprint;
 pub mod intel;
+pub mod model;
 pub mod net;
 pub mod scan;
 pub mod sd_notify;

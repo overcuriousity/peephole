@@ -176,7 +176,7 @@ pub struct Stats {
     /// request is released to this audience.
     pub webshells_dropped: i64,
     /// The commands sent to dropped webshells in the range, by verb: only
-    /// the names on [`crate::trap::webshell::verb`]'s list, else `other`.
+    /// the names on [`crate::model::webshell::verb`]'s list, else `other`.
     /// Most frequent first.
     pub verbs: Vec<Named>,
 }
@@ -644,9 +644,11 @@ impl Store {
         let mut counts: HashMap<&'static str, i64> = HashMap::new();
         while let Some((query, body)) = rows.try_next().await? {
             if let Some(cmd) =
-                crate::trap::webshell::extract_command(query.as_deref(), body.as_deref())
+                crate::model::webshell::extract_command(query.as_deref(), body.as_deref())
             {
-                *counts.entry(crate::trap::webshell::verb(&cmd)).or_default() += 1;
+                *counts
+                    .entry(crate::model::webshell::verb(&cmd))
+                    .or_default() += 1;
             }
         }
         let mut verbs: Vec<Named> = counts
@@ -873,6 +875,9 @@ pub const IPS_CACHE_MAX: usize = 64;
 /// Bound on cached per-IP overviews (anonymous traffic only).
 pub const IP_CACHE_MAX: usize = 256;
 
+/// Bound on cached `/api/blocklist` bodies: distinct parameter sets.
+pub const BLOCKLIST_CACHE_MAX: usize = 32;
+
 type BoxFut<V> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<V>> + Send>>;
 
 struct Entry<V> {
@@ -1035,7 +1040,7 @@ impl Default for StatsCache {
             map: SwrCache::new(Range::ALL.len()),
             ips: SwrCache::new(IPS_CACHE_MAX),
             ip: SwrCache::new(IP_CACHE_MAX),
-            blocklist: SwrCache::new(crate::admin::blocklist::CACHE_MAX),
+            blocklist: SwrCache::new(BLOCKLIST_CACHE_MAX),
             analytics: SwrCache::new(Range::ALL.len()),
             admin_stats: SwrCache::new(Range::ALL.len()),
         }
