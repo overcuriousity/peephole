@@ -699,6 +699,31 @@ pub struct Started {
     pub asked: Vec<VantageView>,
 }
 
+/// The live scanners a probe asks: those of `picked`, or the Actions
+/// card's default pick.
+fn pick<'a>(all: &'a [ask::Vantage], picked: Option<&[String]>) -> Vec<&'a ask::Vantage> {
+    let picked: Vec<String> = match picked {
+        Some(p) => p.to_vec(),
+        None => ask::default_pick(all, DEFAULT_VANTAGES)
+            .iter()
+            .map(NodeId::to_string)
+            .collect(),
+    };
+    all.iter()
+        .filter(|v| picked.iter().any(|f| *f == v.node.to_string()))
+        .collect()
+}
+
+/// What [`start`] with `picked` would offer to pay now, in millicredits
+/// (0 standalone, where a probe costs nothing).
+pub fn price_mc(state: &AdminState, picked: Option<&[String]>) -> u64 {
+    let Some(node) = state.recorder.node() else {
+        return 0;
+    };
+    let all = ask::vantages(node, &state.geo);
+    pick(&all, picked).iter().map(|v| v.price_mc as u64).sum()
+}
+
 /// Start a probe of `ip` (in the dataset as `ip_id`): in a cluster, ask
 /// the `picked` live scanners (None: the Actions card's default pick);
 /// standalone, run it here. The gate is this node's, as the Actions card
@@ -753,18 +778,7 @@ pub async fn start(
         });
     };
     let all = ask::vantages(&node, &state.geo);
-    let default;
-    let picked: Vec<String> = match picked {
-        Some(p) => p.to_vec(),
-        None => {
-            default = ask::default_pick(&all, DEFAULT_VANTAGES);
-            default.iter().map(NodeId::to_string).collect()
-        }
-    };
-    let chosen: Vec<&ask::Vantage> = all
-        .iter()
-        .filter(|v| picked.iter().any(|f| *f == v.node.to_string()))
-        .collect();
+    let chosen = pick(&all, picked);
     if chosen.is_empty() {
         return Err("pick at least one live scanner".into());
     }
@@ -1327,6 +1341,7 @@ secure_cookies = false
             .oneshot(
                 axum::http::Request::get(format!("/admin/api/probes?ip={IP}"))
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1566,6 +1581,7 @@ secure_cookies = false
             &app,
             axum::http::Request::post("/admin/lookup/probe")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded"),
             &format!("ip={IP}"),
         )
@@ -1576,7 +1592,9 @@ secure_cookies = false
         for _ in 0..100 {
             (_, _, html) = send(
                 &app,
-                axum::http::Request::get(format!("/ip/{IP}")).header("cookie", &cookie),
+                axum::http::Request::get(format!("/ip/{IP}"))
+                    .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin"),
                 "",
             )
             .await;
@@ -1637,7 +1655,9 @@ secure_cookies = false
         // The admin sees both.
         let (_, _, html) = send(
             &app,
-            axum::http::Request::get(format!("/ip/{IP}")).header("cookie", &cookie),
+            axum::http::Request::get(format!("/ip/{IP}"))
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin"),
             "",
         )
         .await;

@@ -105,6 +105,7 @@ Every non-2xx response is JSON:
 | 409    | see below      | a scan is not sold, or a quote cannot be spent    |
 | 422    | `refused`      | the probe gate refuses the address, or the scan guard an address not in the dataset (reason in `message`) |
 | 429    | `rate_limited` | per-IP limit hit (`Retry-After` header is set)    |
+| 429    | `spend_cap`    | the device's 24-hour spend cap is reached (see [Act endpoints](#act-endpoints)) |
 | 500    | `internal`     | storage failure; message is generic, never a leak |
 
 Secrets (tokens, codes) never appear in error bodies or logs.
@@ -373,6 +374,25 @@ Every call that queues something writes an audit entry: when, the device
 (id and name), who paired it, the action, the target, the credits and the
 job id. Admins see the newest 50 under **Recent actions** on
 Admin → Devices.
+
+### Spend cap
+
+Each device may commit at most `[credits] device_daily_cap` credits
+(default `100`; `0` turns the cap off) in any 24 hours, counted from its
+audit entries: a probe at the asked scanners' prices, a scan or lookup at
+its quote. A probe, scan buy or lookup buy that would go past it is
+refused before anything happens: `429` with
+
+```json
+{ "error": { "code": "spend_cap", "message": "this device committed 99.50 of its 100.00 credits in the last 24 hours; this costs 1.28" } }
+```
+
+Nothing is queued, asked or charged, and a quote is not spent (it can be
+bought later while it lives). Calls that cost nothing are never refused.
+Each device has its own cap; quotes, prices and reads are not capped. The
+default holds about four level-4 scans at today's median price, or one at
+the dearest, and caps what a leaked token can spend in a day at a tenth
+of the daily credit pool.
 
 ### `GET /api/v1/ips/{addr}/probe/vantages`
 

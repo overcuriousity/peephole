@@ -7,7 +7,7 @@ pub const BASE: &str = "https://api.abuseipdb.com/api/v2";
 
 pub struct AbuseIpDb {
     pub base: String,
-    pub key: String,
+    pub key: crate::config::Secret,
     /// Reports older than this many days are not counted.
     pub max_age_days: u32,
 }
@@ -56,7 +56,7 @@ impl Service for AbuseIpDb {
                 // The reports, for their categories.
                 ("verbose", ""),
             ])
-            .header("Key", &self.key)
+            .header("Key", self.key.expose())
             .header("Accept", "application/json")
     }
 

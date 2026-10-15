@@ -61,7 +61,10 @@ pub fn session_token(state: &AdminState, jar: &CookieJar) -> Option<String> {
         .map(|c| c.value().to_string())
 }
 
-/// Whether the request carries a live session.
+/// Whether the request carries a live session. Such a client also skips
+/// the shared sign-in budget ([`limit`](crate::admin::limit)), so a flood
+/// from elsewhere cannot lock out a signed-in admin. A ceremony cookie does
+/// not: anyone gets one from a free `/login/start`.
 pub async fn session_valid(state: &AdminState, jar: &CookieJar) -> bool {
     match session_token(state, jar) {
         Some(t) => state.store.validate_session(&t).await.unwrap_or(false),
@@ -710,7 +713,9 @@ secure_cookies = {secure}
             .extension(ConnectInfo(peer))
             .header("content-type", "application/x-www-form-urlencoded");
         if let Some(t) = cookie {
-            b = b.header("cookie", format!("peephole_session={t}"));
+            b = b
+                .header("cookie", format!("peephole_session={t}"))
+                .header("sec-fetch-site", "same-origin");
         }
         let r = app
             .clone()

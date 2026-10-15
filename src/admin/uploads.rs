@@ -211,7 +211,11 @@ mod tests {
         let (st, cookie, app, _d) = app().await;
         upload(&st, "held", "<b>x</b>", b"<?php echo 1;", true).await;
         upload(&st, "gone", "y.php", b"<?php echo 2;", false).await;
-        let get = |path: &'static str| Request::get(path).header("cookie", cookie.clone());
+        let get = |path: &'static str| {
+            Request::get(path)
+                .header("cookie", cookie.clone())
+                .header("sec-fetch-site", "same-origin")
+        };
         let (status, _, body) = send(&app, get("/admin/uploads"), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("&#60;b&#62;x&#60;/b&#62;"), "{body}");
@@ -242,6 +246,7 @@ mod tests {
             app.clone(),
             Request::get("/admin/uploads/z/content.zip")
                 .header("cookie", cookie)
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::empty())
                 .unwrap(),
         )
