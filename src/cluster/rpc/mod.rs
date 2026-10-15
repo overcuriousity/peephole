@@ -112,7 +112,9 @@ async fn pull(
         Ok(v) => {
             let kinds = super::traffic::Kinds::of(&v.entries);
             if kinds.total() > 0 {
-                node.traffic.sent(peer, &name_of(&node, &peer), &kinds);
+                node.peers
+                    .traffic
+                    .sent(peer, &name_of(&node, &peer), &kinds);
             }
             Cbor(v).into_response()
         }
@@ -132,7 +134,8 @@ async fn push(
     match repl::apply_batch(&node, batch).await {
         Ok(st) => {
             if kinds.total() > 0 {
-                node.traffic
+                node.peers
+                    .traffic
                     .received(peer, &name_of(&node, &peer), &kinds, st.applied);
             }
             if st.rejected > 0 {
@@ -197,7 +200,7 @@ async fn message(State(node): State<Arc<Node>>, Cbor(mut env): Cbor<Envelope>) -
             return (StatusCode::SERVICE_UNAVAILABLE, "no route to that member").into_response();
         }
     }
-    let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
+    let Ok(permit) = node.peers.route_slots.clone().try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
     };
     tokio::spawn(async move {

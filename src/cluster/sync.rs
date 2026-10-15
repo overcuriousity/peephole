@@ -123,7 +123,7 @@ pub async fn supervise(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiv
             }
             last_heads = Some(h);
         }
-        node.traffic.summarize_if_due();
+        node.peers.traffic.summarize_if_due();
         let targets = node.dial_targets();
         loops.retain(|id, (addr, h)| {
             let keep = !h.is_finished() && targets.iter().any(|t| t.0 == *id && t.2 == *addr);
@@ -147,7 +147,7 @@ pub async fn supervise(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiv
         }
         tokio::select! {
             _ = tokio::time::sleep(SUPERVISE_TICK) => {}
-            _ = node.members_changed.notified() => {}
+            _ = node.peers.members_changed.notified() => {}
             _ = shutdown.changed() => break,
         }
     }
@@ -176,12 +176,12 @@ async fn peer_loop(
         changes.borrow_and_update();
         let hello_due = last_hello.is_none_or(|t| t.elapsed() > HELLO_EVERY);
         let round = {
-            let _slot = node.sync_slots.acquire().await;
+            let _slot = node.peers.sync_slots.acquire().await;
             reconcile(&node, peer, &addr, hello_due).await
         };
-        node.traffic.round(peer, &name, round.is_ok());
+        node.peers.traffic.round(peer, &name, round.is_ok());
         if round.is_ok() {
-            node.reach.note(peer, super::hlc::wall_ms());
+            node.credits.reach.note(peer, super::hlc::wall_ms());
         }
         match round {
             Ok(stuck) => {
@@ -272,7 +272,7 @@ async fn peer_loop(
 
 /// A peer holds our own log this far.
 fn note_own_acked(node: &Node, theirs: &Heads) {
-    node.own_acked.fetch_max(
+    node.peers.own_acked.fetch_max(
         repl::head_in(theirs, &node.id()),
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -307,7 +307,8 @@ fn jitter(max: Duration) -> Duration {
 /// behind), so the caller must back off instead of immediately re-polling
 /// `/wait` (which answers at once while the peer is ahead) and busy-spinning.
 pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Result<bool> {
-    node.sync_rounds
+    node.peers
+        .sync_rounds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = node
         .members()
@@ -356,7 +357,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             .map(|(o, _)| *o)
             .collect()
     };
-    node.unserved.lock().unwrap().insert(peer, unserved);
+    node.peers.unserved.lock().unwrap().insert(peer, unserved);
     let mut stuck = false;
     loop {
         let ours = repl::head_map(&repl::heads(&node.store).await?);
@@ -400,7 +401,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
         let kinds = super::traffic::Kinds::of(&batch.entries);
         let st = repl::apply_batch_with(node, batch, |o| skippable.contains(o)).await?;
         pulled += kinds.total() as usize;
-        node.traffic.received(peer, &name, &kinds, st.applied);
+        node.peers.traffic.received(peer, &name, &kinds, st.applied);
         if st.applied + st.parked == 0 {
             // The peer has entries we cannot make progress on; stop pulling and
             // signal the caller to back off rather than spin.
@@ -454,7 +455,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
                 .filter(|e| e.seq <= theirs.get(&e.origin).copied().unwrap_or(0)),
         );
         pushed += taken.total() as usize;
-        node.traffic.sent(peer, &name, &taken);
+        node.peers.traffic.sent(peer, &name, &taken);
     }
     node.record_status(peer, &name, Ok(None)).await;
     if pulled + pushed > 0 {

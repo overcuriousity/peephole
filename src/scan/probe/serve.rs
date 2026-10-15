@@ -228,7 +228,7 @@ impl Prober {
         let paid = match req.offer_seq {
             None if peer == node.id() => None,
             None if price_u32 == 0 => {
-                node.market.note(price::PROBE, 1);
+                node.credits.market.note(price::PROBE, 1);
                 None
             }
             // Asking at a price without an offer is no demand
@@ -253,7 +253,7 @@ impl Prober {
                 )
                 .await;
                 if pay::counts_as_demand(&accepted) {
-                    node.market.note(price::PROBE, 1);
+                    node.credits.market.note(price::PROBE, 1);
                 }
                 match accepted {
                     Ok(a) => Some((offer_seq, a)),
@@ -508,7 +508,8 @@ mod tests {
             ..Default::default()
         }));
         let demand = || {
-            node.market
+            node.credits
+                .market
                 .peek()
                 .counts
                 .get(price::PROBE)

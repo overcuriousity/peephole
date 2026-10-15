@@ -577,7 +577,7 @@ pub async fn market(node: &Node, book: &super::Book) -> Result<Vec<MarketRow>> {
 
 /// Keep this node's bids and refusals for [`market`], at a refresh.
 async fn keep_market(node: &Node, bids: &HashMap<&str, Mc>) -> Result<()> {
-    let refused = node.market.over_bids();
+    let refused = node.credits.market.over_bids();
     for good in MARKET_GOODS {
         let bid = bids.get(good).copied().unwrap_or(0);
         node.store
@@ -596,7 +596,7 @@ async fn keep_market(node: &Node, bids: &HashMap<&str, Mc>) -> Result<()> {
 /// its own lots in `book` and what its buyer loops want.
 async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> {
     let budget = hourly_budget(node, book).await;
-    let wants = node.wants.lock().unwrap().clone();
+    let wants = node.credits.wants.lock().unwrap().clone();
     MARKET_GOODS
         .iter()
         .map(|g| (*g, super::bid::bid(budget, &wants, g)))
@@ -604,7 +604,7 @@ async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> 
 }
 
 /// This node's bid for `good` now, from its own lots (the cached book)
-/// and what its buyer loops want ([`Node::wants`]); nothing a peer says
+/// and what its buyer loops want (`node.credits.wants`); nothing a peer says
 /// enters it.
 pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
     let book = super::book(node).await?;
@@ -616,14 +616,14 @@ pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
 /// lots and what its buyer loops want. Nothing a peer says enters it.
 pub async fn own_bid_in(node: &Node, book: &super::Book, good: &str) -> Mc {
     let budget = hourly_budget(node, book).await;
-    let wants = node.wants.lock().unwrap().clone();
+    let wants = node.credits.wants.lock().unwrap().clone();
     super::bid::bid(budget, &wants, good)
 }
 
 /// What this node can spend in the coming hour from its own lots in `book`.
 async fn hourly_budget(node: &Node, book: &super::Book) -> Mc {
     let me = node.id();
-    let lots = node.spending.lock().await.lots(book, &me);
+    let lots = node.credits.spending.lock().await.lots(book, &me);
     super::bid::hourly_budget(&lots, book.ledger.today, book.now_ms)
 }
 
@@ -747,7 +747,7 @@ pub async fn load_kept(node: &Node) -> Result<()> {
             refused.insert(good.to_string(), n);
         }
     }
-    node.market.seed_over_bids(refused);
+    node.credits.market.seed_over_bids(refused);
     let mut t = Table {
         resolve_mc: kept_price(node, RESOLVE).await?.map_or(0, as_mc),
         rdns_mc: kept_price(node, RDNS).await?.map_or(0, as_mc),
@@ -803,7 +803,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         .map(|(id, _)| *id)
         .collect();
     let capacity = capacity(&scanners(node, &left_out).await?);
-    let counted = node.market.peek();
+    let counted = node.credits.market.peek();
     let (demand, hours) = (&counted.counts, counted.hours);
     let old = node.price_table();
     // What live members announce, per good (for the start price).
@@ -1016,7 +1016,7 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         offers,
     });
     node.set_price_table(table.clone());
-    node.market.consume(&counted);
+    node.credits.market.consume(&counted);
     let bids = own_bids(node, &book).await;
     if let Err(e) = keep_market(node, &bids).await {
         tracing::debug!(?e, "credits: market counters not kept");
@@ -1282,8 +1282,8 @@ mod tests {
             .unwrap();
         // Refusals kept across a restart add to those counted since.
         load_kept(&node).await.unwrap();
-        node.market.over_bid(RDNS);
-        assert_eq!(node.market.over_bids().get(RDNS), Some(&5));
+        node.credits.market.over_bid(RDNS);
+        assert_eq!(node.credits.market.over_bids().get(RDNS), Some(&5));
         let book = super::super::compute(&node).await.unwrap();
         let rows = market(&node, &book).await.unwrap();
         let rdns = rows.iter().find(|r| r.good == RDNS).unwrap();
