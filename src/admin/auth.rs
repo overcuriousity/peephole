@@ -533,8 +533,10 @@ async fn login_finish(
                     if let Ok(mut pk) = serde_json::from_str::<Passkey>(&j)
                         && pk.update_credential(&result) == Some(true)
                     {
-                        if let Ok(updated) = serde_json::to_string(&pk) {
-                            let _ = state.store.update_credential(&cred_id, &updated).await;
+                        if let Ok(updated) = serde_json::to_string(&pk)
+                            && let Err(e) = state.store.update_credential(&cred_id, &updated).await
+                        {
+                            tracing::warn!(?e, "updating the passkey counter failed");
                         }
                         break;
                     }
@@ -647,8 +649,10 @@ async fn login_password(
 }
 
 async fn logout(State(state): State<Arc<AdminState>>, jar: CookieJar) -> Response {
-    if let Some(t) = session_token(&state, &jar) {
-        let _ = state.store.destroy_session(&t).await;
+    if let Some(t) = session_token(&state, &jar)
+        && let Err(e) = state.store.destroy_session(&t).await
+    {
+        tracing::warn!(?e, "ending the session at logout failed");
     }
     let jar = jar.remove(removal(&state.cfg, session_cookie_name(&state.cfg)));
     (jar, Redirect::to("/")).into_response()

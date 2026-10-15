@@ -833,9 +833,12 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
     }
     if fetched > 0 {
         // Both databases are current: what the admin pages show.
-        let _ = store
+        if let Err(e) = store
             .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-            .await;
+            .await
+        {
+            warn!(?e, "recording the MaxMind fetch time failed");
+        }
     }
     Ok(())
 }
@@ -911,9 +914,12 @@ pub async fn run_scheduler(
                         Ok(l) => *tor.write().unwrap() = l,
                         Err(e) => warn!(?e, "tor exit list reload failed"),
                     }
-                    let _ = store
+                    if let Err(e) = store
                         .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
-                        .await;
+                        .await
+                    {
+                        warn!(?e, "recording the tor exit list fetch time failed");
+                    }
                     tor_backoff.reset();
                     // 24h ± up to 1h deterministic-ish jitter from nanos.
                     let jitter = Duration::from_secs(
