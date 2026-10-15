@@ -339,11 +339,8 @@ mod tests {
         assert!(!g.allow());
     }
 
-    #[tokio::test]
-    async fn the_router_limits_each_client_separately() {
-        use axum::body::Body;
-        use tower::ServiceExt;
-        let dir = tempfile::tempdir().unwrap();
+    /// The full router with its limits, on a fresh store in `dir`.
+    async fn limited_app(dir: &tempfile::TempDir) -> axum::Router {
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
 admin_listen = "127.0.0.1:1"
@@ -365,18 +362,44 @@ secure_cookies = false
         let store = crate::store::Store::connect(&cfg.database_path)
             .await
             .unwrap();
-        let app = crate::admin::full_router(Arc::new(AdminState::public_only(store, cfg)));
+        crate::admin::full_router(Arc::new(AdminState::public_only(store, cfg)))
+    }
+
+    /// One request from `peer`, with `xff` as its X-Forwarded-For if any.
+    async fn call_from(
+        app: &axum::Router,
+        peer: &str,
+        method: &str,
+        path: &str,
+        xff: Option<&str>,
+    ) -> Response {
+        use tower::ServiceExt;
+        let peer: SocketAddr = peer.parse().unwrap();
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(peer));
+        if let Some(c) = xff {
+            b = b.header("x-forwarded-for", c);
+        }
+        app.clone()
+            .oneshot(b.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_router_limits_each_client_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = limited_app(&dir).await;
         // nginx on loopback reports the client in X-Forwarded-For.
-        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        let call = |method: &str, path: &str, client: Option<&str>| {
-            let mut b = axum::http::Request::builder()
-                .method(method)
-                .uri(path)
-                .extension(ConnectInfo(peer));
-            if let Some(c) = client {
-                b = b.header("x-forwarded-for", c);
+        let call = |method: &'static str, path: &'static str, client: Option<&str>| {
+            let (app, client) = (app.clone(), client.map(str::to_string));
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    call_from(&app, "127.0.0.1:40000", method, path, client.as_deref()).await,
+                )
             }
-            app.clone().oneshot(b.body(Body::empty()).unwrap())
         };
         for _ in 0..PUBLIC_BURST {
             let r = call("GET", "/api/countries", Some("203.0.113.1"))
@@ -449,6 +472,64 @@ secure_cookies = false
             .await
             .unwrap();
         assert_ne!(r.status(), 429);
+    }
+
+    /// T6 (MIK-391): a misconfigured proxy (every request from loopback,
+    /// with no X-Forwarded-For or one the client controls) turns off the
+    /// per-client limits, but sign-in stays capped by the shared budget.
+    #[tokio::test]
+    async fn a_misconfigured_proxy_keeps_the_sign_in_limit() {
+        let refused_at = |app: axum::Router, peer: &'static str, path: &'static str, xff: bool| async move {
+            for i in 0..(LOGIN_BURST * 4) {
+                let ip = format!("192.0.2.{i}");
+                let xff = xff.then_some(ip.as_str());
+                if call_from(&app, peer, "POST", path, xff).await.status() == 429 {
+                    return Some(i);
+                }
+            }
+            None
+        };
+        for path in ["/login/start", "/login/password"] {
+            // No X-Forwarded-For: every client looks like the proxy.
+            let dir = tempfile::tempdir().unwrap();
+            let app = limited_app(&dir).await;
+            assert_eq!(
+                refused_at(app, "127.0.0.1:40000", path, false).await,
+                Some(LOGIN_BURST),
+                "{path} without XFF"
+            );
+            // The proxy passes on a client-chosen X-Forwarded-For: a fresh
+            // address per request dodges the per-client bucket only.
+            let dir = tempfile::tempdir().unwrap();
+            let app = limited_app(&dir).await;
+            assert_eq!(
+                refused_at(app, "[::1]:40000", path, true).await,
+                Some(LOGIN_BURST),
+                "{path} with a spoofed XFF per request"
+            );
+            // An untrusted peer's X-Forwarded-For is ignored: its own
+            // per-client budget applies.
+            let dir = tempfile::tempdir().unwrap();
+            let app = limited_app(&dir).await;
+            assert_eq!(
+                refused_at(app, "203.0.113.9:40000", path, true).await,
+                Some(AUTH_BURST),
+                "{path} from an untrusted peer"
+            );
+        }
+        // Pinned, not a brute-force path: setup (`/enroll/*`) and pairing
+        // are outside the shared budget, so behind such a proxy they have
+        // no limit. Their credentials are a 122-bit setup token and a
+        // 192-bit pairing code.
+        let dir = tempfile::tempdir().unwrap();
+        let app = limited_app(&dir).await;
+        for path in ["/enroll/start", "/api/v1/pair"] {
+            assert_eq!(
+                refused_at(app.clone(), "127.0.0.1:40000", path, false).await,
+                None,
+                "{path} without XFF"
+            );
+        }
     }
 
     #[test]
