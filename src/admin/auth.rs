@@ -61,28 +61,13 @@ pub fn session_token(state: &AdminState, jar: &CookieJar) -> Option<String> {
         .map(|c| c.value().to_string())
 }
 
-/// Whether the request carries a live session.
+/// Whether the request carries a live session. Such a client also skips
+/// the shared sign-in budget ([`limit`](crate::admin::limit)), so a flood
+/// from elsewhere cannot lock out a signed-in admin. A ceremony cookie does
+/// not: anyone gets one from a free `/login/start`.
 pub async fn session_valid(state: &AdminState, jar: &CookieJar) -> bool {
     match session_token(state, jar) {
         Some(t) => state.store.validate_session(&t).await.unwrap_or(false),
-        None => false,
-    }
-}
-
-/// Whether the request holds a live session or a sign-in ceremony in
-/// flight: such a client skips the shared sign-in budget
-/// ([`limit`](crate::admin::limit)), so a flood from elsewhere cannot lock
-/// out an admin who has already started.
-pub async fn holds_sign_in(state: &AdminState, jar: &CookieJar) -> bool {
-    if session_valid(state, jar).await {
-        return true;
-    }
-    match jar.get(ceremony_cookie_name(&state.cfg)) {
-        Some(c) => state
-            .store
-            .webauthn_state_live(c.value())
-            .await
-            .unwrap_or(false),
         None => false,
     }
 }

@@ -238,13 +238,14 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     let limits = &state.limits;
     // Sign-in starts from everyone share one budget as well, taken after the
     // client's own so a client over its limit does not spend it. A client
-    // holding a live session or ceremony is not refused by it (checked only
-    // once it is empty, so a flood costs no lookups while it lasts).
+    // holding a live session is not refused by it (checked only once it is
+    // empty, so a flood costs no lookups while it lasts). A ceremony cookie
+    // does not count: one free `/login/start` hands it to anyone.
     let is_sign_in =
         class == Class::Auth && matches!(path.as_str(), "/login/start" | "/login/password");
     let jar = axum_extra::extract::CookieJar::from_headers(req.headers());
     let global = async || {
-        !is_sign_in || limits.login.allow() || crate::admin::auth::holds_sign_in(&state, &jar).await
+        !is_sign_in || limits.login.allow() || crate::admin::auth::session_valid(&state, &jar).await
     };
     // No peer address (in-process callers, tests): nothing to key on.
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() else {
@@ -462,10 +463,11 @@ secure_cookies = false
     }
 
     /// With the shared sign-in budget used up, a client holding a live
-    /// session or a ceremony in flight still gets through; one without,
-    /// or with a dead cookie, is refused. Its own budget still applies.
+    /// session still gets through; one without, with a dead cookie, or with
+    /// only a live ceremony cookie (free from `/login/start`) is refused.
+    /// Its own budget still applies.
     #[tokio::test]
-    async fn a_signed_in_or_mid_ceremony_client_skips_the_shared_budget() {
+    async fn only_a_signed_in_client_skips_the_shared_budget() {
         use axum::body::Body;
         use tower::ServiceExt;
         let (app, store, _dir) = app().await;
@@ -501,7 +503,7 @@ secure_cookies = false
                 Some(format!("peephole_session={session}")),
                 412,
             ),
-            ("198.51.100.5", Some(format!("wa_sid={ceremony}")), 412),
+            ("198.51.100.5", Some(format!("wa_sid={ceremony}")), 429),
         ];
         for (client, cookie, want) in cases {
             let r = call(client, cookie.clone()).await.unwrap();

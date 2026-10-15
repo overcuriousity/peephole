@@ -299,18 +299,6 @@ impl Store {
         Ok(stored.then_some(id))
     }
 
-    /// Whether `id` names a ceremony in flight (any kind, not expired).
-    /// Reads only: the ceremony stays to be finished.
-    pub async fn webauthn_state_live(&self, id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM webauthn_states WHERE id = ? AND expires_at > datetime('now')",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .is_some())
-    }
-
     /// Consume a ceremony state: returns `(state_json, label)` and deletes the
     /// row in the same statement, so a captured id works at most once and an
     /// expired one never works.
