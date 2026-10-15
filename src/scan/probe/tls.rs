@@ -3,6 +3,7 @@
 //! verifier accepts everything and only keeps the chain.
 
 use super::{connect, sha256_hex, timed_out};
+use crate::lock::MutexExt;
 use anyhow::Result;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -44,7 +45,7 @@ impl ServerCertVerifier for Keep {
     ) -> Result<ServerCertVerified, Error> {
         let mut chain = vec![end_entity.to_vec()];
         chain.extend(intermediates.iter().map(|c| c.to_vec()));
-        *self.chain.lock().unwrap_or_else(|e| e.into_inner()) = chain;
+        *self.chain.lock_or_recover() = chain;
         Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -100,7 +101,7 @@ pub async fn capture(ip: IpAddr, port: u16, deadline: Instant) -> Result<TlsSeen
     let alpn = conn
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
-    let chain_der = std::mem::take(&mut *keep.chain.lock().unwrap_or_else(|e| e.into_inner()));
+    let chain_der = std::mem::take(&mut *keep.chain.lock_or_recover());
     Ok(TlsSeen {
         chain_der,
         version,

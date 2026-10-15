@@ -1,6 +1,7 @@
 //! Hybrid logical clock: wall-clock milliseconds in the high 48 bits, a
 //! counter in the low 16. Orders last-write-wins updates across nodes even
 //! when their clocks disagree slightly.
+use crate::lock::MutexExt;
 use std::sync::Mutex;
 
 /// Remote timestamps further ahead than this are not adopted, so one node
@@ -52,7 +53,7 @@ impl Hlc {
 
     /// A timestamp greater than every one issued or observed before.
     pub fn now(&self) -> u64 {
-        let mut last = self.last.lock().unwrap();
+        let mut last = self.last.lock_or_recover();
         let t = (wall_ms() << 16).max(*last + 1);
         *last = t;
         t
@@ -63,7 +64,7 @@ impl Hlc {
         if ahead(remote, wall_ms()) {
             return;
         }
-        let mut last = self.last.lock().unwrap();
+        let mut last = self.last.lock_or_recover();
         *last = (*last).max(remote);
     }
 
@@ -71,7 +72,7 @@ impl Hlc {
     /// ahead: its entries must keep rising (peers ignore one that does not)
     /// even after the wall clock was set back.
     pub fn observe_own(&self, own: u64) {
-        let mut last = self.last.lock().unwrap();
+        let mut last = self.last.lock_or_recover();
         *last = (*last).max(own);
     }
 }
@@ -111,5 +112,21 @@ mod tests {
         assert!(ahead(u64::MAX, now));
         assert_eq!(to_db(u64::MAX), i64::MAX);
         assert_eq!(from_db(-5), 0);
+    }
+
+    #[test]
+    fn stays_monotonic_after_a_poisoning_panic() {
+        let c = std::sync::Arc::new(Hlc::new());
+        let before = c.now();
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.last.lock();
+            panic!("poison the clock");
+        })
+        .join();
+        assert!(c.last.is_poisoned());
+        let a = c.now();
+        let b = c.now();
+        assert!(before < a && a < b);
     }
 }

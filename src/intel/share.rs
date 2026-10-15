@@ -12,6 +12,7 @@
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IntelManifestRec, Record};
+use crate::lock::MutexExt;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -50,8 +51,7 @@ pub fn file_hash(path: &Path) -> Result<(String, u64)> {
     let meta = std::fs::metadata(path)?;
     let key = (meta.modified()?, meta.len());
     if let Some((m, s, h)) = HASHES
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get_or_insert_with(HashMap::new)
         .get(path)
         && (*m, *s) == key
@@ -70,8 +70,7 @@ pub fn file_hash(path: &Path) -> Result<(String, u64)> {
     }
     let hex = data_encoding::HEXLOWER.encode(&hasher.finalize());
     HASHES
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get_or_insert_with(HashMap::new)
         .insert(path.to_path_buf(), (key.0, key.1, hex.clone()));
     Ok((hex, key.1))

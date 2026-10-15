@@ -6,6 +6,7 @@
 use super::Node;
 use super::identity::NodeId;
 use crate::credits::{Mc, pay, price, show};
+use crate::lock::MutexExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -45,15 +46,14 @@ pub struct Leases(Mutex<HashMap<NodeId, u64>>);
 impl Leases {
     pub fn holds(&self, id: &NodeId, now_ms: u64) -> bool {
         self.0
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(id)
             .is_some_and(|until| *until > now_ms)
     }
 
     /// Leases that have not ended.
     pub fn current(&self, now_ms: u64) -> usize {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0.lock_or_recover();
         l.retain(|_, until| *until > now_ms);
         l.len()
     }
@@ -61,13 +61,13 @@ impl Leases {
     /// End `id`'s lease here at once: messages for it are refused.
     #[doc(hidden)] // For tests: a lease otherwise only runs out.
     pub fn end(&self, id: &NodeId) {
-        self.0.lock().unwrap().remove(id);
+        self.0.lock_or_recover().remove(id);
     }
 
     /// Lease (or renew) for `id`: an hour from the end of its current
     /// lease, or from now. Returns the new end.
     pub fn grant(&self, id: NodeId, now_ms: u64) -> u64 {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0.lock_or_recover();
         let from = l
             .get(&id)
             .copied()
@@ -86,7 +86,7 @@ pub struct Leased(Mutex<BTreeMap<NodeId, u64>>, tokio::sync::Notify);
 impl Leased {
     /// Its relays now.
     pub fn relays(&self, now_ms: u64) -> Vec<NodeId> {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0.lock_or_recover();
         l.retain(|_, until| *until > now_ms);
         l.keys().copied().collect()
     }
@@ -94,8 +94,7 @@ impl Leased {
     /// Relays not due a renewal.
     pub fn keep(&self, now_ms: u64) -> Vec<NodeId> {
         self.0
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .iter()
             .filter(|(_, until)| **until > now_ms + RENEW_BEFORE_MS)
             .map(|(id, _)| *id)
@@ -106,7 +105,7 @@ impl Leased {
     /// hour from the end of the lease held there, or from now (what a
     /// relay grants): an answer dated further would never be renewed.
     pub fn set(&self, relay: NodeId, until_ms: u64, now_ms: u64) {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0.lock_or_recover();
         let from = l
             .get(&relay)
             .copied()
@@ -118,7 +117,7 @@ impl Leased {
     /// Drop `relay`, which no longer holds this node's lease (it
     /// restarted): [`lease_once`] replaces it.
     pub fn forget(&self, relay: &NodeId) -> bool {
-        let gone = self.0.lock().unwrap().remove(relay).is_some();
+        let gone = self.0.lock_or_recover().remove(relay).is_some();
         if gone {
             self.1.notify_waiters();
         }

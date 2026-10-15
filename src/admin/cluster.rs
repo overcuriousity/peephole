@@ -9,6 +9,7 @@ use crate::classify::stored::Agreement;
 use crate::cluster::identity::NodeId;
 use crate::cluster::status::PaceInfo;
 use crate::cluster::{Node, invite, members, repl};
+use crate::lock::{MutexExt, RwLockExt};
 use askama::Template;
 use axum::{
     Router,
@@ -253,7 +254,7 @@ pub(crate) async fn views(
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
-    let statuses = node.peer_status.read().unwrap().clone();
+    let statuses = node.peer_status.read_or_recover().clone();
     let me = node.id();
     let sibs = crate::cluster::owner::fleet::siblings(&node.store).await?;
     let managing = crate::cluster::owner::load(&node.store, me)
@@ -304,7 +305,7 @@ pub(crate) async fn views(
             None => format!("{held} held"),
         };
         let pace = if is_self {
-            node.status.local.lock().unwrap().pace
+            node.status.local.lock_or_recover().pace
         } else {
             hb.and_then(|h| h.pace)
         };
@@ -351,7 +352,7 @@ pub(crate) async fn views(
             level_weights: level_weights(m.id),
             pace,
             active_scans: if is_self {
-                node.status.local.lock().unwrap().active_scans
+                node.status.local.lock_or_recover().active_scans
             } else {
                 hb.map_or(0, |h| h.active_scans)
             },
@@ -1375,7 +1376,7 @@ async fn set_pace(
         .await?
         .map(|_| ());
     if outcome.is_ok() {
-        node.status.local.lock().unwrap().pace =
+        node.status.local.lock_or_recover().pace =
             Some(crate::cluster::remote::pace_info(st.pace.get()));
         node.publish_status();
     }

@@ -18,6 +18,7 @@ use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
 use crate::cluster::record::{JobStatusRec, Record};
 use crate::credits::jobs::Afford;
+use crate::lock::MutexExt;
 use crate::store::data::now_ts;
 use crate::store::recorder::Recorder;
 use anyhow::Result;
@@ -227,7 +228,7 @@ impl Arbiter {
         for (uid, scanner) in rows {
             match scanner.and_then(|s| NodeId::from_slice(&s).ok()) {
                 Some(s) if s != me => {
-                    self.leases.lock().unwrap().insert(
+                    self.leases.lock_or_recover().insert(
                         uid,
                         Lease {
                             scanner: s,
@@ -275,7 +276,7 @@ impl Arbiter {
     ) -> Option<Grant> {
         let (tx, rx) = oneshot::channel();
         let first = {
-            let mut w = self.waiting.lock().unwrap();
+            let mut w = self.waiting.lock_or_recover();
             w.push((scanner, exclude, min_mc, tx));
             w.len() == 1
         };
@@ -314,7 +315,7 @@ impl Arbiter {
     /// Remember how a grant to `scanner` ended, for [`delivers`].
     fn note_outcome(&self, scanner: NodeId, delivered: bool) {
         let now = Instant::now();
-        let mut o = self.outcomes.lock().unwrap();
+        let mut o = self.outcomes.lock_or_recover();
         let q = o.entry(scanner).or_default();
         q.push_back((now, delivered));
         while q
@@ -326,7 +327,7 @@ impl Arbiter {
     }
 
     async fn hand_out(&self) -> Result<()> {
-        let waiters = std::mem::take(&mut *self.waiting.lock().unwrap());
+        let waiters = std::mem::take(&mut *self.waiting.lock_or_recover());
         let mut claims: Vec<Claimant> = waiters
             .iter()
             .map(|(id, exclude, min_mc, _)| Claimant {
@@ -358,8 +359,7 @@ impl Arbiter {
         let (all, here) = self.scans_last_hour(scanner).await;
         let delivering = self
             .outcomes
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(scanner)
             .is_none_or(|o| delivers(o, Instant::now()));
         Stand {
@@ -379,8 +379,8 @@ impl Arbiter {
     /// Jobs handed back by a scanner, for now or for good: by whom.
     fn handed_back(&self) -> HashMap<String, HashSet<NodeId>> {
         let now = Instant::now();
-        let mut out: HashMap<String, HashSet<NodeId>> = self.declined.lock().unwrap().clone();
-        for (uid, by) in self.later.lock().unwrap().iter() {
+        let mut out: HashMap<String, HashSet<NodeId>> = self.declined.lock_or_recover().clone();
+        for (uid, by) in self.later.lock_or_recover().iter() {
             out.entry(uid.clone())
                 .or_default()
                 .extend(by.iter().filter(|(_, t)| **t > now).map(|(s, _)| *s));
@@ -416,7 +416,7 @@ impl Arbiter {
         // What each scanner asked for last: a scanner not asking now keeps
         // its level exclusions and least price for the reserve.
         let last = {
-            let mut l = self.last_claim.lock().unwrap();
+            let mut l = self.last_claim.lock_or_recover();
             for c in claims {
                 l.insert(c.id, (c.exclude.clone(), c.min_mc));
             }
@@ -551,14 +551,13 @@ impl Arbiter {
                     match rank::waits(top.effective(), rank::reserve(&standby), job.waited_secs) {
                         Wait::Hold => {
                             self.held
-                                .lock()
-                                .unwrap()
+                                .lock_or_recover()
                                 .entry(job.uid.clone())
                                 .or_insert_with(Instant::now);
                             continue;
                         }
                         Wait::Go => {
-                            let held = self.held.lock().unwrap().get(&job.uid).copied();
+                            let held = self.held.lock_or_recover().get(&job.uid).copied();
                             (
                                 Reason::Cheapest,
                                 held.map_or(0, |t| t.elapsed().as_secs() as i64),
@@ -606,7 +605,7 @@ impl Arbiter {
                     }
                 };
                 gone += 1;
-                self.held.lock().unwrap().remove(&job.uid);
+                self.held.lock_or_recover().remove(&job.uid);
                 if let Some(st) = stands.get_mut(&c.id) {
                     st.load += 1;
                 }
@@ -715,7 +714,7 @@ impl Arbiter {
                 scanner: Some(claim.id),
             })])
             .await?;
-        self.leases.lock().unwrap().insert(
+        self.leases.lock_or_recover().insert(
             job.uid.clone(),
             Lease {
                 scanner: claim.id,
@@ -740,7 +739,7 @@ impl Arbiter {
     }
 
     fn renew(&self, scanner: NodeId, job_uid: &str) -> bool {
-        let mut leases = self.leases.lock().unwrap();
+        let mut leases = self.leases.lock_or_recover();
         match leases.get_mut(job_uid) {
             Some(l) if l.scanner == scanner => {
                 l.expires = Instant::now() + self.lease;
@@ -810,7 +809,7 @@ impl Arbiter {
             return false;
         }
         let _g = self.assign.lock().await;
-        let holder = self.leases.lock().unwrap().get(uid).map(|l| l.scanner);
+        let holder = self.leases.lock_or_recover().get(uid).map(|l| l.scanner);
         // After an arbiter restart the lease may be gone; the replicated
         // scanner column still says who ran it.
         let ok = match holder {
@@ -821,7 +820,7 @@ impl Arbiter {
         if !ok {
             return false;
         }
-        self.leases.lock().unwrap().remove(uid);
+        self.leases.lock_or_recover().remove(uid);
         match status {
             "done" => self.note_outcome(scanner, true),
             "failed" => self.note_outcome(scanner, false),
@@ -837,8 +836,8 @@ impl Arbiter {
         if status == "later" {
             return self.later(scanner, uid).await;
         }
-        self.declined.lock().unwrap().remove(uid);
-        self.later.lock().unwrap().remove(uid);
+        self.declined.lock_or_recover().remove(uid);
+        self.later.lock_or_recover().remove(uid);
         if let Err(e) = self.set_state(uid, status, error, Some(now_ts())).await {
             warn!(?e, job = %uid, "recording job outcome failed");
             return false;
@@ -859,7 +858,7 @@ impl Arbiter {
 
     /// Whether every scanner that could take `uid` has declined it.
     fn all_declined(&self, uid: &str) -> bool {
-        let d = self.declined.lock().unwrap();
+        let d = self.declined.lock_or_recover();
         d.get(uid)
             .is_some_and(|by| self.scanners().iter().all(|s| by.contains(s)))
     }
@@ -872,22 +871,24 @@ impl Arbiter {
         // A job held for a cheaper scanner is granted within the override
         // wait, or was handed out elsewhere.
         let hold = Duration::from_secs(2 * super::weight::OVERRIDE_WAIT_MINS as u64 * 60);
-        self.held.lock().unwrap().retain(|_, t| t.elapsed() < hold);
+        self.held
+            .lock_or_recover()
+            .retain(|_, t| t.elapsed() < hold);
         {
             let now = Instant::now();
-            let mut l = self.later.lock().unwrap();
+            let mut l = self.later.lock_or_recover();
             l.retain(|_, by| {
                 by.retain(|_, until| *until > now);
                 !by.is_empty()
             });
         }
-        let uids: Vec<String> = self.declined.lock().unwrap().keys().cloned().collect();
+        let uids: Vec<String> = self.declined.lock_or_recover().keys().cloned().collect();
         for uid in uids {
             let queued = matches!(self.job(&uid).await?, Some((st, ..)) if st == "queued");
             if !queued {
-                self.declined.lock().unwrap().remove(&uid);
+                self.declined.lock_or_recover().remove(&uid);
             } else if self.all_declined(&uid) {
-                self.declined.lock().unwrap().remove(&uid);
+                self.declined.lock_or_recover().remove(&uid);
                 self.set_state(
                     &uid,
                     "refused",
@@ -904,14 +905,13 @@ impl Arbiter {
     /// scanners; once every scanner has declined, it is refused for good.
     async fn decline(&self, scanner: NodeId, uid: &str, why: Option<String>) -> bool {
         self.declined
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(uid.to_string())
             .or_default()
             .insert(scanner);
         let everyone = self.all_declined(uid);
         if everyone {
-            self.declined.lock().unwrap().remove(uid);
+            self.declined.lock_or_recover().remove(uid);
         }
         let r = if everyone {
             let why = format!(
@@ -934,8 +934,7 @@ impl Arbiter {
     /// this scanner is skipped for it for a while. Never refuses the job.
     async fn later(&self, scanner: NodeId, uid: &str) -> bool {
         self.later
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(uid.to_string())
             .or_default()
             .insert(scanner, Instant::now() + LATER_BACKOFF);
@@ -950,7 +949,7 @@ impl Arbiter {
     /// otherwise back to the queue.
     async fn sweep(&self) -> Result<()> {
         let expired: Vec<(String, NodeId)> = {
-            let mut leases = self.leases.lock().unwrap();
+            let mut leases = self.leases.lock_or_recover();
             let now = Instant::now();
             let gone: Vec<_> = leases
                 .iter()
@@ -1063,7 +1062,7 @@ async fn takeover_once(node: &Arc<Node>, rec: &Recorder, window: Duration) -> Re
         .min()
         == Some(me);
     let idle = {
-        let local = node.status.local.lock().unwrap();
+        let local = node.status.local.lock_or_recover();
         local
             .pace
             .is_some_and(|p| local.active_scans < p.max_workers)
@@ -1212,7 +1211,7 @@ mod tests {
         .unwrap();
         node.bootstrap().await.unwrap();
         // Its scanner runs (it sells at 0 before its first refresh).
-        node.status.local.lock().unwrap().pace = Some(crate::cluster::status::PaceInfo {
+        node.status.local.lock_or_recover().pace = Some(crate::cluster::status::PaceInfo {
             max_workers: 2,
             max_scans_per_hour: 60,
             timeout_secs: 600,
@@ -1467,7 +1466,7 @@ mod tests {
             .unwrap();
         assert_eq!(urgent.len(), 60);
         {
-            let mut d = arbiter.declined.lock().unwrap();
+            let mut d = arbiter.declined.lock_or_recover();
             for uid in urgent {
                 d.entry(uid).or_default().insert(scanner);
             }
@@ -1564,8 +1563,7 @@ mod tests {
         // Once the backoff is over, `a` gets it again.
         arbiter
             .later
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get_mut(&g.job_uid)
             .unwrap()
             .insert(a, Instant::now());
@@ -1981,8 +1979,7 @@ mod tests {
                 "declined" => {
                     arbiter
                         .declined
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .entry(uid.clone())
                         .or_default()
                         .insert(fast);
@@ -2049,15 +2046,14 @@ mod tests {
         let (_node, arbiter, _store, _tx) = setup(dir.path()).await;
         let long = Duration::from_secs(61 * 60);
         if let Some(old) = Instant::now().checked_sub(long) {
-            arbiter.held.lock().unwrap().insert("gone".into(), old);
+            arbiter.held.lock_or_recover().insert("gone".into(), old);
         }
         arbiter
             .held
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .insert("fresh".into(), Instant::now());
         arbiter.recheck_declined().await.unwrap();
-        let held = arbiter.held.lock().unwrap();
+        let held = arbiter.held.lock_or_recover();
         assert!(!held.contains_key("gone"));
         assert!(held.contains_key("fresh"));
     }
@@ -2307,8 +2303,7 @@ mod tests {
         let s = setup_at(dir, crate::cluster::rpc::proto::MARKET_PROTO).await;
         give_credits(&s.2, s.0.id()).await;
         s.0.wants
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .set(crate::credits::price::SCAN, 1);
         let book = crate::credits::book_fresh(&s.0).await.unwrap();
         let bid = crate::credits::price::own_bid_in(&s.0, &book, crate::credits::price::SCAN).await;

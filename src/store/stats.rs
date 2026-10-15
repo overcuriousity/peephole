@@ -2,6 +2,7 @@
 //! TTL cache so anonymous traffic cannot hammer SQLite.
 use super::Store;
 use super::browse::Audience;
+use crate::lock::MutexExt;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -921,7 +922,7 @@ where
         F: Fn() -> BoxFut<V>,
     {
         let flight = {
-            let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = self.inner.lock_or_recover();
             let e = map.entry(key.clone()).or_insert_with(Entry::empty);
             match &e.value {
                 Some((at, v)) if at.elapsed() < ttl => return Ok(v.clone()),
@@ -940,8 +941,7 @@ where
         // Another caller may have computed it while this one waited.
         if let Some((at, v)) = self
             .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .lock_or_recover()
             .get(&key)
             .and_then(|e| e.value.clone())
             && at.elapsed() < ttl
@@ -958,7 +958,7 @@ where
         let max = self.max;
         tokio::spawn(async move {
             let result = fut.await;
-            let mut map = inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = inner.lock_or_recover();
             match result {
                 Ok(v) => Self::insert(&mut map, max, key, Arc::new(v)),
                 // The row was deleted: the next caller finds out.
@@ -976,7 +976,7 @@ where
     }
 
     fn store(&self, key: K, v: Arc<V>) {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.inner.lock_or_recover();
         Self::insert(&mut map, self.max, key, v);
     }
 
@@ -1000,7 +1000,7 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.inner.lock_or_recover().len()
     }
 
     pub fn is_empty(&self) -> bool {

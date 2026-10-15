@@ -5,6 +5,7 @@
 //! level starves. Every node measures the estimates from its replicated
 //! `scan_jobs`, so arbiters and scanners agree closely (order is a
 //! preference, not a correctness property).
+use crate::lock::MutexExt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -105,7 +106,7 @@ impl Cached {
     }
 
     pub async fn get(&self, pool: &sqlx::SqlitePool) -> Estimates {
-        let cur = *self.0.lock().unwrap();
+        let cur = *self.0.lock_or_recover();
         if let Some((at, e)) = cur
             && at.elapsed() < REFRESH
         {
@@ -118,7 +119,7 @@ impl Cached {
                 cur.map(|(_, e)| e).unwrap_or(Estimates::DEFAULT)
             }
         };
-        *self.0.lock().unwrap() = Some((Instant::now(), e));
+        *self.0.lock_or_recover() = Some((Instant::now(), e));
         e
     }
 }

@@ -12,6 +12,7 @@ use crate::cluster::{Node, repl};
 use crate::config::Config;
 use crate::credits::pay::{self, Declined};
 use crate::credits::{Mc, price, show};
+use crate::lock::MutexExt;
 use crate::store::Store;
 use crate::store::data::{new_uid, now_ts};
 use serde::{Deserialize, Serialize};
@@ -71,7 +72,7 @@ struct Running(Arc<Prober>, IpAddr);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.running.lock().unwrap().remove(&self.1);
+        self.0.running.lock_or_recover().remove(&self.1);
     }
 }
 
@@ -117,7 +118,7 @@ impl Prober {
     ) -> Result<(Target, Running), String> {
         let target = self.gate.check(store, node, ip).await?;
         let ip = crate::net::canonical(target.ip);
-        if !self.running.lock().unwrap().insert(ip) {
+        if !self.running.lock_or_recover().insert(ip) {
             return Err("a probe of this address is running".into());
         }
         Ok((target, Running(self.clone(), ip)))

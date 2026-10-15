@@ -3,6 +3,7 @@
 //! requests are recorded in full, and a short-lived cache spares the intel
 //! lookups for an IP seen moments ago.
 use super::config::TrapConfig;
+use crate::lock::MutexExt;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -49,7 +50,7 @@ impl FloodGate {
             (b.tokens + now.saturating_duration_since(b.last).as_secs_f64() * cfg.record_rate)
                 .min(burst)
         };
-        let mut map = self.buckets.lock().unwrap();
+        let mut map = self.buckets.lock_or_recover();
         if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
             // Forget addresses whose bucket is full again and that owe no
             // count; if that is not enough, start over (counts are lost).
@@ -88,7 +89,7 @@ impl FloodGate {
             return;
         }
         let ip = crate::net::source_key(ip);
-        let mut map = self.buckets.lock().unwrap();
+        let mut map = self.buckets.lock_or_recover();
         if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
             return;
         }
@@ -123,7 +124,7 @@ impl UploadGate {
     fn allow_at(&self, ip: IpAddr, per_hour: u32, now: Instant) -> bool {
         let ip = crate::net::source_key(ip);
         let open = |start: &Instant| now.saturating_duration_since(*start) < UPLOAD_WINDOW;
-        let mut map = self.windows.lock().unwrap();
+        let mut map = self.windows.lock_or_recover();
         if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
             map.retain(|_, (start, _)| open(start));
             if map.len() >= MAX_TRACKED {
@@ -142,7 +143,7 @@ impl UploadGate {
     /// that brought no content (already held, or not stored).
     pub fn refund(&self, ip: IpAddr) {
         let ip = crate::net::source_key(ip);
-        if let Some(w) = self.windows.lock().unwrap().get_mut(&ip) {
+        if let Some(w) = self.windows.lock_or_recover().get_mut(&ip) {
             w.1 = w.1.saturating_sub(1);
         }
     }
@@ -165,13 +166,13 @@ impl IntelCache {
     /// True if `data` is what was recorded for this IP and provider
     /// within the last few minutes.
     pub fn is_current(&self, ip: IpAddr, provider: &'static str, data: &serde_json::Value) -> bool {
-        let map = self.map.lock().unwrap();
+        let map = self.map.lock_or_recover();
         map.get(&(ip, provider))
             .is_some_and(|(d, at)| d == data && at.elapsed() < INTEL_TTL)
     }
 
     pub fn put(&self, ip: IpAddr, provider: &'static str, data: serde_json::Value) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock_or_recover();
         if map.len() >= MAX_TRACKED {
             map.retain(|_, (_, at)| at.elapsed() < INTEL_TTL);
             if map.len() >= MAX_TRACKED {
@@ -285,7 +286,7 @@ mod tests {
         for i in 0..(MAX_TRACKED as u32 + 10) {
             g.admit_at(IpAddr::V4(i.into()), &c, t0);
         }
-        assert!(g.buckets.lock().unwrap().len() <= MAX_TRACKED);
+        assert!(g.buckets.lock_or_recover().len() <= MAX_TRACKED);
     }
 
     #[test]
@@ -299,7 +300,7 @@ mod tests {
         assert!(!c.is_current(ip, "tor", &serde_json::json!({"exit": true})));
         assert!(!c.is_current(ip, "geo", &v));
         if let Some(old) = Instant::now().checked_sub(INTEL_TTL + Duration::from_secs(1)) {
-            c.map.lock().unwrap().get_mut(&(ip, "tor")).unwrap().1 = old;
+            c.map.lock_or_recover().get_mut(&(ip, "tor")).unwrap().1 = old;
             assert!(!c.is_current(ip, "tor", &v));
         }
     }

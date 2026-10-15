@@ -4,6 +4,7 @@
 //! UI, the CLI or the owner, goes through [`Settings::apply`].
 use crate::cluster::identity::NodeId;
 use crate::config::{Config, Roles};
+use crate::lock::RwLockExt;
 use crate::scan::pace::{self, Pace, SharedPace};
 use crate::store::Store;
 use crate::store::uploads::{self, Limits};
@@ -339,7 +340,7 @@ impl Settings {
         Snapshot {
             pace: self.pace.get(),
             roles: self.roles(),
-            uploads: *self.uploads.read().unwrap(),
+            uploads: *self.uploads.read_or_recover(),
             version: self.version.load(Ordering::Relaxed),
         }
     }
@@ -356,7 +357,7 @@ impl Settings {
     }
 
     pub fn roles(&self) -> Roles {
-        *self.roles.read().unwrap()
+        *self.roles.read_or_recover()
     }
 
     pub fn prereqs(&self) -> &Prereqs {
@@ -457,8 +458,8 @@ impl Settings {
 
     fn adopt(&self, s: Snapshot) {
         self.pace.replace(s.pace);
-        *self.roles.write().unwrap() = s.roles;
-        *self.uploads.write().unwrap() = s.uploads;
+        *self.roles.write_or_recover() = s.roles;
+        *self.uploads.write_or_recover() = s.uploads;
         self.version.store(s.version, Ordering::Relaxed);
         self.changed.send_replace(s.version);
     }

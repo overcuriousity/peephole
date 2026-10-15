@@ -7,6 +7,7 @@ use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, Record};
 use crate::intel::SharedGeo;
+use crate::lock::MutexExt;
 use crate::store::recorder::Recorder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -734,8 +735,7 @@ pub async fn refresh_pass(node: &Arc<Node>, geo: &SharedGeo) -> anyhow::Result<u
         .names_due_refresh(WANTED_AT_MOST, &me, REFRESH_DAYS)
         .await?;
     node.wants
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .set(price::RESOLVE, due.len() as u32);
     due.truncate(BATCH as usize);
     let n = due.len();
