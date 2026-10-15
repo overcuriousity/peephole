@@ -1123,7 +1123,7 @@ impl Node {
                 .get(&peer)
                 .cloned()
                 .unwrap_or_default();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO peer_contact (id, last_ok, last_error, error_at, version)
                  VALUES (?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, ?)
                  ON CONFLICT(id) DO UPDATE SET
@@ -1138,7 +1138,10 @@ impl Node {
             .bind(&st.last_error)
             .bind(st.hello.as_ref().map(|h| h.version.clone()))
             .execute(&self.store.pool)
-            .await;
+            .await
+            {
+                warn!(?e, "saving the peer contact state failed");
+            }
         }
     }
 }

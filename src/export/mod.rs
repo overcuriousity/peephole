@@ -877,22 +877,33 @@ pub fn stream_requests_counted(
             }
             let done = st.pending.is_empty() && matches!(st.phase, Phase::Done);
             count.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            match format {
-                Format::Csv => out.extend_from_slice(csv_rows(&rows).as_bytes()),
-                Format::Jsonl => out.extend_from_slice(jsonl_rows(&rows).as_bytes()),
-                Format::Parquet => {
-                    let w = st
-                        .parquet
-                        .as_mut()
-                        .ok_or_else(|| std::io::Error::other("parquet writer"))?;
-                    if !rows.is_empty() {
-                        out.extend(w.write(&rows).map_err(io)?);
-                    }
-                    if done && let Some(w) = st.parquet.take() {
-                        out.extend(w.finish().map_err(io)?);
+            // Encoding a chunk (Parquet compresses) is CPU work: off the
+            // async workers, the Parquet writer handed there and back.
+            let mut parquet = st.parquet.take();
+            let (chunk, parquet) = tokio::task::spawn_blocking(move || {
+                let mut out = vec![];
+                match format {
+                    Format::Csv => out.extend_from_slice(csv_rows(&rows).as_bytes()),
+                    Format::Jsonl => out.extend_from_slice(jsonl_rows(&rows).as_bytes()),
+                    Format::Parquet => {
+                        let w = parquet
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("parquet writer"))?;
+                        if !rows.is_empty() {
+                            out.extend(w.write(&rows)?);
+                        }
+                        if done && let Some(w) = parquet.take() {
+                            out.extend(w.finish()?);
+                        }
                     }
                 }
-            }
+                anyhow::Ok((out, parquet))
+            })
+            .await
+            .map_err(|e| io(e.into()))?
+            .map_err(io)?;
+            out.extend(chunk);
+            st.parquet = parquet;
             st.finished = done;
             Ok(Some((axum::body::Bytes::from(out), st)))
         }
