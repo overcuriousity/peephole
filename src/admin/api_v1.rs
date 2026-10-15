@@ -5,7 +5,7 @@
 //! (`{error:{code,message}}`, see `docs/api-v1.md`).
 use crate::admin::AdminState;
 use crate::admin::scan_buy::NotSold;
-use crate::store::browse::{IpFilter, IpSummary};
+use crate::store::browse::{IpFilter, IpSummary, MAX_PAGE, PAGE_SIZE};
 use crate::store::devices::Device;
 use axum::{
     Json, Router,
@@ -378,10 +378,14 @@ async fn ips(
         },
     };
     // The store pages in 100s; an API page of `limit` rows can straddle two
-    // of them. Fetch until limit+1 rows (the +1 decides next_cursor).
-    let offset = (page as i64 - 1) * limit;
-    let store_page = (offset / crate::store::browse::PAGE_SIZE + 1) as i64;
-    let within = (offset % crate::store::browse::PAGE_SIZE) as usize;
+    // of them. Fetch until limit+1 rows (the +1 decides next_cursor). A
+    // cursor is client input: its page is clamped to the store's last page,
+    // and the store page following that one is never asked for (the store
+    // would clamp it back and serve the same rows twice).
+    let page = page.min(MAX_PAGE);
+    let offset = i64::from(page - 1).saturating_mul(limit);
+    let store_page = offset / PAGE_SIZE + 1;
+    let within = (offset % PAGE_SIZE) as usize;
     let fetch = |page: i64| {
         let state = &state;
         let query = &query;
@@ -404,18 +408,18 @@ async fn ips(
         Err(e) => return internal(e),
     };
     let mut rows: Vec<IpSummary> = first.items.into_iter().skip(within).collect();
-    if rows.len() <= limit as usize && first.has_next {
+    if rows.len() <= limit as usize && first.has_next && store_page < i64::from(MAX_PAGE) {
         match fetch(store_page + 1).await {
             Ok(p) => rows.extend(p.items),
             Err(e) => return internal(e),
         }
     }
-    let more = rows.len() > limit as usize;
+    let more = rows.len() > limit as usize && page < MAX_PAGE;
     rows.truncate(limit as usize);
     let next_cursor = more.then(|| {
         encode_cursor(&Cursor {
             q: query,
-            page: page + 1,
+            page: page.saturating_add(1),
         })
     });
     Json(json!({
@@ -1873,6 +1877,33 @@ mod tests {
         let (st, v) = send(&app, authed("GET", "/api/v1/ips?q=203.0.113.0/24", &token)).await;
         assert_eq!(st, 200);
         assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ips_cursor_at_the_largest_page_is_an_empty_last_page() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        seed_ip(&state, "203.0.113.1", "[]", 0).await;
+        for page in [u32::MAX, super::MAX_PAGE] {
+            for limit in [1, 100] {
+                let cursor = super::encode_cursor(&super::Cursor {
+                    q: String::new(),
+                    page,
+                });
+                let (st, v) = send(
+                    &app,
+                    authed(
+                        "GET",
+                        &format!("/api/v1/ips?limit={limit}&cursor={cursor}"),
+                        &token,
+                    ),
+                )
+                .await;
+                assert_eq!(st, 200, "page {page} limit {limit}: {v}");
+                assert_eq!(v["items"].as_array().unwrap().len(), 0, "{v}");
+                assert!(v["next_cursor"].is_null(), "{v}");
+            }
+        }
     }
 
     #[tokio::test]
