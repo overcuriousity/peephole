@@ -18,7 +18,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
-arrow = "60"
+# Arrays, schema and record batches only; parquet does the file I/O.
+arrow = { version = "60", default-features = false }
 askama = "0.16"
 aws-lc-rs = "1"
 axum = "0.8"
@@ -56,7 +57,10 @@ serde_ignored = "0.1.14"
 serde_json = "1"
 serde_urlencoded = "0.7"
 sha2 = "0.11"
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "ipnetwork"] }
+# Defaults off: no `any` driver, no `migrate` (src/store/migrations are applied
+# by our own code), no query macros (only `#[derive(FromRow)]`). `json` stays:
+# without it the admin stats handlers' futures stop being `Handler`s.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "ipnetwork", "derive", "json"] }
 tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
