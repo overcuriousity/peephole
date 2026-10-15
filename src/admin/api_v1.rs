@@ -319,6 +319,13 @@ async fn pair(
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 100;
 
+/// The last API page of `limit` rows that falls inside the store's
+/// `MAX_PAGE` pages of `PAGE_SIZE` rows. With `limit` in 1..=MAX_LIMIT it
+/// is at most `MAX_PAGE * PAGE_SIZE`, which fits a `u32`.
+fn last_page(limit: i64) -> u32 {
+    ((i64::from(MAX_PAGE) * PAGE_SIZE - 1) / limit + 1) as u32
+}
+
 /// The continuation token: the query it belongs to and the page to serve
 /// next, base64url(JSON). Opaque to the client; a cursor answers only the
 /// query it was issued with.
@@ -379,10 +386,12 @@ async fn ips(
     };
     // The store pages in 100s; an API page of `limit` rows can straddle two
     // of them. Fetch until limit+1 rows (the +1 decides next_cursor). A
-    // cursor is client input: its page is clamped to the store's last page,
-    // and the store page following that one is never asked for (the store
-    // would clamp it back and serve the same rows twice).
-    let page = page.min(MAX_PAGE);
+    // cursor is client input: its page is clamped to the last API page the
+    // store can reach, and the store page following the store's last is
+    // never asked for (the store would clamp it back and serve the same rows
+    // twice).
+    let last = last_page(limit);
+    let page = page.min(last);
     let offset = i64::from(page - 1).saturating_mul(limit);
     let store_page = offset / PAGE_SIZE + 1;
     let within = (offset % PAGE_SIZE) as usize;
@@ -414,7 +423,7 @@ async fn ips(
             Err(e) => return internal(e),
         }
     }
-    let more = rows.len() > limit as usize && page < MAX_PAGE;
+    let more = rows.len() > limit as usize && page < last;
     rows.truncate(limit as usize);
     let next_cursor = more.then(|| {
         encode_cursor(&Cursor {
@@ -1879,13 +1888,21 @@ mod tests {
         assert_eq!(v["items"].as_array().unwrap().len(), 2);
     }
 
+    #[test]
+    fn ips_last_page_is_the_stores_reach() {
+        use super::{MAX_PAGE, last_page};
+        assert_eq!(last_page(100), MAX_PAGE);
+        assert_eq!(last_page(1), MAX_PAGE * 100);
+        assert_eq!(last_page(50), MAX_PAGE * 2);
+    }
+
     #[tokio::test]
     async fn ips_cursor_at_the_largest_page_is_an_empty_last_page() {
         let (state, cookie, app, _d) = app().await;
         let (token, _) = pair(&app, &cookie).await;
         seed_ip(&state, "203.0.113.1", "[]", 0).await;
-        for page in [u32::MAX, super::MAX_PAGE] {
-            for limit in [1, 100] {
+        for limit in [1, 50, 100] {
+            for page in [u32::MAX, super::last_page(limit)] {
                 let cursor = super::encode_cursor(&super::Cursor {
                     q: String::new(),
                     page,
