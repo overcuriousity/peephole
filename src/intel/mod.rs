@@ -765,7 +765,12 @@ const RDAP_BACKOFF: Backoff = Backoff::new(Duration::from_secs(60), Duration::fr
 async fn refresh_rdap(cfg: &Config, rdap: &SharedRdap, backoff: &mut Backoff) -> Duration {
     match rdap::Bootstrap::refresh(&cfg.data_dir).await {
         Ok(()) => {
-            *rdap.write().unwrap() = rdap::Bootstrap::load(&cfg.data_dir);
+            // Reads and parses both files: off the async workers.
+            let dir = cfg.data_dir.clone();
+            match tokio::task::spawn_blocking(move || rdap::Bootstrap::load(&dir)).await {
+                Ok(b) => *rdap.write().unwrap() = b,
+                Err(e) => warn!(?e, "loading the rdap bootstrap failed"),
+            }
             info!("rdap bootstrap refreshed");
             backoff.reset();
             rdap::BOOTSTRAP_MAX_AGE

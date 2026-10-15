@@ -100,7 +100,13 @@ async fn content_zip(
     };
     drop(conn);
     let hash = data_encoding::HEXLOWER.encode(&sha);
-    let zip = encrypted_zip(&hash, &content)?;
+    // Deflating up to the upload cap is CPU work: off the async workers.
+    let zip = {
+        let hash = hash.clone();
+        tokio::task::spawn_blocking(move || encrypted_zip(&hash, &content))
+            .await
+            .map_err(anyhow::Error::from)??
+    };
     let by = match crate::admin::auth::session_token(&st, &jar) {
         Some(t) => st.store.session_admin_label(&t).await?,
         None => "admin".to_string(),

@@ -140,8 +140,8 @@ impl Bootstrap {
             // It must parse before it replaces anything.
             let _: Value = serde_json::from_str(&body).context("rdap bootstrap json")?;
             let tmp = data_dir.join(format!("{name}.tmp"));
-            std::fs::write(&tmp, &body)?;
-            std::fs::rename(&tmp, data_dir.join(name))?;
+            tokio::fs::write(&tmp, &body).await?;
+            tokio::fs::rename(&tmp, data_dir.join(name)).await?;
         }
         Ok(())
     }

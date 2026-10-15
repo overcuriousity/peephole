@@ -1183,8 +1183,10 @@ async fn run_nmap(nmap: PathBuf, argv: &[String]) -> Outcome {
     };
     let stderr = errors.await.unwrap_or_default();
     if status.success() {
-        return match nmap_xml::parse_nmap_xml(&out) {
-            Ok(res) => Outcome::Done(res),
+        // Up to MAX_STDOUT of XML: parsed off the async workers.
+        return match tokio::task::spawn_blocking(move || nmap_xml::parse_nmap_xml(&out)).await {
+            Ok(Ok(res)) => Outcome::Done(res),
+            Ok(Err(e)) => Outcome::Failed(e.to_string()),
             Err(e) => Outcome::Failed(e.to_string()),
         };
     }
