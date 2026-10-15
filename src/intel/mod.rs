@@ -168,7 +168,7 @@ pub fn providers(
         out.push(Arc::new(ApiProvider::new(
             abuseipdb::AbuseIpDb {
                 base: abuseipdb::BASE.into(),
-                key: a.api_key.trim().into(),
+                key: a.api_key.expose().trim().into(),
                 max_age_days: a.max_age_days,
             },
             store.clone(),
@@ -180,7 +180,7 @@ pub fn providers(
         out.push(Arc::new(ApiProvider::new(
             shodan::ShodanHost {
                 base: shodan::HOST_BASE.into(),
-                key: s.api_key.trim().into(),
+                key: s.api_key.expose().trim().into(),
             },
             store.clone(),
             daily(s.daily_limit),
@@ -800,7 +800,14 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
         if file.exists() && !is_stale_at(last.as_deref()) {
             continue;
         }
-        match geo::download_edition(&cfg.data_dir, edition, &mm.account_id, &mm.license_key).await {
+        match geo::download_edition(
+            &cfg.data_dir,
+            edition,
+            &mm.account_id,
+            mm.license_key.expose(),
+        )
+        .await
+        {
             Ok(()) => {
                 fetched += 1;
                 store

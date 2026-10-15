@@ -14,7 +14,7 @@ const MAX_NAMES: usize = 20;
 
 pub struct ShodanHost {
     pub base: String,
-    pub key: String,
+    pub key: crate::config::Secret,
 }
 
 impl Service for ShodanHost {
@@ -25,7 +25,7 @@ impl Service for ShodanHost {
     fn request(&self, client: &reqwest::Client, ip: &str) -> reqwest::RequestBuilder {
         client
             .get(format!("{}/shodan/host/{ip}", self.base))
-            .query(&[("key", self.key.as_str())])
+            .query(&[("key", self.key.expose().as_str())])
     }
 
     // Full host answers carry every banner.

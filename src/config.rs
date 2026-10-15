@@ -4,6 +4,42 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// A configured secret (an API or licence key): `Debug` and `Display` print
+/// `[redacted]`, so a logged or printed config never shows it (MIK-372 S6).
+/// Read the value with [`Secret::expose`]; it parses as the bare value.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Secret<T = String>(T);
+
+impl<T> Secret<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// The secret itself: for the request that needs it, never a log.
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl<T> std::fmt::Display for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -165,7 +201,7 @@ impl CreditsConfig {
 /// `[abuseipdb]`: abuse reports per IP (API key required).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AbuseIpDbConfig {
-    pub api_key: String,
+    pub api_key: Secret,
     /// Checks per UTC day (the free plan allows 1000).
     #[serde(default = "default_abuseipdb_daily")]
     pub daily_limit: u64,
@@ -186,7 +222,7 @@ fn default_abuseipdb_age() -> u32 {
 /// membership).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShodanConfig {
-    pub api_key: String,
+    pub api_key: Secret,
     /// Lookups per UTC day; 0 = no local cap (Shodan paces at 1/s).
     #[serde(default)]
     pub daily_limit: u64,
@@ -351,7 +387,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaxmindConfig {
     pub account_id: String,
-    pub license_key: String,
+    pub license_key: Secret,
 }
 
 /// Observational probes of scanner addresses (`scan::probe`).
@@ -899,7 +935,7 @@ impl Config {
                 .context("webauthn.rp_id must be the origin's host or a parent domain of it")?;
         }
         if let Some(m) = &self.maxmind
-            && (m.account_id.is_empty() || m.license_key.is_empty())
+            && (m.account_id.is_empty() || m.license_key.expose().is_empty())
         {
             bail!("[maxmind] needs both account_id and license_key (or omit the section)");
         }
@@ -910,7 +946,7 @@ impl Config {
         self.enrichment.check()?;
         self.credits.check()?;
         if let Some(a) = &self.abuseipdb {
-            if a.api_key.trim().is_empty() {
+            if a.api_key.expose().trim().is_empty() {
                 bail!("[abuseipdb] needs api_key (or omit the section)");
             }
             if !(1..=365).contains(&a.max_age_days) {
@@ -921,16 +957,19 @@ impl Config {
             }
         }
         if let Some(s) = &self.shodan
-            && s.api_key.trim().is_empty()
+            && s.api_key.expose().trim().is_empty()
         {
             bail!("[shodan] needs api_key (or omit the section)");
         }
         for (name, key) in [
             (
                 "abuseipdb",
-                self.abuseipdb.as_ref().map(|a| a.api_key.as_str()),
+                self.abuseipdb.as_ref().map(|a| a.api_key.expose().as_str()),
             ),
-            ("shodan", self.shodan.as_ref().map(|s| s.api_key.as_str())),
+            (
+                "shodan",
+                self.shodan.as_ref().map(|s| s.api_key.expose().as_str()),
+            ),
         ] {
             // Keys go into headers and URLs.
             if key.is_some_and(|k| k.chars().any(|c| !c.is_ascii_graphic())) {
@@ -1797,6 +1836,34 @@ data_dir = "/tmp"
         assert!(cfg.abuseipdb.is_none() && cfg.shodan.is_none());
         assert!(cfg.internetdb.is_none());
         assert_eq!(cfg.enrichment.refresh_after_days, 30.0);
+    }
+
+    /// Keys parse from the same config text as before and never show in
+    /// the config's Debug output (MIK-372 S6).
+    #[test]
+    fn keys_parse_unchanged_and_print_redacted() {
+        let cfg = parse(&format!(
+            "{BASE}[roles]\nlistener = false\nweb = false\n\
+             [abuseipdb]\napi_key = \"abuse-SECRET-1\"\n\
+             [shodan]\napi_key = \"shodan-SECRET-2\"\n\
+             [maxmind]\naccount_id = \"7\"\nlicense_key = \"maxmind-SECRET-3\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.abuseipdb.as_ref().unwrap().api_key.expose(),
+            "abuse-SECRET-1"
+        );
+        assert_eq!(
+            cfg.shodan.as_ref().unwrap().api_key.expose(),
+            "shodan-SECRET-2"
+        );
+        let mm = cfg.maxmind.as_ref().unwrap();
+        assert_eq!(mm.license_key.expose(), "maxmind-SECRET-3");
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("api_key: [redacted]"), "{shown}");
+        assert!(shown.contains("license_key: [redacted]"), "{shown}");
+        assert_eq!(mm.license_key.to_string(), "[redacted]");
     }
 
     #[test]
