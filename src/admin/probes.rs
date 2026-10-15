@@ -13,6 +13,7 @@ use crate::admin::error::AppResult;
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
 use crate::cluster::identity::NodeId;
 use crate::intel::geo::{Coords, haversine_km};
+use crate::lock::MutexExt;
 use crate::scan::probe::gate::LOCAL;
 use crate::scan::probe::{ask, serve::Prober};
 use crate::store::data::{new_uid, now_ts};
@@ -683,7 +684,7 @@ pub async fn actions_for(state: &AdminState, ip: &IpAddr) -> ActionsView {
 
 /// Set what `node` said in `group`.
 fn settle(state: &AdminState, group: &str, node: NodeId, outcome: Result<String, String>) {
-    let mut map = state.pending_probes.lock().unwrap();
+    let mut map = state.pending_probes.lock_or_recover();
     if let Some(p) = map
         .get_mut(group)
         .and_then(|l| l.iter_mut().find(|p| p.node == node))
@@ -751,7 +752,7 @@ pub async fn start(
         outcome,
     };
     let remember = |list: Vec<Pending>| {
-        let mut map = state.pending_probes.lock().unwrap();
+        let mut map = state.pending_probes.lock_or_recover();
         map.retain(|_, l| l.iter().any(|p| p.at.elapsed() < FORGET_AFTER));
         map.insert(group.clone(), list);
     };
@@ -946,7 +947,7 @@ pub async fn groups_for(state: &AdminState, ip_id: i64) -> Vec<GroupView> {
     }
     let now = Instant::now();
     {
-        let map = state.pending_probes.lock().unwrap();
+        let map = state.pending_probes.lock_or_recover();
         for (group, list) in map.iter() {
             if list.first().is_none_or(|p| p.ip_id != ip_id) {
                 continue;
@@ -1324,7 +1325,7 @@ secure_cookies = false
         use futures::StreamExt;
         let server = web().await;
         let (state, cookie, id, _d) = state(Some(server.port()), "").await;
-        state.pending_probes.lock().unwrap().insert(
+        state.pending_probes.lock_or_recover().insert(
             "g1".into(),
             vec![Pending {
                 ip_id: id,
@@ -1611,7 +1612,7 @@ secure_cookies = false
     #[tokio::test]
     async fn the_public_ip_page_shows_neither_card() {
         let (state, cookie, id, _d) = state(Some(8080), "").await;
-        state.pending_probes.lock().unwrap().insert(
+        state.pending_probes.lock_or_recover().insert(
             "g1".into(),
             vec![Pending {
                 ip_id: id,
@@ -1670,7 +1671,7 @@ secure_cookies = false
     #[tokio::test]
     async fn an_accepted_probe_without_a_result_lapses() {
         let (state, _c, id, _d) = state(Some(8080), "").await;
-        state.pending_probes.lock().unwrap().insert(
+        state.pending_probes.lock_or_recover().insert(
             "g1".into(),
             vec![Pending {
                 ip_id: id,

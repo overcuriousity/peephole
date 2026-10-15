@@ -10,6 +10,7 @@
 //! bystanders the operator listed). Marks are this node's own.
 use super::TrapConfig;
 use super::listen::{SourceSlot, Sources};
+use crate::lock::MutexExt;
 use axum::body::Bytes;
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ impl Tarpit {
         if self.cfg.tarpit_pool == 0 || self.exempt(ip) {
             return;
         }
-        let mut m = self.marks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.marks.lock_or_recover();
         m.mark(ip, Instant::now());
     }
 
@@ -123,7 +124,7 @@ impl Tarpit {
         {
             return true;
         }
-        let mut lists = self.lists.lock().unwrap_or_else(|p| p.into_inner());
+        let mut lists = self.lists.lock_or_recover();
         lists.refresh();
         // Lists configured but never loaded: protect everyone.
         lists.unavailable().is_some() || lists.covering(&canon).is_some()
@@ -133,7 +134,7 @@ impl Tarpit {
     /// is marked and both the pool and the source's share have room.
     pub fn take(&self, ip: IpAddr) -> Option<Hold> {
         let marked = {
-            let m = self.marks.lock().unwrap_or_else(|p| p.into_inner());
+            let m = self.marks.lock_or_recover();
             m.marked(ip, Instant::now())
         };
         if !marked {
@@ -153,7 +154,7 @@ impl Tarpit {
     /// How full the tarpit is right now.
     pub fn status(&self) -> Status {
         let now = Instant::now();
-        let m = self.marks.lock().unwrap_or_else(|p| p.into_inner());
+        let m = self.marks.lock_or_recover();
         Status {
             held: self.cfg.tarpit_pool - self.pool.available_permits(),
             pool: self.cfg.tarpit_pool,

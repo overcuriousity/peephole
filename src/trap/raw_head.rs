@@ -1,6 +1,7 @@
 //! The request head as the client sent it: a copy of the first bytes read
 //! from the connection, cut after the blank line.
 
+use crate::lock::MutexExt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -32,7 +33,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Tee<S> {
         let r = Pin::new(&mut self.inner).poll_read(cx, out);
         if let Poll::Ready(Ok(())) = r {
             let cap = self.cap;
-            let mut b = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+            let mut b = self.buf.lock_or_recover();
             let room = cap.saturating_sub(b.len());
             let new = &out.filled()[before..];
             b.extend_from_slice(&new[..new.len().min(room)]);
@@ -98,6 +99,6 @@ mod tests {
         let mut out = vec![];
         t.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"0123456789");
-        assert_eq!(&*buf.lock().unwrap(), b"0123");
+        assert_eq!(&*buf.lock_or_recover(), b"0123");
     }
 }

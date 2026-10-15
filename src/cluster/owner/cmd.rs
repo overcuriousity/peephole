@@ -8,6 +8,7 @@ use crate::cluster::identity::NodeId;
 use crate::cluster::msg::Msg;
 use crate::cluster::remote::{self, State};
 use crate::cluster::rpc::proto::OWNER_PROTO;
+use crate::lock::MutexExt;
 use crate::settings::{Changes, Settings};
 use crate::store::Store;
 use anyhow::{Result, bail};
@@ -271,7 +272,7 @@ type Refusals = Arc<Mutex<HashMap<NodeId, (u64, u32)>>>;
 
 fn may_log(seen: &Refusals, from: NodeId) -> bool {
     let hour = crate::cluster::hlc::wall_ms() / 3_600_000;
-    let mut all = seen.lock().unwrap();
+    let mut all = seen.lock_or_recover();
     all.retain(|_, (h, _)| *h == hour);
     let e = all.entry(from).or_insert((hour, 0));
     e.1 += 1;
@@ -320,7 +321,7 @@ async fn execute(
         } => match settings.apply_at(*base_version, changes, Some(from)).await {
             Ok(Ok(v)) => {
                 if !changes.is_empty() {
-                    node.status.local.lock().unwrap().pace =
+                    node.status.local.lock_or_recover().pace =
                         Some(remote::pace_info(settings.snapshot().pace));
                     node.publish_status();
                 }

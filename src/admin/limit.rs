@@ -16,6 +16,7 @@
 //! applies (a shared bucket would let one client lock everyone out); a
 //! warning says so once.
 use crate::admin::AdminState;
+use crate::lock::MutexExt;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -100,7 +101,7 @@ impl RateLimiter {
     pub fn allow(&self, client: IpAddr) -> bool {
         let now = Instant::now();
         let (per_sec, burst) = (self.per_sec, self.burst);
-        let mut map = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.buckets.lock_or_recover();
         if map.len() >= MAX_CLIENTS && !map.contains_key(&client) {
             map.retain(|_, b| b.level(now, per_sec, burst) < burst);
             if map.len() >= MAX_CLIENTS {
@@ -136,7 +137,7 @@ impl GlobalLimiter {
 
     /// Take one token; `false` when the bucket is empty.
     pub fn allow(&self) -> bool {
-        let mut b = self.bucket.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.bucket.lock_or_recover();
         b.take(Instant::now(), self.per_sec, self.burst)
     }
 }
@@ -328,7 +329,7 @@ mod tests {
         assert!(l.allow(hot) && l.allow(hot));
         assert!(!l.allow(hot));
         assert!(l.allow(ip(MAX_CLIENTS)), "a newcomer gets room");
-        let map = l.buckets.lock().unwrap();
+        let map = l.buckets.lock_or_recover();
         assert!(map.len() < MAX_CLIENTS);
         assert!(!map.contains_key(&ip(0)), "oldest dropped");
         // Not everyone was forgotten: the drained client stays limited.

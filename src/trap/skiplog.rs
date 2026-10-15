@@ -4,6 +4,7 @@
 //! [`crate::net::source_key`]), so rotating addresses buys no more rows.
 
 use crate::cluster::record::SkipRow;
+use crate::lock::MutexExt;
 use crate::store::data::{SKIP_BATCH_MAX, SKIP_PATH_MAX, cut};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -102,7 +103,7 @@ impl SkipLog {
         rate: u32,
         now: Instant,
     ) -> Option<Batch> {
-        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.buffers.lock_or_recover();
         let Buffers {
             pending: map,
             rates,
@@ -163,7 +164,7 @@ impl SkipLog {
 
     /// Take the IP's pending batch (when its next request is recorded).
     pub fn take(&self, ip: IpAddr) -> Option<Batch> {
-        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.buffers.lock_or_recover();
         b.pending.remove(&ip).map(|p| batch(ip, p))
     }
 
@@ -171,7 +172,7 @@ impl SkipLog {
     /// than [`MAX_TRACKED`] addresses are buffered). Forgets the rates of
     /// sources not seen in the last two seconds.
     pub fn take_older(&self, age: Duration, now: Instant) -> Vec<Batch> {
-        let mut b = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.buffers.lock_or_recover();
         b.rates
             .retain(|_, r| now.saturating_duration_since(r.seen) < Duration::from_secs(2));
         let map = &mut b.pending;

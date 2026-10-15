@@ -7,6 +7,7 @@ use super::Target;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::config::Config;
+use crate::lock::MutexExt;
 use crate::scan::{crawler, guard, locally_refused, safety};
 use crate::store::Store;
 use std::net::IpAddr;
@@ -68,7 +69,7 @@ impl Gate {
         }
         let ip = crate::net::canonical(*ip);
         let ip_text = ip.to_string();
-        let local = self.tor.lock().unwrap().local(&ip);
+        let local = self.tor.lock_or_recover().local(&ip);
         let tor = guard::tor_status(&store.pool, local, &ip_text, &self.origins)
             .await
             .map_err(internal)?;

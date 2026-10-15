@@ -5,6 +5,7 @@ use super::Mc;
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::intel;
+use crate::lock::MutexExt;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ pub const PRICE_TOLERANCE: f64 = 1.25;
 /// it does not scan.
 pub fn own_scan_price(node: &Node, table: &Table) -> Option<u32> {
     table.price_of(SCAN).or_else(|| {
-        let scans = node.roles().scanner && node.status.local.lock().unwrap().pace.is_some();
+        let scans = node.roles().scanner && node.status.local.lock_or_recover().pace.is_some();
         scans.then_some(0)
     })
 }
@@ -116,8 +117,7 @@ impl Demand {
     pub fn note(&self, good: &str, n: u32) {
         *self
             .inner
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .1
             .entry(good.to_string())
             .or_default() += n as f64;
@@ -127,21 +127,20 @@ impl Demand {
     pub fn over_bid(&self, good: &str) {
         *self
             .over_bid
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(good.to_string())
             .or_default() += 1;
     }
 
     /// Every good's refused asks so far.
     pub fn over_bids(&self) -> HashMap<String, u64> {
-        self.over_bid.lock().unwrap().clone()
+        self.over_bid.lock_or_recover().clone()
     }
 
     /// Start from the refusals kept across a restart; those counted since
     /// add to them.
     pub fn seed_over_bids(&self, kept: HashMap<String, u64>) {
-        let mut g = self.over_bid.lock().unwrap();
+        let mut g = self.over_bid.lock_or_recover();
         for (good, n) in kept {
             *g.entry(good).or_default() += n;
         }
@@ -151,7 +150,7 @@ impl Demand {
     /// period ends with [`Demand::consume`] once they were used, so a
     /// refresh that fails loses none of them.
     pub fn peek(&self) -> Counted {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_or_recover();
         let now = std::time::Instant::now();
         Counted {
             hours: ((now - g.0).as_secs_f64() / 3600.0).max(1e-6),
@@ -162,7 +161,7 @@ impl Demand {
 
     /// End the period `c` covers; what was noted since stays for the next.
     pub fn consume(&self, c: &Counted) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_or_recover();
         for (good, n) in &c.counts {
             if let Some(v) = g.1.get_mut(good) {
                 *v -= n;
@@ -416,7 +415,7 @@ pub async fn scanners(node: &Node, left_out: &HashSet<NodeId>) -> Result<Vec<Sca
         let pace = if id == me {
             node.roles()
                 .scanner
-                .then(|| node.status.local.lock().unwrap().pace)
+                .then(|| node.status.local.lock_or_recover().pace)
                 .flatten()
         } else {
             node.status
@@ -596,7 +595,7 @@ async fn keep_market(node: &Node, bids: &HashMap<&str, Mc>) -> Result<()> {
 /// its own lots in `book` and what its buyer loops want.
 async fn own_bids(node: &Node, book: &super::Book) -> HashMap<&'static str, Mc> {
     let budget = hourly_budget(node, book).await;
-    let wants = node.wants.lock().unwrap().clone();
+    let wants = node.wants.lock_or_recover().clone();
     MARKET_GOODS
         .iter()
         .map(|g| (*g, super::bid::bid(budget, &wants, g)))
@@ -616,7 +615,7 @@ pub async fn own_bid(node: &Node, good: &str) -> Result<Mc> {
 /// lots and what its buyer loops want. Nothing a peer says enters it.
 pub async fn own_bid_in(node: &Node, book: &super::Book, good: &str) -> Mc {
     let budget = hourly_budget(node, book).await;
-    let wants = node.wants.lock().unwrap().clone();
+    let wants = node.wants.lock_or_recover().clone();
     super::bid::bid(budget, &wants, good)
 }
 

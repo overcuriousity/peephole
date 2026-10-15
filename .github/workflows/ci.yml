@@ -46,6 +46,15 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      # A panic while a std lock is held poisons it; acquire through
+      # crate::lock (lock_or_recover / read_or_recover / write_or_recover).
+      - name: no panicking lock acquisition
+        run: |
+          if grep -rPzl --exclude=lock.rs '\.(lock|read|write)\(\)\s*\.(unwrap|expect)' src/; then
+            echo "use crate::lock::{MutexExt, RwLockExt} instead of lock()/read()/write() + unwrap/expect" >&2
+            exit 1
+          fi
+
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

@@ -527,6 +527,7 @@ fn parse_list(path: &Path) -> std::io::Result<Vec<(IpNet, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::MutexExt;
 
     #[test]
     fn fib_trie_yields_local_addresses() {
@@ -699,7 +700,7 @@ mod tests {
         assert_eq!(own.names, s.own_names());
         assert!(own.addrs.contains(&"198.51.100.5".parse().unwrap()));
         // Looked up once a day: a changed answer is not seen yet.
-        *answer.lock().unwrap() = Some("other.example.net".into());
+        *answer.lock_or_recover() = Some("other.example.net".into());
         s.refresh_names().await;
         assert_eq!(s.own_names(), vec!["scanner-5.example.net".to_string()]);
     }
@@ -720,7 +721,7 @@ mod tests {
                 let id = u16::from_be_bytes([buf[0], buf[1]]);
                 let len = buf[12] as usize;
                 let label = String::from_utf8_lossy(&buf[13..13 + len]).into_owned();
-                let name = answers.lock().unwrap().get(&label).cloned().flatten();
+                let name = answers.lock_or_recover().get(&label).cloned().flatten();
                 let msg = match name {
                     Some(n) => reply(id, 0, Some(&n)),
                     None => reply(id, 2, None),
@@ -766,7 +767,7 @@ mod tests {
         );
         // The lookup for .5 fails while .6 still answers: .5's name stays,
         // nothing twice, and the next refresh tries again.
-        answers.lock().unwrap().insert("5".into(), None);
+        answers.lock_or_recover().insert("5".into(), None);
         s.names_at = None;
         s.refresh_names().await;
         assert_eq!(
@@ -779,8 +780,7 @@ mod tests {
         assert!(s.names_at.is_none(), "retried at the next refresh");
         // A fully successful pass replaces the list.
         answers
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .insert("5".into(), Some("scanner-5b.example.net".into()));
         s.refresh_names().await;
         assert_eq!(

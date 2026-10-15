@@ -18,6 +18,7 @@ use crate::classify::{BotTells, Classifier, RequestView};
 use crate::config::Config;
 use crate::intel::geo::GeoIp;
 use crate::intel::tor::TorExitList;
+use crate::lock::{MutexExt, RwLockExt};
 use crate::store::{Store, requests::NewRequest};
 use anyhow::Result;
 use axum::{
@@ -341,7 +342,7 @@ impl RateLimiter {
 
     fn allow_at(&self, ip: IpAddr, limit: u32, window: Duration, now: Instant) -> bool {
         let key = crate::net::source_key(ip);
-        let mut w = self.windows.lock().unwrap();
+        let mut w = self.windows.lock_or_recover();
         let Windows { open, order } = &mut *w;
         while let Some(&(k, start)) = order.front() {
             if now.saturating_duration_since(start) < window && open.len() < Self::MAX_TRACKED {
@@ -610,7 +611,7 @@ impl ConnCapture {
         // request, so its first bytes are this request's head.
         let raw_head = (version < Version::HTTP_2)
             .then(|| {
-                let b = meta.head.lock().unwrap_or_else(|p| p.into_inner());
+                let b = meta.head.lock_or_recover();
                 raw_head::head_of(&b).map(<[u8]>::to_vec)
             })
             .flatten();
@@ -662,8 +663,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
     // look up are filled in by a node that can (intel::enrich_once).
     let geo_hit = state
         .geo
-        .read()
-        .unwrap()
+        .read_or_recover()
         .as_ref()
         .map(|g| (g.lookup(&ip), g.build_date()));
     if let Some((g, version)) = geo_hit {
@@ -683,7 +683,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
     // With a Tor list loaded, every IP gets a result (false included); with
     // none, this node has nothing to say.
     let tor_hit = {
-        let tor = state.tor.read().unwrap();
+        let tor = state.tor.read_or_recover();
         (!tor.is_empty()).then(|| tor.contains(&ip))
     };
     let is_tor = tor_hit == Some(true);
@@ -843,7 +843,7 @@ async fn trap_handler(
         content_type,
     );
     let limits = kind
-        .map(|_| *state.uploads.read().unwrap())
+        .map(|_| *state.uploads.read_or_recover())
         .filter(|l| l.enabled);
     let (Some(kind), Some(limits)) = (kind, limits) else {
         let body = read_body(body, &state.guards.bodies).await;
@@ -946,7 +946,7 @@ async fn trap(
     }
     // A request to where a file was told it landed: the webshell's answer,
     // from the command alone, never from what the upload carried.
-    if state.uploads.read().unwrap().enabled
+    if state.uploads.read_or_recover().enabled
         && let Some(uid) = state.webshells.lookup(path)
     {
         let form = (body.whole()
@@ -1689,7 +1689,7 @@ async fn collect_handler(
         if (tells.webdriver || tells.inhuman_fill)
             && let Ok(target) = page_ip.parse::<IpAddr>().map(crate::net::canonical)
             && target == crate::net::canonical(ip)
-            && !state.tor.read().unwrap().contains(&target)
+            && !state.tor.read_or_recover().contains(&target)
             && may_scan(&state, target)
         {
             let level = if tells.inhuman_fill { 3 } else { 2 };
@@ -1972,14 +1972,14 @@ mod tests {
             l.allow_at(IpAddr::V4((0x0a00_0000 + i).into()), 1, w, t0);
         }
         {
-            let ws = l.windows.lock().unwrap();
+            let ws = l.windows.lock_or_recover();
             assert!(ws.open.len() <= RateLimiter::MAX_TRACKED);
             assert!(ws.order.len() <= RateLimiter::MAX_TRACKED);
             assert!(!ws.open.contains_key(&first), "the oldest went first");
         }
         // Past the window everything expired goes, in order.
         assert!(l.allow_at(first, 1, w, t0 + w));
-        let ws = l.windows.lock().unwrap();
+        let ws = l.windows.lock_or_recover();
         assert_eq!((ws.open.len(), ws.order.len()), (1, 1));
     }
 

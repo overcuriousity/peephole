@@ -6,6 +6,7 @@ use super::history;
 use super::identity::NodeId;
 use super::record::WireEntry;
 use super::repl::{self, Heads};
+use crate::lock::MutexExt;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -357,7 +358,7 @@ pub async fn reconcile(node: &Node, peer: NodeId, addr: &str, hello: bool) -> Re
             .map(|(o, _)| *o)
             .collect()
     };
-    node.unserved.lock().unwrap().insert(peer, unserved);
+    node.unserved.lock_or_recover().insert(peer, unserved);
     let mut stuck = false;
     loop {
         let ours = repl::head_map(&repl::heads(&node.store).await?);

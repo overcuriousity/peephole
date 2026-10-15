@@ -5,6 +5,7 @@
 //! [`COOLDOWN_HOURS`]).
 //!
 //! The queue metrics feed [`report`], which says how the queue keeps up.
+use crate::lock::RwLockExt;
 use crate::store::Store;
 use anyhow::Result;
 use std::sync::{Arc, RwLock};
@@ -112,7 +113,7 @@ impl SharedPace {
 
     /// Replace the pace in memory (persisting is the caller's business).
     pub fn replace(&self, p: Pace) {
-        *self.0.write().unwrap() = p;
+        *self.0.write_or_recover() = p;
     }
 
     /// The config's worker count overridden by whatever the admin saved.
@@ -136,7 +137,7 @@ impl SharedPace {
     }
 
     pub fn get(&self) -> Pace {
-        *self.0.read().unwrap()
+        *self.0.read_or_recover()
     }
 
     /// Validate, persist and apply. Workers pick it up on their next pass.
@@ -147,7 +148,7 @@ impl SharedPace {
         store
             .setting_set(KEY_WORKERS, &p.max_workers.to_string())
             .await?;
-        *self.0.write().unwrap() = p;
+        *self.0.write_or_recover() = p;
         Ok(Ok(()))
     }
 }
