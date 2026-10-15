@@ -69,6 +69,24 @@ pub async fn session_valid(state: &AdminState, jar: &CookieJar) -> bool {
     }
 }
 
+/// Whether the request holds a live session or a sign-in ceremony in
+/// flight: such a client skips the shared sign-in budget
+/// ([`limit`](crate::admin::limit)), so a flood from elsewhere cannot lock
+/// out an admin who has already started.
+pub async fn holds_sign_in(state: &AdminState, jar: &CookieJar) -> bool {
+    if session_valid(state, jar).await {
+        return true;
+    }
+    match jar.get(ceremony_cookie_name(&state.cfg)) {
+        Some(c) => state
+            .store
+            .webauthn_state_live(c.value())
+            .await
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 /// First-run setup token (spec §8.4): printed to stdout, only its hash
 /// stored. Valid for 24 hours; while neither a password nor a key is set, a
 /// start after it expired (or was used up) prints a new one, and setting
