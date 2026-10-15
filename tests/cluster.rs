@@ -3713,6 +3713,106 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
 }
 
+/// T5 (MIK-391): the very same signed envelope with an owner command,
+/// delivered twice over the wire, runs once (the duplicate filter drops
+/// the copy before the counter sees it); one dated outside the replay
+/// window (as a copy kept past the filter's memory would be) is refused
+/// at the door and never runs.
+#[tokio::test]
+async fn a_replayed_or_stale_owner_envelope_runs_at_most_once() {
+    use peephole::cluster::msg::{Body, Envelope, Msg};
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("b counts a as a member", || async { nb.is_member(&a.id) }).await;
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    // What `msg::Envelope::seal` makes, signed by a.
+    let seal = |counter: u64, blocked: NodeId, created_ms: u64| {
+        let bytes = cmd::encode(&OwnerCmd::Block {
+            node: blocked,
+            subtree: false,
+        })
+        .unwrap();
+        let sig = cmd::sign(&key, &a.id, &b.id, counter, &bytes);
+        let body = peephole::cluster::rpc::cbor::encode(&Body {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            from: a.id,
+            to: b.id,
+            created_ms,
+            in_reply_to: None,
+            msg: Msg::OwnerCmd {
+                counter,
+                cmd: serde_bytes::ByteBuf::from(bytes),
+                sig: serde_bytes::ByteBuf::from(sig),
+            },
+        })
+        .unwrap();
+        let sig = na
+            .node
+            .identity
+            .sign(&[b"peephole-msg-v1\0".as_slice(), &body].concat());
+        Envelope { body, sig, hops: 0 }
+    };
+    let post = |env: Envelope| {
+        let na = na.node.clone();
+        let to = b.clone();
+        async move {
+            let (status, reply) = na
+                .call_raw(to.id, &to.address(), "/rpc/v1/msg", &env)
+                .await
+                .unwrap();
+            (
+                status.as_u16(),
+                String::from_utf8_lossy(&reply).into_owned(),
+            )
+        }
+    };
+
+    let (x, y, z) = (
+        Identity::generate().unwrap().id,
+        Identity::generate().unwrap().id,
+        Identity::generate().unwrap().id,
+    );
+    let first = seal(0, x, now_ms());
+    assert_eq!(post(first.clone()).await.0, 200);
+    eventually("the command runs", || async { nb.is_blocked(&x) }).await;
+    // The identical envelope again: accepted for routing, dropped unrun.
+    assert_eq!(post(first).await.0, 200);
+    // Sync point: the next command runs after the copy was handled.
+    assert_eq!(post(seal(1, y, now_ms())).await.0, 200);
+    eventually("the next command runs", || async { nb.is_blocked(&y) }).await;
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    let log = cmd::log_rows(&nb.store, 10).await.unwrap();
+    assert_eq!(
+        log.len(),
+        2,
+        "one row per command, none for the copy: {log:?}"
+    );
+    assert!(log.iter().all(|r| !r.result.contains("refused")), "{log:?}");
+
+    // Past the replay window (twice the filter's memory), with the next
+    // counter, so only the timestamp stands in its way; and too far ahead.
+    let stale = now_ms() - 21 * 60 * 1000;
+    let ahead = now_ms() + 6 * 60 * 1000;
+    for created in [stale, ahead] {
+        let (status, reply) = post(seal(2, z, created)).await;
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("stale or future-dated"), "{reply}");
+    }
+    assert!(!nb.is_blocked(&z));
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    assert_eq!(cmd::log_rows(&nb.store, 10).await.unwrap().len(), 2);
+}
+
 /// The owner's other commands on a sibling: block and unblock a peer,
 /// revoke an invite, release the node, have it leave.
 #[tokio::test]
@@ -6137,6 +6237,88 @@ async fn an_oversized_routed_call_is_refused_before_sending() {
     );
 }
 
+/// `rpc::BODY_LIMIT` and `rpc::JOIN_BODY_LIMIT` (crate-private).
+const RPC_BODY_LIMIT: usize = 64 * 1024 * 1024;
+const RPC_JOIN_BODY_LIMIT: usize = 64 * 1024;
+
+/// T7 (MIK-391): the receiving side refuses a body one byte over the
+/// member limit, or over the join limit for a key that is not a member,
+/// before any handler sees it ("body too large" comes from the
+/// connection's body reader; a handler would answer with a CBOR error).
+/// A body at the limit gets through to the handler.
+#[tokio::test]
+async fn rpc_bodies_over_the_limit_are_refused_before_a_handler() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ix, x) = new_node("x");
+    let _na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // x pins a's key, but a does not know x.
+    let nx = boot(ix, &x, &[&a], DEFAULT).await;
+    let send = |from: &TestNode, path: &str, len: usize| {
+        let client = from.client_for(a.id).unwrap();
+        let url = format!("https://{}{path}", a.address());
+        async move {
+            let r = client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/cbor")
+                .body(vec![0xffu8; len])
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap_or_default())
+        }
+    };
+    for (from, path, limit) in [
+        (&nx, "/rpc/v1/join", RPC_JOIN_BODY_LIMIT),
+        (&nb, "/rpc/v1/push", RPC_BODY_LIMIT),
+    ] {
+        let (status, text) = send(from, path, limit + 1).await;
+        assert_eq!((status, text.as_str()), (413, "body too large"), "{path}");
+        let (status, text) = send(from, path, limit).await;
+        assert_eq!(
+            status, 400,
+            "{path} at the limit reaches the handler: {text}"
+        );
+        assert!(text.starts_with("cbor:"), "{path}: {text}");
+    }
+    // A key that is not a member gets the join limit on any path.
+    let (status, _) = send(&nx, "/rpc/v1/push", RPC_JOIN_BODY_LIMIT + 1).await;
+    assert_eq!(status, 413);
+}
+
+/// T7 (MIK-391): the router enforces the same limits by itself, should
+/// a request reach it without the connection's body reader.
+#[tokio::test]
+async fn the_rpc_router_limits_bodies_on_its_own() {
+    use peephole::cluster::rpc::server::{Peer, RemoteAddr};
+    use tower::ServiceExt;
+    let (ia, a) = new_node("a");
+    let (_ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let stranger = Identity::generate().unwrap().id;
+    let app = cluster::rpc::router(na.node.clone());
+    let send = |peer: NodeId, path: &'static str, len: usize| {
+        let app = app.clone();
+        async move {
+            let req = axum::http::Request::post(path)
+                .header("content-type", "application/cbor")
+                .extension(Peer(peer))
+                .extension(RemoteAddr("127.0.0.1:40000".parse().unwrap()))
+                .body(axum::body::Body::from(vec![0xffu8; len]))
+                .unwrap();
+            app.oneshot(req).await.unwrap().status().as_u16()
+        }
+    };
+    for (peer, path, limit) in [
+        (stranger, "/rpc/v1/join", RPC_JOIN_BODY_LIMIT),
+        (b.id, "/rpc/v1/push", RPC_BODY_LIMIT),
+    ] {
+        assert_eq!(send(peer, path, limit + 1).await, 413, "{path}");
+        assert_eq!(send(peer, path, limit).await, 400, "{path} at the limit");
+    }
+}
+
 /// The asker pays the announced price; the server gets all of it; both
 /// nodes hold the offer and the receipt and arrive at the same balances.
 #[tokio::test]
@@ -8410,7 +8592,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     let (is, s) = new_node("node-sierra");
     let (ix, x) = new_node("node-xray");
     let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
-    let _ns = boot(
+    let ns = boot(
         is,
         &s,
         &[&a, &x],
@@ -8486,7 +8668,27 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, Some((0, 4)));
     enqueue(&na, "198.51.100.62", 1).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Sync point (MIK-391): a claim of s's own is answered after a whole
+    // handout round, which saw the job and granted nothing.
+    let reply = ns
+        .node
+        .request(
+            a.id,
+            peephole::cluster::msg::Msg::Claim {
+                exclude_levels: vec![],
+                min_mc: 0,
+            },
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            reply,
+            peephole::cluster::msg::Msg::ClaimReply { grant: None }
+        ),
+        "{reply:?}"
+    );
     assert_eq!(
         count(
             &na,
