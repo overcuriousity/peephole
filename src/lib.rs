@@ -18,6 +18,7 @@ pub mod sd_notify;
 pub mod settings;
 pub mod settings_cli;
 pub mod store;
+pub mod supervise;
 pub mod trap;
 
 use anyhow::{Context, Result};
@@ -362,6 +363,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let failed = tokio::select! {
         _ = shutdown_signal() => None,
         e = background.panicked() => Some(e),
+        e = supervise::failed() => Some(e),
     };
     match &failed {
         None => info!("shutting down"),

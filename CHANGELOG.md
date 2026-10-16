@@ -5,6 +5,38 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-14
+
+Fixes from the full review (MIK-370). No database migration, no protocol
+change.
+
+### Security
+
+- The automatic setup token no longer bypasses the password (S1). A node
+  signed in by password minted and printed a fresh 24 h setup token on
+  every start, and that token enrolled a key and opened an admin session
+  without the password. The token is now issued only while neither a
+  password nor a key exists, and checked when used: once either exists it
+  authorises nothing, so a token issued before the password was set stops
+  working. A token from `peephole admin reset-token` is still accepted.
+
+### Fixed
+
+- A panic in a long-lived cluster task (replication and its per-peer
+  loops, heartbeat, maintenance, the cluster RPC server, the arbiter's
+  lease sweep and job hand-out) is logged at `error` with the task's name
+  and stops the node, which systemd restarts, instead of the task dying
+  silently (C1). Every panic is logged through tracing with its message,
+  location and thread.
+- A panicking audit purchase no longer disables audits until restart (C2).
+
+### Tests
+
+- CSRF/Origin refusal of cross-site writes on the admin forms and the
+  JSON buy (T1); `no_price` and `no_budget` refusals on a cluster node,
+  with nothing queued or charged (T2); upgrades from older databases keep
+  their rows, and a database newer than the build is left untouched (T3).
+
 ## [0.15.0] - 2026-10-14
 
 Counter-scans of addresses no listener recorded (MIK-329). Database

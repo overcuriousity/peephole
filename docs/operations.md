@@ -332,9 +332,11 @@ severity maps to counter-scans: [Detection](detection.md#classification).
 
 **Admin keys and sessions.** The first FIDO2 key is enrolled at `/enroll` with
 a one-time setup token from the service log. It is valid for 24 hours; a
-restart without an enrolled key prints a new one once it has expired, and
+restart with neither a key nor a password set prints a new one once it has
+expired. Setting a password or enrolling a key ends that automatic token.
 `peephole admin reset-token` issues a new one (and voids the old) if it is
-lost, or every key is. Further keys are enrolled from **Admin → Keys**. Admin
+lost, or every key is; a token from the shell works even with a password or
+keys set. Further keys are enrolled from **Admin → Keys**. Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
 

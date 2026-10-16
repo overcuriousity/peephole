@@ -1164,16 +1164,26 @@ pub async fn start(
     );
     let tls = tls::server_config(&node.cert)?;
     rpc::routed::serve(&node);
-    tokio::spawn(rpc::server::serve(
-        listener,
-        tls,
-        rpc::router(node.clone()),
-        node.clone(),
-        shutdown.clone(),
-    ));
-    tokio::spawn(heartbeat_loop(node.clone(), shutdown.clone()));
-    tokio::spawn(maintenance_loop(node.clone(), shutdown.clone()));
-    tokio::spawn(sync::supervise(node, shutdown));
+    use crate::supervise::spawn_supervised;
+    spawn_supervised(
+        "cluster rpc server",
+        rpc::server::serve(
+            listener,
+            tls,
+            rpc::router(node.clone()),
+            node.clone(),
+            shutdown.clone(),
+        ),
+    );
+    spawn_supervised(
+        "cluster heartbeat",
+        heartbeat_loop(node.clone(), shutdown.clone()),
+    );
+    spawn_supervised(
+        "cluster maintenance",
+        maintenance_loop(node.clone(), shutdown.clone()),
+    );
+    spawn_supervised("cluster replication", sync::supervise(node, shutdown));
     Ok(addr)
 }
 

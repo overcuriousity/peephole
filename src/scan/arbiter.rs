@@ -198,7 +198,7 @@ impl Arbiter {
         }));
         let sweeper = a.clone();
         let tick = (a.lease / 4).clamp(Duration::from_millis(250), Duration::from_secs(5));
-        tokio::spawn(async move {
+        crate::supervise::spawn_supervised("lease sweep", async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(tick) => {}
@@ -281,7 +281,9 @@ impl Arbiter {
         };
         if first {
             let a = self.clone();
-            tokio::spawn(async move {
+            // Supervised although short: if it died, `waiting` would never
+            // empty and no later claim would start another hand-out.
+            crate::supervise::spawn_supervised("job hand-out", async move {
                 tokio::time::sleep(CLAIM_WINDOW).await;
                 if let Err(e) = a.hand_out().await {
                     warn!(?e, "handing out scan jobs failed");

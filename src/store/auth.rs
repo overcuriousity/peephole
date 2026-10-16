@@ -354,6 +354,8 @@ impl Store {
     }
 
     /// Whether the admin setup token `token` is the current one and unexpired.
+    /// An automatic first-run token stops working once a password or a key
+    /// exists; one from `peephole admin reset-token` does not.
     pub async fn setup_token_valid(&self, token: &str) -> Result<bool> {
         let (Some(hash), Some(expires)) = (
             self.intel_get(SETUP_TOKEN_HASH).await?,
@@ -361,7 +363,10 @@ impl Store {
         ) else {
             return Ok(false);
         };
-        Ok(unexpired(&expires) && hash == token_hash(token))
+        if !unexpired(&expires) || hash != token_hash(token) {
+            return Ok(false);
+        }
+        Ok(!first_run_over(&mut *self.pool.acquire().await?).await?)
     }
 
     /// Store a key enrolled under the session whose hash is `session_hash`,
@@ -409,7 +414,7 @@ impl Store {
                 .bind(SETUP_TOKEN_EXPIRES)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if !expires.is_some_and(|e| unexpired(&e)) {
+        if !expires.is_some_and(|e| unexpired(&e)) || first_run_over(&mut tx).await? {
             return Ok(false);
         }
         let used =
@@ -431,13 +436,29 @@ impl Store {
 
     /// Issue a fresh setup token (replacing any earlier one), valid for
     /// [`SETUP_TOKEN_HOURS`]. Returns the token; only its hash is stored.
+    /// For `peephole admin reset-token`: the local shell is trusted, so the
+    /// token works even with a password or keys set (lost-key recovery).
     pub async fn issue_setup_token(&self) -> Result<String> {
+        self.put_setup_token(true).await
+    }
+
+    /// Issue the automatic first-run token: like [`Self::issue_setup_token`],
+    /// but it stops working once a password or a key exists.
+    pub async fn issue_first_run_token(&self) -> Result<String> {
+        self.put_setup_token(false).await
+    }
+
+    async fn put_setup_token(&self, from_cli: bool) -> Result<String> {
         let token = uuid::Uuid::new_v4().to_string();
         let expires = chrono::Utc::now() + chrono::Duration::hours(SETUP_TOKEN_HOURS);
         let mut tx = self.pool.begin().await?;
         for (k, v) in [
             (SETUP_TOKEN_HASH, token_hash(&token)),
             (SETUP_TOKEN_EXPIRES, expires.to_rfc3339()),
+            (
+                SETUP_TOKEN_CLI,
+                if from_cli { "1" } else { "0" }.to_string(),
+            ),
         ] {
             sqlx::query(
                 "INSERT INTO intel_meta (key, value) VALUES (?, ?)
@@ -482,6 +503,9 @@ const LOGIN_METHOD: &str = "admin_login_method";
 const PASSWORD_HASH: &str = "admin_password_hash";
 const SETUP_TOKEN_HASH: &str = "webauthn_setup_token_hash";
 const SETUP_TOKEN_EXPIRES: &str = "webauthn_setup_token_expires";
+/// "1" when the current setup token came from `peephole admin reset-token`.
+/// Absent (a token from before this flag) counts as automatic.
+const SETUP_TOKEN_CLI: &str = "webauthn_setup_token_cli";
 
 /// What [`Store::delete_credential_guarded`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +540,21 @@ pub enum SetupToken {
 }
 
 /// Whether an RFC 3339 expiry lies in the future.
+/// Whether the current setup token is an automatic one and a password or a
+/// key now exists, so it no longer authorises anything.
+async fn first_run_over(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
+    if get_meta(conn, SETUP_TOKEN_CLI).await?.as_deref() == Some("1") {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM credentials)
+             OR EXISTS (SELECT 1 FROM intel_meta WHERE key = ?)",
+    )
+    .bind(PASSWORD_HASH)
+    .fetch_one(conn)
+    .await?)
+}
+
 fn unexpired(expires: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(expires).is_ok_and(|t| t > chrono::Utc::now())
 }

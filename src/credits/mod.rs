@@ -252,13 +252,10 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
         }
         // Audits of this node's designated scans that are due, bought
         // aside (each may wait on three auditors); one run at a time.
-        if !buying.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let (node, buying) = (node.clone(), buying.clone());
-            tokio::spawn(async move {
-                audit::buy_due(&node).await;
-                buying.store(false, std::sync::atomic::Ordering::SeqCst);
-            });
-        }
+        let node2 = node.clone();
+        buy_aside(&buying, async move {
+            audit::buy_due(&node2).await;
+        });
         // Audit offers to this node that can no longer be served.
         audit::release_stale(&node).await;
         if ticks.is_multiple_of(60) {
@@ -310,8 +307,55 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
     }
 }
 
+/// Runs `buy` in its own task unless one runs already (`buying` set). The
+/// task owns a guard that clears `buying` when it ends, by a panic too:
+/// otherwise a panic would stop audit purchases until restart.
+fn buy_aside(
+    buying: &Arc<std::sync::atomic::AtomicBool>,
+    buy: impl Future<Output = ()> + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    struct Clear(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    if buying.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    let clear = Clear(buying.clone());
+    Some(tokio::spawn(async move {
+        let _clear = clear;
+        buy.await;
+    }))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A panicking audit purchase clears the flag, so the next tick buys
+    /// again; while one runs, no second starts.
+    #[tokio::test]
+    async fn a_panicking_audit_buy_clears_the_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let buying = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let first = super::buy_aside(&buying, async move {
+            let _ = rx.await;
+            panic!("audit bug");
+        })
+        .expect("nothing runs yet");
+        assert!(buying.load(Ordering::SeqCst));
+        assert!(super::buy_aside(&buying, async {}).is_none());
+        tx.send(()).unwrap();
+        assert!(first.await.unwrap_err().is_panic());
+        assert!(!buying.load(Ordering::SeqCst));
+        super::buy_aside(&buying, async {})
+            .expect("buys again")
+            .await
+            .unwrap();
+        assert!(!buying.load(Ordering::SeqCst));
+    }
+
     use super::*;
 
     #[test]
