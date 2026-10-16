@@ -1,0 +1,55 @@
+{% extends "layout.html" %}
+{% block title %}peephole — campaign #{{ c.row.num }}{% endblock %}
+{% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
+{% block content %}
+{% let sub = "campaigns" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
+<div class="meta">
+  <span>{{ c.row.size }} IPs</span>
+  <span>key <span class="mono">{{ c.row.key }}</span></span>
+  <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>
+  <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
+  <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
+</div>
+<p class="muted">Computed from the stored rows; it changes when they do. <a href="/admin/campaigns">All campaigns</a></p></div></div>
+<div class="stack">
+<section class="card">
+  <div class="card-head"><h2>Members</h2></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>
+  {% for m in c.members %}<tr>
+    <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a></td>
+    <td>{% let country = m.country %}{% include "_country.html" %}</td>
+    <td>{% if let Some(a) = m.asn %}{{ m.asn_org.as_deref().unwrap_or_default() }} <span class="mono muted">AS{{ a }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+    <td class="ts">{{ crate::admin::views::minute(m.first_seen.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(m.last_seen.as_str()) }}</td>
+    <td class="num">{{ crate::admin::views::thousands(m.requests) }}</td>
+  </tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft; JA4 and JA4H only ever support a path edge</span></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
+  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
+    <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
+    <td>{{ v.kind_name }}</td>
+    <td>{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}</td>
+    <td class="ts">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
+  </tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>Timeline</h2><span class="muted">requests per day across the members, last 26 weeks, UTC</span></div>
+  {% if calendar.is_empty() %}<p class="empty">No request in the last 26 weeks.</p>{% else %}
+  <div class="chart calendar" data-calendar="{{ calendar_json }}" data-days="{{ calendar_days }}" role="img" aria-label="Days with requests from the members over the last 26 weeks"></div>
+  <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
+  <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
+  {% endif %}
+</section>
+<section class="card">
+  <div class="card-head"><h2>Shapes</h2><span class="muted">the normalized paths most members asked for; IPs: how many in the whole dataset asked for it</span></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Shape</th><th class="num">Members</th><th class="num">IPs</th></tr></thead><tbody>
+  {% for s in shapes %}<tr><td class="mono">{{ s.text }}</td><td class="num">{{ s.members }}</td><td class="num">{{ s.df }}</td></tr>{% endfor %}
+  {% if shapes.is_empty() %}<tr><td colspan="3" class="empty">No path shape recorded.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+</div>
+{% endblock %}

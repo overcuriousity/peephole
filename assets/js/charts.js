@@ -437,6 +437,16 @@
         var drawIp = function () { timeline(week, wb, { height: 150 }); if (cal) calendar(cal, cd, nd); };
         drawIp(); onWidthChange(drawIp);
       } catch (e) {}
+    } else {
+      // A calendar on its own (a campaign's page).
+      var cal1 = document.querySelector("[data-calendar]");
+      if (cal1) {
+        try {
+          var cd1 = JSON.parse(cal1.getAttribute("data-calendar")), nd1 = parseInt(cal1.getAttribute("data-days") || "182", 10);
+          var drawCal = function () { calendar(cal1, cd1, nd1); };
+          drawCal(); onWidthChange(drawCal);
+        } catch (e) {}
+      }
     }
   }
 
