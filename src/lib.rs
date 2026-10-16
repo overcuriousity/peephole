@@ -291,10 +291,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // What rows and scans stored before this build lack; new ones get it
     // as written. Canaries and tokens (or by an older tokenizer), host keys
     // and facts of scans read by an older parser (HOSTKEYS_V, FACTS_V),
-    // JA4H, User-Agent.
+    // JA4H, User-Agent, path shapes (or by older rules, SHAPE_V).
     background.backfill("canaries", "parsed stored rows", {
         let pool = store.pool.clone();
         async move { store::canaries::backfill(&pool).await }
+    });
+    background.backfill("path shapes", "derived stored rows", {
+        let pool = store.pool.clone();
+        async move { store::shapes::backfill(&pool).await }
     });
     background.backfill("host keys", "read stored scans again", {
         let pool = store.pool.clone();
