@@ -143,6 +143,7 @@ impl Identity {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading node key {}", path.display()))?;
+        crate::warn_if_exposed(path, "node key");
         let mut lines = text.lines();
         if lines.next() != Some(KEY_FILE_HEADER) {
             bail!("{}: not a peephole node key", path.display());

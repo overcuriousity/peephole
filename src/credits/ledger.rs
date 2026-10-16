@@ -183,7 +183,7 @@ pub fn parts_from(lots: &[(u32, Mc)], mc: Mc, first_day: u32) -> Option<Vec<(u32
 /// may draw from: a lot that dies before the offer can be charged is left
 /// out (a receipt would hand the server credits already gone).
 pub fn first_day_for(now_ms: u64, ttl_ms: u64) -> u32 {
-    let last = ((now_ms + ttl_ms) / DAY_MS) as u32;
+    let last = (now_ms.saturating_add(ttl_ms) / DAY_MS) as u32;
     last.saturating_sub(LOT_DAYS - 1)
 }
 
@@ -293,8 +293,17 @@ struct Gated {
     paid_by: BTreeMap<NodeId, Mc>,
 }
 
+/// A credit that would take a lot past [`Mc::MAX`]: the step making it is
+/// ignored.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Overflow;
+
 struct Walk<'a> {
     l: Ledger,
+    /// Every credit the pool shares created. Credits are only ever moved
+    /// after that, so while this does not overflow no lot can: an earn that
+    /// would take it past [`Mc::MAX`] is ignored whole.
+    minted: Mc,
     gates: &'a Gates,
     /// The HLC the last 7 days start at.
     week_from: u64,
@@ -304,6 +313,13 @@ struct Walk<'a> {
 impl Walk<'_> {
     fn lot(&mut self, node: NodeId, day: u32) -> &mut Mc {
         self.l.lots.entry((node, day)).or_insert(0)
+    }
+
+    /// Add `mc` to a lot; on overflow the lot is left as it was.
+    fn credit(&mut self, node: NodeId, day: u32, mc: Mc) -> Result<(), Overflow> {
+        let lot = self.lot(node, day);
+        *lot = lot.checked_add(mc).ok_or(Overflow)?;
+        Ok(())
     }
 
     /// Count `f` for `node` in the tallies, and in the week's when `hlc`
@@ -316,18 +332,21 @@ impl Walk<'_> {
     }
 
     /// Give back what offers past their lifetime still hold.
-    fn lapse(&mut self, now_ms: u64) {
+    fn lapse(&mut self, now_ms: u64) -> Result<(), Overflow> {
         for i in 0..self.l.offers.len() {
             let o = &self.l.offers[i];
-            if o.state != OfferState::Open || now_ms <= physical_ms(o.hlc) + o.ttl_ms() {
+            if o.state != OfferState::Open
+                || now_ms <= physical_ms(o.hlc).saturating_add(o.ttl_ms())
+            {
                 continue;
             }
             let (payer, held) = (o.payer, std::mem::take(&mut self.l.offers[i].held));
             self.l.offers[i].state = OfferState::Lapsed;
             for (day, mc) in held {
-                *self.lot(payer, day) += mc;
+                self.credit(payer, day, mc)?;
             }
         }
+        Ok(())
     }
 
     fn offer(
@@ -370,23 +389,23 @@ impl Walk<'_> {
         offer_seq: u64,
         charged: Mc,
         answered: &[String],
-    ) {
+    ) -> Result<(), Overflow> {
         let Some(i) = self.l.offers.iter().position(|o| {
             o.payer == payer
                 && o.seq == offer_seq
                 && o.to == e.origin
                 && o.state == OfferState::Open
                 && e.hlc > o.hlc
-                && physical_ms(e.hlc) <= physical_ms(o.hlc) + o.ttl_ms()
+                && physical_ms(e.hlc) <= physical_ms(o.hlc).saturating_add(o.ttl_ms())
         }) else {
-            return;
+            return Ok(());
         };
         // A scan receipt written after the job's done status pays nothing;
         // the offer lapses back.
         if let Some(job) = &self.l.offers[i].job
             && !charged_in_time(e.hlc, self.gates.done.get(job).copied())
         {
-            return;
+            return Ok(());
         }
         // A member failing a gate here keeps none of this sale: noted, and
         // settled at the end of the walk.
@@ -398,18 +417,22 @@ impl Walk<'_> {
         for (day, mc) in held {
             let take = mc.min(left);
             left -= take;
-            *self.lot(e.origin, day) += take;
-            *self.lot(payer, day) += mc - take;
+            self.credit(e.origin, day, take)?;
+            self.credit(payer, day, mc - take)?;
         }
         let o = &mut self.l.offers[i];
         o.answered = answered.to_vec();
         o.state = OfferState::Charged { charged: paid };
-        self.tally(payer, e.hlc, |t| t.spent += paid);
-        self.tally(e.origin, e.hlc, |t| t.served += paid);
+        self.tally(payer, e.hlc, |t| t.spent = t.spent.saturating_add(paid));
+        self.tally(e.origin, e.hlc, |t| {
+            t.served = t.served.saturating_add(paid)
+        });
         if gated && paid > 0 && payer != e.origin {
             let g = self.gated.entry(e.origin).or_default();
-            *g.paid_by.entry(payer).or_default() += paid;
+            let by = g.paid_by.entry(payer).or_default();
+            *by = by.saturating_add(paid);
         }
+        Ok(())
     }
 
     /// At the end of the walk, take from each gated member, in key order,
@@ -419,14 +442,14 @@ impl Walk<'_> {
     /// what each paid (the odd millicredits to the lowest keys), and the
     /// pool's share is burned. Whatever it spent stays spent. A refund to a
     /// gated payer counts in that payer's balance when its turn comes.
-    fn claw_back(&mut self, now_ms: u64) {
+    fn claw_back(&mut self, now_ms: u64) -> Result<(), Overflow> {
         let hlc = now_ms << 16;
         for (node, g) in std::mem::take(&mut self.gated) {
             if self.gates.left_out.contains(&node) {
                 continue;
             }
-            let receipts: Mc = g.paid_by.values().sum();
-            let income = receipts + g.pool;
+            let receipts = g.paid_by.values().fold(0, |a: Mc, b| a.saturating_add(*b));
+            let income = receipts.saturating_add(g.pool);
             let take = self.l.balance(&node).min(income);
             if take == 0 {
                 continue;
@@ -450,7 +473,7 @@ impl Walk<'_> {
             let mut i = 0;
             for (to, mut mc) in out {
                 if let Some(p) = to {
-                    self.tally(p, hlc, |t| t.refunded += mc);
+                    self.tally(p, hlc, |t| t.refunded = t.refunded.saturating_add(mc));
                 }
                 while mc > 0 && i < lots.len() {
                     let day = lots[i].0;
@@ -459,26 +482,27 @@ impl Walk<'_> {
                     mc -= t;
                     *self.lot(node, day) -= t;
                     match to {
-                        Some(p) => *self.lot(p, day) += t,
-                        None => self.l.burned += t,
+                        Some(p) => self.credit(p, day, t)?,
+                        None => self.l.burned = self.l.burned.checked_add(t).ok_or(Overflow)?,
                     }
                     if lots[i].1 == 0 {
                         i += 1;
                     }
                 }
             }
-            self.tally(node, hlc, |t| t.withheld += take);
+            self.tally(node, hlc, |t| t.withheld = t.withheld.saturating_add(take));
         }
+        Ok(())
     }
 
-    fn transfer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) {
-        let mut moved = 0;
+    fn transfer(&mut self, e: &Entry, to: NodeId, parts: &[(u32, u32)]) -> Result<(), Overflow> {
+        let mut moved: Mc = 0;
         for (day, mc) in parts {
             let lot = self.lot(e.origin, *day);
             let take = (*lot).min(*mc as Mc);
             *lot -= take;
-            *self.lot(to, *day) += take;
-            moved += take;
+            self.credit(to, *day, take)?;
+            moved = moved.saturating_add(take);
         }
         self.l.transfers.push(Moved {
             hlc: e.hlc,
@@ -487,8 +511,9 @@ impl Walk<'_> {
             named: parts.iter().map(|(_, mc)| *mc as Mc).sum(),
             moved,
         });
-        self.tally(e.origin, e.hlc, |t| t.sent += moved);
-        self.tally(to, e.hlc, |t| t.received += moved);
+        self.tally(e.origin, e.hlc, |t| t.sent = t.sent.saturating_add(moved));
+        self.tally(to, e.hlc, |t| t.received = t.received.saturating_add(moved));
+        Ok(())
     }
 }
 
@@ -510,35 +535,57 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
             today: (now_ms / DAY_MS) as u32,
             ..Default::default()
         },
+        minted: 0,
         gates,
         week_from: now_ms.saturating_sub(7 * DAY_MS) << 16,
         gated: BTreeMap::new(),
     };
+    // Only an earn creates credits, and it is checked against `minted`;
+    // every other step moves credits that exist, so cannot overflow a lot.
+    // Should one still, its step stops there and is reported.
+    let overflowed = |r: Result<(), Overflow>| {
+        if r.is_err() {
+            tracing::error!("a credit ledger step overflowed; it was ignored");
+        }
+    };
     for step in steps {
         match step {
             Step::Earn(e) => {
-                w.lapse(physical_ms(e.hlc));
+                overflowed(w.lapse(physical_ms(e.hlc)));
                 if w.gates.left_out.contains(&e.node) {
                     continue;
                 }
-                *w.lot(e.node, day_of(e.hlc)) += e.mc;
+                let Some(minted) = w.minted.checked_add(e.mc) else {
+                    tracing::warn!(
+                        mc = e.mc,
+                        "a pool share overflows the credit supply; ignored"
+                    );
+                    continue;
+                };
+                if w.credit(e.node, day_of(e.hlc), e.mc).is_err() {
+                    continue;
+                }
+                w.minted = minted;
                 w.tally(e.node, e.hlc, |t| t.earned += e.mc);
                 if w.gates.no_sales.contains(&e.node) {
                     w.gated.entry(e.node).or_default().pool += e.mc;
                 }
             }
             Step::Entry(e) => {
-                w.lapse(physical_ms(e.hlc));
+                overflowed(w.lapse(physical_ms(e.hlc)));
                 if w.gates.left_out.contains(&e.origin) {
                     continue;
                 }
-                match &e.kind {
+                let r = match &e.kind {
                     Kind::Offer {
                         to,
                         parts,
                         job,
                         audit,
-                    } if parts_ok(parts, day_of(e.hlc)) => w.offer(e, *to, parts, job, audit),
+                    } if parts_ok(parts, day_of(e.hlc)) => {
+                        w.offer(e, *to, parts, job, audit);
+                        Ok(())
+                    }
                     Kind::Transfer { to, parts }
                         if *to != e.origin && parts_ok(parts, day_of(e.hlc)) =>
                     {
@@ -551,13 +598,14 @@ pub fn run(earned: &[Earned], entries: &[Entry], gates: &Gates, now_ms: u64) -> 
                         answered,
                     } => w.receipt(e, *payer, *offer_seq, *charged_mc as Mc, answered),
                     // Breaks a shape rule: ignored whole.
-                    _ => {}
-                }
+                    _ => Ok(()),
+                };
+                overflowed(r);
             }
         }
     }
-    w.lapse(now_ms);
-    w.claw_back(now_ms);
+    overflowed(w.lapse(now_ms));
+    overflowed(w.claw_back(now_ms));
     // A node left out shows no balance, whatever was sent to it.
     w.l.lots
         .retain(|(node, _), _| !gates.left_out.contains(node));
@@ -677,6 +725,47 @@ mod tests {
         assert_eq!((all.earned, all.spent), (1300, 500));
         assert_eq!((week.earned, week.spent), (300, 100));
         assert_eq!(l.week_tally(&id(2)).served, 100);
+    }
+
+    /// Pool shares past what a credit count can hold are refused whole, on
+    /// one node or across nodes, and leave every balance as it was.
+    #[test]
+    fn an_overflowing_earn_is_ignored_and_leaves_the_balance() {
+        let big = Mc::MAX - 10;
+        let l = ledger(
+            &[
+                earn(1, DAY, 0, big),
+                earn(1, DAY, 1, 100),
+                earn(2, DAY, 2, 100),
+            ],
+            &[],
+            now(DAY, 60),
+        );
+        assert_eq!(l.balance(&id(1)), big);
+        assert_eq!(l.tally(&id(1)).earned, big);
+        assert_eq!(l.balance(&id(2)), 0);
+        // What still fits is taken.
+        let l = ledger(
+            &[earn(1, DAY, 0, big), earn(2, DAY, 1, 10)],
+            &[],
+            now(DAY, 60),
+        );
+        assert_eq!((l.balance(&id(1)), l.balance(&id(2))), (big, 10));
+    }
+
+    #[test]
+    fn an_overflowing_credit_errs_and_leaves_the_lot() {
+        let gates = Gates::default();
+        let mut w = Walk {
+            l: Ledger::default(),
+            minted: 0,
+            gates: &gates,
+            week_from: 0,
+            gated: BTreeMap::new(),
+        };
+        assert_eq!(w.credit(id(1), DAY, Mc::MAX - 1), Ok(()));
+        assert_eq!(w.credit(id(1), DAY, 2), Err(Overflow));
+        assert_eq!(*w.lot(id(1), DAY), Mc::MAX - 1);
     }
 
     #[test]

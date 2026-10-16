@@ -8,6 +8,7 @@
 //! Keys stay in the request: nothing here logs a URL (the Shodan key is a
 //! query parameter), and response bodies are never logged or stored raw.
 use super::provider::{Finding, Provider};
+use crate::lock::MutexExt;
 use crate::store::Store;
 use chrono::{DateTime, Datelike, Duration as CDuration, NaiveDate, Utc};
 use futures::future::BoxFuture;
@@ -161,7 +162,7 @@ impl<S: Service> ApiProvider<S> {
     }
 
     async fn load_usage(&self) {
-        if self.state.lock().unwrap().loaded {
+        if self.state.lock_or_recover().loaded {
             return;
         }
         let now = Utc::now();
@@ -177,7 +178,7 @@ impl<S: Service> ApiProvider<S> {
             };
             used.insert(key, n);
         }
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_or_recover();
         st.used.extend(used);
         st.loaded = true;
     }
@@ -196,7 +197,7 @@ impl<S: Service> ApiProvider<S> {
     async fn count_request(&self) {
         let now = Utc::now();
         let updates: Vec<(String, u64)> = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock_or_recover();
             self.limits
                 .iter()
                 .map(|l| {
@@ -215,7 +216,7 @@ impl<S: Service> ApiProvider<S> {
     }
 
     fn pause(&self, until: DateTime<Utc>, reason: &'static str) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_or_recover();
         if st.paused_until.is_none_or(|t| t < until) {
             st.paused_until = Some(until);
             st.pause_reason = Some(reason);
@@ -224,7 +225,7 @@ impl<S: Service> ApiProvider<S> {
 
     fn fail(&self, why: &str) {
         let wait = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock_or_recover();
             st.failures = st.failures.saturating_add(1);
             (BACKOFF_FIRST << (st.failures - 1).min(10)).min(BACKOFF_MAX)
         };
@@ -238,7 +239,7 @@ impl<S: Service> ApiProvider<S> {
     }
 
     fn skip(&self, ip: &str, until: Option<Instant>) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_or_recover();
         if st.skip.len() >= SKIP_CAP {
             let now = Instant::now();
             st.skip.retain(|_, t| t.is_none_or(|t| t > now));
@@ -249,7 +250,7 @@ impl<S: Service> ApiProvider<S> {
     }
 
     fn skipped(&self, ip: &str) -> bool {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock_or_recover();
         st.skip
             .get(ip)
             .is_some_and(|t| t.is_none_or(|t| t > Instant::now()))
@@ -268,7 +269,7 @@ impl<S: Service> ApiProvider<S> {
 
     async fn pace(&self) {
         let wait = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock_or_recover();
             let wait = st
                 .last_request
                 .map(|t| PACE.saturating_sub(t.elapsed()))
@@ -317,7 +318,7 @@ impl<S: Service> ApiProvider<S> {
     /// Requests made in each budget's current period, for the admin page.
     pub fn usage(&self) -> Vec<(Limit, u64)> {
         let now = Utc::now();
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock_or_recover();
         self.limits
             .iter()
             .map(|l| {
@@ -460,7 +461,7 @@ impl<S: Service> Provider for ApiProvider<S> {
 
     fn ready(&self) -> bool {
         let now = Utc::now();
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock_or_recover();
         !st.key_rejected
             && st.paused_until.is_none_or(|t| t <= now)
             && self.exhausted_until(&st, now).is_none()
@@ -481,8 +482,7 @@ impl<S: Service> Provider for ApiProvider<S> {
     fn skip_list(&self) -> Vec<String> {
         let now = Instant::now();
         self.state
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .skip
             .iter()
             .filter(|(_, t)| t.is_none_or(|t| t > now))
@@ -492,7 +492,7 @@ impl<S: Service> Provider for ApiProvider<S> {
 
     fn status(&self) -> Option<String> {
         let now = Utc::now();
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock_or_recover();
         let mut parts: Vec<String> = self
             .limits
             .iter()
@@ -540,7 +540,7 @@ impl<S: Service> Provider for ApiProvider<S> {
                 self.count_request().await;
                 match self.ask(ip).await {
                     Answer::Result(data) => {
-                        self.state.lock().unwrap().failures = 0;
+                        self.state.lock_or_recover().failures = 0;
                         out.push(Finding {
                             ip: ip.clone(),
                             source_version: None,
@@ -563,7 +563,7 @@ impl<S: Service> Provider for ApiProvider<S> {
                             %status,
                             "API key rejected (or the plan does not include this lookup); provider off until restart"
                         );
-                        self.state.lock().unwrap().key_rejected = true;
+                        self.state.lock_or_recover().key_rejected = true;
                         break;
                     }
                     Answer::Failed(why) => {
@@ -574,7 +574,7 @@ impl<S: Service> Provider for ApiProvider<S> {
                 // The budget may have run out with this request.
                 let now = Utc::now();
                 let spent = {
-                    let st = self.state.lock().unwrap();
+                    let st = self.state.lock_or_recover();
                     self.exhausted_until(&st, now)
                 };
                 if let Some(t) = spent {

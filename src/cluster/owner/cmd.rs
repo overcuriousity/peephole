@@ -8,6 +8,7 @@ use crate::cluster::identity::NodeId;
 use crate::cluster::msg::Msg;
 use crate::cluster::remote::{self, State};
 use crate::cluster::rpc::proto::OWNER_PROTO;
+use crate::lock::MutexExt;
 use crate::settings::{Changes, Settings};
 use crate::store::Store;
 use anyhow::{Result, bail};
@@ -271,7 +272,7 @@ type Refusals = Arc<Mutex<HashMap<NodeId, (u64, u32)>>>;
 
 fn may_log(seen: &Refusals, from: NodeId) -> bool {
     let hour = crate::cluster::hlc::wall_ms() / 3_600_000;
-    let mut all = seen.lock().unwrap();
+    let mut all = seen.lock_or_recover();
     all.retain(|_, (h, _)| *h == hour);
     let e = all.entry(from).or_insert((hour, 0));
     e.1 += 1;
@@ -320,7 +321,7 @@ async fn execute(
         } => match settings.apply_at(*base_version, changes, Some(from)).await {
             Ok(Ok(v)) => {
                 if !changes.is_empty() {
-                    node.status.local.lock().unwrap().pace =
+                    node.status.local.lock_or_recover().pace =
                         Some(remote::pace_info(settings.snapshot().pace));
                     node.publish_status();
                 }
@@ -455,14 +456,17 @@ async fn handle(
         async move {
             if verified || may_log(seen, from) {
                 tracing::info!(by = %from.short(), command = %what, "owner command refused: {why}");
-                let _ = log(
+                if let Err(e) = log(
                     &node.store,
                     &from,
                     &what,
                     &format!("refused: {why}"),
                     verified,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(?e, "writing the owner command log failed");
+                }
             }
             why
         }
@@ -479,14 +483,17 @@ async fn handle(
         if may_log(seen, from) {
             tracing::warn!(by = %from.short(), "owner command with a wrong ownership key refused");
             let what = decode(cmd).map_or_else(|| "unreadable command".into(), |c| c.describe());
-            let _ = log(
+            if let Err(e) = log(
                 &node.store,
                 &from,
                 &what,
                 "refused: the ownership key was not accepted",
                 false,
             )
-            .await;
+            .await
+            {
+                tracing::error!(?e, "writing the owner command log failed");
+            }
         }
         return refuse(0, "the ownership key was not accepted".into());
     }
@@ -515,14 +522,17 @@ async fn handle(
         Ok(false) => {
             let why = "the node changed meanwhile; reload and try again";
             tracing::info!(by = %from.short(), command = %cmd.describe(), "owner command refused: {why}");
-            let _ = log(
+            if let Err(e) = log(
                 &node.store,
                 &from,
                 &cmd.describe(),
                 &format!("refused: {why}"),
                 true,
             )
-            .await;
+            .await
+            {
+                tracing::error!(?e, "writing the owner command log failed");
+            }
             return refuse(current, why.into());
         }
         Err(e) => return refuse(current, refused(format!("{e:#}"), true).await),
@@ -534,6 +544,7 @@ async fn handle(
     // list must say for what also when the node stops halfway.
     let row = log(&node.store, &from, &cmd.describe(), STARTED, true)
         .await
+        .inspect_err(|e| tracing::error!(?e, "writing the owner command log failed"))
         .ok();
     let result = execute(node, settings, from, &cmd).await;
     drop(turn);
@@ -542,8 +553,10 @@ async fn handle(
         Err(e) => format!("refused: {e}"),
     };
     tracing::info!(by = %from.short(), command = %cmd.describe(), result = %text, "owner command");
-    if let Some(row) = row {
-        let _ = log_result(&node.store, row, &text).await;
+    if let Some(row) = row
+        && let Err(e) = log_result(&node.store, row, &text).await
+    {
+        tracing::error!(?e, "writing the owner command result failed");
     }
     match result {
         Ok(note) => Msg::OwnerReply {

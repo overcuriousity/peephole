@@ -26,6 +26,7 @@
 //! The PTR query goes to the first `nameserver` in `/etc/resolv.conf` (the
 //! standard library has no reverse lookup); forward lookups use tokio's
 //! resolver (the system's `getaddrinfo`).
+use crate::lock::MutexExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -127,7 +128,7 @@ impl Crawlers {
         let resolver = self.resolver?;
         // One cache entry per address, whatever its spelling.
         let ip = crate::net::canonical(ip);
-        if let Some((until, v)) = self.cache.lock().unwrap().get(&ip)
+        if let Some((until, v)) = self.cache.lock_or_recover().get(&ip)
             && *until > Instant::now()
         {
             return v.clone();
@@ -143,7 +144,7 @@ impl Crawlers {
                 (None, CACHE_FAILED)
             }
         };
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock_or_recover();
         if cache.len() >= CACHE_MAX {
             let now = Instant::now();
             cache.retain(|_, (until, _)| *until > now);
@@ -637,7 +638,7 @@ mod tests {
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         assert!(c.confirmed(ip).await.is_some());
         // The resolver changes its mind; the cached verdict stands.
-        *answer.lock().unwrap() = None;
+        *answer.lock_or_recover() = None;
         assert!(c.confirmed(ip).await.is_some());
         // A mapped spelling shares the entry.
         assert!(
@@ -645,7 +646,7 @@ mod tests {
                 .await
                 .is_some()
         );
-        assert_eq!(c.cache.lock().unwrap().len(), 1);
+        assert_eq!(c.cache.lock_or_recover().len(), 1);
     }
 
     /// A forward lookup that timed out counts as a crawler, but is cached
@@ -657,7 +658,7 @@ mod tests {
         c.forward = fake_forward();
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         assert!(c.confirmed(ip).await.is_some());
-        let until = c.cache.lock().unwrap()[&ip].0;
+        let until = c.cache.lock_or_recover()[&ip].0;
         assert!(until <= Instant::now() + CACHE_FAILED);
     }
 }
@@ -666,6 +667,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::{TYPE_PTR, query};
+    use crate::lock::MutexExt;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
@@ -702,7 +704,7 @@ pub(crate) mod testing {
             loop {
                 let (_, from) = sock.recv_from(&mut buf).await.unwrap();
                 let id = u16::from_be_bytes([buf[0], buf[1]]);
-                let name = answer.lock().unwrap().clone();
+                let name = answer.lock_or_recover().clone();
                 match name {
                     Some(n) if n == "TIMEOUT" => {}
                     Some(n) => {

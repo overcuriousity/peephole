@@ -6,6 +6,7 @@
 //! holder and abuse contact, so one answer is never reused for a
 //! neighbour.
 use super::provider::{Finding, Provider};
+use crate::lock::{MutexExt, RwLockExt};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
@@ -140,8 +141,8 @@ impl Bootstrap {
             // It must parse before it replaces anything.
             let _: Value = serde_json::from_str(&body).context("rdap bootstrap json")?;
             let tmp = data_dir.join(format!("{name}.tmp"));
-            std::fs::write(&tmp, &body)?;
-            std::fs::rename(&tmp, data_dir.join(name))?;
+            tokio::fs::write(&tmp, &body).await?;
+            tokio::fs::rename(&tmp, data_dir.join(name)).await?;
         }
         Ok(())
     }
@@ -242,7 +243,7 @@ impl Rdap {
     /// longer than a lookup should wait (the IP is tried next pass).
     async fn pace(&self, base: &str) -> bool {
         let wait = {
-            let mut all = self.rirs.lock().unwrap();
+            let mut all = self.rirs.lock_or_recover();
             let st = all.entry(base.to_string()).or_default();
             let now = Instant::now();
             // Each caller takes the next slot: a gap after the one before
@@ -267,8 +268,7 @@ impl Rdap {
 
     fn fail(&self, base: &str) {
         self.rirs
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(base.to_string())
             .or_default()
             .fail();
@@ -276,8 +276,7 @@ impl Rdap {
 
     fn ok(&self, base: &str) {
         self.rirs
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(base.to_string())
             .or_default()
             .ok();
@@ -307,7 +306,7 @@ impl Rdap {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map(|s| Duration::from_secs(s.clamp(1, 3600)));
-            let mut all = self.rirs.lock().unwrap();
+            let mut all = self.rirs.lock_or_recover();
             let st = all.entry(base.to_string()).or_default();
             match retry {
                 Some(d) => st.pause(d),
@@ -339,7 +338,7 @@ impl Rdap {
     /// The object for `ip`: the bootstrap server's answer, following up to
     /// [`MAX_REFERRALS`] `related` links to another RDAP server.
     async fn query(&self, ip: &IpAddr) -> Result<Option<Value>> {
-        let Some(svc) = self.bootstrap.read().unwrap().service_for(ip).cloned() else {
+        let Some(svc) = self.bootstrap.read_or_recover().service_for(ip).cloned() else {
             return Ok(None);
         };
         let mut base = svc.base.trim_end_matches('/').to_string();

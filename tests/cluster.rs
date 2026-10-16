@@ -2701,6 +2701,7 @@ secure_cookies = false
     let jar = Arc::new(reqwest::cookie::Jar::default());
     let client = reqwest::Client::builder()
         .cookie_provider(jar.clone())
+        .default_headers(same_origin())
         .build()
         .unwrap();
     let mut soft = SoftPasskey::new(true);
@@ -8935,4 +8936,15 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
         ),
         before
     );
+}
+
+/// What a browser sends with each request to the admin's own pages: a
+/// signed-in write without it is refused as cross-site (MIK-372 S2).
+fn same_origin() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "sec-fetch-site",
+        reqwest::header::HeaderValue::from_static("same-origin"),
+    );
+    h
 }

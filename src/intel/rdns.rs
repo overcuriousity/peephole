@@ -5,6 +5,7 @@
 //! names from a quorum (`buy_pass`); a standalone node looks up on its own
 //! (`pass`). The names are kept in `ip_names`, source `rdns`; a source's
 //! own DNS often names its hoster or a research scanner.
+use crate::lock::MutexExt;
 use crate::scan::crawler::{Forward, MAX_NAMES, confirmed_names, system_forward, system_resolver};
 use crate::store::Store;
 use futures::StreamExt;
@@ -312,8 +313,7 @@ pub async fn buy_pass(
     let mut due = node.store.rdns_due_own(WANTED_AT_MOST, &me).await?;
     node.credits
         .wants
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .set(price::RDNS, due.len() as u32);
     due.truncate(BATCH as usize);
     let n = due.len();

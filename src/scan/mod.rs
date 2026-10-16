@@ -20,6 +20,7 @@ use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::msg::{Grant, Msg};
 use crate::config::{Config, TorUnknown};
+use crate::lock::MutexExt;
 use crate::store::recorder::Recorder;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -424,7 +425,7 @@ impl Source {
                 return Ok(Some(Refusal::Mine(why)));
             }
         }
-        let local = self.tor.lock().unwrap().local(ip);
+        let local = self.tor.lock_or_recover().local(ip);
         match guard::tor_status(&self.rec.store().pool, local, ip_text, &self.origins).await? {
             guard::TorStatus::Exit => return Ok(Some(Refusal::Never("Tor exit".into()))),
             guard::TorStatus::NotExit => {}
@@ -441,7 +442,7 @@ impl Source {
                         ))));
                     }
                     TorUnknown::Scan => {
-                        let mut w = self.tor_warned.lock().unwrap();
+                        let mut w = self.tor_warned.lock_or_recover();
                         if w.is_none_or(|t| t.elapsed() > TOR_WARN_EVERY) {
                             *w = Some(Instant::now());
                             warn!(
@@ -517,13 +518,13 @@ impl Source {
         picker.poll(&node.store.pool, &node.id()).await?;
         let (mut busy, mut found, mut failed) = (vec![], None, None);
         loop {
-            let bought = node.credits.audit_queue.lock().unwrap().take(exclude);
+            let bought = node.credits.audit_queue.lock_or_recover().take(exclude);
             let Some(t) = bought.or_else(|| picker.take(exclude)) else {
                 break;
             };
             let end = |t: &crate::credits::audit::Task| {
                 if let Some((p, q, _)) = t.offer {
-                    node.credits.audit_queue.lock().unwrap().end((p, q));
+                    node.credits.audit_queue.lock_or_recover().end((p, q));
                 }
             };
             let Ok(ip) = t.ip.parse::<IpAddr>() else {
@@ -531,7 +532,7 @@ impl Source {
                 continue;
             };
             let key = crate::net::canonical(ip);
-            if self.active.lock().unwrap().contains_key(&key) {
+            if self.active.lock_or_recover().contains_key(&key) {
                 if t.offer.is_some() {
                     busy.push(t);
                 }
@@ -550,7 +551,7 @@ impl Source {
                     break;
                 }
             }
-            self.active.lock().unwrap().insert(key, t.level);
+            self.active.lock_or_recover().insert(key, t.level);
             found = Some(Job::Audit {
                 of: t.scan_uid,
                 job_uid: t.job_uid,
@@ -562,7 +563,7 @@ impl Source {
             break;
         }
         {
-            let mut q = node.credits.audit_queue.lock().unwrap();
+            let mut q = node.credits.audit_queue.lock_or_recover();
             for t in busy.into_iter().rev() {
                 q.put_back(t);
             }
@@ -582,7 +583,7 @@ impl Source {
         let mut seen: HashSet<i64> = HashSet::new();
         loop {
             let skip: Vec<i64> = {
-                let mut d = self.deferred.lock().unwrap();
+                let mut d = self.deferred.lock_or_recover();
                 let now = Instant::now();
                 d.retain(|_, until| *until > now);
                 d.keys().copied().chain(seen.iter().copied()).collect()
@@ -624,8 +625,7 @@ impl Source {
                 Some(Refusal::Defer(why)) => {
                     debug!(target = %ip, %why, "scan deferred");
                     self.deferred
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .insert(id, Instant::now() + DEFER_RETRY);
                     continue;
                 }
@@ -717,8 +717,7 @@ impl Source {
             }
             if self
                 .unreachable
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(&arbiter)
                 .is_some_and(|t| t.elapsed() < ARBITER_BACKOFF)
             {
@@ -740,8 +739,7 @@ impl Source {
                 Err(e) => {
                     debug!(arbiter = %arbiter.short(), ?e, "claim failed");
                     self.unreachable
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .insert(arbiter, Instant::now());
                     None
                 }
@@ -768,8 +766,7 @@ impl Source {
             match self.check_grant(arbiter, &g).await? {
                 Ok(job) => {
                     self.active
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .insert(crate::net::canonical(job.ip()), job.level());
                     return Ok(Some(job));
                 }
@@ -860,8 +857,7 @@ impl Source {
         // whose state has not replicated yet): covered, or not now.
         let running = self
             .active
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(&crate::net::canonical(ip))
             .copied();
         if let Some(l) = running {
@@ -985,8 +981,7 @@ impl Source {
     async fn finish(&self, job: &Job, outcome: Outcome) {
         if let Job::Granted { ip, .. } | Job::Audit { ip, .. } = job {
             self.active
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .remove(&crate::net::canonical(*ip));
         }
         match (job, self.node()) {
@@ -1047,7 +1042,10 @@ impl Source {
                 // Charged, or (failed, abandoned) left for `credits::audit`
                 // to release.
                 if let (Some((payer, seq, _)), Some(node)) = (offer, node) {
-                    node.credits.audit_queue.lock().unwrap().end((*payer, *seq));
+                    node.credits
+                        .audit_queue
+                        .lock_or_recover()
+                        .end((*payer, *seq));
                 }
             }
             (
@@ -1183,8 +1181,10 @@ async fn run_nmap(nmap: PathBuf, argv: &[String]) -> Outcome {
     };
     let stderr = errors.await.unwrap_or_default();
     if status.success() {
-        return match nmap_xml::parse_nmap_xml(&out) {
-            Ok(res) => Outcome::Done(res),
+        // Up to MAX_STDOUT of XML: parsed off the async workers.
+        return match tokio::task::spawn_blocking(move || nmap_xml::parse_nmap_xml(&out)).await {
+            Ok(Ok(res)) => Outcome::Done(res),
+            Ok(Err(e)) => Outcome::Failed(e.to_string()),
             Err(e) => Outcome::Failed(e.to_string()),
         };
     }
@@ -1408,7 +1408,7 @@ pub async fn run_workers(
                 }
             })
         });
-        *node.credits.audit_check.lock().unwrap() = Some(check);
+        *node.credits.audit_check.lock_or_recover() = Some(check);
     }
     // Heavy scans (levels 4 and 5) running now (see `L4Slot`).
     let running_l4 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1422,7 +1422,7 @@ pub async fn run_workers(
         // Re-read every pass so admin changes apply without a restart.
         let p = pace.get();
         if let Some(node) = source.node() {
-            *node.status.local.lock().unwrap() = crate::cluster::status::LocalStatus {
+            *node.status.local.lock_or_recover() = crate::cluster::status::LocalStatus {
                 pace: Some(crate::cluster::status::PaceInfo {
                     max_workers: p.max_workers as u32,
                     // Read by nodes of earlier versions only.
@@ -2558,11 +2558,11 @@ license_key = "k"
         // one the grant comes back later.
         let addr: IpAddr = ip.ip.parse().unwrap();
         for (active, want) in [(2, "superseded"), (1, "later")] {
-            source.active.lock().unwrap().insert(addr, active);
+            source.active.lock_or_recover().insert(addr, active);
             let r = source.check_grant(me, &grant(&uid, &ip.ip, 2)).await;
             assert_eq!(turned(r.unwrap()), Some(want));
         }
-        source.active.lock().unwrap().clear();
+        source.active.lock_or_recover().clear();
         assert!(
             source
                 .check_grant(me, &grant(&uid, &ip.ip, 2))

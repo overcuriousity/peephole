@@ -80,6 +80,7 @@ pub fn parse_amount(s: &str) -> Option<Mc> {
 
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
+use crate::lock::MutexExt;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
@@ -207,7 +208,7 @@ const BOOK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// This node's book, at most [`BOOK_TTL`] old.
 pub async fn book(node: &Node) -> anyhow::Result<Arc<Book>> {
-    if let Some((at, b)) = node.credits.credits_book.lock().unwrap().as_ref()
+    if let Some((at, b)) = node.credits.credits_book.lock_or_recover().as_ref()
         && at.elapsed() < BOOK_TTL
     {
         return Ok(b.clone());
@@ -219,7 +220,7 @@ pub async fn book(node: &Node) -> anyhow::Result<Arc<Book>> {
 /// or served).
 pub async fn book_fresh(node: &Node) -> anyhow::Result<Arc<Book>> {
     let b = Arc::new(compute(node).await?);
-    *node.credits.credits_book.lock().unwrap() = Some((std::time::Instant::now(), b.clone()));
+    *node.credits.credits_book.lock_or_recover() = Some((std::time::Instant::now(), b.clone()));
     Ok(b)
 }
 
@@ -275,7 +276,7 @@ pub async fn run(node: Arc<Node>, mut shutdown: tokio::sync::watch::Receiver<boo
         if ticks.is_multiple_of(60) {
             // A scan older than the audit window is never due again.
             {
-                let mut tried = node.credits.audits_tried.lock().unwrap();
+                let mut tried = node.credits.audits_tried.lock_or_recover();
                 if tried.len() > 10_000 {
                     tried.clear();
                 }

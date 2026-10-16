@@ -119,6 +119,10 @@ refresh_after_days = 30
 # # again to check them, unpaid (0 = check nothing). Bought audits of
 # # designated scans do not depend on it.
 # audit_share = 0.05
+# # Most credits one paired device may commit through the act scope of
+# # /api/v1 (probes, scans, lookups) in any 24 hours; 0 = no cap. Over it
+# # the API answers 429 spend_cap and spends nothing.
+# device_daily_cap = 100
 
 # [abuseipdb]
 # # Abuse reports per IP (https://www.abuseipdb.com/account/api).

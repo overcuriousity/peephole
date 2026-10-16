@@ -158,7 +158,9 @@ pub async fn draw(node: &Arc<Node>, mc: Mc) -> bool {
             continue;
         }
         // The transfer is an entry of the sibling's log: fetch it.
-        let _ = node.sync_around_request(from).await;
+        if let Err(e) = node.sync_around_request(from).await {
+            tracing::debug!(?e, "syncing with the sibling after a transfer failed");
+        }
         missing = missing.saturating_sub(sent);
         if missing == 0 {
             break;

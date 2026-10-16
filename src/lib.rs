@@ -12,6 +12,7 @@ pub mod events;
 pub mod export;
 pub mod fingerprint;
 pub mod intel;
+pub mod lock;
 pub mod model;
 pub mod net;
 pub mod scan;
@@ -79,6 +80,32 @@ pub async fn check_config(config_path: &std::path::Path) -> Result<(config::Conf
 /// What the config sets that loads but deserves a warning: unknown keys,
 /// keys that do nothing any more, wide trusted proxies. `check-config`
 /// prints them; the daemon logs them as warnings.
+/// Every file the process creates is its owner's alone (MIK-372 S5): the
+/// database, the node key, exports and uploads hold secrets or private
+/// data. Set first thing, before any file is created.
+pub fn restrict_umask() {
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+}
+
+/// The permission bits of `path` when its group or others have any access;
+/// `None` when they have none (or it cannot be read).
+pub fn exposed_mode(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then_some(mode)
+}
+
+/// Warn when `path` (a `what`) is open to its group or others. Existing
+/// files are not changed: the operator may mean it.
+pub fn warn_if_exposed(path: &std::path::Path, what: &str) {
+    if let Some(mode) = exposed_mode(path) {
+        warn!(
+            "{what} {} has mode {mode:03o}: group or others can access it; chmod 600 it",
+            path.display()
+        );
+    }
+}
+
 fn config_warnings(cfg: &config::Config, config_path: &std::path::Path) -> Vec<String> {
     let mut warnings = config::unknown_key_notes(config_path);
     warnings.extend(cfg.obsolete_notes());
@@ -641,7 +668,9 @@ impl RoleRunner {
                 }
                 _ = shutdown.changed() => break,
             }
-            let _ = self.reconcile(&mut running, false).await;
+            if let Err(e) = self.reconcile(&mut running, false).await {
+                warn!(?e, "applying the role settings failed");
+            }
         }
         let mut tasks = vec![];
         for slot in [running.trap, running.scanner, running.web] {
@@ -758,7 +787,9 @@ impl RoleRunner {
             anyhow::bail!("admin_listen is required");
         };
         // First-run admin setup token (spec §8.4).
-        let _ = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await;
+        if let Err(e) = admin::auth::ensure_setup_token(&self.store, &self.cfg.data_dir).await {
+            warn!(?e, "writing the first-run setup token failed");
+        }
         let (stop, mut rx) = tokio::sync::watch::channel(false);
         let app = admin::full_router(Arc::new(
             admin::AdminState::new(
@@ -910,6 +941,28 @@ async fn forward_job_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Group or other access is reported with the mode; owner-only is not
+    /// (MIK-372 S5).
+    #[test]
+    fn a_file_open_to_group_or_others_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peephole.db");
+        std::fs::write(&path, b"x").unwrap();
+        for (mode, want) in [
+            (0o600, None),
+            (0o400, None),
+            (0o640, Some(0o640)),
+            (0o604, Some(0o604)),
+            (0o644, Some(0o644)),
+            (0o610, Some(0o610)),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(exposed_mode(&path), want, "{mode:o}");
+        }
+        assert_eq!(exposed_mode(&dir.path().join("missing")), None);
+    }
 
     fn cfg(extra: &str) -> config::Config {
         toml::from_str(&format!(

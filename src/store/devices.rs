@@ -283,6 +283,33 @@ impl Store {
         .await?)
     }
 
+    /// What `quote` would cost `device_id`, without spending it; `None`
+    /// when it is unknown, another device's or expired.
+    pub async fn quote_credits(&self, id: &str, device_id: &str) -> Result<Option<u64>> {
+        let mc: Option<i64> = sqlx::query_scalar(
+            "SELECT credits_mc FROM scan_quotes
+             WHERE id = ? AND device_id = ? AND expires_at > datetime('now')",
+        )
+        .bind(id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(mc.map(|m| m.max(0) as u64))
+    }
+
+    /// The credits `device_id` committed in the last 24 hours, by its
+    /// audit entries (what each act call offered to pay).
+    pub async fn device_spent_last_day(&self, device_id: &str) -> Result<u64> {
+        let mc: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(credits_mc), 0) FROM device_actions
+             WHERE at > datetime('now', '-1 day') AND device_id = ?",
+        )
+        .bind(device_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(mc.max(0) as u64)
+    }
+
     /// Log what `device` queued.
     pub async fn record_device_action(
         &self,

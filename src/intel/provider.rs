@@ -3,6 +3,7 @@
 //! the node. What a provider finds out about an IP is shared with the
 //! cluster as an `ip_intel` record.
 use super::{SharedGeo, SharedTor};
+use crate::lock::RwLockExt;
 use futures::future::BoxFuture;
 
 /// What a provider says about one IP.
@@ -70,12 +71,12 @@ impl Provider for MaxMind {
     }
 
     fn ready(&self) -> bool {
-        self.0.read().unwrap().is_some()
+        self.0.read_or_recover().is_some()
     }
 
     fn lookup<'a>(&'a self, ips: &'a [String]) -> BoxFuture<'a, Vec<Finding>> {
         Box::pin(async move {
-            let guard = self.0.read().unwrap();
+            let guard = self.0.read_or_recover();
             let Some(g) = guard.as_ref() else {
                 return vec![];
             };
@@ -110,12 +111,12 @@ impl Provider for TorExits {
     }
 
     fn ready(&self) -> bool {
-        !self.0.read().unwrap().is_empty()
+        !self.0.read_or_recover().is_empty()
     }
 
     fn lookup<'a>(&'a self, ips: &'a [String]) -> BoxFuture<'a, Vec<Finding>> {
         Box::pin(async move {
-            let list = self.0.read().unwrap();
+            let list = self.0.read_or_recover();
             if list.is_empty() {
                 return vec![];
             }
@@ -158,7 +159,7 @@ mod tests {
             )
             .unwrap();
         }
-        *shared.write().unwrap() = Some(crate::intel::geo::GeoIp::load(dir.path()).unwrap());
+        *shared.write_or_recover() = Some(crate::intel::geo::GeoIp::load(dir.path()).unwrap());
         assert!(p.ready());
         let found = p
             .lookup(&["2.125.160.216".into(), "203.0.113.1".into(), "junk".into()])
@@ -180,7 +181,7 @@ mod tests {
         assert!(p.lookup(&["198.51.100.1".into()]).await.is_empty());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("tor-exit.txt"), "198.51.100.1\n").unwrap();
-        *shared.write().unwrap() = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
+        *shared.write_or_recover() = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
         assert!(p.ready());
         let found = p
             .lookup(&["198.51.100.1".into(), "198.51.100.2".into(), "junk".into()])

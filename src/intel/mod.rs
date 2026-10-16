@@ -123,6 +123,7 @@ pub fn tags(provider: &str, data: &serde_json::Map<String, serde_json::Value>) -
 }
 
 use crate::config::Config;
+use crate::lock::{MutexExt, RwLockExt};
 use crate::store::Store;
 use crate::store::recorder::Recorder;
 use std::sync::{Arc, RwLock};
@@ -168,7 +169,7 @@ pub fn providers(
         out.push(Arc::new(ApiProvider::new(
             abuseipdb::AbuseIpDb {
                 base: abuseipdb::BASE.into(),
-                key: a.api_key.trim().into(),
+                key: a.api_key.expose().trim().into(),
                 max_age_days: a.max_age_days,
             },
             store.clone(),
@@ -180,7 +181,7 @@ pub fn providers(
         out.push(Arc::new(ApiProvider::new(
             shodan::ShodanHost {
                 base: shodan::HOST_BASE.into(),
-                key: s.api_key.trim().into(),
+                key: s.api_key.expose().trim().into(),
             },
             store.clone(),
             daily(s.daily_limit),
@@ -465,7 +466,7 @@ pub async fn buy_pass(
     {
         let name = info.name;
         if own.iter().any(|p| p.name() == name && p.ready()) {
-            node.credits.wants.lock().unwrap().set(name, 0);
+            node.credits.wants.lock_or_recover().set(name, 0);
             continue;
         }
         let members = node.members();
@@ -483,7 +484,7 @@ pub async fn buy_pass(
         else {
             // No member of the market sells it: it takes no share of the
             // budget from goods that can be bought.
-            node.credits.wants.lock().unwrap().set(name, 0);
+            node.credits.wants.lock_or_recover().set(name, 0);
             continue;
         };
         let skip = asked.skip(name);
@@ -503,8 +504,7 @@ pub async fn buy_pass(
             .await?;
         node.credits
             .wants
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .set(name, due.len() as u32);
         if due.is_empty() {
             continue;
@@ -769,7 +769,12 @@ const RDAP_BACKOFF: Backoff = Backoff::new(Duration::from_secs(60), Duration::fr
 async fn refresh_rdap(cfg: &Config, rdap: &SharedRdap, backoff: &mut Backoff) -> Duration {
     match rdap::Bootstrap::refresh(&cfg.data_dir).await {
         Ok(()) => {
-            *rdap.write().unwrap() = rdap::Bootstrap::load(&cfg.data_dir);
+            // Reads and parses both files: off the async workers.
+            let dir = cfg.data_dir.clone();
+            match tokio::task::spawn_blocking(move || rdap::Bootstrap::load(&dir)).await {
+                Ok(b) => *rdap.write_or_recover() = b,
+                Err(e) => warn!(?e, "loading the rdap bootstrap failed"),
+            }
             info!("rdap bootstrap refreshed");
             backoff.reset();
             rdap::BOOTSTRAP_MAX_AGE
@@ -804,7 +809,14 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
         if file.exists() && !is_stale_at(last.as_deref()) {
             continue;
         }
-        match geo::download_edition(&cfg.data_dir, edition, &mm.account_id, &mm.license_key).await {
+        match geo::download_edition(
+            &cfg.data_dir,
+            edition,
+            &mm.account_id,
+            mm.license_key.expose(),
+        )
+        .await
+        {
             Ok(()) => {
                 fetched += 1;
                 store
@@ -817,11 +829,11 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
             }
         }
     }
-    let loaded = geo.read().unwrap().is_some();
+    let loaded = geo.read_or_recover().is_some();
     if fetched > 0 || !loaded {
         match geo::GeoIp::load_blocking(&cfg.data_dir).await {
             Ok(g) => {
-                *geo.write().unwrap() = Some(g);
+                *geo.write_or_recover() = Some(g);
                 if fetched > 0 {
                     info!(databases = fetched, "maxmind databases refreshed");
                 }
@@ -837,9 +849,12 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
     }
     if fetched > 0 {
         // Both databases are current: what the admin pages show.
-        let _ = store
+        if let Err(e) = store
             .intel_set("maxmind_last_fetch", &chrono::Utc::now().to_rfc3339())
-            .await;
+            .await
+        {
+            warn!(?e, "recording the MaxMind fetch time failed");
+        }
     }
     Ok(())
 }
@@ -850,20 +865,20 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
 /// that. Without a list their Tor status is unknown (`scan.tor_unknown`);
 /// IPs already recorded as exits stay exits.
 fn drop_stale_tor(tor: &SharedTor, cfg: &Config) {
-    if tor.read().unwrap().is_empty() || !tor::stale(&cfg.data_dir) {
+    if tor.read_or_recover().is_empty() || !tor::stale(&cfg.data_dir) {
         return;
     }
     warn!(
         "tor exit list older than {} h: unloaded until a fresh one is fetched",
         tor::MAX_AGE.as_secs() / 3600
     );
-    *tor.write().unwrap() = tor::TorExitList::default();
+    *tor.write_or_recover() = tor::TorExitList::default();
 }
 
 /// Warn, at most hourly, while no Tor exit list is loaded: Tor exits cannot
 /// be told apart from scanners then (see `scan.tor_unknown`).
 fn warn_without_tor_list(tor: &SharedTor, cfg: &Config, last: &mut Option<std::time::Instant>) {
-    if !tor.read().unwrap().is_empty() {
+    if !tor.read_or_recover().is_empty() {
         return;
     }
     if last.is_some_and(|t| t.elapsed() < Duration::from_secs(3600)) {
@@ -895,7 +910,7 @@ pub async fn run_scheduler(
     if let Recorder::Cluster(node) = &rec {
         return run_cluster(node.clone(), cfg, geo, tor, rdap, shutdown).await;
     }
-    if cfg.maxmind.is_none() && geo.read().unwrap().is_none() {
+    if cfg.maxmind.is_none() && geo.read_or_recover().is_none() {
         warn!("no [maxmind] credentials and no GeoLite2 databases: GeoIP enrichment is off");
     }
     let now = tokio::time::Instant::now();
@@ -912,12 +927,15 @@ pub async fn run_scheduler(
                 Ok(n) => {
                     info!(n, "tor exit list refreshed");
                     match tor::TorExitList::load(&cfg.data_dir) {
-                        Ok(l) => *tor.write().unwrap() = l,
+                        Ok(l) => *tor.write_or_recover() = l,
                         Err(e) => warn!(?e, "tor exit list reload failed"),
                     }
-                    let _ = store
+                    if let Err(e) = store
                         .intel_set("tor_last_fetch", &chrono::Utc::now().to_rfc3339())
-                        .await;
+                        .await
+                    {
+                        warn!(?e, "recording the tor exit list fetch time failed");
+                    }
                     tor_backoff.reset();
                     // 24h ± up to 1h deterministic-ish jitter from nanos.
                     let jitter = Duration::from_secs(
@@ -1023,7 +1041,7 @@ pub const MAXMIND_CLUSTER_SEEN: &str = "maxmind_cluster_seen";
 fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
     if kinds.iter().any(|k| k == share::TOR) {
         match tor::TorExitList::load(&cfg.data_dir) {
-            Ok(l) => *tor.write().unwrap() = l,
+            Ok(l) => *tor.write_or_recover() = l,
             Err(e) => warn!(?e, "tor exit list reload failed"),
         }
     }
@@ -1306,7 +1324,7 @@ mod tests {
         let shared: SharedTor =
             Arc::new(RwLock::new(tor::TorExitList::load(&cfg.data_dir).unwrap()));
         drop_stale_tor(&shared, &cfg);
-        assert!(!shared.read().unwrap().is_empty(), "fresh: kept");
+        assert!(!shared.read_or_recover().is_empty(), "fresh: kept");
         let old = std::time::SystemTime::now() - tor::MAX_AGE - Duration::from_secs(60);
         std::fs::File::options()
             .write(true)
@@ -1315,7 +1333,7 @@ mod tests {
             .set_modified(old)
             .unwrap();
         drop_stale_tor(&shared, &cfg);
-        assert!(shared.read().unwrap().is_empty());
+        assert!(shared.read_or_recover().is_empty());
     }
 
     #[test]

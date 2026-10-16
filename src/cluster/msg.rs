@@ -8,6 +8,7 @@
 use super::Node;
 use super::identity::NodeId;
 use super::rpc::proto::ROUTED_PROTO;
+use crate::lock::{MutexExt, RwLockExt};
 use anyhow::{Context, Result, bail};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -290,7 +291,7 @@ impl Messaging {
             return false;
         }
         let keep = MAX_AGE * 2;
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = self.seen.lock_or_recover();
         if seen.swept.is_none_or(|t| t.elapsed() >= MAX_AGE) {
             seen.by.retain(|_, ids| {
                 ids.retain(|_, t| t.elapsed() < keep);
@@ -361,7 +362,7 @@ impl Node {
     /// Register a handler; each request goes to the handlers in order
     /// until one answers.
     pub fn on_message(&self, h: Handler) {
-        self.msg.handlers.lock().unwrap().push(h);
+        self.msg.handlers.lock_or_recover().push(h);
     }
 
     /// Ask `to` and wait for its answer.
@@ -382,8 +383,7 @@ impl Node {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.msg
             .replies
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .insert(id.clone(), (to, tx));
         self.msg.asking.notify_waiters();
         let mut rx = rx;
@@ -409,7 +409,7 @@ impl Node {
             },
             Err(e) => Err(e),
         };
-        self.msg.replies.lock().unwrap().remove(&id);
+        self.msg.replies.lock_or_recover().remove(&id);
         out
     }
 
@@ -456,7 +456,7 @@ impl Node {
                     }
                 }
                 Some(Hop::Outbox(peer)) => {
-                    let mut all = node.msg.outbox.lock().unwrap();
+                    let mut all = node.msg.outbox.lock_or_recover();
                     // Peers that stopped polling must not pile up messages.
                     for q in all.values_mut() {
                         q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
@@ -487,8 +487,7 @@ impl Node {
     pub(crate) fn dial_failing(&self, id: &NodeId) -> bool {
         self.peers
             .peer_status
-            .read()
-            .unwrap()
+            .read_or_recover()
             .get(id)
             .is_some_and(|s| s.last_error.is_some())
     }
@@ -549,7 +548,7 @@ impl Node {
         // itself everybody's relay by claiming to be.
         let members = self.members();
         let mut claimed: HashSet<(NodeId, NodeId)> = HashSet::new();
-        for k in self.status.heartbeats.lock().unwrap().values() {
+        for k in self.status.heartbeats.lock_or_recover().values() {
             if k.hb.neighbours.len() > MAX_NEIGHBOURS || !members.contains_key(&k.hb.node) {
                 continue;
             }
@@ -622,7 +621,7 @@ impl Node {
             return; // duplicate, or an id not taken
         }
         if let Some(rid) = &b.in_reply_to {
-            let mut replies = self.msg.replies.lock().unwrap();
+            let mut replies = self.msg.replies.lock_or_recover();
             // Only accept the reply from the node we actually asked; a relay
             // that saw the id must not be able to answer in its place.
             if let Some((expected, _)) = replies.get(rid) {
@@ -639,7 +638,7 @@ impl Node {
         let Some(slot) = self.msg.handler_slot() else {
             return debug!(from = %b.from.short(), "too many requests in hand; message dropped");
         };
-        let handlers = self.msg.handlers.lock().unwrap().clone();
+        let handlers = self.msg.handlers.lock_or_recover().clone();
         let node = self.clone();
         // Handlers may wait (claim window); never block the caller.
         tokio::spawn(async move {
@@ -676,8 +675,7 @@ impl Node {
     pub fn has_queued(&self, peer: &NodeId) -> bool {
         self.msg
             .outbox
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get_mut(peer)
             .is_some_and(|q| {
                 q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
@@ -692,7 +690,7 @@ impl Node {
         loop {
             let notified = self.msg.outbox_changed.notified();
             {
-                let mut all = self.msg.outbox.lock().unwrap();
+                let mut all = self.msg.outbox.lock_or_recover();
                 if let Some(q) = all.get_mut(&peer) {
                     q.retain(|(_, t)| t.elapsed() < OUTBOX_TTL);
                     if !q.is_empty() {
@@ -734,7 +732,7 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
         // anywhere while it waits for answers to its own requests.
         if node.cfg.advertise.is_none()
             && !node.leased.relays(super::hlc::wall_ms()).contains(&peer)
-            && node.msg.replies.lock().unwrap().is_empty()
+            && node.msg.replies.lock_or_recover().is_empty()
         {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {}

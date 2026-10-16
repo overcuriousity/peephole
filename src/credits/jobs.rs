@@ -9,6 +9,7 @@ use super::{Mc, price};
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
+use crate::lock::MutexExt;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -355,8 +356,7 @@ pub async fn announce_budget(node: &Arc<Node>) -> Result<()> {
         .sum();
     node.credits
         .wants
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .set(price::SCAN, scan_wants(grantable.max(0) as u64, can_do));
     let book = super::book(node).await?;
     let self_mc = self_committed(&node.store.pool, &node.id()).await?;

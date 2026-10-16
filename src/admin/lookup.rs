@@ -947,7 +947,9 @@ secure_cookies = false
 
         let (status, html) = send(
             &app,
-            axum::http::Request::get("/admin/lookup?ip=203.0.113.9").header("cookie", &cookie),
+            axum::http::Request::get("/admin/lookup?ip=203.0.113.9")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin"),
             "",
         )
         .await;
@@ -957,6 +959,7 @@ secure_cookies = false
         let post = || {
             axum::http::Request::post("/admin/lookup")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded")
         };
         let (status, html) = send(&app, post(), "ip=203.0.113.9").await;

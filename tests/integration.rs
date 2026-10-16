@@ -603,6 +603,7 @@ async fn webauthn_ceremony_with_soft_token() {
     let base = format!("http://{addr}");
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        .default_headers(same_origin())
         .build()
         .unwrap();
 
@@ -708,6 +709,7 @@ async fn enrolled_admin_client_with_state(
     let base = format!("http://{addr}");
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        .default_headers(same_origin())
         .build()
         .unwrap();
     let mut soft = SoftPasskey::new(true);
@@ -1378,6 +1380,7 @@ async fn an_enrollment_ends_with_the_session_that_started_it() {
     signed_in(store.create_session().await.unwrap());
     let client = reqwest::Client::builder()
         .cookie_provider(jar.clone())
+        .default_headers(same_origin())
         .build()
         .unwrap();
     let finish = start_enrollment(&client, &base, serde_json::json!({"label": "x"})).await;
@@ -1422,6 +1425,7 @@ async fn a_setup_token_is_checked_again_when_the_enrollment_finishes() {
     let client = || {
         reqwest::Client::builder()
             .cookie_store(true)
+            .default_headers(same_origin())
             .build()
             .unwrap()
     };
@@ -2243,6 +2247,7 @@ async fn bulk_delete_checked_and_filtered() {
         .unwrap();
     let noredir = reqwest::Client::builder()
         .cookie_store(true)
+        .default_headers(same_origin())
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
@@ -3464,4 +3469,15 @@ async fn scans_history_pages_link_back_to_scans() {
         html.contains("href=\"/admin/scans?status=failed&#38;level=1&#38;page=2#history\""),
         "filters carried: {next}"
     );
+}
+
+/// What a browser sends with each request to the admin's own pages: a
+/// signed-in write without it is refused as cross-site (MIK-372 S2).
+fn same_origin() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "sec-fetch-site",
+        reqwest::header::HeaderValue::from_static("same-origin"),
+    );
+    h
 }
