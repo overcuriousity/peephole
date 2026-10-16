@@ -25,6 +25,7 @@
   </tr>{% endfor %}
   </tbody></table></div>
 </section>
+{% let campaign_key = c.row.key.clone() %}{% include "_campaign_graph.html" %}
 <section class="card">
   <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft; JA4 and JA4H only ever support a path edge</span></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>

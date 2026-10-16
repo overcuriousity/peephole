@@ -562,6 +562,8 @@ pub const GROUP_AT: i64 = 25;
 pub const GROUP_MAX: i64 = 500;
 /// Nodes in one graph.
 pub const GRAPH_MAX: usize = 400;
+/// Edges in one campaign graph; dense `paths` evidence can pass this.
+pub const GRAPH_EDGE_MAX: usize = 2000;
 /// Values of one kind read per IP.
 pub const PER_IP: i64 = 50;
 
@@ -570,10 +572,12 @@ pub const PER_IP: i64 = 50;
 pub enum Focus {
     Item(LinkKind, String),
     Ip(String),
+    /// A campaign by key (its anchor's IP text): its members and evidence.
+    Campaign(String),
 }
 
 impl Focus {
-    /// `<kind>:<value>` or `ip:<addr>`.
+    /// `<kind>:<value>`, `ip:<addr>` or `campaign:<key>` (an address).
     pub fn parse(s: &str) -> Option<Focus> {
         let (k, v) = s.split_once(':')?;
         if v.is_empty() {
@@ -582,6 +586,10 @@ impl Focus {
         if k == "ip" {
             return Some(Focus::Ip(super::browse::canonical_ip(v)));
         }
+        if k == "campaign" {
+            let ip: std::net::IpAddr = v.trim().parse().ok()?;
+            return Some(Focus::Campaign(crate::net::canonical(ip).to_string()));
+        }
         Some(Focus::Item(LinkKind::parse(k)?, v.to_string()))
     }
 
@@ -589,6 +597,7 @@ impl Focus {
         match self {
             Focus::Item(k, v) => format!("{}:{v}", k.key()),
             Focus::Ip(a) => format!("ip:{a}"),
+            Focus::Campaign(k) => format!("campaign:{k}"),
         }
     }
 }
@@ -616,6 +625,11 @@ pub struct GraphNode {
 pub struct GraphEdge {
     pub a: String,
     pub b: String,
+    /// The linking item's kind; in a campaign, the evidence kind
+    /// (`ssh`, `tls`, `fp`, `canary` or `paths`).
+    pub kind: String,
+    /// What the edge stands for, shown on hover (campaign edges).
+    pub label: Option<String>,
     pub identity: bool,
 }
 
@@ -632,7 +646,7 @@ impl LinkGraph {
         self.nodes.iter().any(|n| n.id == id)
     }
 
-    fn link(&mut self, a: &str, b: &str, identity: bool) {
+    fn link(&mut self, a: &str, b: &str, kind: &str, identity: bool) {
         let dup = self
             .edges
             .iter()
@@ -641,6 +655,8 @@ impl LinkGraph {
             self.edges.push(GraphEdge {
                 a: a.into(),
                 b: b.into(),
+                kind: kind.into(),
+                label: None,
                 identity,
             });
         }
@@ -660,6 +676,9 @@ impl Store {
         types: &[LinkKind],
         all: bool,
     ) -> Result<LinkGraph> {
+        if let Focus::Campaign(key) = focus {
+            return self.campaign_graph(key).await;
+        }
         let depth = depth.clamp(1, 3);
         let mut types = types.to_vec();
         if let Focus::Item(k, _) = focus
@@ -705,7 +724,7 @@ impl Store {
                                     of: Some(k.key().into()),
                                 });
                             }
-                            g.link(&from, &gid, k.identity());
+                            g.link(&from, &gid, k.key(), k.identity());
                             continue;
                         }
                         let limit = if all { GROUP_MAX } else { GROUP_AT };
@@ -721,12 +740,14 @@ impl Store {
                         .into_iter()
                         .map(|(k, v)| Focus::Item(k, v))
                         .collect(),
+                    // Only ever the focus, answered by `campaign_graph`.
+                    Focus::Campaign(_) => vec![],
                 };
                 for n in found {
                     let id = n.id();
-                    let identity = match (f, &n) {
-                        (Focus::Item(k, _), _) | (_, Focus::Item(k, _)) => k.identity(),
-                        _ => true,
+                    let (kind, identity) = match (f, &n) {
+                        (Focus::Item(k, _), _) | (_, Focus::Item(k, _)) => (k.key(), k.identity()),
+                        _ => ("ip", true),
                     };
                     if !g.has(&id) {
                         if g.nodes.len() >= GRAPH_MAX {
@@ -739,10 +760,88 @@ impl Store {
                         g.nodes.push(node);
                         next.push(n);
                     }
-                    g.link(&from, &id, identity);
+                    g.link(&from, &id, kind, identity);
                 }
             }
             frontier = next;
+        }
+        Ok(g)
+    }
+
+    /// A campaign's member IPs (the anchor at hop 0, the rest at hop 1,
+    /// by IP text, up to [`GRAPH_MAX`]) and one edge per `campaign_edges`
+    /// row between them, up to [`GRAPH_EDGE_MAX`]: identity edges first,
+    /// then `paths` edges by similarity. `paths` edges are the soft ones.
+    async fn campaign_graph(&self, key: &str) -> Result<LinkGraph> {
+        let mut g = LinkGraph::default();
+        let ips: Vec<String> = sqlx::query_scalar(
+            "SELECT i.ip FROM campaign_members m JOIN ips i ON i.id = m.ip_id
+             WHERE m.campaign_key = ?1 ORDER BY i.ip <> ?1, i.ip",
+        )
+        .bind(key)
+        .fetch_all(&self.read)
+        .await?;
+        let mut ids = std::collections::HashSet::new();
+        for ip in ips {
+            if g.nodes.len() >= GRAPH_MAX {
+                g.truncated = true;
+                break;
+            }
+            let hop = u32::from(ip != key);
+            if let Some(node) = self.graph_node(&Focus::Ip(ip), hop).await? {
+                ids.insert(node.id.clone());
+                g.nodes.push(node);
+            }
+        }
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            Option<f64>,
+            Option<i64>,
+            i64,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support
+             FROM campaign_edges e
+             JOIN campaign_members m ON m.ip_id = e.a
+             JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
+             WHERE m.campaign_key = ?
+             ORDER BY e.kind = 'paths', e.score DESC, ia.ip, ib.ip, e.kind, e.value",
+        )
+        .bind(key)
+        .fetch_all(&self.read)
+        .await?;
+        for (a, b, kind, value, score, shared, fp) in rows {
+            let (a, b) = (format!("ip:{a}"), format!("ip:{b}"));
+            if !ids.contains(&a) || !ids.contains(&b) {
+                continue;
+            }
+            if g.edges.len() >= GRAPH_EDGE_MAX {
+                g.truncated = true;
+                break;
+            }
+            let label = if kind == "paths" {
+                let mut l = format!(
+                    "{} shared path shapes, similarity {:.2}",
+                    shared.unwrap_or(0),
+                    score.unwrap_or(0.0)
+                );
+                if fp != 0 {
+                    l.push_str(", same JA4 and JA4H");
+                }
+                l
+            } else {
+                value
+            };
+            g.edges.push(GraphEdge {
+                a,
+                b,
+                identity: kind != "paths",
+                kind,
+                label: Some(label),
+            });
         }
         Ok(g)
     }
@@ -770,6 +869,8 @@ impl Store {
                     of: None,
                 }))
             }
+            // Drawn by `campaign_graph`, never as one node.
+            Focus::Campaign(_) => Ok(None),
             Focus::Item(k, v) => {
                 let (s, binds) = sightings(
                     *k,
@@ -1382,5 +1483,175 @@ mod tests {
             .await
             .unwrap();
         assert!(g.nodes.is_empty());
+    }
+    #[tokio::test]
+    async fn a_campaign_is_its_members_and_evidence() {
+        let (s, ids) = seeded().await;
+        // a (anchor), b, d in campaign "203.0.113.1"; c is not a member.
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                                    hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.1', 1, ?, 3, 't', 't', 1, 1, 1, 't')",
+        )
+        .bind(ids[0])
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        for i in [0, 1, 3] {
+            sqlx::query("INSERT INTO campaign_members VALUES (?, '203.0.113.1')")
+                .bind(ids[i])
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        // a–b by an SSH key and by paths, d–a by paths (an edge's `a` is
+        // the IP sorting first).
+        for (x, y, kind, value, score, shared, fp) in [
+            (ids[0], ids[1], "ssh", "SHA256:k", None, None, 0),
+            (ids[0], ids[1], "paths", "", Some(0.6), Some(7), 1),
+            (ids[3], ids[0], "paths", "", Some(0.5), Some(4), 0),
+            // c is outside the campaign: never drawn.
+            (ids[2], ids[0], "fp", "F", None, None, 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO campaign_edges (a, b, kind, value, score, shared, fp_support,
+                                             first_ts, last_ts)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 't', 't')",
+            )
+            .bind(x)
+            .bind(y)
+            .bind(kind)
+            .bind(value)
+            .bind(score)
+            .bind(shared)
+            .bind(fp)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let f = Focus::parse("campaign:203.0.113.1").unwrap();
+        assert_eq!(f, Focus::Campaign("203.0.113.1".into()));
+        assert_eq!(f.id(), "campaign:203.0.113.1");
+        assert_eq!(Focus::parse("campaign:x' OR 1"), None);
+        let g = s
+            .link_graph(&f, 2, &LinkKind::IDENTITY, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            g.nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.hop))
+                .collect::<Vec<_>>(),
+            [
+                ("ip:203.0.113.1", 0),
+                ("ip:198.51.100.4", 1),
+                ("ip:203.0.113.2", 1)
+            ]
+        );
+        let e: Vec<_> = g
+            .edges
+            .iter()
+            .map(|e| {
+                (
+                    e.a.as_str(),
+                    e.b.as_str(),
+                    e.kind.as_str(),
+                    e.identity,
+                    e.label.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            e,
+            [
+                ("ip:203.0.113.1", "ip:203.0.113.2", "ssh", true, "SHA256:k"),
+                (
+                    "ip:203.0.113.1",
+                    "ip:203.0.113.2",
+                    "paths",
+                    false,
+                    "7 shared path shapes, similarity 0.60, same JA4 and JA4H"
+                ),
+                (
+                    "ip:198.51.100.4",
+                    "ip:203.0.113.1",
+                    "paths",
+                    false,
+                    "4 shared path shapes, similarity 0.50"
+                ),
+            ]
+        );
+        assert!(!g.truncated);
+        // An unknown campaign is an empty graph.
+        let none = Focus::Campaign("192.0.2.9".into());
+        assert!(
+            s.link_graph(&none, 2, &[], false)
+                .await
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn a_campaign_graph_stops_at_graph_max() {
+        let (s, ids) = seeded().await;
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                                    hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.1', 1, ?, 0, 't', 't', 0, 0, 1, 't')",
+        )
+        .bind(ids[0])
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut members = vec![ids[0]];
+        for n in 0..GRAPH_MAX {
+            let ip = format!("10.8.{}.{}", n / 250, n % 250 + 1);
+            members.push(s.upsert_ip(ip.parse().unwrap()).await.unwrap().id);
+        }
+        for id in members {
+            sqlx::query("INSERT INTO campaign_members VALUES (?, '203.0.113.1')")
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let f = Focus::Campaign("203.0.113.1".into());
+        let g = s.link_graph(&f, 1, &[], false).await.unwrap();
+        assert!(g.truncated);
+        assert_eq!(g.nodes.len(), GRAPH_MAX);
+        assert_eq!(g.nodes[0].id, "ip:203.0.113.1", "the anchor is kept");
+
+        // Dense paths evidence stops at GRAPH_EDGE_MAX; an identity edge
+        // sorting last by IP still makes it, ahead of every paths edge.
+        let (last_a, last_b) = (nth_last_ip(&g, 1), nth_last_ip(&g, 2));
+        sqlx::query(
+            "INSERT INTO campaign_edges
+             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't'
+             FROM campaign_members x JOIN campaign_members y ON x.ip_id < y.ip_id
+             LIMIT 3000",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaign_edges VALUES
+             ((SELECT id FROM ips WHERE ip = ?), (SELECT id FROM ips WHERE ip = ?),
+              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't')",
+        )
+        .bind(&last_a)
+        .bind(&last_b)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let g = s.link_graph(&f, 1, &[], false).await.unwrap();
+        assert_eq!(g.edges.len(), GRAPH_EDGE_MAX);
+        assert_eq!(g.edges[0].kind, "ssh", "identity edges come first");
+        assert!(g.edges[1..].iter().all(|e| e.kind == "paths"));
+    }
+
+    /// The IP of the `n`th node from the end of a graph.
+    fn nth_last_ip(g: &LinkGraph, n: usize) -> String {
+        g.nodes[g.nodes.len() - n].id["ip:".len()..].to_string()
     }
 }

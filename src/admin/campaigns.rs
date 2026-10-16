@@ -212,9 +212,15 @@ mod tests {
             "href=\"/ip/192.0.2.1\"",
             "shared ssh host key",
             "SHA256:operator",
+            // The campaign graph (S4) sits between Members and Evidence.
+            "data-focus=\"campaign:192.0.2.3\"",
+            "<i class=\"line soft\"></i>shared paths",
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
+        let at = |s: &str| a.find(s).unwrap_or_else(|| panic!("{s} missing"));
+        assert!(at("<h2>Members</h2>") < at("data-link-graph"));
+        assert!(at("data-link-graph") < at("<h2>Evidence</h2>"));
         let (_, _, b) = send(
             &app,
             get("/admin/campaigns/198.51.100.10", true),

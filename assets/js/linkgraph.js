@@ -1,5 +1,7 @@
 // The link graph of /admin/links/<kind>/<value>: the focus, the IPs it was
-// seen on and what else links them. Data from /admin/api/links/graph; laid
+// seen on and what else links them. Also a campaign's graph: data-focus
+// `campaign:<key>` asks for its members and evidence edges, data-center
+// names the node laid out in the middle. Data from /admin/api/links/graph; laid
 // out here (one ring per hop, then a short seeded relax) and drawn as SVG.
 // Pan by dragging, zoom with the wheel or a pinch, click a node for its
 // facts, Expand to fetch its neighbours.
@@ -12,7 +14,8 @@
   var status = document.querySelector("[data-graph-status]");
   var panel = document.querySelector("[data-link-panel] [data-selected]");
   var kinds = JSON.parse(host.getAttribute("data-kinds") || "{}");
-  var focusId = host.getAttribute("data-focus");
+  var query = host.getAttribute("data-focus");
+  var focusId = host.getAttribute("data-center") || query;
   var calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var RING = 150, LINK = 90, MAX = 400;
   var g = { nodes: [], edges: [], byId: {}, adj: {} };
@@ -57,13 +60,16 @@
         return r.json();
       });
   }
-  function edgeKey(a, b) { return a < b ? a + "\n" + b : b + "\n" + a; }
+  // A campaign links one pair by several kinds of evidence: one edge each.
+  function edgeKey(e) {
+    return (e.a < e.b ? e.a + "\n" + e.b : e.b + "\n" + e.a) + "\n" + e.kind + "\n" + (e.label || "");
+  }
   // Union by id; new nodes start at `at` (their parent) and are marked.
   // The page holds at most MAX nodes, as one answer does; returns whether
   // some were left out.
   function merge(data, at) {
     var keys = {}, capped = false;
-    g.edges.forEach(function (e) { keys[edgeKey(e.a, e.b)] = 1; });
+    g.edges.forEach(function (e) { keys[edgeKey(e)] = 1; });
     data.nodes.forEach(function (n) {
       if (g.byId[n.id]) return;
       if (g.nodes.length >= MAX) { capped = true; return; }
@@ -73,7 +79,7 @@
       g.nodes.push(n);
     });
     data.edges.forEach(function (e) {
-      var k = edgeKey(e.a, e.b);
+      var k = edgeKey(e);
       if (!keys[k] && g.byId[e.a] && g.byId[e.b]) { keys[k] = 1; g.edges.push(e); }
     });
     reindex();
@@ -187,7 +193,9 @@
       e.el = el("g", { "class": "edge" + (e.identity ? "" : " soft") }, ge);
       e.hit = el("line", { "class": "hit" }, e.el);
       e.line = el("line", { "class": "line" }, e.el);
-      el("title", {}, e.hit).textContent = (e.identity ? "identity" : "software") + " link";
+      el("title", {}, e.hit).textContent = e.label
+        ? (kinds[e.kind] || e.kind) + ": " + e.label
+        : (e.identity ? "identity" : "software") + " link";
       place(e, g.byId[e.a], g.byId[e.b]);
     });
     g.nodes.forEach(function (n) {
@@ -310,7 +318,7 @@
   function fail(e) { say("Could not load the graph (" + e.message + ")."); }
   function reload() {
     say("Loading…");
-    load(focusId).then(function (data) {
+    load(query).then(function (data) {
       g = { nodes: [], edges: [], byId: {}, adj: {} }; selected = null;
       merge(data, null);
       layout(); land();
