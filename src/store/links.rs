@@ -562,6 +562,8 @@ pub const GROUP_AT: i64 = 25;
 pub const GROUP_MAX: i64 = 500;
 /// Nodes in one graph.
 pub const GRAPH_MAX: usize = 400;
+/// Edges in one campaign graph; dense `paths` evidence can pass this.
+pub const GRAPH_EDGE_MAX: usize = 2000;
 /// Values of one kind read per IP.
 pub const PER_IP: i64 = 50;
 
@@ -768,7 +770,8 @@ impl Store {
 
     /// A campaign's member IPs (the anchor at hop 0, the rest at hop 1,
     /// by IP text, up to [`GRAPH_MAX`]) and one edge per `campaign_edges`
-    /// row between them; `paths` edges are the soft ones.
+    /// row between them, up to [`GRAPH_EDGE_MAX`]: identity edges first,
+    /// then `paths` edges by similarity. `paths` edges are the soft ones.
     async fn campaign_graph(&self, key: &str) -> Result<LinkGraph> {
         let mut g = LinkGraph::default();
         let ips: Vec<String> = sqlx::query_scalar(
@@ -805,7 +808,7 @@ impl Store {
              JOIN campaign_members m ON m.ip_id = e.a
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
              WHERE m.campaign_key = ?
-             ORDER BY ia.ip, ib.ip, e.kind, e.value",
+             ORDER BY e.kind = 'paths', e.score DESC, ia.ip, ib.ip, e.kind, e.value",
         )
         .bind(key)
         .fetch_all(&self.read)
@@ -814,6 +817,10 @@ impl Store {
             let (a, b) = (format!("ip:{a}"), format!("ip:{b}"));
             if !ids.contains(&a) || !ids.contains(&b) {
                 continue;
+            }
+            if g.edges.len() >= GRAPH_EDGE_MAX {
+                g.truncated = true;
+                break;
             }
             let label = if kind == "paths" {
                 let mut l = format!(
@@ -1557,13 +1564,7 @@ mod tests {
         assert_eq!(
             e,
             [
-                (
-                    "ip:198.51.100.4",
-                    "ip:203.0.113.1",
-                    "paths",
-                    false,
-                    "4 shared path shapes, similarity 0.50"
-                ),
+                ("ip:203.0.113.1", "ip:203.0.113.2", "ssh", true, "SHA256:k"),
                 (
                     "ip:203.0.113.1",
                     "ip:203.0.113.2",
@@ -1571,7 +1572,13 @@ mod tests {
                     false,
                     "7 shared path shapes, similarity 0.60, same JA4 and JA4H"
                 ),
-                ("ip:203.0.113.1", "ip:203.0.113.2", "ssh", true, "SHA256:k"),
+                (
+                    "ip:198.51.100.4",
+                    "ip:203.0.113.1",
+                    "paths",
+                    false,
+                    "4 shared path shapes, similarity 0.50"
+                ),
             ]
         );
         assert!(!g.truncated);
@@ -1614,5 +1621,37 @@ mod tests {
         assert!(g.truncated);
         assert_eq!(g.nodes.len(), GRAPH_MAX);
         assert_eq!(g.nodes[0].id, "ip:203.0.113.1", "the anchor is kept");
+
+        // Dense paths evidence stops at GRAPH_EDGE_MAX; an identity edge
+        // sorting last by IP still makes it, ahead of every paths edge.
+        let (last_a, last_b) = (nth_last_ip(&g, 1), nth_last_ip(&g, 2));
+        sqlx::query(
+            "INSERT INTO campaign_edges
+             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't'
+             FROM campaign_members x JOIN campaign_members y ON x.ip_id < y.ip_id
+             LIMIT 3000",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaign_edges VALUES
+             ((SELECT id FROM ips WHERE ip = ?), (SELECT id FROM ips WHERE ip = ?),
+              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't')",
+        )
+        .bind(&last_a)
+        .bind(&last_b)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let g = s.link_graph(&f, 1, &[], false).await.unwrap();
+        assert_eq!(g.edges.len(), GRAPH_EDGE_MAX);
+        assert_eq!(g.edges[0].kind, "ssh", "identity edges come first");
+        assert!(g.edges[1..].iter().all(|e| e.kind == "paths"));
+    }
+
+    /// The IP of the `n`th node from the end of a graph.
+    fn nth_last_ip(g: &LinkGraph, n: usize) -> String {
+        g.nodes[g.nodes.len() - n].id["ip:".len()..].to_string()
     }
 }
