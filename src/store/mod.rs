@@ -3,6 +3,7 @@ pub mod auth;
 mod backfill;
 pub mod blocklist;
 pub mod browse;
+pub mod campaigns;
 pub mod canaries;
 pub mod cli;
 pub mod data;
@@ -81,6 +82,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0037_name_refreshes.sql"),
     include_str!("migrations/0038_unseen_ips.sql"),
     include_str!("migrations/0039_shapes.sql"),
+    include_str!("migrations/0040_campaigns.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
