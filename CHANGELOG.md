@@ -5,6 +5,48 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-16
+
+Hardening from the full review (MIK-370, batch 2). No database migration,
+no protocol change. One new setting: `[credits] device_daily_cap`.
+
+### Security
+
+- A signed-in state-changing request must carry `Origin` or
+  `Sec-Fetch-Site`; one with neither is refused (S2). Requests without a
+  session (sign-in ceremony, bearer API calls) are unchanged.
+- Only a live admin session skips the shared sign-in rate limit; a
+  sign-in ceremony cookie no longer does, so one cookie replayed from many
+  sources cannot lift the global cap on password guessing (S3).
+- The process sets umask 077 at start, and warns with path and mode when
+  the node key or the database is readable by group or others (S5).
+  Existing files are not chmodded.
+- AbuseIPDB and Shodan API keys and the MaxMind licence key print as
+  `[redacted]` in logs and debug output (S6). Config files parse unchanged.
+- A paired device's spend through `/api/v1` (probes, scan buys, lookup
+  buys) is capped per rolling 24 hours (S7). A call that would exceed the
+  cap answers `429 spend_cap` before anything is spent; free calls always
+  pass. New setting `[credits] device_daily_cap` (credits, default 100,
+  `0` turns the cap off, 0 to 1000000).
+
+### Fixed
+
+- One panic while a lock is held no longer panics every later user of
+  that lock (C3): every lock recovers from poisoning with a warning naming
+  the call site. CI refuses new unchecked lock sites.
+- Errors that were silently discarded (setup token, fingerprint and claim
+  inserts, owner command log, logout, passkey counter, session prune,
+  intel fetch timestamps, peer contact save, role reconcile, member
+  reload, fleet sync, bot counter-scan enqueue) are now logged (C4).
+- Blocking work (upload zip, export encoding, nmap XML parsing, RDAP
+  bootstrap reload and write) runs off the async workers (C5).
+- The `/api/v1/ips` cursor is clamped to the last page the store reaches,
+  so a crafted cursor cannot overflow the offset or repeat rows, and small
+  page sizes no longer stop early (C6).
+- Credit ledger arithmetic is checked: a step that would overflow is
+  logged and ignored, leaving balances unchanged; release builds panic on
+  integer overflow instead of wrapping (C9).
+
 ## [0.15.1] - 2026-10-14
 
 Fixes from the full review (MIK-370). No database migration, no protocol
