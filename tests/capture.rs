@@ -898,8 +898,20 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
 
 /// Wait (at most five seconds) for the server to close `io`; true if it did.
 async fn closed_by_server<S: tokio::io::AsyncRead + Unpin>(io: &mut S) -> bool {
+    closed_by_server_by(
+        io,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// Whether the server closes `io` before `by`.
+async fn closed_by_server_by<S: tokio::io::AsyncRead + Unpin>(
+    io: &mut S,
+    by: tokio::time::Instant,
+) -> bool {
     let mut buf = [0u8; 1024];
-    let wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let wait = tokio::time::timeout_at(by, async {
         loop {
             match io.read(&mut buf).await {
                 Ok(0) | Err(_) => return,
@@ -983,11 +995,13 @@ async fn a_connection_without_a_request_head_in_time_is_dropped() {
     let tcp = tokio::net::TcpStream::connect(s).await.unwrap();
     let name = rustls::pki_types::ServerName::try_from("probe.test").unwrap();
     let mut tls = tls_client().connect(name, tcp).await.unwrap();
-    let t0 = std::time::Instant::now();
-    assert!(closed_by_server(&mut silent).await);
-    assert!(closed_by_server(&mut partial).await);
-    assert!(closed_by_server(&mut tls).await);
-    assert!(t0.elapsed() < std::time::Duration::from_secs(4));
+    // Closed before any other timer could close them (hyper's 15 s header
+    // timeout, the 120 s connection deadline): the 1 s head timeout did.
+    // A bound, not a measurement, with room for a loaded machine (MIK-391).
+    let by = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    assert!(closed_by_server_by(&mut silent, by).await);
+    assert!(closed_by_server_by(&mut partial, by).await);
+    assert!(closed_by_server_by(&mut tls, by).await);
 
     let mut slow = tokio::net::TcpStream::connect(p).await.unwrap();
     slow.write_all(b"POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n")

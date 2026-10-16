@@ -252,35 +252,49 @@ pub struct Node {
     standings: RwLock<Arc<HashMap<NodeId, members::Standing>>>,
     /// Addresses from `[[cluster.peers]]`, preferred over published ones.
     address_override: HashMap<NodeId, String>,
-    clients: Mutex<HashMap<NodeId, reqwest::Client>>,
-    pub peer_status: RwLock<HashMap<NodeId, PeerStatus>>,
+    /// Peer connections and replication bookkeeping.
+    pub peers: PeerState,
     /// Serializes log writes (local appends and remote batches).
     pub apply_lock: tokio::sync::Mutex<()>,
     /// Owner commands and key rotations, each one at a time.
     pub owner_locks: owner::Locks,
+    /// Credits and market state: prices, demand, bids, payments, audits.
+    pub credits: CreditsState,
+    /// Bumped whenever the log grows; wakes sync loops and long-polls.
+    changed: tokio::sync::watch::Sender<u64>,
+    /// Enrichment providers this node can query right now (heartbeats).
+    providers: RwLock<Vec<String>>,
+    /// Services set once at start, for lookups and probes members ask for.
+    lookups: Lookups,
+    /// The relay leases this node sells to outbound-only members.
+    pub relay_leases: relay::Leases,
+    /// The relay leases this outbound-only node took.
+    pub leased: relay::Leased,
+    /// The hourly per-level scanner weights (`scan::weight`).
+    pub weights: crate::scan::weight::Weights,
+    pub data_dir: std::path::PathBuf,
+    /// Contacts and heartbeats (ephemeral).
+    pub status: status::Status,
+    pub msg: msg::Messaging,
+    pub started: std::time::Instant,
+    /// Uids of scan jobs whose row changed (any origin), for the live queue.
+    pub job_events: tokio::sync::broadcast::Sender<String>,
+    /// Highest sequence this node has written to its own log.
+    pub own_head: std::sync::atomic::AtomicU64,
+    /// Days of history this node keeps; 0: everything (see [`history`]).
+    pub retention_days: u32,
+    /// This node's floors above 1, as last read (for heartbeats).
+    pub own_floors: RwLock<history::Floors>,
+}
+
+/// [`Node`] state of the credits and the market: prices, demand, bids,
+/// payments and audits (`credits`).
+pub struct CreditsState {
     /// How members' requests compare with this node's rules (the credits
     /// gate and the cluster pages).
     pub rules_check: crate::store::stats::SwrCache<(), crate::credits::gates::RulesCheck>,
     /// This node's book of credits, as last computed.
     pub credits_book: Mutex<Option<(std::time::Instant, Arc<crate::credits::Book>)>>,
-    /// Bumped whenever the log grows; wakes sync loops and long-polls.
-    changed: tokio::sync::watch::Sender<u64>,
-    join_attempts: Mutex<JoinAttempts>,
-    /// Sync exchanges running at once (see `sync::MAX_CONCURRENT_SYNCS`).
-    pub sync_slots: tokio::sync::Semaphore,
-    /// Directed messages being routed at once (see `msg`).
-    pub route_slots: Arc<tokio::sync::Semaphore>,
-    /// Wakes the sync supervisor when the set of dialable members changes.
-    pub members_changed: tokio::sync::Notify,
-    /// Enrichment providers this node can query right now (heartbeats).
-    providers: RwLock<Vec<String>>,
-    /// This node's provider objects, for on-demand lookups members ask for.
-    lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
-    /// The on-demand share of each provider budget (see `credits::share`).
-    lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
-    /// This node's observational prober, when it probes (`scan::probe`).
-    prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
-    rdns_lookup: std::sync::OnceLock<crate::intel::rdns::RdnsLookup>,
     /// This node's lookup prices, as last computed (`credits::price`).
     price_table: RwLock<Arc<crate::credits::price::Table>>,
     /// The advertised members this node reached, per hour, until reported
@@ -291,12 +305,6 @@ pub struct Node {
     /// Units of each good this node's buyer loops want this hour, for its
     /// bids (`credits::bid`).
     pub wants: std::sync::Mutex<crate::credits::bid::Wants>,
-    /// The relay leases this node sells to outbound-only members.
-    pub relay_leases: relay::Leases,
-    /// The relay leases this outbound-only node took.
-    pub leased: relay::Leased,
-    /// The hourly per-level scanner weights (`scan::weight`).
-    pub weights: crate::scan::weight::Weights,
     /// This node's scan budget left and queued jobs, for the heartbeat
     /// (`credits::jobs::announce_budget`).
     pub scan_budget_mc: std::sync::atomic::AtomicU32,
@@ -317,19 +325,40 @@ pub struct Node {
     /// What would keep this node's scan workers from running an audit
     /// (`credits::audit::Check`); None while no workers run.
     pub audit_check: Mutex<Option<crate::credits::audit::Check>>,
-    pub data_dir: std::path::PathBuf,
-    /// Contacts and heartbeats (ephemeral).
-    pub status: status::Status,
-    pub msg: msg::Messaging,
-    pub started: std::time::Instant,
-    /// Uids of scan jobs whose row changed (any origin), for the live queue.
-    pub job_events: tokio::sync::broadcast::Sender<String>,
-    /// Highest sequence this node has written to its own log.
-    pub own_head: std::sync::atomic::AtomicU64,
-    /// Days of history this node keeps; 0: everything (see [`history`]).
-    pub retention_days: u32,
-    /// This node's floors above 1, as last read (for heartbeats).
-    pub own_floors: RwLock<history::Floors>,
+}
+
+impl CreditsState {
+    fn new() -> Self {
+        Self {
+            rules_check: crate::store::stats::SwrCache::new(1),
+            credits_book: Mutex::new(None),
+            price_table: Default::default(),
+            reach: Default::default(),
+            market: Default::default(),
+            wants: Default::default(),
+            scan_budget_mc: Default::default(),
+            scan_queued: Default::default(),
+            serving_offers: Mutex::new(Default::default()),
+            spending: Default::default(),
+            drawing: Default::default(),
+            audit_queue: Default::default(),
+            audits_tried: Default::default(),
+            audit_check: Default::default(),
+        }
+    }
+}
+
+/// [`Node`] state of the connections to peers and of replication with them.
+pub struct PeerState {
+    clients: Mutex<HashMap<NodeId, reqwest::Client>>,
+    pub peer_status: RwLock<HashMap<NodeId, PeerStatus>>,
+    join_attempts: Mutex<JoinAttempts>,
+    /// Sync exchanges running at once (see `sync::MAX_CONCURRENT_SYNCS`).
+    pub sync_slots: tokio::sync::Semaphore,
+    /// Directed messages being routed at once (see `msg`).
+    pub route_slots: Arc<tokio::sync::Semaphore>,
+    /// Wakes the sync supervisor when the set of dialable members changes.
+    pub members_changed: tokio::sync::Notify,
     /// Sync rounds run, with any peer (status and tests).
     pub sync_rounds: std::sync::atomic::AtomicU64,
     /// What replication moved per peer, for the journal.
@@ -341,6 +370,36 @@ pub struct Node {
     /// Per peer: origins we lack that its history does not reach back to,
     /// as of the last round (a full node waits for a full member).
     pub unserved: Mutex<HashMap<NodeId, Vec<NodeId>>>,
+}
+
+impl PeerState {
+    fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            peer_status: RwLock::new(HashMap::new()),
+            join_attempts: Mutex::new(Default::default()),
+            sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
+            route_slots: Arc::new(tokio::sync::Semaphore::new(msg::MAX_ROUTING)),
+            members_changed: tokio::sync::Notify::new(),
+            sync_rounds: Default::default(),
+            traffic: Default::default(),
+            own_acked: Default::default(),
+            unserved: Default::default(),
+        }
+    }
+}
+
+/// [`Node`] services set once at start, for lookups and probes members ask
+/// for.
+#[derive(Default)]
+pub struct Lookups {
+    /// This node's provider objects, for on-demand lookups members ask for.
+    lookup_providers: std::sync::OnceLock<crate::intel::Providers>,
+    /// The on-demand share of each provider budget (see `credits::share`).
+    lookup_shares: std::sync::OnceLock<crate::credits::share::Shares>,
+    /// This node's observational prober, when it probes (`scan::probe`).
+    prober: std::sync::OnceLock<Arc<crate::scan::probe::serve::Prober>>,
+    rdns_lookup: std::sync::OnceLock<crate::intel::rdns::RdnsLookup>,
 }
 
 impl Node {
@@ -364,37 +423,16 @@ impl Node {
             blocked: RwLock::new(Arc::new(Default::default())),
             standings: RwLock::new(Arc::new(HashMap::new())),
             address_override,
-            clients: Mutex::new(HashMap::new()),
-            peer_status: RwLock::new(HashMap::new()),
+            peers: PeerState::new(),
             apply_lock: tokio::sync::Mutex::new(()),
             owner_locks: Default::default(),
-            rules_check: crate::store::stats::SwrCache::new(1),
-            credits_book: Mutex::new(None),
+            credits: CreditsState::new(),
             changed: tokio::sync::watch::channel(0).0,
-            join_attempts: Mutex::new(Default::default()),
-            sync_slots: tokio::sync::Semaphore::new(sync::MAX_CONCURRENT_SYNCS),
-            route_slots: Arc::new(tokio::sync::Semaphore::new(msg::MAX_ROUTING)),
-            members_changed: tokio::sync::Notify::new(),
             providers: RwLock::new(vec![]),
-            lookup_providers: Default::default(),
-            lookup_shares: Default::default(),
-            prober: Default::default(),
-            rdns_lookup: Default::default(),
-            price_table: Default::default(),
-            reach: Default::default(),
-            market: Default::default(),
-            wants: Default::default(),
+            lookups: Default::default(),
             relay_leases: Default::default(),
             leased: Default::default(),
             weights: Default::default(),
-            scan_budget_mc: Default::default(),
-            scan_queued: Default::default(),
-            serving_offers: Mutex::new(Default::default()),
-            spending: Default::default(),
-            drawing: Default::default(),
-            audit_queue: Default::default(),
-            audits_tried: Default::default(),
-            audit_check: Default::default(),
             data_dir: p.data_dir,
             status: Default::default(),
             msg: Default::default(),
@@ -403,10 +441,6 @@ impl Node {
             own_head: Default::default(),
             retention_days: p.retention_days,
             own_floors: Default::default(),
-            sync_rounds: Default::default(),
-            traffic: Default::default(),
-            unserved: Default::default(),
-            own_acked: Default::default(),
         });
         // Readers tell this node's rows from the others' by it (RDAP).
         node.store
@@ -562,48 +596,48 @@ impl Node {
     /// The provider objects on-demand lookups from members are served
     /// with; set once at startup.
     pub fn set_lookup_providers(&self, p: crate::intel::Providers) {
-        let _ = self.lookup_providers.set(p);
+        let _ = self.lookups.lookup_providers.set(p);
     }
 
     pub fn lookup_providers(&self) -> Option<&crate::intel::Providers> {
-        self.lookup_providers.get()
+        self.lookups.lookup_providers.get()
     }
 
     pub fn set_lookup_shares(&self, s: crate::credits::share::Shares) {
-        let _ = self.lookup_shares.set(s);
+        let _ = self.lookups.lookup_shares.set(s);
     }
 
     pub fn lookup_shares(&self) -> Option<&crate::credits::share::Shares> {
-        self.lookup_shares.get()
+        self.lookups.lookup_shares.get()
     }
 
     pub fn set_prober(&self, p: Arc<crate::scan::probe::serve::Prober>) {
-        let _ = self.prober.set(p);
+        let _ = self.lookups.prober.set(p);
     }
 
     /// The prober members' `/rpc/v1/probe` requests go to; None when this
     /// node does not probe.
     pub fn prober(&self) -> Option<&Arc<crate::scan::probe::serve::Prober>> {
-        self.prober.get()
+        self.lookups.prober.get()
     }
 
     /// Tests: answer reverse lookups with `f` instead of the system resolver.
     #[doc(hidden)]
     pub fn set_rdns_lookup(&self, f: crate::intel::rdns::RdnsLookup) {
-        let _ = self.rdns_lookup.set(f);
+        let _ = self.lookups.rdns_lookup.set(f);
     }
 
     pub fn rdns_lookup(&self) -> Option<&crate::intel::rdns::RdnsLookup> {
-        self.rdns_lookup.get()
+        self.lookups.rdns_lookup.get()
     }
 
     pub fn price_table(&self) -> Arc<crate::credits::price::Table> {
-        self.price_table.read_or_recover().clone()
+        self.credits.price_table.read_or_recover().clone()
     }
 
     /// Adopt new prices and announce them with the next heartbeat.
     pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
-        *self.price_table.write_or_recover() = t;
+        *self.credits.price_table.write_or_recover() = t;
         self.publish_status();
     }
 
@@ -729,6 +763,7 @@ impl Node {
     /// member that holds more of it).
     pub fn unserved_origins(&self) -> Vec<NodeId> {
         let mut v: Vec<NodeId> = self
+            .peers
             .unserved
             .lock_or_recover()
             .values()
@@ -742,7 +777,8 @@ impl Node {
 
     /// The origins `peer` could not serve this node in the last round.
     pub fn unserved_from(&self, peer: &NodeId) -> Vec<NodeId> {
-        self.unserved
+        self.peers
+            .unserved
             .lock_or_recover()
             .get(peer)
             .cloned()
@@ -835,7 +871,7 @@ impl Node {
         *self.blocked.write_or_recover() = Arc::new(blocked);
         *self.standings.write_or_recover() = Arc::new(standings);
         if self.dial_targets() != before {
-            self.members_changed.notify_one();
+            self.peers.members_changed.notify_one();
         }
         Ok(())
     }
@@ -897,7 +933,8 @@ impl Node {
     /// generous global cap, so one source cannot use up everybody's
     /// attempts.
     pub fn join_allowed(&self, peer: NodeId, ip: std::net::IpAddr) -> bool {
-        self.join_attempts
+        self.peers
+            .join_attempts
             .lock_or_recover()
             .allow(peer, ip, std::time::Instant::now())
     }
@@ -926,7 +963,7 @@ impl Node {
 
     /// HTTP client that only talks to `peer` (its key is pinned in TLS).
     pub fn client_for(&self, peer: NodeId) -> Result<reqwest::Client> {
-        let mut clients = self.clients.lock_or_recover();
+        let mut clients = self.peers.clients.lock_or_recover();
         if let Some(c) = clients.get(&peer) {
             return Ok(c.clone());
         }
@@ -1085,7 +1122,7 @@ impl Node {
             if r.is_ok() {
                 self.status.touch_outbound(peer);
             }
-            let mut all = self.peer_status.write_or_recover();
+            let mut all = self.peers.peer_status.write_or_recover();
             let st = all.entry(peer).or_default();
             match r {
                 Ok(h) => {
@@ -1115,6 +1152,7 @@ impl Node {
         };
         if changed {
             let st = self
+                .peers
                 .peer_status
                 .read_or_recover()
                 .get(&peer)

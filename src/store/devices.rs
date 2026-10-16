@@ -404,6 +404,37 @@ mod tests {
         assert!(s.redeem_pairing_code("nope", "x").await.unwrap().is_none());
     }
 
+    /// T4 (MIK-391): racing redemptions of one code, on as many write
+    /// connections as the pool has, still pair exactly one device.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_redemptions_pair_exactly_one_device() {
+        let (_d, s) = test_store().await;
+        let code = s.mint_pairing_code("read", "admin").await.unwrap();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let tasks: Vec<_> = (0..16)
+            .map(|i| {
+                let (s, code, start) = (s.clone(), code.clone(), start.clone());
+                tokio::spawn(async move {
+                    start.wait().await;
+                    s.redeem_pairing_code(&code, &format!("racer {i}")).await
+                })
+            })
+            .collect();
+        let mut paired = 0;
+        for t in tasks {
+            if t.await.unwrap().unwrap().is_some() {
+                paired += 1;
+            }
+        }
+        assert_eq!(paired, 1, "exactly one racer pairs, the others get None");
+        assert_eq!(s.list_devices().await.unwrap().len(), 1);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the code is consumed");
+    }
+
     #[tokio::test]
     async fn an_expired_code_pairs_nothing() {
         let (_d, s) = test_store().await;

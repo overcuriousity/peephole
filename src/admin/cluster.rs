@@ -254,7 +254,7 @@ pub(crate) async fn views(
     let rows = members::all(&node.store).await?;
     let heads = repl::head_map(&repl::heads(&node.store).await?);
     let purged = crate::cluster::block::purged(&node.store).await?;
-    let statuses = node.peer_status.read_or_recover().clone();
+    let statuses = node.peers.peer_status.read_or_recover().clone();
     let me = node.id();
     let sibs = crate::cluster::owner::fleet::siblings(&node.store).await?;
     let managing = crate::cluster::owner::load(&node.store, me)

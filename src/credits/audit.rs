@@ -633,7 +633,8 @@ pub async fn obligations(
 
 /// Whether this node's scan workers would run an audit of an address
 /// (parsed, as stored) of a scan of a job (its uid) at a level now: None,
-/// or why not. Registered by `scan::run_workers` in [`Node::audit_check`].
+/// or why not. Registered by `scan::run_workers` in
+/// `node.credits.audit_check`.
 pub type Check = Arc<
     dyn Fn(
             std::net::IpAddr,
@@ -677,8 +678,12 @@ pub async fn release_stale(node: &Arc<Node>) -> usize {
     let stale = stale(&book);
     let mut released = 0;
     for offer in stale {
-        let busy = node.audit_queue.lock_or_recover().holds(offer)
-            || node.serving_offers.lock_or_recover().contains(&offer);
+        let busy = node.credits.audit_queue.lock_or_recover().holds(offer)
+            || node
+                .credits
+                .serving_offers
+                .lock_or_recover()
+                .contains(&offer);
         if !busy {
             crate::credits::pay::release(node, offer.0, offer.1).await;
             released += 1;
@@ -792,7 +797,12 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     use crate::credits::{JOB_OFFER_TTL_MS, entries, pay, price};
     // Asked again with an offer whose audit waits or runs here: turned
     // down before anything could release that offer.
-    if node.audit_queue.lock_or_recover().holds((peer, seq)) {
+    if node
+        .credits
+        .audit_queue
+        .lock_or_recover()
+        .holds((peer, seq))
+    {
         return Err("this audit is queued already".into());
     }
     let refuse = async |why: &str| {
@@ -818,7 +828,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     }
     // What would keep a worker here from running it: declined now, so the
     // scanner asks its next auditor.
-    let check = node.audit_check.lock_or_recover().clone();
+    let check = node.credits.audit_check.lock_or_recover().clone();
     let Some(check) = check else {
         return refuse("this node runs no scan workers").await;
     };
@@ -869,7 +879,7 @@ async fn sell(node: &Arc<Node>, peer: NodeId, scan_uid: &str, seq: u64) -> Resul
     // Checked and queued at once, while the offer still counts as served:
     // asked twice with one offer, the first answer stands.
     let queued = {
-        let mut q = node.audit_queue.lock_or_recover();
+        let mut q = node.credits.audit_queue.lock_or_recover();
         if q.holds((peer, seq)) {
             Some(false)
         } else {
@@ -1014,7 +1024,12 @@ pub async fn buy_due(node: &Arc<Node>) -> usize {
     let rows = due(&node.store.pool, &me, since).await.unwrap_or_default();
     let mut bought = 0;
     for scan_uid in rows {
-        if !node.audits_tried.lock_or_recover().insert(scan_uid.clone()) {
+        if !node
+            .credits
+            .audits_tried
+            .lock_or_recover()
+            .insert(scan_uid.clone())
+        {
             continue;
         }
         match buy(node, &scan_uid).await {
@@ -1024,7 +1039,10 @@ pub async fn buy_due(node: &Arc<Node>) -> usize {
             }
             Err(why) => {
                 tracing::info!(scan = %scan_uid, %why, "designated scan not audited yet");
-                node.audits_tried.lock_or_recover().remove(&scan_uid);
+                node.credits
+                    .audits_tried
+                    .lock_or_recover()
+                    .remove(&scan_uid);
             }
         }
     }
@@ -1611,7 +1629,7 @@ mod tests {
         );
         assert_eq!(buy_due(&node).await, 0);
         assert!(
-            !node.audits_tried.lock_or_recover().contains(&scan),
+            !node.credits.audits_tried.lock_or_recover().contains(&scan),
             "not marked tried"
         );
         assert_eq!(
@@ -1652,7 +1670,7 @@ mod tests {
             .await
             .unwrap();
         }
-        assert!(node.audit_queue.lock_or_recover().push(Task {
+        assert!(node.credits.audit_queue.lock_or_recover().push(Task {
             scan_uid: "queued".into(),
             job_uid: "job".into(),
             ip: "203.0.113.5".into(),

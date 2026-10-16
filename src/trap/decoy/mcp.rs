@@ -167,10 +167,7 @@ pub const LATEST: &str = "2025-06-18";
 const JSON: &str = "application/json";
 const TEXT: &str = "text/plain; charset=utf-8";
 
-/// The session id served to the request with this page token.
-pub fn session_id(page_token: &str) -> String {
-    value(page_token, Kind::McpSession)
-}
+pub use crate::model::mcp::session_id;
 
 /// The legacy transport's first event.
 pub fn endpoint_event(page_token: &str) -> String {

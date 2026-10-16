@@ -2567,6 +2567,7 @@ async fn geo_results_come_from_a_node_that_has_the_database() {
     market_known(&na, b.id).await;
     market_known(&nb, a.id).await;
     nb.node
+        .credits
         .wants
         .lock()
         .unwrap()
@@ -3269,7 +3270,11 @@ async fn quiet_rounds(nodes: &[&Node]) -> u64 {
     let total = || {
         nodes
             .iter()
-            .map(|n| n.sync_rounds.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|n| {
+                n.peers
+                    .sync_rounds
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
             .sum::<u64>()
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -3707,6 +3712,106 @@ async fn owner_commands_reach_an_outbound_only_sibling() {
         .unwrap_err();
     assert!(e.contains("changed meanwhile"), "{e}");
     assert_eq!(owner::counter(&nb.store).await.unwrap(), 1);
+}
+
+/// T5 (MIK-391): the very same signed envelope with an owner command,
+/// delivered twice over the wire, runs once (the duplicate filter drops
+/// the copy before the counter sees it); one dated outside the replay
+/// window (as a copy kept past the filter's memory would be) is refused
+/// at the door and never runs.
+#[tokio::test]
+async fn a_replayed_or_stale_owner_envelope_runs_at_most_once() {
+    use peephole::cluster::msg::{Body, Envelope, Msg};
+    use peephole::cluster::owner::{self, cmd, cmd::OwnerCmd};
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    let key = owner::create(&na.store, a.id).await.unwrap();
+    owner::adopt(&nb.store, b.id, &key, false).await.unwrap();
+    eventually("b counts a as a member", || async { nb.is_member(&a.id) }).await;
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    // What `msg::Envelope::seal` makes, signed by a.
+    let seal = |counter: u64, blocked: NodeId, created_ms: u64| {
+        let bytes = cmd::encode(&OwnerCmd::Block {
+            node: blocked,
+            subtree: false,
+        })
+        .unwrap();
+        let sig = cmd::sign(&key, &a.id, &b.id, counter, &bytes);
+        let body = peephole::cluster::rpc::cbor::encode(&Body {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            from: a.id,
+            to: b.id,
+            created_ms,
+            in_reply_to: None,
+            msg: Msg::OwnerCmd {
+                counter,
+                cmd: serde_bytes::ByteBuf::from(bytes),
+                sig: serde_bytes::ByteBuf::from(sig),
+            },
+        })
+        .unwrap();
+        let sig = na
+            .node
+            .identity
+            .sign(&[b"peephole-msg-v1\0".as_slice(), &body].concat());
+        Envelope { body, sig, hops: 0 }
+    };
+    let post = |env: Envelope| {
+        let na = na.node.clone();
+        let to = b.clone();
+        async move {
+            let (status, reply) = na
+                .call_raw(to.id, &to.address(), "/rpc/v1/msg", &env)
+                .await
+                .unwrap();
+            (
+                status.as_u16(),
+                String::from_utf8_lossy(&reply).into_owned(),
+            )
+        }
+    };
+
+    let (x, y, z) = (
+        Identity::generate().unwrap().id,
+        Identity::generate().unwrap().id,
+        Identity::generate().unwrap().id,
+    );
+    let first = seal(0, x, now_ms());
+    assert_eq!(post(first.clone()).await.0, 200);
+    eventually("the command runs", || async { nb.is_blocked(&x) }).await;
+    // The identical envelope again: accepted for routing, dropped unrun.
+    assert_eq!(post(first).await.0, 200);
+    // Sync point: the next command runs after the copy was handled.
+    assert_eq!(post(seal(1, y, now_ms())).await.0, 200);
+    eventually("the next command runs", || async { nb.is_blocked(&y) }).await;
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    let log = cmd::log_rows(&nb.store, 10).await.unwrap();
+    assert_eq!(
+        log.len(),
+        2,
+        "one row per command, none for the copy: {log:?}"
+    );
+    assert!(log.iter().all(|r| !r.result.contains("refused")), "{log:?}");
+
+    // Past the replay window (twice the filter's memory), with the next
+    // counter, so only the timestamp stands in its way; and too far ahead.
+    let stale = now_ms() - 21 * 60 * 1000;
+    let ahead = now_ms() + 6 * 60 * 1000;
+    for created in [stale, ahead] {
+        let (status, reply) = post(seal(2, z, created)).await;
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("stale or future-dated"), "{reply}");
+    }
+    assert!(!nb.is_blocked(&z));
+    assert_eq!(owner::counter(&nb.store).await.unwrap(), 2);
+    assert_eq!(cmd::log_rows(&nb.store, 10).await.unwrap().len(), 2);
 }
 
 /// The owner's other commands on a sibling: block and unblock a peer,
@@ -5148,7 +5253,7 @@ async fn wants_scans(n: &TestNode) {
 /// far above its supply before each refresh; returns the price.
 async fn priced(n: &TestNode, good: &str, at_least: u32) -> u32 {
     for _ in 0..50 {
-        n.node.market.note(good, 10_000);
+        n.node.credits.market.note(good, 10_000);
         let p = peephole::credits::price::refresh(&n.node)
             .await
             .unwrap()
@@ -5558,8 +5663,8 @@ async fn announced_prices_follow_demand_and_supply() {
     // Prices have no floor: what sold nothing is free, what sold leaves 0.
     let t = price::refresh(&na.node).await.unwrap();
     assert_eq!(t.price_of("abuseipdb"), Some(0));
-    na.node.market.note("abuseipdb", 10);
-    na.node.market.note("maxmind-geolite2", 10);
+    na.node.credits.market.note("abuseipdb", 10);
+    na.node.credits.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let first = t.price_of("abuseipdb").unwrap();
     assert!(first > 0);
@@ -5579,8 +5684,8 @@ async fn announced_prices_follow_demand_and_supply() {
     })
     .await;
     // Sold again: the price rises.
-    na.node.market.note("abuseipdb", 10);
-    na.node.market.note("maxmind-geolite2", 10);
+    na.node.credits.market.note("abuseipdb", 10);
+    na.node.credits.market.note("maxmind-geolite2", 10);
     let t = price::refresh(&na.node).await.unwrap();
     let risen = t.price_of("abuseipdb").unwrap();
     assert!(risen > first, "{first} then {risen}");
@@ -6131,6 +6236,88 @@ async fn an_oversized_routed_call_is_refused_before_sending() {
         format!("{err:#}").contains("request larger than"),
         "{err:#}"
     );
+}
+
+/// `rpc::BODY_LIMIT` and `rpc::JOIN_BODY_LIMIT` (crate-private).
+const RPC_BODY_LIMIT: usize = 64 * 1024 * 1024;
+const RPC_JOIN_BODY_LIMIT: usize = 64 * 1024;
+
+/// T7 (MIK-391): the receiving side refuses a body one byte over the
+/// member limit, or over the join limit for a key that is not a member,
+/// before any handler sees it ("body too large" comes from the
+/// connection's body reader; a handler would answer with a CBOR error).
+/// A body at the limit gets through to the handler.
+#[tokio::test]
+async fn rpc_bodies_over_the_limit_are_refused_before_a_handler() {
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let (ix, x) = new_node("x");
+    let _na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    // x pins a's key, but a does not know x.
+    let nx = boot(ix, &x, &[&a], DEFAULT).await;
+    let send = |from: &TestNode, path: &str, len: usize| {
+        let client = from.client_for(a.id).unwrap();
+        let url = format!("https://{}{path}", a.address());
+        async move {
+            let r = client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/cbor")
+                .body(vec![0xffu8; len])
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap_or_default())
+        }
+    };
+    for (from, path, limit) in [
+        (&nx, "/rpc/v1/join", RPC_JOIN_BODY_LIMIT),
+        (&nb, "/rpc/v1/push", RPC_BODY_LIMIT),
+    ] {
+        let (status, text) = send(from, path, limit + 1).await;
+        assert_eq!((status, text.as_str()), (413, "body too large"), "{path}");
+        let (status, text) = send(from, path, limit).await;
+        assert_eq!(
+            status, 400,
+            "{path} at the limit reaches the handler: {text}"
+        );
+        assert!(text.starts_with("cbor:"), "{path}: {text}");
+    }
+    // A key that is not a member gets the join limit on any path.
+    let (status, _) = send(&nx, "/rpc/v1/push", RPC_JOIN_BODY_LIMIT + 1).await;
+    assert_eq!(status, 413);
+}
+
+/// T7 (MIK-391): the router enforces the same limits by itself, should
+/// a request reach it without the connection's body reader.
+#[tokio::test]
+async fn the_rpc_router_limits_bodies_on_its_own() {
+    use peephole::cluster::rpc::server::{Peer, RemoteAddr};
+    use tower::ServiceExt;
+    let (ia, a) = new_node("a");
+    let (_ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let stranger = Identity::generate().unwrap().id;
+    let app = cluster::rpc::router(na.node.clone());
+    let send = |peer: NodeId, path: &'static str, len: usize| {
+        let app = app.clone();
+        async move {
+            let req = axum::http::Request::post(path)
+                .header("content-type", "application/cbor")
+                .extension(Peer(peer))
+                .extension(RemoteAddr("127.0.0.1:40000".parse().unwrap()))
+                .body(axum::body::Body::from(vec![0xffu8; len]))
+                .unwrap();
+            app.oneshot(req).await.unwrap().status().as_u16()
+        }
+    };
+    for (peer, path, limit) in [
+        (stranger, "/rpc/v1/join", RPC_JOIN_BODY_LIMIT),
+        (b.id, "/rpc/v1/push", RPC_BODY_LIMIT),
+    ] {
+        assert_eq!(send(peer, path, limit + 1).await, 413, "{path}");
+        assert_eq!(send(peer, path, limit).await, 400, "{path} at the limit");
+    }
 }
 
 /// The asker pays the announced price; the server gets all of it; both
@@ -7585,7 +7772,7 @@ async fn rdns_asks(n: &TestNode, on: &TestNode, mc: u32) {
 /// `n`'s rDNS bid for one wanted source, as its buyer computes it.
 async fn rdns_bid_for_one(n: &TestNode) -> u64 {
     use peephole::credits::price;
-    n.node.wants.lock().unwrap().set(price::RDNS, 1);
+    n.node.credits.wants.lock().unwrap().set(price::RDNS, 1);
     let bid = price::own_bid(&n.node, price::RDNS).await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     bid
@@ -7625,7 +7812,10 @@ async fn the_reverse_name_buyer_pays_at_most_its_bid() {
             .unwrap(),
         1
     );
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     assert_eq!(
         count(&na, OFFERS).await,
         offers,
@@ -7644,7 +7834,10 @@ async fn the_reverse_name_buyer_pays_at_most_its_bid() {
         1
     );
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     eventually("b's answer was bought", || async {
         count(&na, &q("198.51.100.92")).await == 1
     })
@@ -7692,7 +7885,10 @@ async fn reverse_names_trade_between_protocol_eight_and_nine() {
             .unwrap(),
         1
     );
-    assert_eq!(na.node.market.over_bids().get(price::RDNS), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RDNS),
+        Some(&1)
+    );
     assert_eq!(
         count(&na, OFFERS).await,
         offers,
@@ -7770,7 +7966,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
     let ip = "198.51.100.95";
     record(&na, ip, "/x").await;
     holds_source(&nb, ip).await;
-    na.node.wants.lock().unwrap().set("shodan", 1);
+    na.node.credits.wants.lock().unwrap().set("shodan", 1);
     let bid = price::own_bid(&na.node, "shodan").await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     let none: peephole::intel::Providers = vec![];
@@ -7806,7 +8002,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
         .await
         .unwrap();
     assert_eq!(n, 0);
-    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    assert_eq!(na.node.credits.market.over_bids().get("shodan"), Some(&1));
     assert_eq!(count(&na, OFFERS).await, offers, "no offer");
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
 
@@ -7817,7 +8013,7 @@ async fn a_recorder_buys_a_key_holders_answer_within_its_bid() {
         .unwrap();
     assert_eq!(n, 1);
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get("shodan"), Some(&1));
+    assert_eq!(na.node.credits.market.over_bids().get("shodan"), Some(&1));
     eventually("the answer is in both datasets", || async {
         count(&na, &kept).await == 1 && count(&nb, &kept).await == 1
     })
@@ -7937,7 +8133,7 @@ async fn resolve_asks(n: &TestNode, on: &TestNode, mc: u32) {
 /// `n`'s resolve bid for one wanted name, as its refresh computes it.
 async fn resolve_bid_for_one(n: &TestNode) -> u64 {
     use peephole::credits::price;
-    n.node.wants.lock().unwrap().set(price::RESOLVE, 1);
+    n.node.credits.wants.lock().unwrap().set(price::RESOLVE, 1);
     let bid = price::own_bid(&n.node, price::RESOLVE).await.unwrap();
     assert!(bid > 1, "a funded node bids: {bid}");
     bid
@@ -7990,7 +8186,10 @@ async fn the_resolve_refresh_reconfirms_old_names_within_its_bid() {
     old_name(&na, "198.51.100.95", "1.0x1", 10).await;
     let offers = count(&na, OFFERS).await;
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RESOLVE),
+        Some(&1)
+    );
     assert_eq!(count(&na, OFFERS).await, offers, "no offer above the bid");
     let book = credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.ledger.held(&a.id), 0);
@@ -8005,7 +8204,10 @@ async fn the_resolve_refresh_reconfirms_old_names_within_its_bid() {
     old_name(&na, "198.51.100.96", "1.0x2", 10).await;
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
     assert_eq!(count(&na, OFFERS).await, offers + 1, "one offer, to b");
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), Some(&1));
+    assert_eq!(
+        na.node.credits.market.over_bids().get(price::RESOLVE),
+        Some(&1)
+    );
     assert_eq!(count(&na, &confirmed_by("1.0x2", 2)).await, 1, "a and b");
     assert!(
         na.store
@@ -8052,7 +8254,7 @@ async fn the_resolve_refresh_between_protocol_eight_and_nine() {
     assert_eq!(dns::refresh_pass(&na.node, &geo).await.unwrap(), 1);
     assert_eq!(count(&na, OFFERS).await, offers);
     assert_eq!(count(&na, &confirmed_by("1.0x3", 1)).await, 1, "a alone");
-    assert_eq!(na.node.market.over_bids().get(price::RESOLVE), None);
+    assert_eq!(na.node.credits.market.over_bids().get(price::RESOLVE), None);
 
     // 8 buys from 9 as before: an offer at 9's ask is served and charged.
     resolve_asks(&na, &nb, 5).await;
@@ -8235,7 +8437,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
             .is_err_and(|w| w.contains("do not back a scan")),
         "{declined:?}"
     );
-    assert!(nx.node.audit_queue.lock().unwrap().is_empty());
+    assert!(nx.node.credits.audit_queue.lock().unwrap().is_empty());
     backed(&nx, ip).await;
     // x takes more now than its heartbeat says: it declines naming its
     // price, and s offers that once.
@@ -8268,7 +8470,11 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     .await
     .unwrap();
     assert_eq!(last, least as i64, "at the price x named");
-    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1, "x queued it");
+    assert_eq!(
+        nx.node.credits.audit_queue.lock().unwrap().len(),
+        1,
+        "x queued it"
+    );
     // Asked again with the queued offer: refused, and nothing released.
     let seq: i64 = sqlx::query_scalar(
         "SELECT MAX(seq) FROM credit_entries WHERE origin = ? AND audit_uid = 'scan-d'",
@@ -8301,7 +8507,7 @@ async fn a_designated_scan_is_audited_by_its_auditor() {
     .await
     .unwrap();
     assert_eq!(receipts, 0, "the queued offer is not released");
-    assert_eq!(nx.node.audit_queue.lock().unwrap().len(), 1);
+    assert_eq!(nx.node.credits.audit_queue.lock().unwrap().len(), 1);
     // a is no scanner, so no auditor of it.
     let req = Msg::AuditReq {
         scan_uid: "scan-d".into(),
@@ -8374,7 +8580,7 @@ async fn a_bought_audit_is_run_charged_and_counted_everywhere() {
             == Some(&(1, 1))
     })
     .await;
-    assert!(nx.node.audit_queue.lock().unwrap().is_empty());
+    assert!(nx.node.credits.audit_queue.lock().unwrap().is_empty());
 }
 
 /// A scanner that buys no audits of its designated scans of paid jobs owes
@@ -8387,7 +8593,7 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     let (is, s) = new_node("node-sierra");
     let (ix, x) = new_node("node-xray");
     let na = boot(ia, &a, &[&s, &x], DEFAULT).await;
-    let _ns = boot(
+    let ns = boot(
         is,
         &s,
         &[&a, &x],
@@ -8463,7 +8669,27 @@ async fn a_scanner_that_buys_no_audits_of_its_designated_scans_stops_being_funde
     let book = peephole::credits::book_fresh(&na.node).await.unwrap();
     assert_eq!(book.standing(&s.id).audits_owed, Some((0, 4)));
     enqueue(&na, "198.51.100.62", 1).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Sync point (MIK-391): a claim of s's own is answered after a whole
+    // handout round, which saw the job and granted nothing.
+    let reply = ns
+        .node
+        .request(
+            a.id,
+            peephole::cluster::msg::Msg::Claim {
+                exclude_levels: vec![],
+                min_mc: 0,
+            },
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            reply,
+            peephole::cluster::msg::Msg::ClaimReply { grant: None }
+        ),
+        "{reply:?}"
+    );
     assert_eq!(
         count(
             &na,
@@ -8519,7 +8745,7 @@ async fn offers_written_at_once_are_each_covered() {
         .await
         .unwrap();
     // One scan job wanted: the whole hour's budget is its bid.
-    na.node.wants.lock().unwrap().set("scan", 1);
+    na.node.credits.wants.lock().unwrap().set("scan", 1);
     // A round of handing out jobs reads its book now.
     let mut funding = jobs::Funding::default();
     assert_eq!(

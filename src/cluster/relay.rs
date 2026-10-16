@@ -203,7 +203,7 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &RelayReq) -> RelayResp 
     }
     // A sale: only a lease granted counts as demand (a full house counts
     // as at capacity in `credits::price`).
-    node.market.note(price::RELAY, 1);
+    node.credits.market.note(price::RELAY, 1);
     let until_ms = node.relay_leases.grant(peer, now);
     tracing::info!(lessee = %peer.short(), charged = %show(cost as Mc), "relay leased");
     RelayResp::Accepted { until_ms }
@@ -369,7 +369,7 @@ mod tests {
             hours: 1,
             offer_seq: None,
         };
-        let sold = || node.market.peek().counts.get(price::RELAY).copied();
+        let sold = || node.credits.market.peek().counts.get(price::RELAY).copied();
         node.relay_leases.grant(id(8), super::super::hlc::wall_ms());
         let full = serve(&node, id(7), &req).await;
         assert!(matches!(full, RelayResp::Declined { .. }), "{full:?}");

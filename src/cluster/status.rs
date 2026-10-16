@@ -438,9 +438,13 @@ impl Node {
             probe_price_mc: self.prober().map(|p| p.price(&table)),
             scan_price_mc: crate::credits::price::own_scan_price(self, &table),
             scan_budget_mc: self
+                .credits
                 .scan_budget_mc
                 .load(std::sync::atomic::Ordering::Relaxed),
-            scan_queued: self.scan_queued.load(std::sync::atomic::Ordering::Relaxed),
+            scan_queued: self
+                .credits
+                .scan_queued
+                .load(std::sync::atomic::Ordering::Relaxed),
             relays: self.leased.relays(super::hlc::wall_ms()),
         };
         let Ok(body) = super::rpc::cbor::encode(&hb) else {

@@ -516,7 +516,10 @@ impl Arbiter {
                 }
                 let Some(pick) = payee else {
                     if let Some((ask, bid)) = over {
-                        self.node.market.over_bid(crate::credits::price::SCAN);
+                        self.node
+                            .credits
+                            .market
+                            .over_bid(crate::credits::price::SCAN);
                         if !refused {
                             refused = true;
                             info!(good = crate::credits::price::SCAN, ask, bid, job = %job.uid,
@@ -2302,7 +2305,8 @@ mod tests {
     async fn market_arbiter(dir: &std::path::Path) -> (Setup, u64) {
         let s = setup_at(dir, crate::cluster::rpc::proto::MARKET_PROTO).await;
         give_credits(&s.2, s.0.id()).await;
-        s.0.wants
+        s.0.credits
+            .wants
             .lock_or_recover()
             .set(crate::credits::price::SCAN, 1);
         let book = crate::credits::book_fresh(&s.0).await.unwrap();
@@ -2358,10 +2362,14 @@ mod tests {
         let uid = queue(&node, &store, 63, 2).await;
         assert!(arbiter.next_job(over, &[], 0).await.is_none());
         assert_eq!(status(&store, &uid).await, "queued");
-        assert_eq!(node.market.over_bids().get(SCAN), Some(&1));
+        assert_eq!(node.credits.market.over_bids().get(SCAN), Some(&1));
         let g = arbiter.next_job(at, &[], 0).await.unwrap();
         assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), bid));
-        assert_eq!(node.market.over_bids().get(SCAN), Some(&1), "not again");
+        assert_eq!(
+            node.credits.market.over_bids().get(SCAN),
+            Some(&1),
+            "not again"
+        );
     }
 
     /// An operator's bought job is no automatic purchase: no bid bounds
@@ -2382,6 +2390,6 @@ mod tests {
             .unwrap();
         let g = arbiter.next_job(v9, &[], 0).await.unwrap();
         assert_eq!((g.job_uid.as_str(), g.price_mc), (uid.as_str(), ask));
-        assert!(node.market.over_bids().is_empty());
+        assert!(node.credits.market.over_bids().is_empty());
     }
 }

@@ -114,13 +114,13 @@ pub async fn serve_rdns(
         );
     }
     if req.offer_seq.is_none() {
-        node.market.note(price::RDNS, 1);
+        node.credits.market.note(price::RDNS, 1);
     }
     if let Some(seq) = req.offer_seq {
         let accepted =
             pay::accept_offer(node, peer, seq, cost as u64, "rdns", pay::SERVE_MARGIN_MS).await;
         if pay::counts_as_demand(&accepted) {
-            node.market.note(price::RDNS, 1);
+            node.credits.market.note(price::RDNS, 1);
         }
         match accepted {
             Ok(_) => {}
@@ -211,7 +211,7 @@ async fn ask_once(
 /// An ask of `ask` mc above this node's `bid`: not bought, and counted.
 fn above_bid(node: &crate::cluster::Node, ask: u64, bid: u64) -> String {
     use crate::credits::{price, show};
-    node.market.over_bid(price::RDNS);
+    node.credits.market.over_bid(price::RDNS);
     tracing::info!(
         good = price::RDNS,
         ask,
@@ -311,7 +311,8 @@ pub async fn buy_pass(
     use crate::credits::price;
     let me = node.id();
     let mut due = node.store.rdns_due_own(WANTED_AT_MOST, &me).await?;
-    node.wants
+    node.credits
+        .wants
         .lock_or_recover()
         .set(price::RDNS, due.len() as u32);
     due.truncate(BATCH as usize);
@@ -514,7 +515,7 @@ mod tests {
         let peer = crate::cluster::identity::NodeId([9; 32]);
         let resp = serve_rdns(&node, peer, &req).await;
         assert_eq!(resp.price_mc, Some(5), "{resp:?}");
-        assert_eq!(node.market.peek().counts.get(price::RDNS), None);
+        assert_eq!(node.credits.market.peek().counts.get(price::RDNS), None);
     }
 
     #[tokio::test]

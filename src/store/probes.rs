@@ -7,7 +7,7 @@ use super::hostkeys::insert_probe_keys;
 use super::requests::IpRow;
 use crate::cluster::identity::NodeId;
 use crate::cluster::record::{IpNameRec, ProbeResultRec};
-use crate::scan::hostkeys::{
+use crate::model::hostkeys::{
     FAVICON, HASSH, HTTP_404, HTTP_BODY, HostKey, JARM, SSH_HOSTKEY, TLS_CERT,
 };
 use anyhow::Result;

@@ -586,7 +586,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::nmap_xml::{PortResult, ScanResult};
+    use crate::model::nmap_xml::{PortResult, ScanResult};
     use crate::store::requests::NewRequest;
 
     #[tokio::test]

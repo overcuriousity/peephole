@@ -38,7 +38,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use crate::scan::nmap_xml::{PortResult, ScanResult};
+    use crate::model::nmap_xml::{PortResult, ScanResult};
     use crate::store::Store;
     use crate::store::recorder::Pruned;
     use crate::store::requests::NewRequest;

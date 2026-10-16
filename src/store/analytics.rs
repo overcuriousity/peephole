@@ -164,10 +164,10 @@ impl Store {
             )
         };
         let hassh = self
-            .named_ips(host_key(crate::scan::hostkeys::HASSH), since)
+            .named_ips(host_key(crate::model::hostkeys::HASSH), since)
             .await?;
         let ja4x = self
-            .named_ips(host_key(crate::scan::hostkeys::JA4X), since)
+            .named_ips(host_key(crate::model::hostkeys::JA4X), since)
             .await?;
         // Bands in display order; an IP active in the range counts once.
         let active = match r {

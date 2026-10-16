@@ -96,7 +96,8 @@ async fn compare_rules(store: &crate::store::Store) -> anyhow::Result<RulesCheck
 /// used while it is made again), shared by the ledger and the pages.
 pub async fn rules_check(node: &Node) -> Result<Arc<RulesCheck>> {
     let store = node.store.clone();
-    node.rules_check
+    node.credits
+        .rules_check
         .get((), RULES_CHECK_TTL, move || {
             let store = store.clone();
             Box::pin(async move { compare_rules(&store).await })

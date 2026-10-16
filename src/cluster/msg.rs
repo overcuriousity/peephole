@@ -485,7 +485,8 @@ impl Node {
     /// Whether dialling `id` failed last time (it is retried by its sync
     /// loop with backoff, not by every message).
     pub(crate) fn dial_failing(&self, id: &NodeId) -> bool {
-        self.peer_status
+        self.peers
+            .peer_status
             .read_or_recover()
             .get(id)
             .is_some_and(|s| s.last_error.is_some())
@@ -747,7 +748,7 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
                 backoff = Duration::from_secs(1);
                 for mut env in envs.into_iter().take(MAX_OUTBOX) {
                     env.hops = env.hops.saturating_add(1);
-                    let Ok(permit) = node.route_slots.clone().try_acquire_owned() else {
+                    let Ok(permit) = node.peers.route_slots.clone().try_acquire_owned() else {
                         debug!("too many messages in flight; inbox message dropped");
                         continue;
                     };

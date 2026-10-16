@@ -524,3 +524,40 @@ whose files are replaced in place. Pushing a tag `v<version>` publishes an
 immutable release the same way; the tag must equal the `version` in
 `Cargo.toml` (`v0.1.0` for `0.1.0`), which CI checks. Verify a download with
 `gh attestation verify <tarball> --repo overcuriousity/peephole`.
+
+### Dependencies
+
+Heavy dependencies are built with only the features the code uses: `arrow`
+without its defaults (no arrow-csv or arrow-json; `parquet` does the file
+I/O), `sqlx` without `any`, `migrate` and the query macros (the
+schema in `src/store/migrations` is applied by our own code), `parquet`,
+`rcgen`, `qrcode`, `rustix` and `zip` with an explicit feature list.
+
+**One TLS crypto provider.** rustls, tokio-rustls, reqwest, rcgen and
+x509-parser all use aws-lc-rs. `ring` and `quinn` appear in `Cargo.lock`
+only because the lockfile records optional dependencies (reqwest's HTTP/3,
+quinn-proto's ring backend); neither is compiled:
+`cargo tree -i ring --target all` prints nothing. OpenSSL is linked for
+webauthn-rs (its signature and attestation checks), not for TLS; removing it means replacing
+webauthn-rs.
+
+**Duplicate versions that remain** (`cargo tree -d --target
+x86_64-unknown-linux-gnu`), none of them from a dependency we could bump:
+
+| Crate | Versions | Why both |
+|---|---|---|
+| x509-parser, der-parser, asn1-rs, asn1-rs-derive, oid-registry, synstructure 0.13 | 0.16 / 0.18 and their stacks | webauthn-rs 0.5 (latest stable) pins x509-parser 0.16; rcgen 0.14 and our code use 0.18. |
+| thiserror, thiserror-impl | 1 / 2 | 1 from webauthn-rs and x509-parser 0.16. |
+| base64 | 0.21 / 0.22 / 0.23 | 0.21 webauthn-rs; 0.22 cookie (axum-extra) and sqlx-core; 0.23 the rest. |
+| rand, rand_core, rand_chacha, getrandom | rand 0.8 / 0.9 / 0.10 | 0.8 cookie (signed cookies via axum-extra), 0.9 webauthn-rs, 0.10 ours; getrandom 0.2/0.3 follow rand_core 0.6/0.9 (0.3 also tempfile, ahash). |
+| sha2, digest, block-buffer, crypto-common, cpufeatures | 0.10 / 0.11 line | ours (sha2, md-5) are on 0.11; cookie, sqlx-core and argon2 0.5 are on 0.10. Downgrading ours would only move us back a line upstream is leaving; argon2 0.6 is a breaking release on the password path and would not remove 0.10 (cookie, sqlx still use it). |
+| hashbrown | 0.16 / 0.17 | 0.16 sqlx-core (hashlink). |
+| atoi | 2 / 3 | 2 sqlx-sqlite, 3 arrow-cast. |
+| num-bigint | 0.4 / 0.5 | 0.4 der-parser (x509), 0.5 arrow/parquet. |
+| untrusted | 0.7 / 0.9 | 0.7 aws-lc-rs, 0.9 rustls-webpki. |
+| bitflags | 1 / 2 | 1 webauthn-authenticator-rs (tests only). |
+| syn | 2 / 3 | proc-macro crates (build time only) on both majors. |
+
+CI's cargo-deny reports duplicates as warnings (`deny.toml`,
+`multiple-versions = "warn"`); recheck this list when bumping webauthn-rs,
+axum-extra or sqlx.

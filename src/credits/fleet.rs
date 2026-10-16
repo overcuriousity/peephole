@@ -41,7 +41,7 @@ pub async fn send(node: &Node, to: NodeId, mc: Mc) -> Result<Mc> {
         );
     }
     let me = node.id();
-    let mut spending = node.spending.lock().await;
+    let mut spending = node.credits.spending.lock().await;
     let book = super::book_fresh(node).await?;
     let lots = spending.lots(&book, &me);
     let Some(parts) = super::ledger::parts_from(&lots, mc, 0) else {

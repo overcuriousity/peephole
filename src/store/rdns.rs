@@ -6,8 +6,9 @@ use super::Store;
 use crate::cluster::identity::NodeId;
 use anyhow::Result;
 
-// Most names kept of one lookup: as many as the lookup checks.
-use crate::scan::crawler::MAX_NAMES;
+/// Most PTR names of one address checked forward (`scan::crawler`), and
+/// so most names kept of one lookup.
+pub(crate) const MAX_NAMES: usize = 4;
 
 /// Per name, how many of those that answered gave it, and whether that
 /// is more than half; most votes first. A node's second answer counts for

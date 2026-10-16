@@ -35,7 +35,8 @@ confidence-threshold = 0.9
 
 [bans]
 # Several versions of one crate (rand 0.8/0.9/0.10 through cookie and
-# webauthn-rs, for one) are common in this tree: shown, not fatal.
+# webauthn-rs, for one) are common in this tree: shown, not fatal. Each
+# remaining duplicate and its reason: docs/operations.md, "Dependencies".
 multiple-versions = "warn"
 wildcards = "deny"
 # The workspace's own path dependencies are not wildcards.
