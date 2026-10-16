@@ -5,6 +5,51 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-16
+
+Campaign clustering (roadmap item 2): source IPs tied together by shared
+evidence are grouped into campaigns, recomputed on each node from the
+replicated rows. Two database migrations (0039, 0040), applied on start. No
+protocol change, no new setting.
+
+### Added
+
+- Path shapes (MIK-433): each request path gets a normalized, versioned
+  shape (query dropped, lowercased, UUID, digit, hex and random-token
+  segments replaced by placeholders; `SHAPE_V` 1). Shapes are derived on
+  insert, local and replicated, for full requests and light rows, and a
+  startup backfill derives them for stored rows. Shapes are never
+  replicated. Migration 0039 adds `requests.shape`/`shape_v`,
+  `skipped_requests.shape`, `skipped_batches.shape_v`, their indexes and
+  the `shapes` table.
+- Campaign recompute (MIK-434): a deterministic pass groups IPs by hard
+  edges (a shared SSH host key, TLS certificate, browser fingerprint or
+  reused canary) and soft edges (rarity-weighted Jaccard over path shapes;
+  a shared JA4 and JA4H only lowers the threshold). A hard value on more
+  than 50 IPs is excluded as shared infrastructure and reported. Every
+  order and tie-break goes by IP text, so the campaign key (the IP text of
+  the member active first) is the same on every node. The pass runs once
+  after the shape backfill, then hourly, and skips when its input is
+  unchanged; a failed pass logs a warning. Migration 0040 adds
+  `campaigns`, `campaign_members` and `campaign_edges`.
+- `peephole store recompute-campaigns [CONFIG]` runs a pass at once and
+  prints the report. `store` is an alias of `db`.
+- Admin Campaigns area (MIK-435): a read-only list at `/admin/campaigns`
+  filtered by country, ASN, minimum size and period, with the excluded
+  values and the last pass's time; a campaign page with members, every
+  evidence edge and its reason, requests per day and the shared path
+  shapes; and a "member of campaign #N" chip on IP pages.
+- Campaign graph (MIK-436): the campaign page draws its members and
+  evidence edges (focus `campaign:<key>`), paths edges dashed, the edge
+  reason on hover. The graph stops at 2000 edges, identity edges first,
+  and is then marked truncated.
+- Public wall (MIK-437): a "Campaigns this period" tile with counts and
+  family labels only, no addresses.
+- Dataset export (MIK-437): a `campaign` column in CSV, JSON Lines and
+  Parquet, the campaign key of the row's address when the export ran
+  (null when none). Documented in `docs/dataset.md`, with the Campaigns
+  area in `docs/operations.md` and `docs/overview.md`.
+
 ## [0.15.3] - 2026-10-16
 
 Code structure, tests and dependencies from the full review (MIK-370,

@@ -15,6 +15,7 @@ usage: peephole [CONFIG]                 run the daemon (default /etc/peephole/c
        peephole admin password [--stdin] [CONFIG]
        peephole admin login-method passkey|password|both [CONFIG]
        peephole db vacuum [CONFIG]
+       peephole store recompute-campaigns [CONFIG]
        peephole --version | -V
        peephole --help | -h | help
 
@@ -75,7 +76,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         Some("export") => Ok(Cmd::Export),
         Some("decoy") => Ok(Cmd::Decoy),
         Some("admin") => Ok(Cmd::Admin),
-        Some("db") => Ok(Cmd::Db),
+        Some("db" | "store") => Ok(Cmd::Db),
         _ => config_at(0).map(Cmd::Run),
     }
 }

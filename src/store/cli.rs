@@ -1,10 +1,12 @@
-//! `peephole db …`: database maintenance from the shell.
+//! `peephole db …` (or `peephole store …`): database maintenance from the
+//! shell.
 use crate::config::Config;
 use crate::store::Store;
 use anyhow::{Result, bail};
 use std::path::Path;
 
-pub const USAGE: &str = "usage: peephole db vacuum [CONFIG]";
+pub const USAGE: &str = "usage: peephole db vacuum [CONFIG]
+       peephole store recompute-campaigns [CONFIG]";
 
 /// Run a `db` subcommand; `args` excludes `db` itself.
 pub async fn run(args: &[String], default_config: &str) -> Result<()> {
@@ -24,6 +26,12 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                 mib(before),
                 mib(after)
             );
+            Ok(())
+        }
+        Some("recompute-campaigns") => {
+            let cfg = Config::load(Path::new(config))?;
+            let store = Store::connect(&cfg.database_path).await?;
+            println!("{}", store.recompute_campaigns(true).await?);
             Ok(())
         }
         _ => bail!("{USAGE}"),

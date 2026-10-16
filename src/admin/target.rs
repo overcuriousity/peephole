@@ -30,6 +30,8 @@ pub struct Target {
     pub actions: Option<crate::admin::probes::ActionsView>,
     /// Probe requests and results, newest first (admin only).
     pub probes: Vec<crate::admin::probes::GroupView>,
+    /// The campaign (key, number) the address is a member of (admin only).
+    pub campaign: Option<(String, i64)>,
 }
 
 impl Target {
@@ -155,7 +157,13 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
+    let campaign = if authed {
+        state.store.campaign_of_ip(ip.id).await?
+    } else {
+        None
+    };
     Ok(Some(Target {
+        campaign,
         actions,
         probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),

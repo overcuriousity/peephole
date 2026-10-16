@@ -370,6 +370,7 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .await?;
     if done.rows_affected() == 1 {
         super::canaries::derive_request(conn, done.last_insert_rowid()).await?;
+        super::shapes::derive_request(conn, done.last_insert_rowid()).await?;
     }
     Ok(Effect::Applied)
 }
@@ -456,6 +457,7 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
         .await?;
     }
     super::canaries::derive_batch(conn, id).await?;
+    super::shapes::derive_batch(conn, id).await?;
     Ok(Effect::Applied)
 }
 

@@ -292,6 +292,7 @@ peephole admin password [--stdin]                 # set or change the admin pass
 peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
+peephole store recompute-campaigns                # recompute campaigns now and print the report
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
@@ -401,6 +402,20 @@ Links area (every browser fingerprint, SSH host key, TLS certificate, JA4,
 JA4H, HASSH and JA4X, filterable, each with a graph of the IPs it was seen
 on and what else links them), canary reuse, the false-positive inbox,
 deletion (standalone nodes only) and the dataset export.
+
+The Campaigns area (`/admin/campaigns`) lists the groups of source IPs the
+hourly recompute tied together: by a shared SSH host key, TLS certificate,
+browser fingerprint or canary (hard edges), or by near-identical sets of
+path shapes (soft edges; a shared JA4 and JA4H only lowers the bar for one,
+never forms an edge alone). Filter by country, ASN, minimum size and
+period. Below the list are the excluded values (a hard value on more than 50
+IPs is shared infrastructure, not one operator) and when the last pass ran
+and how long it took. A campaign's page shows its members, every evidence
+edge with the reason, the members' requests per day and the path shapes most
+of them asked for, with how many IPs of the whole dataset asked for each.
+An IP page shows "member of campaign #N" for a member. The area is
+read-only: a campaign is computed from the stored rows on each node, and
+`peephole store recompute-campaigns` runs a pass at once.
 
 ### Public pages are delayed
 
