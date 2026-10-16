@@ -22,6 +22,7 @@ pub mod tls;
 pub mod traffic;
 
 use crate::config::{ClusterConfig, Config, Roles};
+use crate::lock::{MutexExt, RwLockExt};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use identity::{Identity, NodeId};
@@ -434,7 +435,7 @@ impl Node {
         if node.detached().is_none()
             && let Some(last) = node.own_last_hlc().await?
             && hlc::wall_ms().saturating_sub(hlc::physical_ms(last)) > members::PRUNE_AFTER_MS
-            && node.standings.read().unwrap().len() > 1
+            && node.standings.read_or_recover().len() > 1
         {
             warn!(
                 "no entry of our own for over 30 days: pruned from the cluster; rejoin with an invite"
@@ -455,7 +456,7 @@ impl Node {
 
     /// The roles this node runs right now.
     pub fn roles(&self) -> Roles {
-        *self.roles.read().unwrap()
+        *self.roles.read_or_recover()
     }
 
     /// Adopt new roles and tell the cluster (member info and heartbeat).
@@ -463,10 +464,10 @@ impl Node {
         if self.roles() == r {
             return Ok(());
         }
-        let before = std::mem::replace(&mut *self.roles.write().unwrap(), r);
+        let before = std::mem::replace(&mut *self.roles.write_or_recover(), r);
         if let Err(e) = repl::append(self, &[Record::MemberUpdate(self.self_info())]).await {
             // Not announced: try again on the next call.
-            *self.roles.write().unwrap() = before;
+            *self.roles.write_or_recover() = before;
             return Err(e);
         }
         self.publish_status();
@@ -502,7 +503,7 @@ impl Node {
             .find(|m| m.id == self.id() && m.info_hlc > 0);
         if let Some(m) = announced {
             let has = |n: &str| m.roles.iter().any(|r| r == n);
-            *self.roles.write().unwrap() = Roles {
+            *self.roles.write_or_recover() = Roles {
                 listener: has("listener"),
                 scanner: has("scanner"),
                 web: has("web"),
@@ -597,12 +598,12 @@ impl Node {
     }
 
     pub fn price_table(&self) -> Arc<crate::credits::price::Table> {
-        self.price_table.read().unwrap().clone()
+        self.price_table.read_or_recover().clone()
     }
 
     /// Adopt new prices and announce them with the next heartbeat.
     pub fn set_price_table(&self, t: Arc<crate::credits::price::Table>) {
-        *self.price_table.write().unwrap() = t;
+        *self.price_table.write_or_recover() = t;
         self.publish_status();
     }
 
@@ -663,18 +664,18 @@ impl Node {
 
     /// Enrichment providers this node can query right now.
     pub fn providers(&self) -> Vec<String> {
-        self.providers.read().unwrap().clone()
+        self.providers.read_or_recover().clone()
     }
 
     pub fn set_providers(&self, p: Vec<String>) {
-        if *self.providers.read().unwrap() != p {
-            *self.providers.write().unwrap() = p;
+        if *self.providers.read_or_recover() != p {
+            *self.providers.write_or_recover() = p;
             self.publish_status();
         }
     }
 
     pub fn detached(&self) -> Option<Detached> {
-        *self.detached.read().unwrap()
+        *self.detached.read_or_recover()
     }
 
     /// Whether every other member looks pruned from here (see `isolated`).
@@ -684,12 +685,12 @@ impl Node {
 
     /// Whether this node blocked `id` (a local decision, see [`block`]).
     pub fn is_blocked(&self, id: &NodeId) -> bool {
-        self.blocked.read().unwrap().contains(id)
+        self.blocked.read_or_recover().contains(id)
     }
 
     /// The standing of any known node, member or not.
     pub fn standing_of(&self, id: &NodeId) -> Option<members::Standing> {
-        self.standings.read().unwrap().get(id).copied()
+        self.standings.read_or_recover().get(id).copied()
     }
 
     /// Whether this node keeps only a window of the history.
@@ -729,8 +730,7 @@ impl Node {
     pub fn unserved_origins(&self) -> Vec<NodeId> {
         let mut v: Vec<NodeId> = self
             .unserved
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .values()
             .flatten()
             .copied()
@@ -743,8 +743,7 @@ impl Node {
     /// The origins `peer` could not serve this node in the last round.
     pub fn unserved_from(&self, peer: &NodeId) -> Vec<NodeId> {
         self.unserved
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(peer)
             .cloned()
             .unwrap_or_default()
@@ -773,7 +772,7 @@ impl Node {
     pub async fn reload_floors(&self) -> Result<()> {
         let mut conn = self.store.pool.acquire().await?;
         let f = history::floors(&mut conn).await?;
-        *self.own_floors.write().unwrap() = f;
+        *self.own_floors.write_or_recover() = f;
         Ok(())
     }
 
@@ -830,11 +829,11 @@ impl Node {
             .map(|m| (m.id, m))
             .collect();
         let before = self.dial_targets();
-        *self.members.write().unwrap() = Arc::new(map);
+        *self.members.write_or_recover() = Arc::new(map);
         self.status.retain_heartbeats(|id| self.is_member(id));
-        *self.detached.write().unwrap() = detached;
-        *self.blocked.write().unwrap() = Arc::new(blocked);
-        *self.standings.write().unwrap() = Arc::new(standings);
+        *self.detached.write_or_recover() = detached;
+        *self.blocked.write_or_recover() = Arc::new(blocked);
+        *self.standings.write_or_recover() = Arc::new(standings);
         if self.dial_targets() != before {
             self.members_changed.notify_one();
         }
@@ -843,11 +842,11 @@ impl Node {
 
     /// Whether `id` may use the RPC API (an active member, or this node).
     pub fn is_member(&self, id: &NodeId) -> bool {
-        *id == self.id() || self.members.read().unwrap().contains_key(id)
+        *id == self.id() || self.members.read_or_recover().contains_key(id)
     }
 
     pub fn members(&self) -> Arc<HashMap<NodeId, MemberRow>> {
-        self.members.read().unwrap().clone()
+        self.members.read_or_recover().clone()
     }
 
     /// Whether sync serves `peer` as an older member (each origin up to
@@ -899,8 +898,7 @@ impl Node {
     /// attempts.
     pub fn join_allowed(&self, peer: NodeId, ip: std::net::IpAddr) -> bool {
         self.join_attempts
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .allow(peer, ip, std::time::Instant::now())
     }
 
@@ -928,7 +926,7 @@ impl Node {
 
     /// HTTP client that only talks to `peer` (its key is pinned in TLS).
     pub fn client_for(&self, peer: NodeId) -> Result<reqwest::Client> {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock_or_recover();
         if let Some(c) = clients.get(&peer) {
             return Ok(c.clone());
         }
@@ -1087,7 +1085,7 @@ impl Node {
             if r.is_ok() {
                 self.status.touch_outbound(peer);
             }
-            let mut all = self.peer_status.write().unwrap();
+            let mut all = self.peer_status.write_or_recover();
             let st = all.entry(peer).or_default();
             match r {
                 Ok(h) => {
@@ -1118,12 +1116,11 @@ impl Node {
         if changed {
             let st = self
                 .peer_status
-                .read()
-                .unwrap()
+                .read_or_recover()
                 .get(&peer)
                 .cloned()
                 .unwrap_or_default();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO peer_contact (id, last_ok, last_error, error_at, version)
                  VALUES (?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, ?)
                  ON CONFLICT(id) DO UPDATE SET
@@ -1138,7 +1135,10 @@ impl Node {
             .bind(&st.last_error)
             .bind(st.hello.as_ref().map(|h| h.version.clone()))
             .execute(&self.store.pool)
-            .await;
+            .await
+            {
+                warn!(?e, "saving the peer contact state failed");
+            }
         }
     }
 }

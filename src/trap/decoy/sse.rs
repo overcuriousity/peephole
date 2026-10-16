@@ -2,6 +2,7 @@
 //! the endpoint to POST to; the answers to those POSTs go down the stream.
 //! Streams live on this node only, in a pool of their own (as the
 //! tarpit's), and end after the hold cap or two idle minutes.
+use crate::lock::MutexExt;
 use crate::trap::TrapConfig;
 use axum::body::Bytes;
 use std::collections::HashMap;
@@ -42,7 +43,7 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let mut g = self.hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.hub.inner.lock_or_recover();
         g.sessions.remove(&self.session);
         if let Some(n) = g.sources.get_mut(&self.ip) {
             *n = n.saturating_sub(1);
@@ -82,11 +83,7 @@ impl SseHub {
 
     /// Streams open now.
     pub fn open_count(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sessions
-            .len()
+        self.inner.lock_or_recover().sessions.len()
     }
 
     /// A stream for `session` from `ip`, opened with `first`, and where the
@@ -106,7 +103,7 @@ impl SseHub {
         let permit = self.pool.clone().try_acquire_owned().ok()?;
         let (tx, rx) = mpsc::channel(QUEUE);
         {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.inner.lock_or_recover();
             if g.sessions.contains_key(&session)
                 || g.sources.get(&key).copied().unwrap_or(0) >= self.per_source
             {
@@ -158,7 +155,7 @@ impl SseHub {
     /// Push `frame` down the stream of `session` (None: only ask whether
     /// it is open).
     pub fn deliver(&self, session: &str, frame: Option<String>) -> Delivery {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.inner.lock_or_recover();
         let Some(tx) = g.sessions.get(session) else {
             return Delivery::NoSession;
         };

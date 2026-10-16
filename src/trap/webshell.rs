@@ -4,6 +4,7 @@
 //!
 //! [`reply`] takes only the command and the node's site word, so no reply
 //! can be derived from stored content.
+use crate::lock::MutexExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
@@ -96,7 +97,7 @@ impl PathMap {
     /// upload's uid, or None when it was not recorded. The path stops
     /// being answered only when no upload there is recorded or pending.
     pub fn settle(&self, path: &str, is_prefix: bool, seq: u64, uid: Option<&str>) {
-        let mut p = self.0.lock().unwrap();
+        let mut p = self.0.lock_or_recover();
         let map = p.map(is_prefix);
         // Evicted since: the bound already dropped it.
         let Some(e) = map.get_mut(path) else {
@@ -121,7 +122,7 @@ impl PathMap {
     /// Count one more unsettled upload at `path`, evicting the oldest
     /// past `max`.
     fn answer(&self, path: &str, is_prefix: bool, max: usize) -> u64 {
-        let mut p = self.0.lock().unwrap();
+        let mut p = self.0.lock_or_recover();
         p.seq += 1;
         let seq = p.seq;
         let e = p.map(is_prefix).entry(path.to_string()).or_default();
@@ -145,7 +146,7 @@ impl PathMap {
     /// prefix folder (each ends in `/`) it lies under. Empty while only
     /// unsettled uploads answer it.
     pub fn lookup(&self, path: &str) -> Option<String> {
-        let p = self.0.lock().unwrap();
+        let p = self.0.lock_or_recover();
         let uid = |e: &Entry| e.uid.as_ref().map(|(_, u)| u.clone()).unwrap_or_default();
         if let Some(e) = p.exact.get(path) {
             return Some(uid(e));
@@ -159,7 +160,7 @@ impl PathMap {
     }
 
     pub fn len(&self) -> usize {
-        let p = self.0.lock().unwrap();
+        let p = self.0.lock_or_recover();
         p.exact.len() + p.prefix.len()
     }
 

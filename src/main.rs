@@ -87,6 +87,7 @@ fn fail(e: anyhow::Error) -> ! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    peephole::restrict_umask();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse(&args) {
         Ok(c) => c,

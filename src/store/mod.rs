@@ -121,6 +121,7 @@ impl Store {
             .connect_with(opts)
             .await
             .context("opening sqlite")?;
+        crate::warn_if_exposed(path, "database");
         incremental_vacuum_if_new(&pool).await;
         check_application_id(&pool)
             .await

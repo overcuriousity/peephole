@@ -9,6 +9,7 @@
 use crate::cluster::Node;
 use crate::cluster::identity::NodeId;
 use crate::cluster::tls::cert_node_id;
+use crate::lock::MutexExt;
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
@@ -77,7 +78,7 @@ impl PerAddress {
 
     fn take(self: &Arc<Self>, ip: IpAddr) -> Option<AddressSlot> {
         let key = address_key(ip);
-        let mut m = self.open.lock().unwrap();
+        let mut m = self.open.lock_or_recover();
         let n = m.entry(key).or_default();
         if *n >= self.max {
             return None;
@@ -89,7 +90,7 @@ impl PerAddress {
 
 impl Drop for AddressSlot {
     fn drop(&mut self) {
-        let mut m = self.0.open.lock().unwrap();
+        let mut m = self.0.open.lock_or_recover();
         if let Some(n) = m.get_mut(&self.1) {
             *n -= 1;
             if *n == 0 {

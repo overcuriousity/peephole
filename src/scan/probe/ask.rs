@@ -247,6 +247,7 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::MutexExt;
     use std::sync::Mutex;
 
     /// Offers made to a scanner whose price is `price`; it accepts any
@@ -254,7 +255,7 @@ mod tests {
     async fn offers_to(price: u32, first: Mc) -> (ProbeResp, Vec<Mc>) {
         let made = Mutex::new(vec![]);
         let resp = with_retry(first, |offer| {
-            made.lock().unwrap().push(offer);
+            made.lock_or_recover().push(offer);
             async move {
                 match offer >= price as Mc {
                     true => ProbeResp::Accepted {

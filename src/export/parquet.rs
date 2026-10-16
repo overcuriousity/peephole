@@ -2,6 +2,7 @@
 //! per-IP JSON columns as text. Footer metadata names the format version,
 //! the mode and the filter.
 use super::{ExportFilter, ExportRow, Mode};
+use crate::lock::MutexExt;
 use crate::store::Store;
 use crate::store::uploads::{UploadMeta, UploadQuery};
 use anyhow::Result;
@@ -247,16 +248,13 @@ struct Pending(Arc<Mutex<Vec<u8>>>);
 
 impl Pending {
     fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|p| p.into_inner()))
+        std::mem::take(&mut *self.0.lock_or_recover())
     }
 }
 
 impl std::io::Write for Pending {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .extend_from_slice(buf);
+        self.0.lock_or_recover().extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {

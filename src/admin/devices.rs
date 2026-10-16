@@ -194,7 +194,11 @@ secure_cookies = false
         )
         .await;
         assert_eq!(st, axum::http::StatusCode::SEE_OTHER);
-        let get = || axum::http::Request::get("/admin/devices").header("cookie", &cookie);
+        let get = || {
+            axum::http::Request::get("/admin/devices")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+        };
         let (st, _, html) = send(&app, get(), Body::empty()).await;
         assert_eq!(st, 200);
         assert!(html.contains("No devices paired yet"), "{html}");
@@ -203,6 +207,7 @@ secure_cookies = false
             &app,
             axum::http::Request::post("/admin/devices/pair")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded"),
             Body::from("act=1"),
         )
@@ -237,6 +242,7 @@ secure_cookies = false
             &app,
             axum::http::Request::post("/admin/devices/revoke")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded"),
             Body::from(format!("id={}", device.id)),
         )
@@ -250,6 +256,7 @@ secure_cookies = false
             &app,
             axum::http::Request::post("/admin/devices/revoke")
                 .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded"),
             Body::from(format!("id={}", device.id)),
         )

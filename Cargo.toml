@@ -1,6 +1,6 @@
 [package]
 name = "peephole"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Oldest toolchain that builds this crate (sqlx 0.9 needs 1.94); CI checks it.
@@ -49,7 +49,7 @@ reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "
 rpassword = "7"
 rustls = "0.23"
 # Free disk under the database, for the upload store's floor (statvfs).
-rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_ignored = "0.1.14"
@@ -88,3 +88,5 @@ webauthn-rs-proto = "0.5"
 lto = "thin"
 codegen-units = 1
 strip = true
+# An integer overflow panics (in its task) instead of wrapping silently.
+overflow-checks = true

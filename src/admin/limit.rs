@@ -6,7 +6,9 @@
 //! resolved with the same `X-Forwarded-For` logic as the trap. Sign-in
 //! starts also share one global bucket, so many sources together cannot
 //! churn through the open ceremonies faster than a pending one may be
-//! evicted.
+//! evicted. A client with a live session or a ceremony in flight is not
+//! held to that shared bucket (its own still applies), so a flood cannot
+//! lock out an admin already signing in.
 //!
 //! The admin listener normally sits behind a local nginx; loopback peers
 //! are trusted to report the client in `X-Forwarded-For`. Without that
@@ -14,6 +16,7 @@
 //! applies (a shared bucket would let one client lock everyone out); a
 //! warning says so once.
 use crate::admin::AdminState;
+use crate::lock::MutexExt;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -98,7 +101,7 @@ impl RateLimiter {
     pub fn allow(&self, client: IpAddr) -> bool {
         let now = Instant::now();
         let (per_sec, burst) = (self.per_sec, self.burst);
-        let mut map = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.buckets.lock_or_recover();
         if map.len() >= MAX_CLIENTS && !map.contains_key(&client) {
             map.retain(|_, b| b.level(now, per_sec, burst) < burst);
             if map.len() >= MAX_CLIENTS {
@@ -134,7 +137,7 @@ impl GlobalLimiter {
 
     /// Take one token; `false` when the bucket is empty.
     pub fn allow(&self) -> bool {
-        let mut b = self.bucket.lock().unwrap_or_else(|p| p.into_inner());
+        let mut b = self.bucket.lock_or_recover();
         b.take(Instant::now(), self.per_sec, self.burst)
     }
 }
@@ -235,13 +238,19 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     let path = req.uri().path().to_string();
     let limits = &state.limits;
     // Sign-in starts from everyone share one budget as well, taken after the
-    // client's own so a client over its limit does not spend it.
+    // client's own so a client over its limit does not spend it. A client
+    // holding a live session is not refused by it (checked only once it is
+    // empty, so a flood costs no lookups while it lasts). A ceremony cookie
+    // does not count: one free `/login/start` hands it to anyone.
     let is_sign_in =
         class == Class::Auth && matches!(path.as_str(), "/login/start" | "/login/password");
-    let global = || !is_sign_in || limits.login.allow();
+    let jar = axum_extra::extract::CookieJar::from_headers(req.headers());
+    let global = async || {
+        !is_sign_in || limits.login.allow() || crate::admin::auth::session_valid(&state, &jar).await
+    };
     // No peer address (in-process callers, tests): nothing to key on.
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() else {
-        if !global() {
+        if !global().await {
             return too_many(&path);
         }
         return next.run(req).await;
@@ -255,14 +264,14 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
                  to the nginx location blocks of the admin site."
             );
         }
-        if !global() {
+        if !global().await {
             return too_many(&path);
         }
         return next.run(req).await;
     }
     let key = client_key(client, &class);
     let allowed = match class {
-        Class::Auth => limits.auth.allow(key) && global(),
+        Class::Auth => limits.auth.allow(key) && global().await,
         _ => limits.public.allow(key),
     };
     if allowed {
@@ -270,11 +279,8 @@ pub async fn enforce(State(state): State<Arc<AdminState>>, req: Request, next: N
     }
     // An admin browsing the public pages is not limited (checked only once
     // the bucket is empty, so anonymous traffic costs no session lookup).
-    if class == Class::Public {
-        let jar = axum_extra::extract::CookieJar::from_headers(req.headers());
-        if crate::admin::auth::session_valid(&state, &jar).await {
-            return next.run(req).await;
-        }
+    if class == Class::Public && crate::admin::auth::session_valid(&state, &jar).await {
+        return next.run(req).await;
     }
     too_many(&path)
 }
@@ -323,7 +329,7 @@ mod tests {
         assert!(l.allow(hot) && l.allow(hot));
         assert!(!l.allow(hot));
         assert!(l.allow(ip(MAX_CLIENTS)), "a newcomer gets room");
-        let map = l.buckets.lock().unwrap();
+        let map = l.buckets.lock_or_recover();
         assert!(map.len() < MAX_CLIENTS);
         assert!(!map.contains_key(&ip(0)), "oldest dropped");
         // Not everyone was forgotten: the drained client stays limited.
@@ -339,10 +345,8 @@ mod tests {
         assert!(!g.allow());
     }
 
-    #[tokio::test]
-    async fn the_router_limits_each_client_separately() {
-        use axum::body::Body;
-        use tower::ServiceExt;
+    /// The web app on a fresh database (plain-http cookies), and its store.
+    async fn app() -> (axum::Router, crate::store::Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -365,7 +369,15 @@ secure_cookies = false
         let store = crate::store::Store::connect(&cfg.database_path)
             .await
             .unwrap();
-        let app = crate::admin::full_router(Arc::new(AdminState::public_only(store, cfg)));
+        let state = Arc::new(AdminState::public_only(store.clone(), cfg));
+        (crate::admin::full_router(state), store, dir)
+    }
+
+    #[tokio::test]
+    async fn the_router_limits_each_client_separately() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let (app, _store, _dir) = app().await;
         // nginx on loopback reports the client in X-Forwarded-For.
         let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let call = |method: &str, path: &str, client: Option<&str>| {
@@ -449,6 +461,63 @@ secure_cookies = false
             .await
             .unwrap();
         assert_ne!(r.status(), 429);
+    }
+
+    /// With the shared sign-in budget used up, a client holding a live
+    /// session still gets through; one without, with a dead cookie, or with
+    /// only a live ceremony cookie (free from `/login/start`) is refused.
+    /// Its own budget still applies.
+    #[tokio::test]
+    async fn only_a_signed_in_client_skips_the_shared_budget() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let (app, store, _dir) = app().await;
+        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let call = |client: &str, cookie: Option<String>| {
+            let mut b = axum::http::Request::post("/login/start")
+                .extension(ConnectInfo(peer))
+                .header("x-forwarded-for", client)
+                .header("sec-fetch-site", "same-origin");
+            if let Some(c) = cookie {
+                b = b.header("cookie", c);
+            }
+            app.clone().oneshot(b.body(Body::empty()).unwrap())
+        };
+        // Many sources together empty the shared bucket.
+        let mut i = 0;
+        while call(&format!("192.0.2.{i}"), None).await.unwrap().status() != 429 {
+            i += 1;
+            assert!(i < LOGIN_BURST * 4, "the shared budget never ran out");
+        }
+        let session = store.create_session().await.unwrap();
+        let ceremony = store
+            .put_webauthn_state("auth", "{}", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let cases = [
+            ("198.51.100.1", None, 429),
+            ("198.51.100.2", Some("peephole_session=forged".into()), 429),
+            ("198.51.100.3", Some("wa_sid=forged".into()), 429),
+            (
+                "198.51.100.4",
+                Some(format!("peephole_session={session}")),
+                412,
+            ),
+            ("198.51.100.5", Some(format!("wa_sid={ceremony}")), 429),
+        ];
+        for (client, cookie, want) in cases {
+            let r = call(client, cookie.clone()).await.unwrap();
+            assert_eq!(r.status(), want, "{cookie:?}");
+        }
+        // The client's own bucket applies to a session holder all the same.
+        let cookie = format!("peephole_session={session}");
+        for _ in 1..AUTH_BURST {
+            let r = call("198.51.100.4", Some(cookie.clone())).await.unwrap();
+            assert_eq!(r.status(), 412);
+        }
+        let r = call("198.51.100.4", Some(cookie)).await.unwrap();
+        assert_eq!(r.status(), 429);
     }
 
     #[test]

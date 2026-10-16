@@ -510,6 +510,7 @@ secure_cookies = false
     pub(crate) fn post(cookie: &str, body: &str) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::post("/admin/lookup/scan")
             .header("cookie", cookie)
+            .header("sec-fetch-site", "same-origin")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
@@ -712,6 +713,7 @@ secure_cookies = false
                 .oneshot(
                     axum::http::Request::get(&page)
                         .header("cookie", &cookie)
+                        .header("sec-fetch-site", "same-origin")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )
@@ -873,6 +875,7 @@ secure_cookies = false
             .oneshot(
                 axum::http::Request::get(format!("/admin/api/scan-jobs?ip={IP}"))
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -904,6 +907,7 @@ secure_cookies = false
             .oneshot(
                 axum::http::Request::get(format!("/admin/api/scan-jobs?ip={IP}"))
                     .header("cookie", &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

@@ -4,6 +4,7 @@
 
 use super::identity::NodeId;
 use super::record::WireEntry;
+use crate::lock::MutexExt;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -99,7 +100,7 @@ impl Default for Traffic {
 
 impl Traffic {
     fn with(&self, peer: NodeId, name: &str, f: impl FnOnce(&mut Peer)) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock_or_recover();
         let p = peers.entry(peer).or_default();
         if !name.is_empty() {
             p.name = name.to_string();
@@ -132,13 +133,13 @@ impl Traffic {
     /// with nothing to report gets no line.
     pub fn summarize_if_due(&self) {
         {
-            let mut since = self.since.lock().unwrap();
+            let mut since = self.since.lock_or_recover();
             if since.elapsed() < SUMMARY_EVERY {
                 return;
             }
             *since = Instant::now();
         }
-        let peers = std::mem::take(&mut *self.peers.lock().unwrap());
+        let peers = std::mem::take(&mut *self.peers.lock_or_recover());
         let mut active: Vec<_> = peers.into_iter().filter(|(_, p)| p.active()).collect();
         active.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         for (id, p) in active {
@@ -194,16 +195,16 @@ mod tests {
         t.sent(a, "a", &k);
         t.sent(a, "a", &k);
         {
-            let peers = t.peers.lock().unwrap();
+            let peers = t.peers.lock_or_recover();
             let p = &peers[&a];
             assert_eq!((p.name.as_str(), p.rounds, p.failed), ("a", 2, 1));
             assert_eq!((p.received.total(), p.applied, p.sent.total()), (1, 1, 2));
         }
         // Not due yet: nothing is reset.
         t.summarize_if_due();
-        assert!(t.peers.lock().unwrap().contains_key(&a));
-        *t.since.lock().unwrap() -= SUMMARY_EVERY;
+        assert!(t.peers.lock_or_recover().contains_key(&a));
+        *t.since.lock_or_recover() -= SUMMARY_EVERY;
         t.summarize_if_due();
-        assert!(t.peers.lock().unwrap().is_empty());
+        assert!(t.peers.lock_or_recover().is_empty());
     }
 }

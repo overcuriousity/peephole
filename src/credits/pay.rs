@@ -12,6 +12,7 @@ use crate::cluster::record::Record;
 use crate::cluster::{Node, repl};
 use crate::intel::lookup::{LookupReq, LookupResp, NodeAnswer};
 use crate::intel::{Providers, provider_info};
+use crate::lock::MutexExt;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -182,7 +183,7 @@ struct Serving(Arc<Node>, (NodeId, u64));
 
 impl Drop for Serving {
     fn drop(&mut self) {
-        self.0.serving_offers.lock().unwrap().remove(&self.1);
+        self.0.serving_offers.lock_or_recover().remove(&self.1);
     }
 }
 
@@ -265,8 +266,7 @@ pub async fn accept_offer(
     }
     if !node
         .serving_offers
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .insert((peer, offer_seq))
     {
         return why("this offer is being served already".into());

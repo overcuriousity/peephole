@@ -8,6 +8,7 @@
 //! here is stored in the database.
 use super::Node;
 use super::identity::NodeId;
+use crate::lock::{MutexExt, RwLockExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -177,7 +178,7 @@ impl Status {
     /// A member's authenticated connection came from `ip`.
     pub fn note_peer_ip(&self, peer: NodeId, ip: std::net::IpAddr) {
         let ip = crate::net::canonical(ip);
-        let mut all = self.peer_ips.lock().unwrap();
+        let mut all = self.peer_ips.lock_or_recover();
         let ips = all.entry(peer).or_default();
         if ips.last() == Some(&ip) {
             return;
@@ -192,8 +193,7 @@ impl Status {
     /// Every address a member has connected from since this node started.
     pub fn peer_ips(&self) -> Vec<(NodeId, std::net::IpAddr)> {
         self.peer_ips
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .iter()
             .flat_map(|(id, ips)| ips.iter().map(|ip| (*id, *ip)))
             .collect()
@@ -205,7 +205,7 @@ impl Status {
         if !crate::net::is_scannable_target(ip) {
             return; // private, loopback, link-local: a LAN or tunnel view
         }
-        let mut all = self.seen_from.lock().unwrap();
+        let mut all = self.seen_from.lock_or_recover();
         all.entry(ip)
             .or_default()
             .insert(reporter, (sibling, Instant::now()));
@@ -233,7 +233,7 @@ impl Status {
     /// This node's public addresses: reported by a sibling, or by two
     /// members. Newest confirmation first.
     pub fn public_addresses(&self) -> Vec<IpAddr> {
-        let mut all = self.seen_from.lock().unwrap();
+        let mut all = self.seen_from.lock_or_recover();
         Self::expire_seen_from(&mut all);
         let mut v: Vec<(Instant, IpAddr)> = all
             .iter()
@@ -247,7 +247,7 @@ impl Status {
     /// Every reported address with its reporters (and whether each is a
     /// sibling) and whether it is taken; taken ones first.
     pub fn seen_from_report(&self) -> Vec<SeenReport> {
-        let mut all = self.seen_from.lock().unwrap();
+        let mut all = self.seen_from.lock_or_recover();
         Self::expire_seen_from(&mut all);
         let mut v: Vec<_> = all
             .iter()
@@ -264,7 +264,7 @@ impl Status {
     /// Shift every seen-from report back by `by`.
     #[cfg(test)]
     pub fn age_seen_from(&self, by: Duration) {
-        for r in self.seen_from.lock().unwrap().values_mut() {
+        for r in self.seen_from.lock_or_recover().values_mut() {
             for (_, t) in r.values_mut() {
                 *t = t.checked_sub(by).unwrap_or(*t);
             }
@@ -273,8 +273,7 @@ impl Status {
 
     pub fn touch_inbound(&self, peer: NodeId) {
         self.contacts
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(peer)
             .or_default()
             .inbound = Some(Instant::now());
@@ -282,8 +281,7 @@ impl Status {
 
     pub fn touch_outbound(&self, peer: NodeId) {
         self.contacts
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(peer)
             .or_default()
             .outbound = Some(Instant::now());
@@ -297,8 +295,7 @@ impl Status {
     pub fn neighbours(&self) -> Vec<NodeId> {
         let mut v: Vec<_> = self
             .contacts
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .iter()
             .filter(|(_, c)| Self::recent(c.outbound) || Self::recent(c.inbound))
             .map(|(id, _)| *id)
@@ -311,8 +308,7 @@ impl Status {
     pub fn polled_recently(&self, peer: &NodeId) -> bool {
         Self::recent(
             self.contacts
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(peer)
                 .and_then(|c| c.inbound),
         )
@@ -322,8 +318,7 @@ impl Status {
     pub fn reached_recently(&self, peer: &NodeId) -> bool {
         Self::recent(
             self.contacts
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(peer)
                 .and_then(|c| c.outbound),
         )
@@ -332,7 +327,11 @@ impl Status {
     /// Whether [`Self::merge`] would take `hb` (checked before its
     /// signature, which costs more).
     pub fn is_news(&self, hb: &Heartbeat) -> bool {
-        news(&self.heartbeats.lock().unwrap(), hb, super::hlc::wall_ms())
+        news(
+            &self.heartbeats.lock_or_recover(),
+            hb,
+            super::hlc::wall_ms(),
+        )
     }
 
     /// Store a heartbeat if it is newer than what we have.
@@ -346,7 +345,7 @@ impl Status {
     /// newer-looking one: otherwise it would mute its node until our clock
     /// caught up with it.
     fn merge_at(&self, hb: Heartbeat, signed: SignedHeartbeat, now_ms: u64) -> bool {
-        let mut all = self.heartbeats.lock().unwrap();
+        let mut all = self.heartbeats.lock_or_recover();
         if !news(&all, &hb, now_ms) {
             return false;
         }
@@ -363,20 +362,19 @@ impl Status {
 
     pub fn all_signed(&self) -> Vec<SignedHeartbeat> {
         self.heartbeats
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .values()
             .map(|k| k.signed.clone())
             .collect()
     }
 
     pub fn known(&self, id: &NodeId) -> Option<Known> {
-        self.heartbeats.lock().unwrap().get(id).cloned()
+        self.heartbeats.lock_or_recover().get(id).cloned()
     }
 
     fn next_at(&self) -> u64 {
         let wall = super::hlc::wall_ms();
-        let mut last = self.last_at.lock().unwrap();
+        let mut last = self.last_at.lock_or_recover();
         // After our clock was set back from far ahead, start again from
         // it: peers refuse heartbeats dated beyond their drift limit.
         *last = if *last > wall.saturating_add(super::hlc::MAX_DRIFT_MS) {
@@ -391,14 +389,14 @@ impl Status {
     /// pruned): they are neither gossiped on nor counted. What a node that
     /// returns is known by comes back with its next heartbeat.
     pub fn retain_heartbeats(&self, keep: impl Fn(&NodeId) -> bool) {
-        self.heartbeats.lock().unwrap().retain(|id, _| keep(id));
+        self.heartbeats.lock_or_recover().retain(|id, _| keep(id));
     }
 }
 
 impl Node {
     /// Build, sign and store this node's current heartbeat.
     pub fn refresh_heartbeat(&self) {
-        let local = self.status.local.lock().unwrap().clone();
+        let local = self.status.local.lock_or_recover().clone();
         let table = self.price_table();
         let (on_demand, mut prices) = table.announced();
         if let Some(p) = super::relay::price(self)
@@ -427,8 +425,7 @@ impl Node {
             floors: {
                 let mut f: Vec<_> = self
                     .own_floors
-                    .read()
-                    .unwrap()
+                    .read_or_recover()
                     .iter()
                     .map(|(o, s)| (*o, *s))
                     .collect();
@@ -465,7 +462,7 @@ impl Node {
     /// so many are looked at per message (one per member, plus a little),
     /// so a peer cannot make this node verify signatures by the thousand.
     pub fn merge_heartbeats(&self, incoming: Vec<SignedHeartbeat>) -> usize {
-        let limit = self.members.read().unwrap().len() + GOSSIP_SLACK;
+        let limit = self.members.read_or_recover().len() + GOSSIP_SLACK;
         incoming
             .into_iter()
             .take(limit)
@@ -662,7 +659,7 @@ mod tests {
     fn own_heartbeat_time_recovers_from_a_clock_set_back() {
         let s = Status::default();
         let wall = crate::cluster::hlc::wall_ms();
-        *s.last_at.lock().unwrap() = wall + 3_600_000;
+        *s.last_at.lock_or_recover() = wall + 3_600_000;
         let at = s.next_at();
         assert!(at <= crate::cluster::hlc::wall_ms(), "{at}");
         assert!(s.next_at() > at);

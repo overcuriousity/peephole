@@ -100,7 +100,13 @@ async fn content_zip(
     };
     drop(conn);
     let hash = data_encoding::HEXLOWER.encode(&sha);
-    let zip = encrypted_zip(&hash, &content)?;
+    // Deflating up to the upload cap is CPU work: off the async workers.
+    let zip = {
+        let hash = hash.clone();
+        tokio::task::spawn_blocking(move || encrypted_zip(&hash, &content))
+            .await
+            .map_err(anyhow::Error::from)??
+    };
     let by = match crate::admin::auth::session_token(&st, &jar) {
         Some(t) => st.store.session_admin_label(&t).await?,
         None => "admin".to_string(),
@@ -211,7 +217,11 @@ mod tests {
         let (st, cookie, app, _d) = app().await;
         upload(&st, "held", "<b>x</b>", b"<?php echo 1;", true).await;
         upload(&st, "gone", "y.php", b"<?php echo 2;", false).await;
-        let get = |path: &'static str| Request::get(path).header("cookie", cookie.clone());
+        let get = |path: &'static str| {
+            Request::get(path)
+                .header("cookie", cookie.clone())
+                .header("sec-fetch-site", "same-origin")
+        };
         let (status, _, body) = send(&app, get("/admin/uploads"), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("&#60;b&#62;x&#60;/b&#62;"), "{body}");
@@ -242,6 +252,7 @@ mod tests {
             app.clone(),
             Request::get("/admin/uploads/z/content.zip")
                 .header("cookie", cookie)
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::empty())
                 .unwrap(),
         )

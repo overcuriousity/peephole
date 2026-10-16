@@ -216,9 +216,10 @@ async fn security_headers(
     // SameSite=Strict session cookie already covers this, but a browser also
     // sends Sec-Fetch-Site (and/or Origin); reject a cross-site write so XSS
     // on a sibling vhost behind the same proxy cannot drive admin actions.
-    // Non-browser clients (curl, the test suite) send neither and are allowed;
-    // the cookie still gates them.
-    if method_mutates(&method) && !same_origin(req.headers()) {
+    // A write carrying a session cookie must show one of them (every
+    // current browser sends at least Origin on a POST); one without a
+    // session (the sign-in ceremony, bearer API calls) may send neither.
+    if method_mutates(&method) && !same_origin(req.headers(), carries_session(req.headers())) {
         use axum::response::IntoResponse;
         return (
             axum::http::StatusCode::FORBIDDEN,
@@ -304,9 +305,11 @@ fn method_mutates(m: &axum::http::Method) -> bool {
 }
 
 /// Whether a mutating request is same-origin, from the browser fetch-metadata
-/// and Origin headers. Requests with neither (non-browser clients) are treated
-/// as allowed — the SameSite=Strict cookie is the primary control.
-fn same_origin(h: &axum::http::HeaderMap) -> bool {
+/// and Origin headers. A request with neither passes only without a session
+/// cookie (`session`): nothing it could do rides on an admin's sign-in. With
+/// one it is refused, so a browser or proxy that strips both headers cannot
+/// carry a cross-site write past this check (MIK-372 S2).
+fn same_origin(h: &axum::http::HeaderMap, session: bool) -> bool {
     if let Some(site) = h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         // "same-origin"/"none" are safe; "same-site"/"cross-site" are not.
         return site == "same-origin" || site == "none";
@@ -322,8 +325,8 @@ fn same_origin(h: &axum::http::HeaderMap) -> bool {
             .split_once("://")
             .map(|(_, rest)| rest)
             .is_some_and(|oh| oh.eq_ignore_ascii_case(host)),
-        // No Origin header at all: not a cross-site browser form post.
-        (None, _) => true,
+        // No Origin header at all: allowed only where no session is at stake.
+        (None, _) => !session,
         _ => false,
     }
 }
@@ -580,26 +583,46 @@ mod tests {
         assert_eq!(jobs_and_spent(&state).await, (1, 1));
     }
 
-    /// No Origin and no Sec-Fetch-Site (curl, the test suite): allowed
-    /// today; the session cookie is SameSite=Strict. MIK-372 S2 proposes
-    /// to require one of them when a session cookie is present; this test
-    /// changes with it.
+    /// A write with a session cookie but neither Origin nor Sec-Fetch-Site
+    /// is refused (MIK-372 S2); Sec-Fetch-Site alone suffices; without a
+    /// session cookie (the sign-in ceremony) neither is needed.
     #[tokio::test]
-    async fn a_write_without_origin_or_fetch_metadata_is_allowed() {
+    async fn a_signed_in_write_without_origin_or_fetch_metadata_is_refused() {
         use crate::admin::scan_buy::tests::{IP, post, state};
         let (state, cookie, _ip, _d) = state().await;
-        let r = full_router(state.clone())
-            .oneshot(post(&cookie, &format!("ip={IP}&level=2")))
-            .await
-            .unwrap();
+        let bare = |level: u8| {
+            let mut req = post(&cookie, &format!("ip={IP}&level={level}"));
+            req.headers_mut().remove("origin");
+            req.headers_mut().remove("sec-fetch-site");
+            req
+        };
+        let r = full_router(state.clone()).oneshot(bare(2)).await.unwrap();
+        assert_eq!(r.status(), 403);
+        assert_eq!(jobs_and_spent(&state).await, (0, 0));
+        // Fetch metadata without an Origin (some same-origin requests).
+        let mut req = bare(2);
+        req.headers_mut()
+            .insert("sec-fetch-site", "same-origin".parse().unwrap());
+        let r = full_router(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(r.status(), 303);
         assert_eq!(jobs_and_spent(&state).await, (1, 0));
         // An Origin without a Host to compare it to is refused.
-        let mut req = post(&cookie, &format!("ip={IP}&level=3"));
+        let mut req = bare(3);
+        req.headers_mut().remove("host");
         req.headers_mut()
             .insert("origin", "https://localhost".parse().unwrap());
         let r = full_router(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(r.status(), 403);
         assert_eq!(jobs_and_spent(&state).await, (1, 0));
+        // No session cookie: the sign-in ceremony needs neither header.
+        let r = full_router(state.clone())
+            .oneshot(
+                axum::http::Request::post("/login/start")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 412, "no keys enrolled: the handler ran");
     }
 }

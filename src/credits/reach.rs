@@ -11,6 +11,7 @@ use crate::cluster::hlc;
 use crate::cluster::identity::NodeId;
 use crate::cluster::members::MemberRow;
 use crate::cluster::record::{ReachReportRec, Record};
+use crate::lock::MutexExt;
 use crate::store::data::{Ctx, Effect};
 use anyhow::Result;
 use sqlx::{SqliteConnection, SqlitePool};
@@ -226,8 +227,7 @@ impl Tracker {
     /// naming nobody.
     pub fn note_alive(&self, now_ms: u64) {
         self.hours
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(hour_of(now_ms))
             .or_default();
     }
@@ -235,8 +235,7 @@ impl Tracker {
     /// A sync round with `peer` completed at `now_ms`.
     pub fn note(&self, peer: NodeId, now_ms: u64) {
         self.hours
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .entry(hour_of(now_ms))
             .or_default()
             .insert(peer);
@@ -245,7 +244,7 @@ impl Tracker {
     /// Put hours taken by [`Tracker::take_due`] back, merged with what was
     /// noted since (a report that could not be written).
     pub fn restore(&self, taken: Vec<(u32, Vec<NodeId>)>) {
-        let mut hours = self.hours.lock().unwrap();
+        let mut hours = self.hours.lock_or_recover();
         for (h, reached) in taken {
             hours.entry(h).or_default().extend(reached);
         }
@@ -254,7 +253,7 @@ impl Tracker {
     /// The hours before the one of `now_ms`, with whom they reached; taken
     /// out, so each is reported once.
     pub fn take_due(&self, now_ms: u64) -> Vec<(u32, Vec<NodeId>)> {
-        let mut hours = self.hours.lock().unwrap();
+        let mut hours = self.hours.lock_or_recover();
         let current = hours.split_off(&hour_of(now_ms));
         std::mem::replace(&mut *hours, current)
             .into_iter()

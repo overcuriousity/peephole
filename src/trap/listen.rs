@@ -10,6 +10,7 @@
 use super::proxy_proto::{self, Proxy};
 use super::raw_head::{HeadBuf, Tee};
 use super::tls_hello::{self, Hello};
+use crate::lock::MutexExt;
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use rustls::pki_types::pem::PemObject;
@@ -120,10 +121,7 @@ impl Drop for Release {
 impl std::fmt::Debug for Handover {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handover")
-            .field(
-                "until",
-                &*self.0.until.lock().unwrap_or_else(|p| p.into_inner()),
-            )
+            .field("until", &*self.0.until.lock_or_recover())
             .finish_non_exhaustive()
     }
 }
@@ -131,7 +129,7 @@ impl std::fmt::Debug for Handover {
 impl Handover {
     /// Count `slot` as the connection's until it ends or is taken over.
     fn hold(&self, slot: impl Send + 'static) {
-        let mut slots = self.0.slots.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slots = self.0.slots.lock_or_recover();
         slots.push(Box::new(slot));
     }
 
@@ -139,25 +137,19 @@ impl Handover {
     /// (or longer, if it already may).
     pub fn take_over(&self, until: tokio::time::Instant) {
         self.release();
-        let mut u = self.0.until.lock().unwrap_or_else(|p| p.into_inner());
+        let mut u = self.0.until.lock_or_recover();
         *u = Some(u.map_or(until, |t| t.max(until)));
         self.0.moved.notify_one();
     }
 
     /// Give the slots back without moving the deadline.
     fn release(&self) {
-        drop(std::mem::take(
-            &mut *self.0.slots.lock().unwrap_or_else(|p| p.into_inner()),
-        ));
+        drop(std::mem::take(&mut *self.0.slots.lock_or_recover()));
     }
 
     /// The connection's deadline: `end`, or the one it was taken over with.
     fn deadline(&self, end: tokio::time::Instant) -> tokio::time::Instant {
-        self.0
-            .until
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .unwrap_or(end)
+        self.0.until.lock_or_recover().unwrap_or(end)
     }
 }
 
@@ -232,7 +224,7 @@ impl Sources {
     /// Count a connection from `ip`; None when its source has `max` open.
     pub(super) fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<SourceSlot> {
         let key = crate::net::source_key(ip);
-        let mut open = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut open = self.0.lock_or_recover();
         let n = open.entry(key).or_default();
         if *n >= max {
             return None;
@@ -246,13 +238,13 @@ impl Sources {
 
     #[cfg(test)]
     fn open(&self) -> usize {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.0.lock_or_recover().len()
     }
 }
 
 impl Drop for SourceSlot {
     fn drop(&mut self) {
-        let mut open = self.sources.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut open = self.sources.0.lock_or_recover();
         if let Some(n) = open.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
@@ -348,7 +340,7 @@ pub async fn serve_trap_with(
                         // every TLS connection through it: say so.
                         Err(Unusable::Proxy(why)) => {
                             if warn_refusal_now(
-                                &mut REFUSALS_WARNED.lock().unwrap(),
+                                &mut REFUSALS_WARNED.lock_or_recover(),
                                 peer.ip(),
                                 Instant::now(),
                             ) {
@@ -363,7 +355,7 @@ pub async fn serve_trap_with(
                         // trusted_proxies.
                         Err(Unusable::UntrustedProxy) => {
                             if warn_refusal_now(
-                                &mut UNTRUSTED_WARNED.lock().unwrap(),
+                                &mut UNTRUSTED_WARNED.lock_or_recover(),
                                 peer.ip(),
                                 Instant::now(),
                             ) {
