@@ -1,7 +1,8 @@
 //! Housekeeping that keeps the database bounded and its query plans good:
 //! expired sessions and WebAuthn ceremonies, `PRAGMA optimize`, returning
 //! freed pages to the file system, and (standalone nodes only) the
-//! tombstones that local deletes leave behind.
+//! tombstones that local deletes leave behind. Also recomputes the
+//! campaigns ([`super::campaigns`]) when their inputs changed.
 use super::Store;
 use anyhow::Result;
 use std::time::Duration;
@@ -27,6 +28,8 @@ pub struct Report {
 /// cluster, so tombstones of local deletes protect nothing and can go.
 pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut next_daily = tokio::time::Instant::now() + AUTH_EVERY;
+    // The first pass runs after the shape backfill (`crate::run`).
+    let mut next_campaigns = tokio::time::Instant::now() + super::campaigns::RECOMPUTE_EVERY;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(AUTH_EVERY) => {}
@@ -50,6 +53,26 @@ pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watc
                 Err(e) => tracing::warn!(?e, "database maintenance failed"),
             }
         }
+        if tokio::time::Instant::now() >= next_campaigns {
+            next_campaigns = tokio::time::Instant::now() + super::campaigns::RECOMPUTE_EVERY;
+            recompute_campaigns(&store).await;
+        }
+    }
+}
+
+/// Recompute the campaigns if their inputs changed. A failure is logged
+/// only: the next pass tries again.
+pub async fn recompute_campaigns(store: &Store) {
+    match store.recompute_campaigns(false).await {
+        Ok(r) if r.unchanged => {}
+        Ok(r) => tracing::info!(
+            campaigns = r.campaigns,
+            members = r.members,
+            excluded = r.excluded.len(),
+            seconds = r.seconds,
+            "campaigns recomputed"
+        ),
+        Err(e) => tracing::warn!(?e, "campaign recompute failed"),
     }
 }
 

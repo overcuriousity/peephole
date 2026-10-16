@@ -292,6 +292,7 @@ peephole admin password [--stdin]                 # set or change the admin pass
 peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
+peephole store recompute-campaigns                # recompute campaigns now and print the report
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
