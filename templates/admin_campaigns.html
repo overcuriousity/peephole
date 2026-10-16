@@ -1,0 +1,39 @@
+{% extends "layout.html" %}
+{% block title %}peephole — campaigns{% endblock %}
+{% block content %}
+{% let sub = "campaigns" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Campaigns</h1><p class="muted">Source IPs tied together by evidence: a shared SSH host key, TLS certificate, browser fingerprint or canary, or near-identical path sets. Computed on this node every hour from the replicated rows; read-only.</p></div></div>
+<div class="stack">
+<section class="card">
+  <form class="filters" method="get" action="/admin/campaigns">
+    <label>Country <input name="country" size="3" maxlength="2" value="{{ f.country.as_deref().unwrap_or_default() }}"></label>
+    <label>ASN <input name="asn" size="10" value="{{ f.asn.as_deref().unwrap_or_default() }}"></label>
+    <label>Min. size <input name="min" type="number" min="2" size="4" value="{{ f.min.as_deref().unwrap_or_default() }}"></label>
+    <label>Active from (UTC) <input name="from" type="date" value="{{ f.from.as_deref().unwrap_or_default() }}"></label>
+    <label>To (UTC) <input name="to" type="date" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
+    <button class="btn btn-primary" type="submit">Filter</button>
+  </form>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Campaign</th><th class="num">Size</th><th>First seen</th><th>Last seen</th><th>ASNs</th><th>Countries</th><th class="num" title="Shared host key, certificate, fingerprint or canary">Hard edges</th><th class="num" title="Path similarity">Soft edges</th></tr></thead><tbody>
+  {% for c in items %}<tr>
+    <td><a href="/admin/campaigns/{{ c.row.key }}">#{{ c.row.num }}</a> <span class="mono muted">{{ c.row.key }}</span></td>
+    <td class="num">{{ c.row.size }}</td>
+    <td class="ts">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</td>
+    <td>{% for (asn, org, n) in c.asns.iter().take(crate::admin::campaigns::SPREAD_TOP) %}<a href="/ips?asn={{ asn }}" title="{{ org.as_deref().unwrap_or_default() }}: {{ n }}"><span class="mono">AS{{ asn }}</span></a>{% if !loop.last %}, {% endif %}{% endfor %}{% if c.asns.len() > crate::admin::campaigns::SPREAD_TOP %} <span class="muted">+{{ c.asns.len() - crate::admin::campaigns::SPREAD_TOP }}</span>{% endif %}{% if c.asns.is_empty() %}<span class="muted">—</span>{% endif %}</td>
+    <td>{% for (cc, n) in c.countries.iter().take(crate::admin::campaigns::SPREAD_TOP) %}<span title="{{ crate::admin::countries::country_name(cc) }}: {{ n }}">{{ crate::admin::countries::flag(cc) }}</span> {% endfor %}{% if c.countries.len() > crate::admin::campaigns::SPREAD_TOP %}<span class="muted">+{{ c.countries.len() - crate::admin::campaigns::SPREAD_TOP }}</span>{% endif %}{% if c.countries.is_empty() %}<span class="muted">—</span>{% endif %}</td>
+    <td class="num">{{ c.row.hard_edges }}</td><td class="num">{{ c.row.soft_edges }}</td>
+  </tr>{% endfor %}
+  {% if items.is_empty() %}<tr><td colspan="8" class="empty">No campaign{% if f.country.is_some() || f.asn.is_some() || f.min.is_some() || f.from.is_some() || f.to.is_some() %} matches{% endif %}.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs: shared infrastructure, not one operator; they form no edge</span></div>
+  {% if let Some(r) = report %}
+  {% if r.excluded.is_empty() %}<p class="empty">None.</p>{% else %}
+  <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">IPs</th></tr></thead><tbody>
+  {% for e in r.excluded %}<tr><td>{{ e.kind }}</td><td class="mono hk-fp">{% if let Some(k) = crate::store::links::LinkKind::parse(e.kind.as_str()) %}<a href="{{ crate::admin::views::link_href(k.key(), e.value.as_str()) }}">{{ e.value }}</a>{% else %}{{ e.value }}{% endif %}</td><td class="num">{{ e.ips }}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+  <p class="muted">Last recompute{% if let Some(at) = r.at %} <span class="mono">{{ crate::admin::views::minute(at.as_str()) }}</span> UTC{% endif %}, took {{ "{:.2}"|format(r.seconds) }} s.</p>
+  {% else %}<p class="empty">No recompute has run on this node yet.</p>{% endif %}
+</section>
+</div>
+{% endblock %}

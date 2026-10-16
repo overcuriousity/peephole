@@ -115,6 +115,9 @@ pub struct ExportRow {
     pub asn: Option<i64>,
     pub asn_org: Option<String>,
     pub is_tor: Option<bool>,
+    /// The campaign `key` of the address at export time; None when it is
+    /// in none.
+    pub campaign: Option<String>,
     /// JSON text, shared by every row of the IP on a page (it can be
     /// large: nmap XML) rather than copied.
     pub intel: Arc<str>,
@@ -167,6 +170,7 @@ pub const COLUMNS: &[&str] = &[
     "asn",
     "asn_org",
     "is_tor",
+    "campaign",
     "intel",
     "scans",
     "names",
@@ -330,6 +334,7 @@ impl ExportRow {
             "asn": self.asn,
             "asn_org": self.asn_org,
             "is_tor": self.is_tor,
+            "campaign": self.campaign,
             "message": self.message(),
             "datetime": rfc3339(self.ts_ms),
             "timestamp_desc": self.timestamp_desc(),
@@ -610,6 +615,7 @@ fn fill_ip(
         row.asn_org = g["asn_org"].as_str().map(str::to_string);
     }
     row.is_tor = as_of(&cols.tor, row.ts_ms);
+    row.campaign = ctx.campaigns.get(&ip_id).cloned();
 }
 
 fn request_row(
@@ -1891,6 +1897,91 @@ mod tests {
             text(&collect(&s, f, Format::Jsonl).await).lines().count(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn rows_carry_their_campaign_key_in_every_format() {
+        let (s, _d) = rich().await;
+        let member = s.upsert_ip("203.0.113.5".parse().unwrap()).await.unwrap();
+        let single = s.upsert_ip("192.0.2.77".parse().unwrap()).await.unwrap();
+        s.insert_request(&crate::store::requests::NewRequest {
+            ip_id: single.id,
+            method: "GET".into(),
+            path: "/alone".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                                    hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.5', 1, ?, 2, '2026-10-01 00:00:00', '2026-10-01 00:00:00',
+                     1, 0, 1, '2026-10-01 00:00:00')",
+        )
+        .bind(member.id)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.5')")
+            .bind(member.id)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let want = |ip: &str| (ip == "203.0.113.5").then_some("203.0.113.5");
+
+        let out = text(&collect(&s, ExportFilter::default(), Format::Jsonl).await);
+        let mut n = 0;
+        for l in out.lines() {
+            let r: serde_json::Value = serde_json::from_str(l).unwrap();
+            assert_eq!(
+                r["campaign"].as_str(),
+                want(r["ip"].as_str().unwrap()),
+                "{l}"
+            );
+            n += 1;
+        }
+        assert_eq!(n, 4);
+
+        let csv = text(&collect(&s, ExportFilter::default(), Format::Csv).await);
+        let mut rdr = csv::Reader::from_reader(csv.as_bytes());
+        let h = rdr.headers().unwrap().clone();
+        let (ip, camp) = (
+            h.iter().position(|c| c == "ip").unwrap(),
+            h.iter().position(|c| c == "campaign").unwrap(),
+        );
+        for rec in rdr.records() {
+            let rec = rec.unwrap();
+            assert_eq!(rec[camp], *want(&rec[ip]).unwrap_or(""), "{rec:?}");
+        }
+
+        use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use arrow::array::AsArray;
+        let pq = axum::body::Bytes::from(
+            collect(&s, ExportFilter::default(), Format::Parquet)
+                .await
+                .concat(),
+        );
+        let mut n = 0;
+        for b in ParquetRecordBatchReaderBuilder::try_new(pq)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let b = b.unwrap();
+            let ips = b.column_by_name("ip").unwrap().as_string::<i32>().clone();
+            let c = b
+                .column_by_name("campaign")
+                .unwrap()
+                .as_string::<i32>()
+                .clone();
+            for (ip, c) in ips.iter().zip(c.iter()) {
+                assert_eq!(c, want(ip.unwrap()));
+                n += 1;
+            }
+        }
+        assert_eq!(n, 4);
     }
 
     #[tokio::test]

@@ -54,45 +54,27 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
   timeline of the requests sent to it.
 - **Public dashboard:** a "webshells dropped" tile and counts per command verb.
 
-### 2. Campaign clustering
+### 2. Campaign clustering (shipped)
 
-- **Cost:** L
-- **Benefit:** very high. It answers "who is this" across addresses and is
-  the main analysis gain for operators and for the dataset.
-
-A typed evidence graph, recomputed deterministically from replicated data,
-so every node arrives at the same campaigns. Every edge says why it exists.
-
-- **Hard edges:**
-  - a shared SSH host key or TLS certificate (shipped: `host_keys`);
-  - a shared browser fingerprint;
-  - canary reuse (shipped: `canaries`).
-- **Soft edges:**
-  - rarity-weighted Jaccard similarity of each IP's normalized path set,
-    above a threshold. About 500 IPs a month allows plain pairwise
-    comparison; MinHash only if that grows by orders of magnitude;
-  - JA4 together with JA4H (shipped: `requests.ja4h`) as supporting evidence, never alone.
-- **Path normalization** (IDs, random filenames, query values) is most of
-  the work and is shared with item 3.
-
-**Shown:**
-
-- **Admin:** a Campaigns page (size, first and last seen, ASNs, countries)
-  and a campaign page with its member IPs, its evidence edges with their
-  reasons, a timeline, and the graph (the fingerprints graph, generalized).
-  The IP page shows "member of campaign #N".
-- **Public dashboard:** "Campaigns this period": size, ASN and country spread,
-  and paths per campaign, as aggregates without fingerprints.
-- **Dataset:** a `campaign` column.
+Recomputed hourly and deterministically from replicated data, so every
+node arrives at the same campaigns: hard edges (SSH host key, TLS
+certificate, browser fingerprint, canary reuse) and soft edges (similar
+sets of normalized paths, JA4 with JA4H as support only). Shown in the
+admin area, as counts on the public dashboard ("Campaigns this period")
+and as the dataset's `campaign` column. See [Overview](overview.md) and
+[The dataset](dataset.md#campaign).
 
 ### 3. New paths and exploit waves
 
-- **Cost:** M (once item 2's path normalization exists)
+- **Cost:** M (the path normalization shipped with item 2)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
 - A cluster-wide `first_seen` per normalized path, plus the number of
-  distinct IPs that sent it.
+  distinct IPs that sent it. The node-local start exists: the `shapes`
+  table (one row per path shape, with `first_seen`, `last_seen` and `ips`,
+  derived on insert and backfilled); what is left is agreeing on it across
+  the cluster.
 - A path with no matching rule that reaches N distinct IPs within an hour
   is an exploit wave.
 - It lives inside the campaign view ("campaign #N started probing a path no

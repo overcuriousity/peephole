@@ -195,6 +195,8 @@ pub struct PageContext {
     pub canary_used_from: HashMap<i64, Vec<String>>,
     /// IPs that filed a false-positive claim.
     pub claimed: HashSet<i64>,
+    /// The campaign key per member IP id.
+    pub campaigns: HashMap<i64, String>,
 }
 
 /// Most scan XML (decompressed) exported per address, newest scans first
@@ -434,6 +436,14 @@ impl Store {
         .fetch_all(&self.read)
         .await?;
         c.claimed = claimed.into_iter().collect();
+        let campaigns: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT ip_id, campaign_key FROM campaign_members
+             WHERE ip_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(json_list(ip_ids))
+        .fetch_all(&self.read)
+        .await?;
+        c.campaigns = campaigns.into_iter().collect();
         let used: Vec<(i64, String)> = sqlx::query_as(
             "SELECT DISTINCT t.request_id,
                     COALESCE(sr.uid, CAST(sr.id AS TEXT), sb.uid || '#' || c.skip_row)

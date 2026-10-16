@@ -56,6 +56,10 @@ pub struct Report {
     /// Hard values on more than [`HARD_FANOUT_MAX`] IPs.
     pub excluded: Vec<Excluded>,
     pub seconds: f64,
+    /// When the pass ran (as `requests.ts`); absent in reports written
+    /// before it was recorded.
+    #[serde(default)]
+    pub at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -113,7 +117,81 @@ pub struct CampaignRow {
 pub struct Member {
     pub ip_id: i64,
     pub ip: String,
+    pub country: Option<String>,
+    pub asn: Option<i64>,
+    pub asn_org: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub requests: i64,
 }
+
+/// The admin list's filter (`/admin/campaigns`); empty or unparsable
+/// values are ignored.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct CampaignFilter {
+    /// ISO 3166 alpha-2: a member is there.
+    pub country: Option<String>,
+    /// `64496` or `AS64496`: a member is in it.
+    pub asn: Option<String>,
+    /// At least this many members.
+    pub min: Option<String>,
+    /// Active on or after / on or before this day (`YYYY-MM-DD`, UTC).
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+impl CampaignFilter {
+    fn country(&self) -> Option<String> {
+        self.country
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| c.len() == 2)
+            .map(str::to_ascii_uppercase)
+    }
+
+    fn asn(&self) -> Option<i64> {
+        let a = self.asn.as_deref()?.trim();
+        let a = a
+            .strip_prefix("AS")
+            .or_else(|| a.strip_prefix("as"))
+            .unwrap_or(a);
+        a.parse().ok()
+    }
+
+    fn min(&self) -> Option<i64> {
+        self.min.as_deref()?.trim().parse().ok()
+    }
+
+    fn day(d: &Option<String>) -> Option<&str> {
+        d.as_deref()
+            .map(str::trim)
+            .filter(|d| d.len() == 10 && chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+    }
+}
+
+/// A campaign as the admin list shows it: the row and where its members
+/// are, most members first.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CampaignListItem {
+    pub row: CampaignRow,
+    /// (country, members); members of unknown country are not counted.
+    pub countries: Vec<(String, i64)>,
+    /// (ASN, organisation, members).
+    pub asns: Vec<(i64, Option<String>, i64)>,
+}
+
+/// A path shape the members asked for.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct CampaignShape {
+    pub text: String,
+    /// Members that asked for it.
+    pub members: i64,
+    /// IPs that asked for it, over the whole dataset.
+    pub df: i64,
+}
+
+/// Shapes listed on a campaign's page.
+pub const CAMPAIGN_SHAPES: i64 = 25;
 
 /// An evidence edge; `a`'s IP text sorts before `b`'s.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
@@ -178,6 +256,7 @@ impl Store {
             edges: BTreeMap::new(),
             excluded: out.excluded.clone(),
             seconds: 0.0,
+            at: Some(now.clone()),
         };
         for e in &out.edges {
             *report.edges.entry(e.kind.to_string()).or_default() += 1;
@@ -283,7 +362,9 @@ impl Store {
             return Ok(None);
         };
         let members = sqlx::query_as(
-            "SELECT m.ip_id, i.ip FROM campaign_members m JOIN ips i ON i.id = m.ip_id
+            "SELECT m.ip_id, i.ip, i.country, i.asn, i.asn_org, i.first_seen, i.last_seen,
+                    i.request_count AS requests
+             FROM campaign_members m JOIN ips i ON i.id = m.ip_id
              WHERE m.campaign_key = ? ORDER BY i.ip",
         )
         .bind(key)
@@ -306,6 +387,105 @@ impl Store {
             members,
             edges,
         }))
+    }
+
+    /// The campaigns `f` lets through, most recently active first, with
+    /// their members' countries and ASNs.
+    pub async fn campaign_index(&self, f: &CampaignFilter) -> Result<Vec<CampaignListItem>> {
+        type Where = (String, Option<String>, Option<i64>, Option<String>);
+        let spread: Vec<Where> = sqlx::query_as(
+            "SELECT m.campaign_key, i.country, i.asn, i.asn_org
+             FROM campaign_members m JOIN ips i ON i.id = m.ip_id",
+        )
+        .fetch_all(&self.read)
+        .await?;
+        type Spread = (BTreeMap<String, i64>, BTreeMap<i64, (Option<String>, i64)>);
+        let mut by_key: BTreeMap<String, Spread> = BTreeMap::new();
+        for (key, country, asn, org) in spread {
+            let (countries, asns) = by_key.entry(key).or_default();
+            if let Some(c) = country {
+                *countries.entry(c).or_default() += 1;
+            }
+            if let Some(a) = asn {
+                let e = asns.entry(a).or_insert((None, 0));
+                e.1 += 1;
+                if e.0.is_none() {
+                    e.0 = org;
+                }
+            }
+        }
+        let (country, asn, min) = (f.country(), f.asn(), f.min());
+        let (from, to) = (CampaignFilter::day(&f.from), CampaignFilter::day(&f.to));
+        let mut out: Vec<CampaignListItem> = self
+            .campaign_list()
+            .await?
+            .into_iter()
+            .filter(|r| min.is_none_or(|m| r.size >= m))
+            .filter(|r| from.is_none_or(|d| r.last_seen.get(..10).is_some_and(|l| l >= d)))
+            .filter(|r| to.is_none_or(|d| r.first_seen.get(..10).is_some_and(|l| l <= d)))
+            .filter_map(|row| {
+                let (countries, asns) = by_key.remove(&row.key).unwrap_or_default();
+                if country.as_ref().is_some_and(|c| !countries.contains_key(c))
+                    || asn.is_some_and(|a| !asns.contains_key(&a))
+                {
+                    return None;
+                }
+                let mut countries: Vec<(String, i64)> = countries.into_iter().collect();
+                countries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let mut asns: Vec<(i64, Option<String>, i64)> =
+                    asns.into_iter().map(|(a, (o, n))| (a, o, n)).collect();
+                asns.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                Some(CampaignListItem {
+                    row,
+                    countries,
+                    asns,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.row
+                .last_seen
+                .cmp(&a.row.last_seen)
+                .then_with(|| a.row.num.cmp(&b.row.num))
+        });
+        Ok(out)
+    }
+
+    /// Requests per day across a campaign's members, over the IP page's
+    /// calendar window.
+    pub async fn campaign_calendar(&self, key: &str) -> Result<Vec<super::browse::CalendarDay>> {
+        Ok(sqlx::query_as(
+            "SELECT date(r.ts) AS day, COUNT(*) AS count, MAX(r.severity) AS max_severity
+             FROM campaign_members m JOIN requests r ON r.ip_id = m.ip_id
+             WHERE m.campaign_key = ? AND r.ts >= date('now', ?)
+             GROUP BY day ORDER BY day",
+        )
+        .bind(key)
+        .bind(format!("-{} days", super::browse::CALENDAR_DAYS - 1))
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// The shapes most of a campaign's members asked for (light rows
+    /// included), with how many IPs of the dataset asked for each.
+    pub async fn campaign_shapes(&self, key: &str) -> Result<Vec<CampaignShape>> {
+        Ok(sqlx::query_as(
+            "SELECT s.text, COUNT(DISTINCT x.ip_id) AS members, s.ips AS df FROM (
+               SELECT r.ip_id, r.shape FROM campaign_members m
+               JOIN requests r ON r.ip_id = m.ip_id
+               WHERE m.campaign_key = ?1 AND r.shape IS NOT NULL
+               UNION
+               SELECT b.ip_id, q.shape FROM campaign_members m
+               JOIN skipped_batches b ON b.ip_id = m.ip_id
+               JOIN skipped_requests q ON q.batch_id = b.id
+               WHERE m.campaign_key = ?1 AND q.shape IS NOT NULL
+             ) x JOIN shapes s ON s.hash = x.shape
+             GROUP BY x.shape ORDER BY members DESC, df, s.text LIMIT ?2",
+        )
+        .bind(key)
+        .bind(CAMPAIGN_SHAPES)
+        .fetch_all(&self.read)
+        .await?)
     }
 
     /// The campaign (key, number) an IP is a member of.
@@ -767,7 +947,7 @@ fn compute(input: &Input) -> Output {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cluster::record::{Record, RequestRec, SkipBatchRec, SkipRow};
     use crate::store::data::{Ctx, apply};
@@ -779,7 +959,7 @@ mod tests {
 
     /// A step of a fixture: a replicated record, or a host key a probe
     /// stored at a time.
-    enum Op {
+    pub(crate) enum Op {
         Rec(Record),
         Key(&'static str, &'static str, String, &'static str),
     }
@@ -836,7 +1016,7 @@ mod tests {
         (s, dir)
     }
 
-    async fn feed(s: &Store, ops: impl IntoIterator<Item = Op>) {
+    pub(crate) async fn feed(s: &Store, ops: impl IntoIterator<Item = Op>) {
         for op in ops {
             match op {
                 Op::Rec(r) => {
@@ -892,7 +1072,7 @@ mod tests {
     /// (c) two crawlers sharing only robots.txt and favicon.ico; (d) two
     /// pairs at about 0.5, one sharing JA4 and JA4H (`tls_fixture`); (e) a
     /// TLS certificate on 60 IPs that also crawl.
-    fn fixture() -> Vec<Op> {
+    pub(crate) fn fixture() -> Vec<Op> {
         let mut ops = vec![
             req("192.0.2.1", "2026-09-02 10:00:00", "/alpha"),
             req("192.0.2.2", "2026-09-03 10:00:00", "/beta"),
@@ -955,7 +1135,7 @@ mod tests {
         ops
     }
 
-    async fn tls_fixture(s: &Store) {
+    pub(crate) async fn tls_fixture(s: &Store) {
         tls(s, "198.51.100.30", "t13d1516h2_x", "ge11nn05enus_y").await;
         tls(s, "198.51.100.31", "t13d1516h2_x", "ge11nn05enus_y").await;
         tls(s, "198.51.100.40", "t13d1516h2_x", "ge11nn05enus_y").await;
@@ -1207,5 +1387,83 @@ mod tests {
             &span("2026-07-01 00:00:00", "2026-09-03 00:00:00")
         ));
         assert!(!apart(&x, &(None, None)));
+    }
+
+    #[tokio::test]
+    async fn admin_readers_filter_and_describe_a_campaign() {
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        tls_fixture(&s).await;
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert!(r.at.is_some());
+        sqlx::query(
+            "UPDATE ips SET country = 'DE', asn = 64496, asn_org = 'Example'
+             WHERE ip IN ('192.0.2.1', '192.0.2.2')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ips SET country = 'FR' WHERE ip = '192.0.2.3'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+
+        let keys = |l: Vec<CampaignListItem>| -> Vec<String> {
+            l.into_iter().map(|c| c.row.key).collect()
+        };
+        let all = s.campaign_index(&CampaignFilter::default()).await.unwrap();
+        // Most recently active first.
+        assert_eq!(
+            keys(all.clone()),
+            ["198.51.100.10", "198.51.100.30", "192.0.2.3"]
+        );
+        let a = all.iter().find(|c| c.row.key == "192.0.2.3").unwrap();
+        assert_eq!(a.countries, [("DE".to_string(), 2), ("FR".to_string(), 1)]);
+        assert_eq!(a.asns, [(64496, Some("Example".to_string()), 2)]);
+        let f = |country: &str, asn: &str, min: &str, from: &str, to: &str| CampaignFilter {
+            country: Some(country.into()),
+            asn: Some(asn.into()),
+            min: Some(min.into()),
+            from: Some(from.into()),
+            to: Some(to.into()),
+        };
+        let only = |c: CampaignFilter| {
+            let s = &s;
+            async move { keys(s.campaign_index(&c).await.unwrap()) }
+        };
+        assert_eq!(only(f("de", "", "", "", "")).await, ["192.0.2.3"]);
+        assert_eq!(only(f("", "AS64496", "", "", "")).await, ["192.0.2.3"]);
+        assert_eq!(only(f("", "", "3", "", "")).await, ["192.0.2.3"]);
+        assert_eq!(
+            only(f("", "", "", "2026-10-03", "")).await,
+            ["198.51.100.10"]
+        );
+        assert_eq!(only(f("", "", "", "", "2026-09-30")).await, ["192.0.2.3"]);
+        // Unparsable values are ignored, not matched.
+        assert_eq!(only(f("x", "nope", "-", "soon", "later")).await.len(), 3);
+
+        let b = s.campaign("198.51.100.10").await.unwrap().unwrap();
+        let m = &b.members[0];
+        assert_eq!((m.ip.as_str(), m.requests), ("198.51.100.10", 132));
+        let shapes = s.campaign_shapes("198.51.100.10").await.unwrap();
+        assert_eq!(shapes.len(), CAMPAIGN_SHAPES as usize);
+        // Light rows count: every listed shape is asked by both members.
+        assert!(
+            shapes.iter().all(|x| x.members == 2 && x.df >= 2),
+            "{shapes:?}"
+        );
+        assert!(
+            shapes.iter().all(|x| x.text.ends_with("/.env")),
+            "{shapes:?}"
+        );
+
+        sqlx::query("UPDATE requests SET ts = datetime('now') WHERE ip_id IN (SELECT id FROM ips WHERE ip LIKE '192.0.2.%')")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let cal = s.campaign_calendar("192.0.2.3").await.unwrap();
+        assert_eq!(cal.len(), 1);
+        assert_eq!(cal[0].count, 3);
+        assert!(s.campaign_shapes("nope").await.unwrap().is_empty());
     }
 }
