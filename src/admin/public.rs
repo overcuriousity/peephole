@@ -1471,7 +1471,9 @@ show_labels = {show_labels}
 
     /// The text between `start` and the first `end` after it.
     fn between<'a>(s: &'a str, start: &str, end: &str) -> &'a str {
-        let i = s.find(start).unwrap_or_else(|| panic!("no {start:?} in {s}"));
+        let i = s
+            .find(start)
+            .unwrap_or_else(|| panic!("no {start:?} in {s}"));
         let rest = &s[i..];
         &rest[..rest.find(end).map_or(rest.len(), |j| j + end.len())]
     }
@@ -1490,7 +1492,10 @@ show_labels = {show_labels}
         let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let c = &v["campaigns"];
-        assert_eq!((c["active"].as_i64(), c["members"].as_i64()), (Some(3), Some(6)));
+        assert_eq!(
+            (c["active"].as_i64(), c["members"].as_i64()),
+            (Some(3), Some(6))
+        );
         // Nothing that names a member or what tied them.
         let mut secrets: Vec<String> = sqlx::query_scalar("SELECT text FROM shapes")
             .fetch_all(&st.store.pool)
@@ -1506,7 +1511,11 @@ show_labels = {show_labels}
             .await
             .unwrap(),
         );
-        secrets.extend(["hostkey".into(), "campaignpath".into(), "campaignja4".into()]);
+        secrets.extend([
+            "hostkey".into(),
+            "campaignpath".into(),
+            "campaignja4".into(),
+        ]);
         for part in [tile, card, &c.to_string()] {
             for x in &secrets {
                 assert!(!part.contains(x.as_str()), "{x:?} in {part}");
@@ -1538,7 +1547,14 @@ show_labels = {show_labels}
             .await
             .unwrap();
         seed_campaigns(&st, 3).await;
-        assert!(st.store.stats(Range::H24).await.unwrap().campaigns.is_some());
+        assert!(
+            st.store
+                .stats(Range::H24)
+                .await
+                .unwrap()
+                .campaigns
+                .is_some()
+        );
         let app = crate::admin::full_router(st.clone());
         let (_, html) = get_with(&app, "/?range=7d", None).await;
         assert!(!html.contains("Campaigns this period"), "{html}");
