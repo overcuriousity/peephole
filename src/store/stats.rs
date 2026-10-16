@@ -180,6 +180,9 @@ pub struct Stats {
     /// the names on [`crate::model::webshell::verb`]'s list, else `other`.
     /// Most frequent first.
     pub verbs: Vec<Named>,
+    /// Campaigns with released activity in the range, as counts and family
+    /// labels only; only from [`CAMPAIGN_TILE_MIN`] campaigns up.
+    pub campaigns: Option<CampaignTile>,
 }
 
 /// Most rows "Recent requests" can show (`[public] recent_rows` is at most
@@ -195,6 +198,28 @@ pub struct CanaryTile {
     pub median_s: i64,
     pub share_pct: i64,
     pub reused: i64,
+}
+
+/// Fewest campaigns active in the range before the wall shows the
+/// campaign tile, so it never describes one group of IPs.
+pub const CAMPAIGN_TILE_MIN: i64 = 3;
+
+/// "Campaigns this period": aggregates only. Membership, paths and
+/// fingerprints are admin-only, so none of them is here.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CampaignTile {
+    /// Campaigns with a member request in the range this audience may see.
+    pub active: i64,
+    /// Their members with such a request.
+    pub members: i64,
+    /// The most such members in one campaign.
+    pub largest: i64,
+    /// Distinct ASNs and countries among those members.
+    pub asns: i64,
+    pub countries: i64,
+    /// Their requests per label family (`classify::FAMILIES` order,
+    /// non-zero only).
+    pub families: Vec<Named>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -576,6 +601,7 @@ impl Store {
             share_pct: sum.harvest_share_pct(),
             reused: sum.harvests_reused,
         });
+        let campaigns = self.campaign_tile_as(r, a).await?;
         Ok(Stats {
             range: r.key(),
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -605,7 +631,59 @@ impl Store {
             ai_decoys,
             webshells_dropped,
             verbs,
+            campaigns,
         })
+    }
+
+    /// The campaign tile, counted over the member requests in the range
+    /// this audience may see; `None` below [`CAMPAIGN_TILE_MIN`].
+    async fn campaign_tile_as(&self, r: Range, a: Audience) -> Result<Option<CampaignTile>> {
+        let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
+        type Row = (String, i64, Option<i64>, Option<String>, String, i64);
+        let rows = bind_since!(
+            sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
+                "SELECT m.campaign_key, i.id, i.asn, i.country, r.labels_json, COUNT(*)
+                 FROM requests r JOIN campaign_members m ON m.ip_id = r.ip_id
+                 JOIN ips i ON i.id = r.ip_id
+                 WHERE 1=1{w} GROUP BY m.campaign_key, i.id, r.labels_json"
+            ))),
+            since
+        )
+        .fetch_all(&self.read)
+        .await?;
+        let mut per: HashMap<String, std::collections::HashSet<i64>> = HashMap::new();
+        let mut asns = std::collections::HashSet::new();
+        let mut countries = std::collections::HashSet::new();
+        let mut fam: HashMap<&'static str, i64> = HashMap::new();
+        for (key, ip, asn, country, labels, n) in rows {
+            per.entry(key).or_default().insert(ip);
+            asns.extend(asn);
+            countries.extend(country);
+            let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            for f in crate::classify::request_families(&labels) {
+                *fam.entry(f).or_default() += n;
+            }
+        }
+        if (per.len() as i64) < CAMPAIGN_TILE_MIN {
+            return Ok(None);
+        }
+        Ok(Some(CampaignTile {
+            active: per.len() as i64,
+            members: per.values().map(|m| m.len() as i64).sum(),
+            largest: per.values().map(|m| m.len() as i64).max().unwrap_or(0),
+            asns: asns.len() as i64,
+            countries: countries.len() as i64,
+            families: crate::classify::FAMILIES
+                .iter()
+                .filter_map(|f| {
+                    fam.get(f).map(|&count| Named {
+                        name: (*f).to_string(),
+                        count,
+                    })
+                })
+                .collect(),
+        }))
     }
 
     /// Uploads in the range. The public counts one only once the request

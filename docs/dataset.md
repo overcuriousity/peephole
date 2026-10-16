@@ -133,6 +133,23 @@ row of the same address, `fingerprints` belongs to the row's request. They
 can be large (an nmap XML per scan), so for per-address work take one row
 per `ip` first (`DISTINCT ON`, `group_by(...).first()`).
 
+### Campaign
+
+| Column | Type | Meaning |
+|---|---|---|
+| `campaign` | string? | The campaign `key` of the address when the export ran; null when the address is in no campaign |
+
+A campaign is a group of addresses tied by evidence: a shared SSH host key,
+TLS certificate, browser fingerprint or canary, or a similar set of
+normalized paths. The column is derived, not recorded: every node
+recomputes campaigns from the replicated rows about once an hour, so it is
+node-local in timing (a node that has not caught up yet, or not recomputed
+yet, can still miss a new member). It is stable in identity: the key is the
+IP text of the campaign's oldest member, the same on every node, and
+survives recomputes as long as that member stays in it. The key is not a
+row of the export; join on it, not on the `#N` the admin pages show, which
+is a display rank.
+
 **`intel`**: every enrichment lookup ever recorded, oldest first.
 
 ```json

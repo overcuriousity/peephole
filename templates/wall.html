@@ -27,6 +27,7 @@
   <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources</div></div>
   {% if let Some(c) = stats.canaries %}<div class="tile"><span class="label">Harvest to first use</span><div class="value">{{ crate::admin::views::duration(c.median_s) }}</div><div class="hint">median · {{ c.share_pct }} % of harvested credentials used again</div></div>{% endif %}
   {% if stats.tarpit_held_ms > 0 %}<div class="tile"><span class="label">Scanner time wasted</span><div class="value">{{ crate::admin::views::duration(stats.tarpit_held_ms / 1000) }}</div><div class="hint">held by the tarpit</div></div>{% endif %}
+  {% if let Some(c) = stats.campaigns %}<div class="tile"><span class="label">Campaigns this period</span><div class="value">{{ crate::admin::views::thousands(c.active) }}</div><div class="hint">{{ c.members }} sources · largest {{ c.largest }} · {{ c.asns }} networks, {{ c.countries }} countries</div></div>{% endif %}
   {% if stats.webshells_dropped > 0 %}<div class="tile"><span class="label">Webshells dropped</span><div class="value">{{ crate::admin::views::thousands(stats.webshells_dropped) }}</div><div class="hint">files uploaded to the trap, kept, never served</div></div>{% endif %}
 </div>
 
@@ -65,6 +66,18 @@
       <table class="visually-hidden"><tbody>{% for n in stats.severity_distribution %}<tr><td>{{ n.name }}</td><td>{{ n.count }}</td></tr>{% endfor %}</tbody></table>
     </section>
     {% endif %}
+    {% if labels %}{% if let Some(c) = stats.campaigns %}{% if !c.families.is_empty() %}<section class="card">
+      <div class="card-head"><h2>What the campaigns were after</h2><span class="muted">requests of {{ c.active }} campaigns: sources tied by shared keys, certificates or paths</span></div>
+      <ul class="families">
+        {% for f in c.families %}
+        <li>
+          <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
+          <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, campaign_family_max) }}" height="8"/></svg></span>
+          <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>{% endif %}{% endif %}{% endif %}
     {% if let Some(ai) = stats.ai_decoys %}<section class="card">
       <div class="card-head"><h2>What they asked our fake AI</h2><span class="muted">{{ crate::admin::views::thousands(ai.total) }} requests to our MCP server and LLM gateway</span></div>
       {% if !ai.tools.is_empty() %}<h3>Tools called</h3>

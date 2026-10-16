@@ -73,6 +73,7 @@ struct WallPage {
     port_max: i64,
     family_max: i64,
     verb_max: i64,
+    campaign_family_max: i64,
     /// "Recent requests": the newest `[public] recent_rows` of `stats.recent`.
     recent: Vec<crate::store::stats::RecentRequest>,
     /// Shortest and longest publication delay, in minutes.
@@ -161,6 +162,10 @@ async fn wall(
         port_max: max(&mut stats.ports.iter().map(|p| p.ips)),
         family_max: max(&mut stats.families.iter().map(|n| n.count)),
         verb_max: max(&mut stats.verbs.iter().map(|n| n.count)),
+        campaign_family_max: max(&mut stats
+            .campaigns
+            .iter()
+            .flat_map(|c| c.families.iter().map(|n| n.count))),
         recent,
         delay_min: state.cfg.public.delay_minutes,
         delay_max: state.cfg.public.delay_minutes + state.cfg.public.jitter_minutes,
@@ -193,6 +198,9 @@ async fn stats_json(
     hidden.top_labels.clear();
     hidden.families.clear();
     hidden.owasp.clear();
+    if let Some(c) = hidden.campaigns.as_mut() {
+        c.families.clear();
+    }
     Ok(Json(Arc::new(hidden)))
 }
 
@@ -1410,6 +1418,159 @@ show_labels = {show_labels}
         let (_, body) = get_with(&app, "/?range=7d", None).await;
         assert!(!body.contains("Webshells dropped"), "{body}");
         assert!(!body.contains("whoami"), "{body}");
+    }
+
+    /// `groups` campaigns of two IPs each, tied by an SSH host key; their
+    /// requests carry a label and a path unique to the IP.
+    async fn seed_campaigns(st: &AdminState, groups: u8) {
+        for g in 0..groups {
+            for m in 0..2u8 {
+                let ip = st
+                    .store
+                    .upsert_ip(format!("192.0.2.{}", 10 * g + m + 1).parse().unwrap())
+                    .await
+                    .unwrap();
+                st.store
+                    .insert_request(&crate::store::requests::NewRequest {
+                        ip_id: ip.id,
+                        method: "GET".into(),
+                        path: format!("/campaignpath{g}{m}/.env"),
+                        headers_json: "[]".into(),
+                        labels_json: r#"["env-probe"]"#.into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let probe: i64 = sqlx::query_scalar(
+                    "INSERT INTO probes (uid, group_uid, ip_id, asker, started_at, finished_at)
+                     VALUES (?, 'g', ?, x'01', datetime('now'), datetime('now')) RETURNING id",
+                )
+                .bind(format!("p{g}{m}"))
+                .bind(ip.id)
+                .fetch_one(&st.store.pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO host_keys (probe_id, ip_id, port, kind, fingerprint)
+                     VALUES (?, ?, 22, 'ssh-hostkey', ?)",
+                )
+                .bind(probe)
+                .bind(ip.id)
+                .bind(format!("SHA256:hostkey{g}"))
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+            }
+        }
+        sqlx::query("UPDATE requests SET ja4 = 't13d1516h2_campaignja4'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        st.store.recompute_campaigns(true).await.unwrap();
+    }
+
+    /// The text between `start` and the first `end` after it.
+    fn between<'a>(s: &'a str, start: &str, end: &str) -> &'a str {
+        let i = s
+            .find(start)
+            .unwrap_or_else(|| panic!("no {start:?} in {s}"));
+        let rest = &s[i..];
+        &rest[..rest.find(end).map_or(rest.len(), |j| j + end.len())]
+    }
+
+    #[tokio::test]
+    async fn wall_shows_campaign_counts_and_families_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_campaigns(&st, 3).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        let tile = between(&html, "Campaigns this period", "</div></div>");
+        assert!(tile.contains(">3<"), "{tile}");
+        assert!(tile.contains("6 sources · largest 2"), "{tile}");
+        let card = between(&html, "What the campaigns were after", "</section>");
+        assert!(card.contains("fam-recon"), "{card}");
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let c = &v["campaigns"];
+        assert_eq!(
+            (c["active"].as_i64(), c["members"].as_i64()),
+            (Some(3), Some(6))
+        );
+        // Nothing that names a member or what tied them.
+        let mut secrets: Vec<String> = sqlx::query_scalar("SELECT text FROM shapes")
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap();
+        assert!(!secrets.is_empty());
+        secrets.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT ip FROM ips UNION SELECT fingerprint FROM host_keys
+                 UNION SELECT path FROM requests UNION SELECT key FROM campaigns",
+            )
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap(),
+        );
+        secrets.extend([
+            "hostkey".into(),
+            "campaignpath".into(),
+            "campaignja4".into(),
+        ]);
+        for part in [tile, card, &c.to_string()] {
+            for x in &secrets {
+                assert!(!part.contains(x.as_str()), "{x:?} in {part}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_hides_campaigns_below_the_minimum() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_campaigns(&st, 2).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        assert!(!html.contains("Campaigns this period"), "{html}");
+        assert!(!html.contains("What the campaigns were after"), "{html}");
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["campaigns"].is_null(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn wall_hides_campaigns_while_rows_await_their_publish_delay() {
+        let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
+        st.store
+            .set_publish_delay(
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        seed_campaigns(&st, 3).await;
+        assert!(
+            st.store
+                .stats(Range::H24)
+                .await
+                .unwrap()
+                .campaigns
+                .is_some()
+        );
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        assert!(!html.contains("Campaigns this period"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn campaign_families_follow_show_labels() {
+        let (st, _d) = state_with(false, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_campaigns(&st, 3).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        assert!(html.contains("Campaigns this period"), "{html}");
+        assert!(!html.contains("What the campaigns were after"), "{html}");
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["campaigns"]["families"], serde_json::json!([]), "{json}");
     }
 
     #[tokio::test]
