@@ -227,7 +227,7 @@ async fn graph(
     let Some(focus) = q.focus.as_deref().and_then(Focus::parse) else {
         return Ok((
             StatusCode::BAD_REQUEST,
-            "focus: <kind>:<value> or ip:<addr>",
+            "focus: <kind>:<value>, ip:<addr> or campaign:<key>",
         )
             .into_response());
     };
@@ -398,4 +398,36 @@ async fn decoy_canaries(
         uses,
         ips,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Template)]
+    #[template(source = r#"{% include "_campaign_graph.html" %}"#, ext = "html")]
+    struct Embed {
+        chrome: Chrome,
+        campaign_key: String,
+    }
+
+    #[test]
+    fn the_campaign_embed_draws_paths_edges_dashed() {
+        let html = Embed {
+            chrome: chrome(),
+            campaign_key: "203.0.113.1".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains(r#"data-focus="campaign:203.0.113.1""#));
+        assert!(html.contains(r#"data-center="ip:203.0.113.1""#));
+        assert!(html.contains("/assets/js/linkgraph.js"));
+        // The legend's dashed line, and the class linkgraph.js gives a
+        // non-identity edge, which the stylesheet dashes.
+        assert!(html.contains(r#"<i class="line soft"></i>shared paths"#));
+        let js = include_str!("../../assets/js/linkgraph.js");
+        assert!(js.contains(r#""edge" + (e.identity ? "" : " soft")"#));
+        let css = include_str!("../../assets/css/45-viz.css");
+        assert!(css.contains(".link-graph .edge.soft .line { stroke-dasharray"));
+    }
 }
