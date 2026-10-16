@@ -59,7 +59,16 @@ it can be read: request search and inspection, a live feed, analytics, a
 page per IP with every enrichment result and scan, the scan queue, a Links
 area that connects addresses sharing a browser fingerprint, SSH host key,
 TLS certificate or other fingerprint, canary reuse, a false-positive inbox,
-and the dataset export. Every row says which node recorded it, by name and
+and the dataset export.
+
+**Campaigns** group the addresses behind one operation. Every node
+recomputes them about once an hour from the replicated rows, so each
+arrives at the same groups: a shared SSH host key, TLS certificate,
+browser fingerprint or reused canary ties two addresses outright; a set of
+normalized paths that is rare and largely shared ties them too, with JA4
+and JA4H as supporting evidence only, never alone. Every tie says why it
+exists. Campaigns are read-only and admin-only; the public dashboard shows
+only their counts. Every row says which node recorded it, by name and
 key, and which build it ran.
 
 peephole is one binary with SQLite. Fonts, scripts and the world map are
@@ -139,6 +148,11 @@ calendar, rank and neighbours (same /24 and ASN).
 - **The card "What they asked our fake AI"** shows only our own tool names,
   and model names that are lowercased, match `[a-z0-9._:/-]{1,64}` and were
   asked by at least 2 IPs (else "other").
+- **Campaigns only as counts**: "Campaigns this period" shows how many
+  were active, their sources in total, the largest, their ASN and country
+  spread as counts and their requests per attack family. It appears only
+  from three active campaigns up; which address belongs to which campaign,
+  and what tied them, is admin-only.
 - **Rule labels**, and the families and OWASP tags derived from them, can
   be hidden too.
 
