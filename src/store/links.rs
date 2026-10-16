@@ -303,6 +303,12 @@ fn sightings(kind: LinkKind, w: &Where) -> (String, Vec<String>) {
     (parts.join(" UNION ALL "), binds)
 }
 
+/// `SELECT v, ip_id, ts, origin` over every sighting of `kind`, for the
+/// campaign recompute ([`super::campaigns`]).
+pub(super) fn all_sightings(kind: LinkKind) -> String {
+    sightings(kind, &Where::default()).0
+}
+
 /// The index's filter; names and formats as `RequestFilter`, so the
 /// drill-down chips (piece D) can share them.
 #[derive(Debug, Clone, Default, serde::Deserialize)]

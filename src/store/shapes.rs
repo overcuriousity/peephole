@@ -76,7 +76,7 @@ pub(crate) async fn derive_batch(conn: &mut SqliteConnection, batch_id: i64) -> 
 }
 
 /// A light row's millisecond time as `requests.ts` holds times.
-fn ts_text(ms: i64) -> String {
+pub(crate) fn ts_text(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_default()
