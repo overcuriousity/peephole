@@ -5,6 +5,33 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-16
+
+Code structure, tests and dependencies from the full review (MIK-370,
+batch 3). No behaviour change, no database migration, no protocol change,
+no new setting.
+
+### Changed
+
+- The store no longer depends on the admin, scan or trap modules (C7).
+  Pure code both sides use moves into a new `model` module and into the
+  store; the old paths re-export it.
+- `cluster::Node` groups its credits, peer and lookup state into
+  `Node::credits`, `Node::peers` and `Node::lookups` (C7). Fields, locks
+  and initial values are unchanged.
+- `arrow` and `sqlx` build without unused default features: no
+  arrow-csv/arrow-json, no sqlx `any` driver, `migrate` or query macros.
+  Remaining duplicate crates are documented.
+
+### Tests
+
+- Racing pairing-code redemptions pair exactly one device (T4).
+- A replayed owner envelope runs once over the wire; a stale or
+  future-dated one is refused (T5).
+- A misconfigured proxy keeps the shared sign-in limit (T6).
+- The RPC receiver refuses oversized bodies before a handler (T7).
+- Two timing tests wait for an event instead of sleeping.
+
 ## [0.15.2] - 2026-10-16
 
 Hardening from the full review (MIK-370, batch 2). No database migration,
