@@ -1783,6 +1783,12 @@ show_labels = {show_labels}
         .execute(&st.store.pool)
         .await
         .unwrap();
+        // The fixture's released request carries shape 1: the public count
+        // only covers shapes with a released request.
+        sqlx::query("UPDATE requests SET shape = 1")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
         let app = crate::admin::full_router(st.clone());
         let (_, html) = get_with(&app, "/?range=7d", None).await;
         let tile = between(&html, "New path shapes", "</div></div>");
