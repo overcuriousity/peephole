@@ -37,13 +37,28 @@
   </tr>{% endfor %}
   </tbody></table></div>
 </section>
-<section class="card">
+<section class="card" data-section="artifacts">
+  <div class="card-head"><h2>Artifacts</h2></div>
+  <h3>Uploads</h3>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Kind</th><th>File name</th><th>Type</th><th class="num">Size</th><th>SHA-256</th><th>Answered at</th><th>Content</th></tr></thead><tbody>
+  {% for u in uploads %}<tr><td class="mono"><a href="/admin/uploads/{{ u.uid|urlencode }}">{{ u.ts }}</a></td><td class="mono"><a href="/ip/{{ u.ip }}">{{ u.ip }}</a></td><td class="mono">{{ u.kind }}</td><td class="mono">{% if let Some(f) = u.filename %}{{ f }}{% endif %}</td><td class="mono">{{ u.sniffed_type }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="path">{{ u.answered_path }}</td>
+    <td>{% if u.held %}<a class="btn btn-sm" href="/admin/uploads/{{ u.uid|urlencode }}/content.zip">zip</a>{% else %}<span class="muted" title="{{ u.content_state }}">content not held</span>{% endif %}</td></tr>{% endfor %}
+  {% if uploads.is_empty() %}<tr><td colspan="9" class="empty">No file dropped by a member.</td></tr>{% endif %}
+  </tbody></table></div>
+  <h3>Webshell commands</h3>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Command</th><th class="num">Runs</th><th class="num">Members</th><th>Last (UTC)</th></tr></thead><tbody>
+  {% for x in commands %}<tr><td class="mono break"><a href="{{ crate::admin::views::pivot_href("cmd", x.cmd.as_str()) }}">{{ x.cmd }}</a></td><td class="num">{{ x.count }}</td><td class="num">{{ x.ips }}</td><td class="ts">{{ crate::admin::views::minute(x.last_ts.as_str()) }}</td></tr>{% endfor %}
+  {% if commands.is_empty() %}<tr><td colspan="4" class="empty">No webshell command run by a member.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+<section class="card" data-section="timeline">
   <div class="card-head"><h2>Timeline</h2><span class="muted">per day, last 26 weeks, UTC</span></div>
   {% if calendar.is_empty() %}<p class="empty">No request in the last 26 weeks.</p>{% else %}
   <div class="chart calendar" data-calendar="{{ calendar_json }}" data-days="{{ calendar_days }}" role="img" aria-label="Days with requests from the members over the last 26 weeks"></div>
   <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
   <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
   {% endif %}
+  {% include "_events.html" %}
 </section>
 <section class="card">
   <div class="card-head"><h2>Shapes</h2></div>
