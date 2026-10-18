@@ -142,7 +142,7 @@ fn webhook_body(
             "shape": clean(&w.text),
             "ips": w.ips,
             "window_minutes": window_minutes,
-            "first_seen": w.window_start,
+            "window_start": w.window_start,
             "url": page,
         })).collect::<Vec<_>>(),
     })
@@ -312,7 +312,7 @@ mod tests {
                     "shape": SHAPE,
                     "ips": 12,
                     "window_minutes": 60,
-                    "first_seen": "2026-10-04 12:00:00",
+                    "window_start": "2026-10-04 12:00:00",
                     "url": "https://admin.example/admin/paths",
                 }],
             })
