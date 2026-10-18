@@ -174,6 +174,7 @@ impl LinkPage {
         match self.kind_key.as_str() {
             "ja4" => Some(format!("/requests?ja4={enc}")),
             "ja4h" => Some(format!("/requests?ja4h={enc}")),
+            "ua" => Some(format!("/requests?ua={enc}")),
             _ => None,
         }
     }
