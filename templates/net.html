@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% block title %}peephole — {% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} · {% endif %}{% endif %}{{ handle }}{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} · {% endif %}{% endif %}<span class="mono">{{ handle }}</span></h1>
+{% if !facts.is_empty() %}<p class="muted">{% for f in facts %}{% if !loop.first %} · {% endif %}{{ f.label }} <span{% if f.mono %} class="mono"{% endif %}>{{ f.value }}</span>{% endfor %}</p>{% endif %}</div></div>
+{% if let Some(r) = r %}
+{% include "_rollup.html" %}
+{% else %}
+<p class="empty">No IP recorded in this RDAP network.</p>
+{% endif %}
+{% endblock %}
