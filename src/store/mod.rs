@@ -32,6 +32,7 @@ pub mod shapes;
 pub mod stats;
 pub mod uploads;
 pub mod useragent;
+pub mod waves;
 pub mod webshell_cmd;
 
 use anyhow::Context;
@@ -91,6 +92,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0042_webshell_cmd.sql"),
     include_str!("migrations/0043_rdap_net.sql"),
     include_str!("migrations/0044_price_history_cluster.sql"),
+    include_str!("migrations/0045_waves.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -401,6 +403,7 @@ fn statements(sql: &str) -> Vec<String> {
 /// process (the CLI) racing the daemon cannot apply one twice.
 async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
+    let mut from = None;
     for (i, sql) in migrations.iter().enumerate() {
         let target = i as i64 + 1;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -409,7 +412,7 @@ async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result
                 .fetch_one(&mut *conn)
                 .await?;
             if current >= target {
-                return Ok(());
+                return Ok(None);
             }
             for stmt in statements(sql) {
                 sqlx::query(sqlx::AssertSqlSafe(stmt))
@@ -423,12 +426,13 @@ async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result
             )))
             .execute(&mut *conn)
             .await?;
-            anyhow::Ok(())
+            anyhow::Ok(Some(current))
         }
         .await;
         match applied {
-            Ok(()) => {
+            Ok(was) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
+                from = from.or(was);
             }
             Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -439,6 +443,9 @@ async fn migrate(pool: &sqlx::SqlitePool, migrations: &[&str]) -> anyhow::Result
     let current: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&mut *conn)
         .await?;
+    if let Some(from) = from {
+        tracing::info!(from, to = current, "database schema migrated");
+    }
     if current > migrations.len() as i64 {
         // A newer build migrated this database (e.g. before an installer
         // rollback). Migrations are additive, so keep going.
