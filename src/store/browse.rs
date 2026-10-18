@@ -129,6 +129,8 @@ pub struct RequestFilter {
     pub method: Option<String>,
     /// Admin only: the User-Agent, exactly (`(none)`: without one).
     pub ua: Option<String>,
+    /// Admin only: the command sent to a dropped webshell, exactly.
+    pub cmd: Option<String>,
     /// Admin only: `http`, `https`, …; `unknown` for a row without one.
     pub transport: Option<String>,
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
@@ -592,6 +594,10 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         }
         if let Some(v) = nonempty(&f.ua) {
             sql.push_str(" AND r.user_agent = ?");
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.cmd) {
+            sql.push_str(" AND r.cmd = ?");
             binds.push(v);
         }
         if let Some(v) = nonempty(&f.session) {

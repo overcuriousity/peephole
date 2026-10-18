@@ -325,8 +325,8 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
            headers_json, body, labels_json, owasp_json, severity, scan_level, is_fp_claim,
            page_token, answer, status, unrecorded, transport, via_proxy, raw_head,
            tls_client_hello, ja4, build, rules, decoy_v, decoy_site, ja4h, ja4h_v,
-           user_agent, ua_v, held_ms, decoy_in)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           user_agent, ua_v, held_ms, decoy_in, cmd, cmd_v)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&r.uid)
     .bind(ctx.origin_bytes())
@@ -366,6 +366,12 @@ async fn request(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &RequestRec) -> R
     .bind(super::useragent::UA_V)
     .bind(r.held_ms.filter(|ms| *ms >= 0))
     .bind(r.decoy_in.as_deref().filter(|d| d.len() <= 512))
+    .bind(super::webshell_cmd::derive(
+        r.answer.as_deref(),
+        r.query.as_deref(),
+        r.body.as_deref(),
+    ))
+    .bind(super::webshell_cmd::CMD_V)
     .execute(&mut *conn)
     .await?;
     if done.rows_affected() == 1 {

@@ -29,6 +29,7 @@ pub mod shapes;
 pub mod stats;
 pub mod uploads;
 pub mod useragent;
+pub mod webshell_cmd;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -84,6 +85,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0039_shapes.sql"),
     include_str!("migrations/0040_campaigns.sql"),
     include_str!("migrations/0041_campaign_agreement.sql"),
+    include_str!("migrations/0042_webshell_cmd.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
