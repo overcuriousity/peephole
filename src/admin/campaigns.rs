@@ -7,7 +7,8 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::{Chrome, link_href};
 use crate::store::browse::{CALENDAR_DAYS, CalendarDay, canonical_ip};
 use crate::store::campaigns::{
-    Campaign, CampaignFilter, CampaignListItem, CampaignShape, Edge, HARD_FANOUT_MAX, Report,
+    Campaign, CampaignFilter, CampaignListItem, CampaignShape, Edge, HARD_FANOUT_MAX, ORDER_AGREE,
+    Report,
 };
 use crate::store::links::LinkKind;
 use askama::Template;
@@ -75,10 +76,15 @@ impl EdgeView {
         let kind_name = kind.map_or("Path similarity", |k| k.name());
         let reason = match e.kind.as_str() {
             "paths" => format!(
-                "path similarity {:.2}, {} shared shapes{}",
+                "path similarity {:.2}, {} shared shapes{}{}",
                 e.score.unwrap_or(0.0),
                 e.shared.unwrap_or(0),
-                if e.fp_support { ", JA4/JA4H match" } else { "" }
+                if e.fp_support { ", JA4/JA4H match" } else { "" },
+                if e.agreement.is_some_and(|x| x >= ORDER_AGREE) {
+                    ", order agrees"
+                } else {
+                    ""
+                }
             ),
             "canary" => "canary served here, used there".into(),
             _ => format!("shared {}", kind_name.to_lowercase()),
