@@ -306,18 +306,194 @@
   }
 
   // Actions card: the total of the ticked probe vantages, live, on the
-  // button; with none ticked the button does nothing.
-  document.querySelectorAll("[data-probe-form]").forEach(function (f) {
-    var out = f.querySelector("[data-probe-total]");
+  // button; with none ticked the button does nothing. Delegated: a lookup
+  // result filled in later has its card too.
+  document.addEventListener("change", function (e) {
+    var f = e.target.closest && e.target.closest("[data-probe-form]");
+    var out = f && f.querySelector("[data-probe-total]");
     if (!out) return;
-    var go = out.closest("button");
-    f.addEventListener("change", function () {
-      var mc = 0, n = 0;
-      f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; n++; });
-      var cents = Math.floor((mc + 5) / 10);
-      out.textContent = Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
-      if (go) { go.disabled = n === 0; go.title = n === 0 ? "Pick at least one scanner" : ""; }
+    var go = out.closest("button"), mc = 0, n = 0;
+    f.querySelectorAll("input[data-mc]:checked").forEach(function (c) { mc += parseInt(c.getAttribute("data-mc"), 10) || 0; n++; });
+    var cents = Math.floor((mc + 5) / 10);
+    out.textContent = Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
+    if (go) { go.disabled = n === 0; go.title = n === 0 ? "Pick at least one scanner" : ""; }
+  });
+
+  // Firm prices (MIK-505): a paid button (`data-quote`, only in a cluster)
+  // first asks its endpoint for one price for what its form would buy. The
+  // dialog shows it with the balance and counts its expiry down; Confirm
+  // submits the form with the quote (a probe: with the price shown). An
+  // expired price cannot be confirmed: "Get a new price" asks again.
+  // Cancel, Esc or closing the dialog spends nothing.
+  var qd = null, cur = null;
+  function q$(sel) { return qd.querySelector(sel); }
+  function quoteDialog() {
+    if (qd) return qd;
+    qd = document.createElement("dialog");
+    qd.className = "quote-dialog";
+    qd.setAttribute("aria-labelledby", "quote-title");
+    qd.innerHTML = '<h3 id="quote-title" data-q-title></h3>' +
+      '<p class="quote-price"><b class="num" data-q-price></b> credits</p>' +
+      '<p class="muted small" data-q-what></p>' +
+      '<p class="small" data-q-meta aria-live="polite"></p>' +
+      '<p class="small text-warning" data-q-error role="alert"></p>' +
+      '<div class="actions"><button class="btn" type="button" data-close>Cancel</button>' +
+      '<button class="btn" type="button" data-q-again hidden>Get a new price</button>' +
+      '<button class="btn btn-primary" type="button" data-q-go disabled>Confirm</button></div>';
+    document.body.appendChild(qd);
+    qd.seq = 0;
+    q$("[data-close]").addEventListener("click", function () { qd.close(); });
+    qd.addEventListener("close", function () { clearInterval(qd.tick); qd.seq++; });
+    q$("[data-q-again]").addEventListener("click", function () { getQuote(); });
+    q$("[data-q-go]").addEventListener("click", confirmQuote);
+    return qd;
+  }
+  // What the button's form would send, as the quote's query.
+  function quoteQuery(b) {
+    var p = new URLSearchParams();
+    new FormData(b.form).forEach(function (v, k) { if (k !== "quote_id" && k !== "price_mc") p.append(k, v); });
+    if (b.name) p.append(b.name, b.value);
+    return p.toString();
+  }
+  function quoteState(st, meta) {
+    qd.setAttribute("data-state", st);
+    q$("[data-q-meta]").textContent = meta;
+    q$("[data-q-go]").disabled = st !== "quoted";
+    q$("[data-q-again]").hidden = st !== "expired" && st !== "error";
+  }
+  function getQuote() {
+    var b = cur.button, seq = ++qd.seq;
+    clearInterval(qd.tick);
+    cur.quote = null;
+    q$("[data-q-price]").textContent = "…";
+    q$("[data-q-what]").textContent = "";
+    q$("[data-q-error]").textContent = "";
+    quoteState("asking", "Getting the price…");
+    fetch(b.getAttribute("data-quote") + "?" + quoteQuery(b), { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.redirected) throw new Error("Signed out: reload the page.");
+        return r.json().then(function (v) {
+          if (!r.ok) throw new Error((v.error && v.error.message) || "error " + r.status);
+          return v;
+        });
+      })
+      .then(function (q) {
+        if (seq !== qd.seq) return;
+        cur.quote = q;
+        q$("[data-q-price]").textContent = q.credits;
+        var what = [];
+        if (q.offer) what.push(q.offer.about);
+        if (q.providers) what.push(q.providers.map(function (p) { return p.label + " · " + p.node + " · " + p.credits; }).join("; "));
+        q$("[data-q-what]").textContent = what.join(" — ");
+        var bal = q.balance ? "Balance " + q.balance + " credits" : "";
+        if (!q.expires_in) { quoteState("quoted", bal); return; }
+        // Counted from receipt, whatever the browser's clock says.
+        var end = Date.now() + q.expires_in * 1000;
+        var tick = function () {
+          var left = Math.max(0, Math.round((end - Date.now()) / 1000));
+          if (left > 0) {
+            quoteState("quoted", (bal ? bal + " · " : "") + "this price holds for " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0"));
+            return;
+          }
+          clearInterval(qd.tick);
+          cur.quote = null;
+          quoteState("expired", "This price expired; nothing was spent.");
+        };
+        tick();
+        qd.tick = setInterval(tick, 1000);
+      })
+      .catch(function (e) {
+        if (seq !== qd.seq) return;
+        q$("[data-q-price]").textContent = "—";
+        q$("[data-q-error]").textContent = e.message || String(e);
+        quoteState("error", "");
+      });
+  }
+  function confirmQuote() {
+    var b = cur.button, q = cur.quote, f = b.form;
+    if (!q) return;
+    var probe = b.getAttribute("data-quote-kind") === "probe";
+    var name = probe ? "price_mc" : "quote_id";
+    var h = f.querySelector('input[name="' + name + '"]');
+    if (!h) { h = document.createElement("input"); h.type = "hidden"; h.name = name; f.appendChild(h); }
+    h.value = probe ? String(q.credits_mc) : q.quote_id;
+    clearInterval(qd.tick);
+    qd.seq++;
+    quoteState("confirmed", "Confirmed at " + q.credits + " credits: sending…");
+    q$("[data-close]").disabled = true;
+    if (f.requestSubmit) { f.requestSubmit(b); } else { f.submit(); }
+  }
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest("button[data-quote]");
+    if (!b || b.disabled || !b.form) return;
+    e.preventDefault();
+    cur = { button: b, quote: null };
+    quoteDialog();
+    q$("[data-close]").disabled = false;
+    q$("[data-q-title]").textContent = b.getAttribute("data-quote-title") || "Confirm the price";
+    qd.showModal();
+    getQuote();
+  });
+
+  // Lookup (MIK-505): the form asks for what the dataset holds at once
+  // (`live`); the providers' cards fill in one by one, each spinning until
+  // its answer is in and showing its own error or timeout. A looked-up
+  // name resolves the same way, and its addresses' cards then fill in.
+  var FILL_MS = 30000;
+  var lbar = document.querySelector("form[data-live]");
+  if (lbar) lbar.addEventListener("submit", function () {
+    if (lbar.querySelector("input[name=live]")) return;
+    var l = document.createElement("input");
+    l.type = "hidden"; l.name = "live"; l.value = "1";
+    lbar.appendChild(l);
+  });
+  function postFragment(url, data, signal) {
+    return fetch(url, {
+      method: "POST", credentials: "same-origin", signal: signal,
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(data).toString()
+    }).then(function (r) {
+      if (r.redirected) throw new Error("signed out: reload the page");
+      if (!r.ok) throw new Error("the node answered " + r.status);
+      return r.text();
     });
+  }
+  function fillCards(root) {
+    root.querySelectorAll("[data-fill-ip] [data-fill]").forEach(function (el) {
+      var ip = el.closest("[data-fill-ip]").getAttribute("data-fill-ip");
+      var ctl = window.AbortController ? new AbortController() : null;
+      var timer = setTimeout(function () { if (ctl) ctl.abort(); }, FILL_MS);
+      postFragment("/admin/lookup/answer", { ip: ip, provider: el.getAttribute("data-fill") }, ctl && ctl.signal)
+        .then(function (html) {
+          var t = document.createElement("template");
+          t.innerHTML = html.trim();
+          el.replaceWith(t.content);
+          ago();
+        })
+        .catch(function (e) {
+          var s = el.querySelector("[data-fill-state]");
+          if (!s) return;
+          s.className = "intel-asking text-warning";
+          s.textContent = e && e.name === "AbortError" ? "No answer within " + FILL_MS / 1000 + " s." : "Not asked: " + (e.message || e) + ".";
+        })
+        .then(function () { clearTimeout(timer); });
+    });
+  }
+  fillCards(document);
+  document.querySelectorAll("[data-fill-name]").forEach(function (sec) {
+    postFragment("/admin/lookup/name", { ips: sec.getAttribute("data-fill-name") })
+      .then(function (html) {
+        var box = document.createElement("div");
+        box.innerHTML = html;
+        sec.replaceWith(box);
+        ago();
+        fillCards(box);
+      })
+      .catch(function (e) {
+        var p = sec.querySelector("p");
+        p.className = "text-warning";
+        p.textContent = "Not resolved: " + (e.message || e) + ".";
+      });
   });
 
   // A button that starts something (`data-busy="Asking…"`) says so at
