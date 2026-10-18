@@ -60,6 +60,13 @@ pub fn when(hlc: u64) -> String {
         .unwrap_or_default()
 }
 
+/// The minute of wall-clock `ms` (UTC), as `14:05 UTC`.
+pub fn minute_utc(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.format("%H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
 /// An amount typed by an operator ("1", "0.25"): more than nothing, at
 /// most three decimals.
 pub fn parse_amount(s: &str) -> Option<Mc> {

@@ -34,14 +34,16 @@
     <li>1 in 20 scans of paid jobs is designated for an audit the scanner buys from auditors the log ranks; this node also checks {{ price.audit_share }} % of other nodes' fresh scans unpaid.</li>
   </ul>
   {% if !goods.is_empty() %}
+  <p class="muted small">Sold here and offered here are this node's own figures; cluster sold counts receipts in the replicated ledger, cluster offered adds up members' announced capacity (for scans: live scanners' capacity).</p>
   <div class="table-wrap"><table class="price-table">
-    <thead><tr><th>Good</th><th class="num">Here</th><th class="num">24 h</th><th class="num">Members ask</th><th class="num" title="Asked for, per hour">Demand / h</th><th class="num" title="Offered, per hour">Supply / h</th><th>7 days</th></tr></thead>
+    <thead><tr><th>Good</th><th class="num">Here</th><th class="num">24 h</th><th class="num">Members ask</th><th class="num" title="Sold by this node, per hour">Sold here / h</th><th class="num" title="Offered by this node, per hour">Offered here / h</th><th class="num" title="Receipts in the replicated ledger, per hour">Cluster sold / h</th><th class="num" title="Members' announced capacity, per hour (scan: live scanners' capacity)">Cluster offered / h</th><th>7 days</th></tr></thead>
     <tbody>{% for g in goods %}<tr>
       <td><a href="#market" data-pick-good="{{ g.key }}">{{ g.label }}</a></td>
       <td class="num">{{ g.price }}</td>
       <td class="num">{% if let Some((c, trend)) = g.change %}<span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="num">{% if g.band.is_empty() %}<span class="muted">—</span>{% else %}{{ g.band }}{% endif %}</td>
       <td class="num">{{ g.demand }}</td><td class="num">{{ g.supply }}</td>
+      <td class="num">{{ g.cluster_demand }}</td><td class="num">{{ g.cluster_supply }}</td>
       <td class="spark-cell"><div class="sparkline" data-sparkline="{{ g.spark }}" aria-hidden="true"></div></td>
     </tr>{% endfor %}</tbody>
   </table></div>
@@ -62,6 +64,15 @@
     <tbody>{% for t in trades %}<tr><td>{{ t.good }}</td><td class="num">{{ t.ask }}</td><td class="num">{{ t.bid }}</td><td class="num">{{ t.sold }}</td><td class="num">{{ t.bought }}</td><td class="num">{{ t.over_bid }}</td></tr>{% endfor %}</tbody>
   </table></div>
 </section>
+{% if let Some(leases) = relays_leased %}
+<section class="card"><div class="card-head"><h2>Relays leased</h2><span class="muted">this node cannot be dialled: these relays hold its outbox</span></div>
+  {% if leases.is_empty() %}<p class="muted">No relay leased: nothing can reach this node's outbox yet.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Relay</th><th>Until</th><th class="num">Price (credits / h)</th></tr></thead>
+    <tbody>{% for r in leases %}<tr><td>{{ r.relay }}</td><td>{{ r.until }}</td><td class="num">{{ r.price }}</td></tr>{% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+{% endif %}
 <div class="grid-2 market-split">
 <section class="card"><div class="card-head"><h2>Money flow</h2><span class="muted">7 days · UTC</span></div>
   <div class="chart flow-chart" data-flow="{{ flow_json }}" role="img" aria-label="This node's income and spending per day"></div>

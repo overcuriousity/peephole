@@ -187,7 +187,8 @@ fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
 }
 
 /// One good in the price table: this node's price, its move over 24
-/// hours, what members announce, and its demand and supply now.
+/// hours, what members announce, what sells and is offered here, and
+/// the same across the cluster.
 struct GoodRow {
     key: String,
     label: String,
@@ -197,8 +198,14 @@ struct GoodRow {
     change: Option<(String, &'static str)>,
     /// Lowest–highest that members announce; empty: nobody does.
     band: String,
+    /// Sold and offered by this node, per hour.
     demand: String,
     supply: String,
+    /// Sold across the cluster (receipts in the replicated ledger) and
+    /// offered by members (announced capacity), per hour; a dash before
+    /// the cluster figures are known.
+    cluster_demand: String,
+    cluster_supply: String,
     /// Prices over 7 days, in credits, for the sparkline.
     spark: String,
 }
@@ -244,6 +251,11 @@ fn shown_change(pct: f64) -> (String, &'static str) {
     (format!("{pct:+.0} %"), trend)
 }
 
+/// A rate per hour with one decimal; a dash when it is not known.
+fn per_hour(v: Option<f64>) -> String {
+    v.map_or("\u{2014}".to_string(), |v| format!("{v:.1}"))
+}
+
 /// What a good is called on the page.
 fn good_label(good: &str) -> String {
     match good {
@@ -257,6 +269,13 @@ fn good_label(good: &str) -> String {
             .map(|i| i.label.to_string())
             .unwrap_or_else(|| p.to_string()),
     }
+}
+
+/// A relay lease this outbound-only node holds.
+struct LeaseRow {
+    relay: String,
+    until: String,
+    price: String,
 }
 
 #[derive(Template)]
@@ -291,6 +310,8 @@ struct CreditsPage {
     trades: Vec<TradeRow>,
     /// This node's last 7 days of income and spending, oldest first.
     flow_json: String,
+    /// Not advertised: the relay leases it pays for.
+    relays_leased: Option<Vec<LeaseRow>>,
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -555,6 +576,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 },
                 demand: format!("{:.1}", last.demand),
                 supply: format!("{:.1}", last.supply),
+                cluster_demand: per_hour(last.cluster_demand),
+                cluster_supply: per_hour(last.cluster_supply),
                 spark: serde_json::to_string(
                     &pts.iter()
                         .filter_map(charted)
@@ -638,6 +661,26 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             over_bid: r.tally.over_bid,
         })
         .collect();
+    let relays_leased = if node.cfg.advertise.is_none() {
+        let names: BTreeMap<NodeId, String> = crate::cluster::members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.name))
+            .collect();
+        Some(
+            node.leased
+                .leases(crate::cluster::hlc::wall_ms())
+                .into_iter()
+                .map(|(id, until, p)| LeaseRow {
+                    relay: names.get(&id).cloned().unwrap_or_else(|| id.short()),
+                    until: credits::minute_utc(until),
+                    price: show(p as Mc),
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     render(&CreditsPage {
         chrome: Chrome::new(true, "admin"),
         balance: show(book.balance(&me)),
@@ -657,6 +700,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         market_json,
         trades,
         flow_json,
+        relays_leased,
     })
 }
 
@@ -694,6 +738,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cluster_rate_shows_a_dash_until_it_is_known() {
+        assert_eq!(per_hour(None), "\u{2014}");
+        assert_eq!(per_hour(Some(3.0)), "3.0");
+        assert_eq!(per_hour(Some(2.46)), "2.5");
+    }
+
+    #[test]
     fn days_and_times_read_as_utc() {
         // 2026-10-06 is day 20_732 of the epoch.
         assert_eq!(date_of(20_732), "2026-10-06");
@@ -714,6 +765,8 @@ mod tests {
             hi_mc: median,
             demand: 0.0,
             supply: 0.0,
+            cluster_demand: None,
+            cluster_supply: None,
         }
     }
 
@@ -845,6 +898,7 @@ mod tests {
                 over_bid: 3,
             }],
             flow_json: "[]".into(),
+            relays_leased: None,
         };
         // The template states these in words.
         assert_eq!(
@@ -887,5 +941,22 @@ mod tests {
         let html = page.render().unwrap();
         assert!(html.contains("does not qualify"));
         assert!(!html.contains("A relay lease"));
+        assert!(!html.contains("Relays leased"), "advertised: none taken");
+        page.relays_leased = Some(vec![]);
+        assert!(
+            page.render()
+                .unwrap()
+                .contains("No relay leased: nothing can reach this node's outbox yet.")
+        );
+        page.relays_leased = Some(vec![LeaseRow {
+            relay: "node-charlie".into(),
+            until: "14:05 UTC".into(),
+            price: "0.12".into(),
+        }]);
+        let html = page.render().unwrap();
+        assert!(html.contains("Relays leased"));
+        assert!(
+            html.contains("<td>node-charlie</td><td>14:05 UTC</td><td class=\"num\">0.12</td>")
+        );
     }
 }
