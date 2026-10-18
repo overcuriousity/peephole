@@ -129,6 +129,20 @@ struct CampaignPage {
     t: CampaignTimeline,
 }
 
+/// Wave lines on a campaign's page, at most.
+pub const CAMPAIGN_WAVES: usize = 3;
+
+impl CampaignPage {
+    /// The listed shapes that formed a wave, for the Shapes card.
+    fn waves(&self) -> Vec<&CampaignShape> {
+        self.shapes
+            .iter()
+            .filter(|s| s.wave.is_some())
+            .take(CAMPAIGN_WAVES)
+            .collect()
+    }
+}
+
 /// The members' events for `_events.html`: an IP column, no older pages.
 pub struct CampaignTimeline {
     pub events: EventPage,
@@ -201,6 +215,15 @@ mod tests {
         tls_fixture(&state.store).await;
         state.store.recompute_campaigns(true).await.unwrap();
         seed_artifacts(&state.store).await;
+        // A member's shape formed a wave.
+        sqlx::query(
+            "INSERT INTO waves (shape, detected_at, window_start, ips)
+             SELECT hash, '2026-09-01 11:00:00', '2026-09-01 10:00:00', 12
+             FROM shapes WHERE text = '/gamma'",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
         let get = |path: &str, authed: bool| {
             let r = Request::get(path).header("sec-fetch-site", "same-origin");
             if authed {
@@ -314,6 +337,15 @@ mod tests {
             assert!(tl.contains(want), "{want} missing:\n{tl}");
         }
         assert!(!tl.contains("Older →"), "{tl}");
+        // The wave line sits in the Shapes card.
+        let shapes = &a[at("<h2>Shapes</h2>")..];
+        assert!(
+            shapes.contains(
+                "started probing a path no rule knows: <code>/gamma</code> (12 IPs in 60 min, first seen 2026-09-01 10:00)"
+            ),
+            "{shapes}"
+        );
+        assert_eq!(shapes.matches("data-wave").count(), 1, "{shapes}");
         let (_, _, b) = send(
             &app,
             get("/admin/campaigns/198.51.100.10", true),
