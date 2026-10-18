@@ -7,7 +7,7 @@
 //! (`peephole decoy render`). Version 1 serves canaries derived from the
 //! page token ([`crate::canary`]); version 0 (rows with no `decoy_v`)
 //! served `canary-<ref>`. Version 3 adds an ETag canary to the web decoys
-//! that answer 200.
+//! that answer 200; version 4 the file-manager page.
 pub mod ai;
 pub mod llm;
 pub mod mcp;
@@ -59,9 +59,25 @@ const HTML: &str = "text/html; charset=UTF-8";
 /// WordPress's login cookie lifetime without "remember me".
 const WP_SESSION_SECS: i64 = 172_800;
 
+/// A file manager's landing page, as the probes before an upload ask for
+/// it: answered with an upload form even from a tarpitted source, or the
+/// probe would never get to the upload. Curated: no shell names, no other
+/// `*.php`, or the webshell probes would read as answered.
+pub fn file_manager(method: &str, path: &str, query: Option<&str>) -> bool {
+    if !matches!(method, "GET" | "HEAD") {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or("");
+    matches!(
+        file,
+        "wp_filemanager.php" | "elfinder.html" | "elfinder.php"
+    ) || (path.ends_with("/wp-admin/admin.php")
+        && query.is_some_and(|q| q.split('&').any(|kv| kv == "page=wp_file_manager")))
+}
+
 /// The answer for this request, first match wins: the wp-login POST,
-/// wp-admin and git routes; a canary in `Authorization`; the probe decoys.
-/// None: the trap 404.
+/// the file-manager page, wp-admin and git routes; a canary in
+/// `Authorization`; the probe decoys. None: the trap 404.
 pub fn choose(
     method: &str,
     path: &str,
@@ -74,6 +90,9 @@ pub fn choose(
     let repo = format!("/git/{word}.git");
     if method == "POST" && file == "wp-login.php" && p.body {
         return Some("wp-login-ok");
+    }
+    if file_manager(method, path, query) {
+        return Some("file-manager");
     }
     if get && (path == "/wp-admin" || path.starts_with("/wp-admin/")) && p.cookie {
         return Some("wp-admin");
@@ -141,7 +160,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 _ => return None,
             }
         }
-        1..=3 => {
+        1..=4 => {
             let word = inp.word;
             let site_name = format!("{word}.internal");
             match name {
@@ -182,6 +201,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 ),
                 "git-pack" => (500, ct(TEXT), String::new()),
                 "phpinfo" => (200, ct(HTML), phpinfo(word)),
+                "file-manager" if inp.v >= 4 => (200, ct(HTML), FILE_MANAGER.into()),
                 _ => return None,
             }
         }
@@ -480,6 +500,29 @@ fn wp_login(failed: bool) -> String {
     )
 }
 
+/// The file-manager page: fixed, whatever was uploaded before. Its form
+/// posts to an upload script `upload::detect` takes.
+const FILE_MANAGER: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>File Manager</title>
+<link rel="stylesheet" href="css/elfinder.min.css">
+</head>
+<body>
+<div id="elfinder">
+<h3>File Manager</h3>
+<form action="/filemanager/upload.php" method="post" enctype="multipart/form-data">
+<input type="hidden" name="cmd" value="upload">
+<input type="hidden" name="target" value="l1_Lw">
+<input type="file" name="upload[]" multiple>
+<input type="submit" value="Upload">
+</form>
+</div>
+</body>
+</html>
+"#;
+
 fn phpinfo(host: &str) -> String {
     let rows = [
         (
@@ -559,7 +602,46 @@ mod tests {
             let one = inp(1, None, "GET", "/");
             let two = inp(2, None, "GET", "/");
             assert_eq!(render(&one, name), render(&two, name), "{name}");
+            let (three, four) = (inp(3, None, "GET", "/"), inp(4, None, "GET", "/"));
+            assert_eq!(render(&three, name), render(&four, name), "{name}");
         }
+        assert_eq!(render(&inp(3, None, "GET", "/"), "file-manager"), None);
+    }
+
+    #[test]
+    fn file_manager_answers_its_landing_pages_only() {
+        let n = crate::canary::site::word(Some(&NODE));
+        for (m, p, q) in [
+            ("GET", "/hellopress/wp_filemanager.php", None),
+            ("HEAD", "/wp_filemanager.php", None),
+            ("GET", "/elfinder/elfinder.html", None),
+            ("GET", "/admin/elfinder/elfinder.php", None),
+            ("GET", "/wp-admin/admin.php", Some("page=wp_file_manager")),
+        ] {
+            assert_eq!(choose(m, p, q, none(), n), Some("file-manager"), "{p}");
+        }
+        for (m, p, q) in [
+            ("POST", "/wp_filemanager.php", None),
+            ("GET", "/filemanager.php", None),
+            ("GET", "/shell.php", None),
+            ("GET", "/wp-admin/admin.php", Some("page=other")),
+        ] {
+            assert_eq!(choose(m, p, q, none(), n), None, "{m} {p}");
+        }
+        // Its form posts where an upload is taken.
+        let d = render(&inp(4, None, "GET", "/wp_filemanager.php"), "file-manager").unwrap();
+        let action = d
+            .body
+            .split("action=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(
+            crate::trap::upload::detect("POST", action, None, Some("multipart/form-data; b=x")),
+            Some(crate::trap::upload::Kind::Script)
+        );
     }
 
     #[test]
@@ -818,6 +900,7 @@ mod tests {
             (3, "GET", "/phpinfo.php", "phpinfo"),
             (3, "POST", "/wp-login.php", "wp-login-ok"),
             (3, "POST", "/git/x.git/git-upload-pack", "git-pack"),
+            (4, "GET", "/wp_filemanager.php", "file-manager"),
         ];
         for (v, m, p, name) in cases {
             let d = render(&inp(*v, Some("203.0.113.7"), m, p), name).unwrap();

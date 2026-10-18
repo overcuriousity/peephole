@@ -24,8 +24,9 @@ const MAX_PATH: usize = 2048;
 const MAX_FILENAME: usize = 255;
 
 /// Upload scripts a multipart POST is taken as an upload to, in any
-/// directory.
-const SCRIPTS: [&str; 7] = [
+/// directory. Not `/wp-admin/admin-ajax.php`: most of its actions are no
+/// upload.
+const SCRIPTS: [&str; 13] = [
     "/upload.php",
     "/uploader.php",
     "/upload_file.php",
@@ -33,6 +34,12 @@ const SCRIPTS: [&str; 7] = [
     "/up.php",
     "/filemanager/upload.php",
     "/elfinder/php/connector.php",
+    "/general/index/UploadFile.php",
+    "/ueditor/php/action_upload.php",
+    "/mobile/api/api.ali.php",
+    "/developmentserver/metadatauploader",
+    "/wp-file-manager/lib/php/connector.minimal.php",
+    "/laravel-filemanager/upload",
 ];
 
 /// What kind of upload a request is (`uploads.kind`).
@@ -451,6 +458,7 @@ mod tests {
         }
         assert_eq!(d("POST", "/upload.php5", None), None);
         assert_eq!(d("POST", "/myupload.php", None), None);
+        assert_eq!(d("POST", "/wp-admin/admin-ajax.php", None), None);
         // A form that is not multipart, or another method, is no upload.
         assert_eq!(
             detect(
