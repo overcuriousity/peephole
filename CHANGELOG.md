@@ -3,6 +3,32 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.19.0] - 2026-10-18
+
+New paths and exploit waves (roadmap #1): early warning when a path no rule
+knows starts spreading. One database migration (0045, additive), applied on
+start; `rule_hits` is backfilled in the background. Two new optional
+settings sections, `[waves]` and `[notify]`. No protocol change.
+
+### Added
+- `/admin/paths` ("New paths"): every path shape with first and last seen,
+  distinct IPs, whether a rule matched, its wave and the campaigns that asked
+  for it; `?since=` and `?unknown=1` filters (MIK-534).
+- Exploit waves: a shape no rule knows that `[waves] min_ips` (default 10)
+  distinct IPs ask for within `[waves] window_minutes` (default 60) is
+  recorded once as a wave; checked every 5 minutes (MIK-539).
+- The live feed badges new shapes and waves; a campaign's page names the
+  waves its members started.
+- `[notify]`: an optional webhook (JSON) or ntfy push per detection pass,
+  at most 10 waves, three attempts, no redirects, 10 s timeout; https or a
+  loopback/private http address only. Off by default.
+- The public dashboard and `/api/stats` count the new path shapes of the
+  period (`new_shapes`); paths themselves stay admin-only (MIK-542).
+
+### Database
+- Migration 0045: `shapes` gains `rule_hits` (backfilled in the background),
+  new table `waves` (additive).
+
 ## [0.18.2] - 2026-10-18
 
 Credits visibility (#75): the Credits page says whose figures it shows

@@ -34,26 +34,7 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ### 1. New paths and exploit waves
 
-- **Cost:** M (the path normalization shipped with campaign clustering)
-- **Benefit:** high. It gives early warning when a new exploit starts
-  spreading, often before CVE write-ups.
-
-- A cluster-wide `first_seen` per normalized path, plus the number of
-  distinct IPs that sent it. The node-local start exists: the `shapes`
-  table (one row per path shape, with `first_seen`, `last_seen` and `ips`,
-  derived on insert and backfilled); what is left is agreeing on it across
-  the cluster.
-- A path with no matching rule that reaches N distinct IPs within an hour
-  is an exploit wave.
-- It lives inside the campaign view ("campaign #N started probing a path no
-  rule knows"), not as a separate inbox, which would only be noise.
-
-**Shown:**
-
-- **Admin:** a "New paths" view (first seen, distinct IPs, campaigns), a
-  badge on the live feed, and an optional webhook or ntfy push.
-- **Public dashboard:** a count of new path shapes this period (paths themselves
-  are request contents, so not public).
+Shipped in [0.19.0](../CHANGELOG.md#0190---2026-10-18).
 
 ### 2. Personas per node or hostname (opt-in)
 

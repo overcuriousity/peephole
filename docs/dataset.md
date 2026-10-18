@@ -152,6 +152,10 @@ row of the export; join on it, not on the `#N` the admin pages show, which
 is a display rank. A new clustering version can split a campaign, and the
 split-off parts get new keys: join across exports made by the same version.
 
+Path shapes are not exported either: `shapes` (with its `rule_hits`) and
+`waves` are derived on each node from the rows it holds, so they are
+node-local, like the campaigns.
+
 **`intel`**: every enrichment lookup ever recorded, oldest first.
 
 ```json
