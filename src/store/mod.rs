@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod asn;
 pub mod auth;
 mod backfill;
 pub mod blocklist;
