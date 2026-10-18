@@ -62,7 +62,7 @@ certificate, browser fingerprint, canary reuse) and soft edges (similar
 sets of normalized paths, JA4 with JA4H as support only). Shown in the
 admin area, as counts on the public dashboard ("Campaigns this period")
 and as the dataset's `campaign` column. See [Overview](overview.md) and
-[The dataset](dataset.md#campaign).
+[The dataset](dataset.md#campaign). v2: order agreement, chaining guard.
 
 ### 3. New paths and exploit waves
 

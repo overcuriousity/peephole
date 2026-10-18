@@ -148,7 +148,8 @@ yet, can still miss a new member). It is stable in identity: the key is the
 IP text of the campaign's oldest member, the same on every node, and
 survives recomputes as long as that member stays in it. The key is not a
 row of the export; join on it, not on the `#N` the admin pages show, which
-is a display rank.
+is a display rank. A new clustering version can split a campaign, and the
+split-off parts get new keys: join across exports made by the same version.
 
 **`intel`**: every enrichment lookup ever recorded, oldest first.
 

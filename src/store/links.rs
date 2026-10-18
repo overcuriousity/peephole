@@ -801,9 +801,11 @@ impl Store {
             Option<f64>,
             Option<i64>,
             i64,
+            Option<f64>,
         );
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support
+            "SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support,
+                    e.agreement
              FROM campaign_edges e
              JOIN campaign_members m ON m.ip_id = e.a
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
@@ -813,7 +815,7 @@ impl Store {
         .bind(key)
         .fetch_all(&self.read)
         .await?;
-        for (a, b, kind, value, score, shared, fp) in rows {
+        for (a, b, kind, value, score, shared, fp, agreement) in rows {
             let (a, b) = (format!("ip:{a}"), format!("ip:{b}"));
             if !ids.contains(&a) || !ids.contains(&b) {
                 continue;
@@ -830,6 +832,9 @@ impl Store {
                 );
                 if fp != 0 {
                     l.push_str(", same JA4 and JA4H");
+                }
+                if agreement.is_some_and(|x| x >= crate::store::campaigns::ORDER_AGREE) {
+                    l.push_str(", order agrees");
                 }
                 l
             } else {
@@ -1627,7 +1632,7 @@ mod tests {
         let (last_a, last_b) = (nth_last_ip(&g, 1), nth_last_ip(&g, 2));
         sqlx::query(
             "INSERT INTO campaign_edges
-             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't'
+             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't', NULL
              FROM campaign_members x JOIN campaign_members y ON x.ip_id < y.ip_id
              LIMIT 3000",
         )
@@ -1637,7 +1642,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO campaign_edges VALUES
              ((SELECT id FROM ips WHERE ip = ?), (SELECT id FROM ips WHERE ip = ?),
-              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't')",
+              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't', NULL)",
         )
         .bind(&last_a)
         .bind(&last_b)

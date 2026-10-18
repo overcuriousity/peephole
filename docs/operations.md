@@ -293,6 +293,7 @@ peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
 peephole store recompute-campaigns                # recompute campaigns now and print the report
+peephole store campaigns-eval copy.toml           # compare campaign parameters (run on a copy: it writes to the database)
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
@@ -407,7 +408,12 @@ The Campaigns area (`/admin/campaigns`) lists the groups of source IPs the
 hourly recompute tied together: by a shared SSH host key, TLS certificate,
 browser fingerprint or canary (hard edges), or by near-identical sets of
 path shapes (soft edges; a shared JA4 and JA4H only lowers the bar for one,
-never forms an edge alone). Filter by country, ASN, minimum size and
+never forms an edge alone). Since clustering v2 a soft edge also weighs the
+order: two IPs that first asked for their shared rare shapes in the same
+order count like a JA4 and JA4H match, and an edge's reason then ends in
+"order agrees". Two groups of two or more IPs merge only on two soft edges
+between them, so one look-alike pair no longer chains two campaigns into
+one. Filter by country, ASN, minimum size and
 period. Below the list are the excluded values (a hard value on more than 50
 IPs is shared infrastructure, not one operator) and when the last pass ran
 and how long it took. A campaign's page shows its members, every evidence
@@ -415,7 +421,12 @@ edge with the reason, the members' requests per day and the path shapes most
 of them asked for, with how many IPs of the whole dataset asked for each.
 An IP page shows "member of campaign #N" for a member. The area is
 read-only: a campaign is computed from the stored rows on each node, and
-`peephole store recompute-campaigns` runs a pass at once.
+`peephole store recompute-campaigns` runs a pass at once. Its report counts
+campaigns, members and edges by kind, then one line `withheld soft edges N,
+vetoed pairs M, order known for O of C candidate pairs`: the soft edges the
+two-edge rule held back, the pairs dropped for a reversed order (none under
+the default parameters), and how many candidate pairs had enough shared
+shapes for an order to count.
 
 ### Public pages are delayed
 
