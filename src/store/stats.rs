@@ -122,6 +122,11 @@ pub struct RecentRequest {
     pub owasp: Vec<String>,
     pub country: Option<String>,
     pub is_tor: bool,
+    /// Its shape was first seen within [`super::waves::NEW_SHAPE_WINDOW`]
+    /// (admin feed only; false for the public).
+    pub new_shape: bool,
+    /// Its shape formed an exploit wave (admin feed only).
+    pub wave: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -264,10 +269,12 @@ pub(crate) type RecentTuple = (
     String,
     Option<String>,
     bool,
+    bool,
+    bool,
 );
 
 pub(crate) fn recent_from(
-    (id, ts, ip, method, path, severity, labels, owasp, country, is_tor): RecentTuple,
+    (id, ts, ip, method, path, severity, labels, owasp, country, is_tor, new_shape, wave): RecentTuple,
 ) -> RecentRequest {
     let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
     RecentRequest {
@@ -285,6 +292,8 @@ pub(crate) fn recent_from(
         owasp: serde_json::from_str(&owasp).unwrap_or_default(),
         country,
         is_tor,
+        new_shape,
+        wave,
     }
 }
 
@@ -475,10 +484,14 @@ impl Store {
     pub async fn recent_requests(&self, limit: i64, a: Audience) -> Result<Vec<RecentRequest>> {
         let sql = format!(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
-                    i.country, i.is_tor_exit
+                    i.country, i.is_tor_exit, {}
              FROM requests r JOIN ips i ON r.ip_id = i.id
              WHERE r.ts >= datetime('now', '-24 hours'){}
              ORDER BY r.id DESC LIMIT ?",
+            match a {
+                Audience::Admin => super::waves::feed_flags_sql(),
+                Audience::Public => "0, 0".into(),
+            },
             a.released("r")
         );
         Ok(

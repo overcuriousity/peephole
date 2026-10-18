@@ -239,13 +239,16 @@ pub struct CampaignListItem {
 }
 
 /// A path shape the members asked for.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CampaignShape {
     pub text: String,
     /// Members that asked for it.
     pub members: i64,
     /// IPs that asked for it, over the whole dataset.
     pub df: i64,
+    pub first_seen: String,
+    /// The exploit wave it formed, if one.
+    pub wave: Option<super::waves::WaveMark>,
 }
 
 /// A webshell command the members ran.
@@ -560,8 +563,18 @@ impl Store {
     /// The shapes most of a campaign's members asked for (light rows
     /// included), with how many IPs of the dataset asked for each.
     pub async fn campaign_shapes(&self, key: &str) -> Result<Vec<CampaignShape>> {
-        Ok(sqlx::query_as(
-            "SELECT s.text, COUNT(DISTINCT x.ip_id) AS members, s.ips AS df FROM (
+        type Row = (
+            String,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT s.text, COUNT(DISTINCT x.ip_id) AS members, s.ips AS df, s.first_seen,
+                    w.ips, w.window_start, w.detected_at FROM (
                SELECT r.ip_id, r.shape FROM campaign_members m
                JOIN requests r ON r.ip_id = m.ip_id
                WHERE m.campaign_key = ?1 AND r.shape IS NOT NULL
@@ -571,12 +584,25 @@ impl Store {
                JOIN skipped_requests q ON q.batch_id = b.id
                WHERE m.campaign_key = ?1 AND q.shape IS NOT NULL
              ) x JOIN shapes s ON s.hash = x.shape
+             LEFT JOIN waves w ON w.shape = x.shape
              GROUP BY x.shape ORDER BY members DESC, df, s.text LIMIT ?2",
         )
         .bind(key)
         .bind(CAMPAIGN_SHAPES)
         .fetch_all(&self.read)
-        .await?)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(text, members, df, first_seen, wi, ws, wd)| CampaignShape {
+                    text,
+                    members,
+                    df,
+                    first_seen,
+                    wave: super::waves::WaveMark::from_join(wi, ws, wd),
+                },
+            )
+            .collect())
     }
 
     /// Up to `limit` of the members' uploads, newest first.
