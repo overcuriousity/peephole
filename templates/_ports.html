@@ -3,10 +3,10 @@
   <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Details</th></tr></thead>
   <tbody>
   {% for p in ports %}
-    <tr><td class="mono">{{ p.port }}/{{ p.proto }}</td>
+    <tr><td class="mono">{% if p.state == "open" %}<a href="{{ crate::admin::views::pivot_href("port", p.port.to_string().as_str()) }}">{{ p.port }}</a>{% else %}{{ p.port }}{% endif %}/{{ p.proto }}</td>
         <td><span class="badge badge-status" data-status="{% if p.state == "open" %}done{% else %}queued{% endif %}">{{ p.state }}</span></td>
         <td>{{ p.service.as_deref().unwrap_or("") }}</td>
-        <td>{{ p.described() }}
+        <td>{% if let Some(k) = p.product_key() %}<a href="{{ crate::admin::views::pivot_href("product", k.as_str()) }}">{{ k }}</a>{% if let Some(x) = p.extrainfo %} {{ x }}{% endif %}{% else %}{{ p.described() }}{% endif %}
           {% let system = p.system() %}{% if !system.is_empty() %}<div class="muted">{{ system }}</div>{% endif %}
           {% let cpes = p.cpes() %}{% if !cpes.is_empty() %}<div class="muted mono small">{{ cpes.join(" ") }}</div>{% endif %}
           {% for f in p.facts %}<div class="small"><strong>{{ f.label() }}</strong> {{ f.value }}</div>{% endfor %}</td></tr>

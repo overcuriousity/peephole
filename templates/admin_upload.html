@@ -12,7 +12,7 @@
     <dt>File name</dt><dd class="mono">{% if let Some(f) = u.filename %}{{ f }}{% else %}<span class="muted">none sent</span>{% endif %}</dd>
     <dt>Type</dt><dd class="mono">{{ u.sniffed_type }} <span class="muted small">from its first bytes</span></dd>
     <dt>Size</dt><dd>{{ crate::admin::views::thousands(u.size) }} bytes{% if u.truncated %} <span class="muted small">· the first 1 MiB kept</span>{% endif %}</dd>
-    <dt>SHA-256</dt><dd class="mono">{{ u.hash() }}</dd>
+    <dt>SHA-256</dt><dd class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}">{{ u.hash() }}</a></dd>
     <dt>Answered at</dt><dd class="path">{{ u.answered_path }}{% if u.path_is_prefix %} <span class="muted small">and under it</span>{% endif %}</dd>
     <dt>Request</dt><dd>{% if let Some(id) = u.request_id %}<a href="/admin/requests/{{ id }}">inspect</a>{% else %}<span class="muted">not held here</span>{% endif %}</dd>
     <dt>Content</dt><dd>{% if u.held %}<a class="btn btn-sm" href="/admin/uploads/{{ u.uid|urlencode }}/content.zip">Download zip</a> <span class="muted small">password <span class="mono">infected</span></span>{% else %}<span class="muted">content not held</span> <span class="mono small">{{ u.content_state }}</span>{% endif %}</dd>

@@ -292,6 +292,25 @@ pub fn link_href(kind: &str, value: &str) -> String {
     )
 }
 
+/// The list a value pivots to, already filtered to it (MIK-482 table
+/// 5.3): `ua`, `path` and `cmd` to the requests; `port`, `product`, `os`
+/// and `label` to the IPs; `sha256` (lowercase hex) to the uploads;
+/// `campaign` (its key) to its page. The value is urlencoded, so a
+/// template never builds such an `href` by concatenation.
+pub fn pivot_href(kind: &str, value: &str) -> String {
+    let v = crate::admin::public::urlencode(value);
+    match kind {
+        "ua" | "path" | "cmd" => format!("/requests?{kind}={v}"),
+        "port" | "product" | "os" | "label" => format!("/ips?{kind}={v}"),
+        "sha256" => format!("/admin/uploads?sha256={v}"),
+        "campaign" => format!("/admin/campaigns/{v}"),
+        _ => {
+            debug_assert!(false, "pivot_href: unknown kind {kind}");
+            format!("/admin/search?q={v}")
+        }
+    }
+}
+
 impl crate::store::hostkeys::HostKeyRow {
     /// Its page under Links.
     pub fn link_href(&self) -> String {
@@ -317,6 +336,31 @@ pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pivot_href_encodes_the_value() {
+        assert_eq!(
+            pivot_href("ua", "Mozilla/5.0 (X11)"),
+            "/requests?ua=Mozilla%2F5.0%20%28X11%29"
+        );
+        assert_eq!(
+            pivot_href("path", "/a.php?x=1&y"),
+            "/requests?path=%2Fa.php%3Fx%3D1%26y"
+        );
+        assert_eq!(pivot_href("cmd", "id;ls"), "/requests?cmd=id%3Bls");
+        assert_eq!(pivot_href("port", "22/tcp"), "/ips?port=22%2Ftcp");
+        assert_eq!(
+            pivot_href("product", "OpenSSH 9.6p1"),
+            "/ips?product=OpenSSH%209.6p1"
+        );
+        assert_eq!(pivot_href("os", "Linux 5.X"), "/ips?os=Linux%205.X");
+        assert_eq!(pivot_href("label", "scanner"), "/ips?label=scanner");
+        assert_eq!(pivot_href("sha256", "ab01"), "/admin/uploads?sha256=ab01");
+        assert_eq!(
+            pivot_href("campaign", "192.0.2.4"),
+            "/admin/campaigns/192.0.2.4"
+        );
+    }
 
     #[test]
     fn minute_and_public_path() {

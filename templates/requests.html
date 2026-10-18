@@ -54,7 +54,7 @@
       <td class="ts">{{ r.ts }}</td>
       <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
-      <td class="path">{% if chrome.authed %}<a href="/admin/requests/{{ r.id }}">{% endif %}{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}{% if chrome.authed %}</a>{% endif %}</td>
+      <td class="path"><a href="{{ crate::admin::views::pivot_href("path", r.path.as_str()) }}">{{ r.path }}</a>{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
       <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
       {% if !nodes.is_empty() %}<td class="muted">{{ r.node.as_deref().unwrap_or("") }}</td>{% endif %}
