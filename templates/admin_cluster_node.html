@@ -46,8 +46,11 @@
   </dl>
 </section>
 <section class="card"><h2>Credits</h2>
+  <div class="table-wrap"><table class="node-credits">
+    <thead><tr><th></th><th class="num">Here</th>{% if credits.there.is_some() %}<th class="num">As {{ m.name }} counts them</th>{% endif %}</tr></thead>
+    <tbody><tr><td>Balance</td><td class="num">{{ credits.balance }}</td>{% if let Some(t) = credits.there %}<td class="num">{{ t }}</td>{% endif %}</tr></tbody>
+  </table></div>
   <dl class="kv">
-    <dt>Balance</dt><dd>{{ credits.balance }} <span class="muted small">credits, as this node counts them</span></dd>
     <dt>Earns here</dt><dd>{% if credits.earns %}<span class="badge badge-status" data-status="done">yes</span>{% else %}<span class="badge badge-status" data-status="failed">no</span>{% endif %}{% for r in credits.reasons %} <span class="small">{{ r }}{% if !loop.last %};{% endif %}</span>{% endfor %}</dd>
     {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}.{% if credits.fork_proof %} <a href="/admin/cluster/node/{{ m.key }}/fork-proof">Download the proof</a>{% endif %} <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
     <dt>Audits, 7 days</dt><dd>{{ credits.counted.0 }} agree · {{ credits.counted.1 }} differ · {{ credits.counted.2 }} inconclusive <span class="muted small">by this node and your other nodes: these count</span>{% if credits.others.0 + credits.others.1 + credits.others.2 > 0 %}<br>{{ credits.others.0 }} agree · {{ credits.others.1 }} differ · {{ credits.others.2 }} inconclusive <span class="muted small">by other members: shown, not counted</span>{% endif %}</dd>
@@ -66,7 +69,6 @@
 {% if m.scanner %}
 <section class="card"><h2>Pace</h2>
   {% match m.pace %}{% when Some(p) %}<p>{{ p.max_workers }} workers{% if !m.level_weights.is_empty() %} · {{ m.level_weights }}{% endif %}.</p>{% when None %}<p class="muted">Pace not reported yet.</p>{% endmatch %}
-  <p class="muted">All scanners: <a href="/admin/scans#scanners">Scans › Scanners</a>.</p>
 </section>
 {% endif %}
 <section class="card"><h2>Settings</h2>
@@ -87,7 +89,7 @@
     <button class="btn btn-primary" type="submit">Save</button>
     <span class="muted small">version {{ status.state.version }} · build {{ status.build }}</span>
   </form>
-  <p class="muted">Web off removes its admin pages; restore: <code>peephole settings reset roles.web</code></p>
+  <p class="muted">Web off removes its admin pages.</p>
 
   <h3>Blocked there</h3>
   {% if blocked.is_empty() %}<p class="muted">{{ m.name }} blocks nobody.</p>{% else %}
@@ -106,7 +108,7 @@
   </form>{% endif %}
 
   <h3>Its invites</h3>
-  {% if status.invites.is_empty() %}<p class="muted">None. Invites are created on the node itself: the invite is a secret and would pass through other members.</p>{% else %}
+  {% if status.invites.is_empty() %}<p class="muted">None.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>For</th><th>Uses</th><th>Expires (UTC)</th><th></th></tr></thead>
     <tbody>{% for i in status.invites %}<tr{% if !i.usable %} class="muted"{% endif %}>
@@ -117,9 +119,8 @@
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 
-  <h3>Credits there</h3>
-  <p>{{ crate::credits::show(status.balance_mc.clone()) }} credits as {{ m.name }} counts them</p>
   {% if !peers.is_empty() %}
+  <h3>Send credits</h3>
   <form method="post" action="/admin/cluster/node/{{ m.key }}/owner" class="filters">
     <input type="hidden" name="counter" value="{{ status.counter }}"><input type="hidden" name="action" value="send-credits">
     <label>Send from there to <select name="target">{% for p in peers %}<option value="{{ p.0 }}">{{ p.1 }}</option>{% endfor %}</select></label>

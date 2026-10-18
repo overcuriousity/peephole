@@ -990,6 +990,8 @@ pub struct CreditsBlock {
     pub fork: Option<String>,
     /// A proof is held here and can be downloaded.
     pub fork_proof: bool,
+    /// Its balance as the member itself counts it, when it answered.
+    pub there: Option<String>,
 }
 
 async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
@@ -1042,6 +1044,7 @@ async fn credits_block(node: &Node, id: NodeId) -> AppResult<CreditsBlock> {
         others,
         fork,
         fork_proof,
+        there: None,
     })
 }
 
@@ -1123,9 +1126,13 @@ async fn node_view(st: &AdminState, key: &str) -> AppResult<Html<String>> {
             Err(e) => Remote::Silent(format!("{} did not answer: {e:#}", m.name)),
         }
     };
+    let mut credits = credits_block(node, id).await?;
+    if let Remote::Settings { status, .. } = &remote {
+        credits.there = Some(crate::credits::show(status.balance_mc));
+    }
     render(&NodePage {
         chrome: Chrome::new(true, "admin"),
-        credits: credits_block(node, id).await?,
+        credits,
         m,
         contrib,
         remote,

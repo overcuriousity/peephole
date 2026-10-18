@@ -4,28 +4,27 @@
 {% block content %}
 {% let sub = "cluster" %}{% include "_admin_nav.html" %}
 {% let subtab = "credits" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Credits</h1><p class="muted">A fixed pool a day for the members anyone can reach, earned by selling goods, spent on goods. Every figure is this node's own count, from its copy of the log.</p></div></div>
+<div class="page-head"><div><h1>Credits</h1><p class="muted">Every figure is this node's own count.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
-  <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}reported by the members · 12 hours earn today's pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
-  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}its selling price · {{ price.scan_paid }} paid of {{ price.scan_target }} an hour{% endif %}</div></div>
+  <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}12 h earns a pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
+  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}">{{ c }}</span>{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}{{ price.scan_paid }} paid of {{ price.scan_target }}/h{% endif %}</div></div>
   <div class="tile"><span class="label">Scan capacity used</span><div class="value">{{ price.utilization }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ price.utilization }}" height="4" rx="2"/></svg><div class="hint">{{ price.capacity_per_hour }} scans an hour possible</div></div>
 </div>
 <section class="card market" id="market">
-  <div class="card-head"><h2>Prices</h2><span class="muted">hourly, last 7 days · this node's price and what members announce</span></div>
+  <div class="card-head"><h2>Prices</h2><span class="muted">hourly · 7 days</span></div>
   {% if goods.is_empty() %}<p class="muted">No price history yet: prices are computed every hour, the first one shortly after the start.</p>{% else %}
   <nav class="seg market-goods" aria-label="Good">{% for g in goods %}<a href="#market" data-pick-good="{{ g.key }}"{% if loop.first %} aria-current="true"{% endif %}>{{ g.label }}</a>{% endfor %}</nav>
   <div class="chart market-chart" data-market="{{ market_json }}" data-good="{% if let Some(g) = goods.first() %}{{ g.key }}{% endif %}" role="img" aria-label="Price over the last 7 days"></div>
   <div class="legend market-legend" aria-hidden="true"><span><i class="line own"></i>this node</span><span><i class="swatch band"></i>members, lowest to highest</span><span><i class="line median"></i>members' median</span></div>
-  <h3>Demand and supply <span class="muted small">per hour: the price rises while demand is above supply</span></h3>
+  <h3>Demand and supply <span class="muted small">per hour</span></h3>
   <div class="chart market-flow" data-market-ds role="img" aria-label="Demand and supply over the last 7 days"></div>
   <div class="legend market-legend" aria-hidden="true"><span><i class="line demand"></i>demand</span><span><i class="line supply"></i>supply</span></div>
   <div class="visually-hidden" data-market-table></div>
   {% endif %}
 </section>
 <section class="card"><div class="card-head"><h2>What things cost here</h2></div>
-  <p class="muted">Each price follows sales: it rises while the good sells (or every slot is taken) and falls while it does not, down to nothing. What this node answers itself is free, though its own scan jobs are paid from its balance.</p>
   <ul>
     <li>This node sells a funded scan job for <b>{{ price.scan }}</b> credits; each scanner prices itself by how busy it is with paid work ({{ price.capacity_per_hour }} scans an hour possible here, {{ price.utilization }} % used).</li>
     {% if let Some(p) = price.probe %}<li>A probe for another member costs <b>{{ p }}</b> credits here.</li>{% endif %}
@@ -51,27 +50,25 @@
   <div class="table-wrap"><table>
     <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
     <tbody>{% for s in price.scanners %}<tr><td>{{ s.name }}</td><td class="num">{{ s.announced }}</td><td class="num">{{ s.reference }}</td><td class="num">{{ s.paid }}</td>{% for c in s.levels %}<td class="num" title="{{ c.basis }}">{% if c.cheapest %}<b>{{ c.price }}</b>{% else %}{{ c.price }}{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
-  </table></div>
-  <p class="muted small">L1 to L5: what one delivered result costs per level, the price divided by the scanner's success rate there against the best live scanner. A failed scan is not paid, so jobs go to the cheapest per delivered result. {{ price.weights_as_of }}</p>{% endif %}
+  </table></div>{% endif %}
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
     <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">{{ o.2 }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
-  <h3>Market <span class="muted small">this node's ask and bid as of the last hourly refresh; sold and bought over the last 7 days</span></h3>
+  <h3>Market <span class="muted small">last refresh · 7-day volumes</span></h3>
   <div class="table-wrap"><table>
     <thead><tr><th>Good</th><th class="num">Ask here</th><th class="num" title="The most this node's automatic buyers pay for one">Bid here</th><th class="num">Sold</th><th class="num">Bought</th><th class="num" title="Asks above the bid this node's automatic buyers refused">Over bid</th></tr></thead>
     <tbody>{% for t in trades %}<tr><td>{{ t.good }}</td><td class="num">{{ t.ask }}</td><td class="num">{{ t.bid }}</td><td class="num">{{ t.sold }}</td><td class="num">{{ t.bought }}</td><td class="num">{{ t.over_bid }}</td></tr>{% endfor %}</tbody>
   </table></div>
 </section>
 <div class="grid-2 market-split">
-<section class="card"><div class="card-head"><h2>Money flow</h2><span class="muted">this node, last 7 days (UTC)</span></div>
+<section class="card"><div class="card-head"><h2>Money flow</h2><span class="muted">7 days · UTC</span></div>
   <div class="chart flow-chart" data-flow="{{ flow_json }}" role="img" aria-label="This node's income and spending per day"></div>
   <div class="legend flow-legend" aria-hidden="true"><span><i class="swatch k-pool"></i>pool</span><span><i class="swatch k-sales"></i>sales</span><span><i class="swatch k-spent"></i>spent</span></div>
   <div class="visually-hidden" data-flow-table></div>
 </section>
 <section class="card"><div class="card-head"><h2>Where credits come from</h2></div>
-  <p>Every day 1000 credits are split evenly among the members anyone can reach: advertised listeners that at least half of the members reached in at least 12 of the day's 24 hours. Nothing else creates credits and nothing destroys them, but what a member that does not earn here still holds of its pool shares; a credit is gone 7 days after the day of its pool. Everything else is earned by selling: lookups, names, probes, scans, audits and relays.</p>
   <p>This node: {{ today_up.0 }} hours up today so far; the day's pool is credited an hour after it ends (UTC).</p>
   {% if !income.is_empty() %}<div class="table-wrap"><table>
     <thead><tr><th>Day</th><th class="num">Pool</th></tr></thead>
@@ -79,7 +76,7 @@
   </table></div>{% endif %}
 </section>
 </div>
-<section class="card"><div class="card-head"><h2>Cluster</h2><span class="muted">as this node counts it</span></div>
+<section class="card"><div class="card-head"><h2>Cluster</h2></div>
   <div class="table-wrap"><table>
     <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Pool (7 days)</th><th class="num">Sales (7 days)</th><th class="num" title="Hours up today, as the members report; 12 earn the day's pool share">Up today</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
@@ -89,15 +86,13 @@
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted">In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
 </section>
 <section class="card" id="ledger"><div class="card-head"><h2>Your credits</h2><span class="muted">this node: <b class="num">{{ balance }}</b> · set aside <span class="num">{{ held }}</span> in open lookups{% if let Some((total, _)) = fleet %} · all your nodes: <b class="num">{{ total }}</b>{% endif %}</span></div>
   {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from the daily pool, above, and from sales.</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>Earned on (UTC)</th><th class="num">Credits</th><th>Expires</th></tr></thead>
     <tbody>{% for d in days %}<tr><td class="mono">{{ d.date }}</td><td class="num">{{ d.amount }}</td><td>{{ d.expires }}</td></tr>{% endfor %}</tbody>
-  </table></div>
-  <p class="muted small">A credit can be used on the day it was earned and the 6 days after, whoever holds it by then.</p>{% endif %}
+  </table></div>{% endif %}
 
   {% if let Some((_, nodes)) = fleet %}
 <div class="ledger-part"><h3>My nodes</h3>
@@ -105,7 +100,6 @@
     <thead><tr><th>Node</th><th class="num">Credits</th></tr></thead>
     <tbody>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td class="num">{{ n.balance }}</td></tr>{% endfor %}</tbody>
   </table></div>
-  <p class="muted small">Every node keeps what it earns. A node whose lookup needs more than it holds draws the rest from the others, the richest first.</p>
 </div>
 {% endif %}
   <details class="ledger-more"><summary>Earned, spent, sent and received</summary>
@@ -117,8 +111,7 @@
       <td class="ts">{{ s.at }}</td><td>{{ s.server }}</td><td class="mono">{{ s.providers }}</td>
       <td class="num">{{ s.offered }}</td><td class="num">{{ s.charged }}</td><td>{{ s.state }}</td>
     </tr>{% endfor %}</tbody>
-  </table></div>
-  <p class="muted small">What is charged goes to the node that answered. An offer without an answer lapses after 15 minutes (a scan offer after the longest scan) and costs nothing.</p>{% endif %}
+  </table></div>{% endif %}
 </div>
   <div class="ledger-part"><div class="card-head"><h3>Sent and received</h3></div>
   {% if moved.is_empty() %}<p class="muted">No transfers.</p>{% else %}
@@ -136,5 +129,15 @@
 </div>
   </details>
 </section>
+<details class="muted"><summary>How credits work</summary>
+  <p>A fixed pool a day for the members anyone can reach, earned by selling goods, spent on goods. Every figure is this node's own count, from its copy of the log.</p>
+  <p>Every day 1000 credits are split evenly among the members anyone can reach: advertised listeners that at least half of the members reached in at least 12 of the day's 24 hours. Nothing else creates credits and nothing destroys them, but what a member that does not earn here still holds of its pool shares; a credit is gone 7 days after the day of its pool. Everything else is earned by selling: lookups, names, probes, scans, audits and relays.</p>
+  <p>Each price follows sales: it rises while the good sells (or every slot is taken) and falls while it does not, down to nothing. What this node answers itself is free, though its own scan jobs are paid from its balance. The price rises while demand is above supply.</p>
+  <p>L1 to L5: what one delivered result costs per level, the price divided by the scanner's success rate there against the best live scanner. A failed scan is not paid, so jobs go to the cheapest per delivered result. {{ price.weights_as_of }}</p>
+  <p>A credit can be used on the day it was earned and the 6 days after, whoever holds it by then.</p>
+  <p>Every node keeps what it earns. A node whose lookup needs more than it holds draws the rest from the others, the richest first.</p>
+  <p>What is charged goes to the node that answered. An offer without an answer lapses after 15 minutes (a scan offer after the longest scan) and costs nothing.</p>
+  <p>In 7 days earned {{ totals.0 }} · in circulation now {{ totals.1 }} credits. Another node may count differently: it holds other entries, blocks other members, or runs other rules.</p>
+</details>
 </div>
 {% endblock %}
