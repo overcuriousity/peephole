@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
-## [0.18.2] - unreleased
+## [0.18.2] - 2026-10-18
 
 Credits visibility (#75): the Credits page says whose figures it shows
 and adds the cluster's. One database migration (0044, additive), applied
