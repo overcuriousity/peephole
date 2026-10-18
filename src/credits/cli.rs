@@ -1,7 +1,7 @@
 //! `peephole credits …`: this node's credits from the shell. Like
 //! `peephole cluster`, it works on the node's database, also while the
 //! daemon runs; every figure is this node's own count.
-use super::{Book, Mc, date_of, day_of, show, when};
+use super::{Book, Mc, date_of, day_of, minute_utc, show, when};
 use crate::cluster::cli::{open, resolve};
 use crate::cluster::identity::NodeId;
 use crate::cluster::members;
@@ -68,6 +68,14 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
                     date_of(day),
                     show(mc)
                 );
+            }
+            let leases: Vec<(String, u64, u32)> = crate::cluster::relay::leased_kept(&node.store)
+                .await
+                .into_iter()
+                .map(|(id, until, p)| (name(&id), until, p))
+                .collect();
+            for line in relay_lines(&leases, crate::cluster::hlc::wall_ms()) {
+                println!("{line}");
             }
         }
         ["uptime"] => {
@@ -241,6 +249,23 @@ pub fn log_lines(
     lines
 }
 
+/// `peephole credits`, after the balance: one line per relay lease this
+/// node holds, `(relay name, end (ms), price (mc/h))`; ended ones are
+/// left out (the daemon prunes them).
+pub fn relay_lines(leases: &[(String, u64, u32)], now_ms: u64) -> Vec<String> {
+    leases
+        .iter()
+        .filter(|(_, until, _)| *until > now_ms)
+        .map(|(name, until, p)| {
+            format!(
+                "relay    {name}  until {}  {} credits/h",
+                minute_utc(*until),
+                show(*p as Mc)
+            )
+        })
+        .collect()
+}
+
 /// `peephole credits market`, after the goods: per member, its RDAP rows
 /// this node spot-checked and the disputes among them (`intel::rdap_check`).
 /// A dispute blocks nobody: `peephole cluster block` stays the operator's.
@@ -283,6 +308,28 @@ pub fn market_lines(rows: &[super::price::MarketRow]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_balance_lists_each_live_relay_lease() {
+        // 2026-10-18 14:05 UTC.
+        let t = 1_792_332_300_000u64;
+        let lines = relay_lines(
+            &[
+                ("relay-a".into(), t, 120),
+                ("relay-b".into(), t + 60_000, 0),
+                ("gone".into(), t - 120_000, 50),
+            ],
+            t - 60_000,
+        );
+        assert_eq!(
+            lines,
+            [
+                "relay    relay-a  until 14:05 UTC  0.12 credits/h",
+                "relay    relay-b  until 14:06 UTC  0.00 credits/h",
+            ]
+        );
+        assert!(relay_lines(&[("x".into(), t, 1)], t).is_empty(), "ended");
+    }
 
     #[test]
     fn market_lists_each_members_rdap_checks_and_disputes() {

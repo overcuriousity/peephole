@@ -259,6 +259,13 @@ fn good_label(good: &str) -> String {
     }
 }
 
+/// A relay lease this outbound-only node holds.
+struct LeaseRow {
+    relay: String,
+    until: String,
+    price: String,
+}
+
 #[derive(Template)]
 #[template(path = "admin_cluster_credits.html")]
 struct CreditsPage {
@@ -291,6 +298,8 @@ struct CreditsPage {
     trades: Vec<TradeRow>,
     /// This node's last 7 days of income and spending, oldest first.
     flow_json: String,
+    /// Not advertised: the relay leases it pays for.
+    relays_leased: Option<Vec<LeaseRow>>,
 }
 
 async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<Html<String>> {
@@ -638,6 +647,26 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             over_bid: r.tally.over_bid,
         })
         .collect();
+    let relays_leased = if node.cfg.advertise.is_none() {
+        let names: BTreeMap<NodeId, String> = crate::cluster::members::all(&node.store)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m.name))
+            .collect();
+        Some(
+            node.leased
+                .leases(crate::cluster::hlc::wall_ms())
+                .into_iter()
+                .map(|(id, until, p)| LeaseRow {
+                    relay: names.get(&id).cloned().unwrap_or_else(|| id.short()),
+                    until: credits::minute_utc(until),
+                    price: show(p as Mc),
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     render(&CreditsPage {
         chrome: Chrome::new(true, "admin"),
         balance: show(book.balance(&me)),
@@ -657,6 +686,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         market_json,
         trades,
         flow_json,
+        relays_leased,
     })
 }
 
@@ -847,6 +877,7 @@ mod tests {
                 over_bid: 3,
             }],
             flow_json: "[]".into(),
+            relays_leased: None,
         };
         // The template states these in words.
         assert_eq!(
@@ -889,5 +920,22 @@ mod tests {
         let html = page.render().unwrap();
         assert!(html.contains("does not qualify"));
         assert!(!html.contains("A relay lease"));
+        assert!(!html.contains("Relays leased"), "advertised: none taken");
+        page.relays_leased = Some(vec![]);
+        assert!(
+            page.render()
+                .unwrap()
+                .contains("No relay leased: nothing can reach this node's outbox yet.")
+        );
+        page.relays_leased = Some(vec![LeaseRow {
+            relay: "node-charlie".into(),
+            until: "14:05 UTC".into(),
+            price: "0.12".into(),
+        }]);
+        let html = page.render().unwrap();
+        assert!(html.contains("Relays leased"));
+        assert!(
+            html.contains("<td>node-charlie</td><td>14:05 UTC</td><td class=\"num\">0.12</td>")
+        );
     }
 }
