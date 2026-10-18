@@ -679,3 +679,29 @@ async fn a_tarpitted_source_still_drops_its_file() {
     assert_eq!(state.tarpit.status().held, 0);
     assert!(state.tarpit.take(ip.parse().unwrap()).is_some());
 }
+
+#[tokio::test]
+async fn a_tarpitted_source_gets_the_file_manager_unchanged_by_uploads() {
+    let (base, store, _dir, state) = serve_with(TARPIT, true, true).await;
+    let ip = "8.8.8.8";
+    state.tarpit.mark(ip.parse().unwrap());
+    let page = "/hellopress/wp_filemanager.php";
+    let r = send(&base, "GET", page, ip, None, vec![]).await;
+    assert_eq!(r.status(), 200);
+    let first = r.text().await.unwrap();
+    assert!(first.contains("enctype=\"multipart/form-data\""), "{first}");
+    let (ct, b) = multipart("upload[]", "fm.php", b"<?php MARKfm ?>");
+    let r = send(&base, "POST", "/filemanager/upload.php", ip, Some(&ct), b).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(uploads(&store).await.len(), 1);
+    let again = send(&base, "GET", page, ip, None, vec![]).await;
+    assert_eq!(again.text().await.unwrap(), first);
+    let answers: Vec<String> =
+        sqlx::query_scalar("SELECT answer FROM requests WHERE path = ? ORDER BY id")
+            .bind(page)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(answers, ["decoy:file-manager", "decoy:file-manager"]);
+    assert_eq!(state.tarpit.status().held, 0);
+}

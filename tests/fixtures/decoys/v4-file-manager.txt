@@ -1,0 +1,22 @@
+200
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>File Manager</title>
+<link rel="stylesheet" href="css/elfinder.min.css">
+</head>
+<body>
+<div id="elfinder">
+<h3>File Manager</h3>
+<form action="/filemanager/upload.php" method="post" enctype="multipart/form-data">
+<input type="hidden" name="cmd" value="upload">
+<input type="hidden" name="target" value="l1_Lw">
+<input type="file" name="upload[]" multiple>
+<input type="submit" value="Upload">
+</form>
+</div>
+</body>
+</html>

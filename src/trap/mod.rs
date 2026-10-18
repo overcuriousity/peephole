@@ -902,7 +902,8 @@ async fn trap(
         None
     };
     // A canary presented is answered as always: its trace is worth more.
-    // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
+    // So is a file manager's landing page: it is the probe before an
+    // upload, and its senders are mostly severity 4. So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
     // cut the session it marks short. So is an upload: the bots that drop
     // files are mostly severity 4 already, and their files are what the
     // sink is for (its per-source, daily and store gates still hold). The
@@ -910,6 +911,7 @@ async fn trap(
     if presented == decoy::Presented::default()
         && ai.is_none()
         && upload.is_none()
+        && !decoy::file_manager(method, path, parts.uri.query())
         && let Some(hold) = state.tarpit.take(ip)
     {
         return tarpit_answer(
