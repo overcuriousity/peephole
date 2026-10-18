@@ -87,6 +87,11 @@ pub struct Config {
     /// What the public (anonymous) pages show.
     #[serde(default)]
     pub public: PublicConfig,
+    /// When an unknown path shape counts as an exploit wave.
+    #[serde(default)]
+    pub waves: WavesConfig,
+    /// Where this node pushes new waves; absent: no push, no connection.
+    pub notify: Option<NotifyConfig>,
     /// When API providers look an IP up again.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
@@ -254,6 +259,92 @@ pub struct InternetDbConfig {
     /// Lookups per UTC day; 0 = no local cap.
     #[serde(default)]
     pub daily_limit: u64,
+}
+
+/// `[waves]`: an unknown path shape asked for by at least `min_ips`
+/// distinct IPs within `window_minutes` is an exploit wave (node-local).
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct WavesConfig {
+    #[serde(default = "default_wave_min_ips")]
+    pub min_ips: i64,
+    #[serde(default = "default_wave_window_minutes")]
+    pub window_minutes: i64,
+}
+
+fn default_wave_min_ips() -> i64 {
+    10
+}
+
+fn default_wave_window_minutes() -> i64 {
+    60
+}
+
+impl Default for WavesConfig {
+    fn default() -> Self {
+        Self {
+            min_ips: default_wave_min_ips(),
+            window_minutes: default_wave_window_minutes(),
+        }
+    }
+}
+
+impl WavesConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(2..=100_000).contains(&self.min_ips) {
+            bail!("waves.min_ips must be between 2 and 100000");
+        }
+        if !(5..=1440).contains(&self.window_minutes) {
+            bail!("waves.window_minutes must be between 5 and 1440");
+        }
+        Ok(())
+    }
+}
+
+/// `[notify]`: push new exploit waves to a webhook or an ntfy topic. The
+/// URL (an ntfy topic is a credential) and the token are secrets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyConfig {
+    pub url: Secret,
+    pub kind: NotifyKind,
+    /// Sent as `Authorization: Bearer …`, nowhere else.
+    pub token: Option<Secret>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyKind {
+    /// A JSON POST.
+    Webhook,
+    /// A text POST to an ntfy topic.
+    Ntfy,
+}
+
+impl NotifyConfig {
+    /// https anywhere; plain http only to loopback or a private address
+    /// (`net::is_scannable_target` is false), never to a public name. No
+    /// error names the URL.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(self.url.expose())
+            .ok()
+            .filter(|u| u.has_host())
+            .context("notify.url must be an absolute https:// URL")?;
+        let host = url.host_str().unwrap_or_default();
+        let private = match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(ip) => !crate::net::is_scannable_target(ip),
+            Err(_) => host.eq_ignore_ascii_case("localhost"),
+        };
+        match url.scheme() {
+            "https" => {}
+            "http" if private => {}
+            _ => bail!("notify.url must be https://, or http:// to a loopback or private address"),
+        }
+        if let Some(t) = &self.token
+            && (t.expose().is_empty() || !t.expose().bytes().all(|b| b.is_ascii_graphic()))
+        {
+            bail!("notify.token must be printable ASCII without spaces (or omit it)");
+        }
+        Ok(())
+    }
 }
 
 /// `[public]`: what anonymous visitors see.
@@ -963,6 +1054,10 @@ impl Config {
         }
         self.enrichment.check()?;
         self.credits.check()?;
+        self.waves.check()?;
+        if let Some(n) = &self.notify {
+            n.check()?;
+        }
         if let Some(a) = &self.abuseipdb {
             if a.api_key.expose().trim().is_empty() {
                 bail!("[abuseipdb] needs api_key (or omit the section)");
@@ -1990,5 +2085,71 @@ data_dir = "/tmp"
         let cfg: Config =
             toml::from_str(&format!("{base}[enrichment]\noffer_per_day = 50\n")).unwrap();
         assert_eq!(cfg.enrichment.offer_per_day, 50);
+    }
+
+    /// A listener-only config with `extra` appended.
+    fn listener(extra: &str) -> anyhow::Result<Config> {
+        parse(&format!(
+            "{BASE}trap_listen = \"127.0.0.1:1\"\n[roles]\nweb = false\nscanner = false\n{extra}"
+        ))
+    }
+
+    #[test]
+    fn waves_default_to_ten_ips_in_an_hour() {
+        let cfg = listener("").unwrap();
+        assert_eq!((cfg.waves.min_ips, cfg.waves.window_minutes), (10, 60));
+        assert!(cfg.notify.is_none());
+        assert!(listener("[waves]\nmin_ips = 1\n").is_err());
+        assert!(listener("[waves]\nwindow_minutes = 0\n").is_err());
+        let cfg = listener("[waves]\nmin_ips = 25\nwindow_minutes = 30\n").unwrap();
+        assert_eq!((cfg.waves.min_ips, cfg.waves.window_minutes), (25, 30));
+    }
+
+    #[test]
+    fn notify_url_is_https_or_a_private_host() {
+        let notify = |url: &str| listener(&format!("[notify]\nkind = \"ntfy\"\nurl = \"{url}\"\n"));
+        for bad in [
+            "http://ntfy.example/t",
+            "http://8.8.8.8/t",
+            "ftp://127.0.0.1/t",
+            "ntfy.example/t",
+            "file:///etc/passwd",
+        ] {
+            let e = notify(bad).unwrap_err().to_string();
+            assert!(e.contains("notify.url"), "{bad}: {e}");
+            assert!(!e.contains(bad), "the error names the url: {e}");
+        }
+        for good in [
+            "http://127.0.0.1:2586/t",
+            "http://[::1]:2586/t",
+            "http://10.0.0.5/t",
+            "http://localhost:2586/t",
+            "https://ntfy.example/t",
+        ] {
+            assert!(notify(good).is_ok(), "{good}");
+        }
+        assert!(listener("[notify]\nkind = \"pager\"\nurl = \"https://a.example/\"\n").is_err());
+        assert!(
+            listener("[notify]\nkind = \"webhook\"\nurl = \"https://a.example/\"\ntoken = \" \"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn notify_debug_redacts_the_url_and_token() {
+        let cfg = listener(
+            "[notify]\nkind = \"ntfy\"\nurl = \"https://ntfy.example/secret-topic\"\ntoken = \"tk_secret\"\n",
+        )
+        .unwrap();
+        let n = cfg.notify.as_ref().unwrap();
+        assert_eq!(n.kind, NotifyKind::Ntfy);
+        assert_eq!(n.url.expose(), "https://ntfy.example/secret-topic");
+        for shown in [format!("{:?}", cfg.notify), format!("{cfg:?}")] {
+            assert!(shown.contains("[redacted]"), "{shown}");
+            assert!(
+                !shown.contains("secret-topic") && !shown.contains("tk_secret"),
+                "{shown}"
+            );
+        }
     }
 }
