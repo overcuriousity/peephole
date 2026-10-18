@@ -1,0 +1,5 @@
+{# One provider's card as the Lookup page fills it in (lookup::AnswerCard): its answer, or why there is none. #}
+{% for g in grid %}{% if g.card.newest.is_some() %}{% include "_lookup_card.html" %}{% endif %}{% endfor %}
+{% if !answered %}<div class="intel" data-declined><div class="intel-head"><h3>{{ label }}</h3><span class="intel-id mono">{{ provider }}</span></div>
+  <p class="intel-src text-warning">{% if declined.is_empty() %}No answer.{% else %}{% for (node, why) in declined %}{{ why }} ({{ node }}){% if !loop.last %}; {% endif %}{% endfor %}{% endif %}</p></div>{% endif %}
+{% for (node, amount) in charges %}<p class="intel-src">{{ node }} charged {{ amount }} credits.</p>{% endfor %}

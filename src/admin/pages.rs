@@ -710,6 +710,7 @@ mod short_strings_tests {
         let html = Unrecorded {
             s: crate::admin::lookup::UnrecordedScan {
                 offers: vec![],
+                standalone: true,
                 refused: None,
             },
             r: R { ip: "198.51.100.7" },

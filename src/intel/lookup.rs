@@ -180,30 +180,30 @@ pub fn cheap(me: NodeId, quotes: &HashMap<String, Vec<crate::credits::pay::Quote
     v
 }
 
-/// Look `ip` up: first in the dataset, then at the providers. This
-/// node's own providers (free here) are asked when the dataset lacks a
-/// fresh result; `ask` names the providers to ask as well, `again` those
-/// to ask although the dataset has a fresh result. Only those two are
-/// bought from other nodes.
-pub async fn run(
+/// What a lookup reads from the dataset before it asks anyone, and whom
+/// it then asks (see [`run`]).
+#[derive(Debug, Clone, Default)]
+pub struct Plan {
+    /// Provider results the dataset holds under 24 hours old (none
+    /// standalone).
+    pub stored: Vec<crate::credits::pay::Stored>,
+    /// The providers asked now.
+    pub wanted: Vec<String>,
+}
+
+/// The [`Plan`] of [`run`]: no provider is asked.
+pub async fn plan(
     rec: &Recorder,
     providers: &Providers,
     ip: IpAddr,
     ask: &[String],
     again: &[String],
-) -> Outcome {
-    let known: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| p.name.to_string()).collect();
+) -> Plan {
     let Recorder::Cluster(node) = rec else {
-        // Standalone: this node's providers, no credits, nothing stored.
-        let mut answers = vec![NodeAnswer {
-            node: "this node".into(),
-            resp: local(providers, &ip, &[]).await,
-            charged_mc: 0,
-        }];
-        note_unserved(&mut answers, &known);
-        return Outcome {
-            answers,
-            ..Default::default()
+        // Standalone: every provider this node runs.
+        return Plan {
+            stored: vec![],
+            wanted: providers.iter().map(|p| p.name().to_string()).collect(),
         };
     };
     let stored: Vec<_> = match crate::credits::pay::stored(&node.store.pool, &ip).await {
@@ -217,13 +217,73 @@ pub async fn run(
         }
     };
     let cheap = cheap(node.id(), &crate::credits::pay::quotes(node, providers));
-    let wanted: Vec<String> = known
-        .into_iter()
+    let wanted: Vec<String> = KNOWN_PROVIDERS
+        .iter()
+        .map(|p| p.name.to_string())
         .filter(|p| cheap.contains(p) || ask.contains(p) || again.contains(p))
         .filter(|p| !stored.iter().any(|s| &s.provider == p))
         .collect();
+    Plan { stored, wanted }
+}
+
+/// Look `ip` up: first in the dataset, then at the providers. This
+/// node's own providers (free here) are asked when the dataset lacks a
+/// fresh result; `ask` names the providers to ask as well, `again` those
+/// to ask although the dataset has a fresh result. Only those two are
+/// bought from other nodes.
+pub async fn run(
+    rec: &Recorder,
+    providers: &Providers,
+    ip: IpAddr,
+    ask: &[String],
+    again: &[String],
+) -> Outcome {
+    run_only(rec, providers, ip, ask, again, None).await
+}
+
+/// [`run`] of no paid provider, for `provider` alone: its stored result,
+/// or its answer now when a lookup asks it unbidden (the web Lookup page
+/// fills its cards one by one with this).
+pub async fn run_one(rec: &Recorder, providers: &Providers, ip: IpAddr, provider: &str) -> Outcome {
+    run_only(rec, providers, ip, &[], &[], Some(provider)).await
+}
+
+async fn run_only(
+    rec: &Recorder,
+    providers: &Providers,
+    ip: IpAddr,
+    ask: &[String],
+    again: &[String],
+    only: Option<&str>,
+) -> Outcome {
+    let mine = |p: &String| only.is_none_or(|o| o == p);
+    let Recorder::Cluster(node) = rec else {
+        // Standalone: this node's providers, no credits, nothing stored.
+        let wanted: Vec<String> = only.map(|o| vec![o.to_string()]).unwrap_or_default();
+        let mut answers = vec![NodeAnswer {
+            node: "this node".into(),
+            resp: local(providers, &ip, &wanted).await,
+            charged_mc: 0,
+        }];
+        let known: Vec<String> = KNOWN_PROVIDERS
+            .iter()
+            .map(|p| p.name.to_string())
+            .filter(mine)
+            .collect();
+        note_unserved(&mut answers, &known);
+        return Outcome {
+            answers,
+            ..Default::default()
+        };
+    };
+    let Plan { mut stored, wanted } = plan(rec, providers, ip, ask, again).await;
+    stored.retain(|s| mine(&s.provider));
+    let wanted: Vec<String> = wanted.into_iter().filter(mine).collect();
     let paid: Vec<String> = ask.iter().chain(again).cloned().collect();
-    let mut answers = crate::credits::pay::ask(node, providers, ip, &wanted, &paid, None).await;
+    let mut answers = match wanted.is_empty() {
+        true => vec![],
+        false => crate::credits::pay::ask(node, providers, ip, &wanted, &paid, None).await,
+    };
     if answers.is_empty() {
         answers.push(NodeAnswer {
             node: "this node".into(),

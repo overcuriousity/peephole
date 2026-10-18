@@ -4,9 +4,11 @@
 //! with its level (`credits::jobs::level_factor`). A finished scan of the
 //! same level less than a day old is shown instead and costs nothing.
 use crate::admin::AdminState;
+use crate::admin::api_v1;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::AppResult;
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
+use crate::admin::web_quote::WebBuyer;
 use crate::scan::valid_level;
 use crate::store::scans::EnqueueOutcome;
 use axum::{
@@ -127,11 +129,13 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/api/scan-jobs", get(stream))
 }
 
-/// The form: the address and the level.
+/// The form: the address and the level; in a cluster, the quote the
+/// price dialog got (`admin::web_quote`).
 #[derive(Debug, Default)]
 struct BuyForm {
     ip: String,
     level: String,
+    quote_id: String,
 }
 
 impl BuyForm {
@@ -142,6 +146,7 @@ impl BuyForm {
             match k.as_str() {
                 "ip" => f.ip = v,
                 "level" => f.level = v,
+                "quote_id" => f.quote_id = v,
                 _ => {}
             }
         }
@@ -319,9 +324,11 @@ pub async fn enqueue(
 
 /// POST /admin/lookup/scan: queue a marked job, then back to the IP
 /// page's Counter-scans section. A job of this level already on its way,
-/// or a fresh result of it, sells nothing.
+/// or a fresh result of it, sells nothing. With a quote (always in a
+/// cluster) it buys exactly the quoted scan, as the machine API does, and
+/// audits it; standalone a scan is free and needs none.
 async fn buy(
-    _u: SessionUser,
+    WebBuyer(buyer): WebBuyer,
     State(state): State<Arc<AdminState>>,
     body: Bytes,
 ) -> AppResult<Response> {
@@ -340,6 +347,41 @@ async fn buy(
         Some(_) => format!("/ip/{ip}#actions"),
         None => lookup,
     };
+    let queued = match row {
+        Some(_) => "the result appears below when it is in.",
+        None => {
+            "the address is now in the dataset, marked unseen: no traffic recorded. \
+             The result appears below when it is in."
+        }
+    };
+    if !form.quote_id.is_empty() {
+        return Ok(
+            match crate::admin::api_v1::buy_scan(&state, &buyer, &ip.to_string(), &form.quote_id)
+                .await
+            {
+                Ok(v) => redirect_with_notice(
+                    &format!("/ip/{ip}#actions"),
+                    &format!(
+                        "Scan queued at {} credits; {queued}",
+                        v["credits"].as_str().unwrap_or_default()
+                    ),
+                ),
+                Err(r) => redirect_with_error(
+                    &back,
+                    &format!(
+                        "No scan: {}. Nothing was charged.",
+                        api_v1::message_of(*r).await
+                    ),
+                ),
+            },
+        );
+    }
+    if state.recorder.node().is_some() {
+        return Ok(redirect_with_error(
+            &back,
+            "No scan: get its price first (the level button opens it).",
+        ));
+    }
     let Some(level) = form.level.parse::<i64>().ok().and_then(valid_level) else {
         return Ok(redirect_with_error(&back, "No scan: not a scan level."));
     };
