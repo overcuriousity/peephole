@@ -473,6 +473,30 @@ impl Store {
         Ok(())
     }
 
+    /// Every `(key, value)` whose key starts with `prefix`, by key. The
+    /// prefix is bound, its `%`, `_` and `\` escaped: it matches only
+    /// itself (and, unlike `LIKE`, case-sensitively).
+    pub async fn intel_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut pattern = String::with_capacity(prefix.len() + 1);
+        for c in prefix.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM intel_meta WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+        )
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .collect())
+    }
+
     pub async fn intel_delete(&self, key: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM intel_meta WHERE key = ?")
             .bind(key)
@@ -889,5 +913,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn intel_prefix_matches_only_the_literal_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        for k in [
+            "relay.leased.aa",
+            "relay.leased.bb",
+            "relay.leasedX",
+            "RELAY.LEASED.cc",
+            "relayXleased.dd",
+            "%other",
+        ] {
+            s.intel_set(k, "v").await.unwrap();
+        }
+        let keys = |rows: Vec<(String, String)>| rows.into_iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(
+            keys(s.intel_prefix("relay.leased.").await.unwrap()),
+            ["relay.leased.aa", "relay.leased.bb"]
+        );
+        assert_eq!(keys(s.intel_prefix("%").await.unwrap()), ["%other"]);
+        assert!(s.intel_prefix("relay_leased.").await.unwrap().is_empty());
+        assert!(s.intel_prefix("relay.leased.%").await.unwrap().is_empty());
     }
 }

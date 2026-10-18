@@ -79,16 +79,36 @@ impl Leases {
     }
 }
 
-/// The leases this node took as a lessee: relay → end (ms).
+/// The leases this node took as a lessee: relay → (end (ms), the ask
+/// it paid (mc/h)). Each is also kept in `intel_meta` under
+/// [`LEASED_KEY`], for `peephole credits` (another process).
 #[derive(Default)]
-pub struct Leased(Mutex<BTreeMap<NodeId, u64>>, tokio::sync::Notify);
+pub struct Leased(Mutex<BTreeMap<NodeId, (u64, u32)>>, tokio::sync::Notify);
+
+/// `intel_meta` key prefix of a lease taken: `relay.leased.<relay id
+/// hex>` = `<until_ms>@<price_mc>`.
+pub const LEASED_KEY: &str = "relay.leased.";
+
+fn leased_key(relay: &NodeId) -> String {
+    format!("{LEASED_KEY}{}", data_encoding::HEXLOWER.encode(&relay.0))
+}
 
 impl Leased {
     /// Its relays now.
     pub fn relays(&self, now_ms: u64) -> Vec<NodeId> {
         let mut l = self.0.lock_or_recover();
-        l.retain(|_, until| *until > now_ms);
+        l.retain(|_, (until, _)| *until > now_ms);
         l.keys().copied().collect()
+    }
+
+    /// Its leases now: relay, end (ms), price (mc/h).
+    pub fn leases(&self, now_ms: u64) -> Vec<(NodeId, u64, u32)> {
+        self.0
+            .lock_or_recover()
+            .iter()
+            .filter(|(_, (until, _))| *until > now_ms)
+            .map(|(id, (until, p))| (*id, *until, *p))
+            .collect()
     }
 
     /// Relays not due a renewal.
@@ -96,32 +116,87 @@ impl Leased {
         self.0
             .lock_or_recover()
             .iter()
-            .filter(|(_, until)| **until > now_ms + RENEW_BEFORE_MS)
+            .filter(|(_, (until, _))| *until > now_ms + RENEW_BEFORE_MS)
             .map(|(id, _)| *id)
             .collect()
     }
 
-    /// `relay` leased this node until `until_ms`, but no longer than an
-    /// hour from the end of the lease held there, or from now (what a
-    /// relay grants): an answer dated further would never be renewed.
-    pub fn set(&self, relay: NodeId, until_ms: u64, now_ms: u64) {
-        let mut l = self.0.lock_or_recover();
-        let from = l
-            .get(&relay)
-            .copied()
-            .filter(|u| *u > now_ms)
-            .unwrap_or(now_ms);
-        l.insert(relay, until_ms.min(from.saturating_add(LEASE_MS)));
+    /// `relay` leased this node until `until_ms` at `price_mc`, but no
+    /// longer than an hour from the end of the lease held there, or from
+    /// now (what a relay grants): an answer dated further would never be
+    /// renewed. Kept in `store` too.
+    pub async fn set(
+        &self,
+        store: &crate::store::Store,
+        relay: NodeId,
+        until_ms: u64,
+        price_mc: u32,
+        now_ms: u64,
+    ) {
+        let until = {
+            let mut l = self.0.lock_or_recover();
+            let from = l
+                .get(&relay)
+                .map(|(u, _)| *u)
+                .filter(|u| *u > now_ms)
+                .unwrap_or(now_ms);
+            let until = until_ms.min(from.saturating_add(LEASE_MS));
+            l.insert(relay, (until, price_mc));
+            until
+        };
+        if let Err(e) = store
+            .intel_set(&leased_key(&relay), &format!("{until}@{price_mc}"))
+            .await
+        {
+            tracing::warn!(?e, "relay lease not kept");
+        }
     }
 
     /// Drop `relay`, which no longer holds this node's lease (it
     /// restarted): [`lease_once`] replaces it.
-    pub fn forget(&self, relay: &NodeId) -> bool {
+    pub async fn forget(&self, store: &crate::store::Store, relay: &NodeId) -> bool {
         let gone = self.0.lock_or_recover().remove(relay).is_some();
         if gone {
             self.1.notify_waiters();
+            if let Err(e) = store.intel_delete(&leased_key(relay)).await {
+                tracing::warn!(?e, "relay lease not dropped");
+            }
         }
         gone
+    }
+}
+
+/// The leases kept in `store`, as `peephole credits` reads them: relay,
+/// end (ms), price (mc/h). Ended ones too, until [`lease_once`] prunes
+/// them.
+pub async fn leased_kept(store: &crate::store::Store) -> Vec<(NodeId, u64, u32)> {
+    match store.intel_prefix(LEASED_KEY).await {
+        Ok(rows) => rows.iter().filter_map(|(k, v)| parse_kept(k, v)).collect(),
+        Err(e) => {
+            tracing::warn!(?e, "relay leases not read");
+            vec![]
+        }
+    }
+}
+
+fn parse_kept(key: &str, value: &str) -> Option<(NodeId, u64, u32)> {
+    let hex = key.strip_prefix(LEASED_KEY)?;
+    let id = NodeId::from_slice(&data_encoding::HEXLOWER.decode(hex.as_bytes()).ok()?).ok()?;
+    let (until, price) = value.split_once('@')?;
+    Some((id, until.parse().ok()?, price.parse().ok()?))
+}
+
+/// Delete the kept leases that ended by `now_ms` (and any unreadable).
+async fn prune_kept(store: &crate::store::Store, now_ms: u64) {
+    let Ok(rows) = store.intel_prefix(LEASED_KEY).await else {
+        return;
+    };
+    for (k, v) in rows {
+        if parse_kept(&k, &v).is_none_or(|(_, until, _)| until <= now_ms)
+            && let Err(e) = store.intel_delete(&k).await
+        {
+            tracing::warn!(?e, "ended relay lease not pruned");
+        }
     }
 }
 
@@ -210,8 +285,9 @@ pub async fn serve(node: &Arc<Node>, peer: NodeId, req: &RelayReq) -> RelayResp 
 }
 
 /// One lease request to `relay` at `price`, offered again once at a
-/// higher price it names.
-async fn ask(node: &Arc<Node>, relay: NodeId, first: u32) -> Option<u64> {
+/// higher price it names. Returns the end and the price accepted (0:
+/// free).
+async fn ask(node: &Arc<Node>, relay: NodeId, first: u32) -> Option<(u64, u32)> {
     let once = async |p: Mc| -> Option<RelayResp> {
         let offer_seq = match p {
             0 => None,
@@ -225,14 +301,18 @@ async fn ask(node: &Arc<Node>, relay: NodeId, first: u32) -> Option<u64> {
             .await
             .ok()
     };
-    let mut resp = once(first as Mc).await?;
+    let mut paid = first as Mc;
+    let mut resp = once(paid).await?;
     if let RelayResp::Declined { price_mc, .. } = &resp
         && let Some(p) = pay::retry_price(first as Mc, *price_mc, true)
     {
+        paid = p;
         resp = once(p).await?;
     }
     match resp {
-        RelayResp::Accepted { until_ms } => Some(until_ms),
+        RelayResp::Accepted { until_ms } => {
+            Some((until_ms, u32::try_from(paid).unwrap_or(u32::MAX)))
+        }
         RelayResp::Declined { why, .. } => {
             tracing::debug!(relay = %relay.short(), %why, "relay lease declined");
             None
@@ -248,6 +328,7 @@ pub async fn lease_once(node: &Arc<Node>) -> usize {
         return 0;
     }
     let now = super::hlc::wall_ms();
+    prune_kept(&node.store, now).await;
     let keep = node.leased.keep(now);
     let need = WANTED.saturating_sub(keep.len());
     if need == 0 {
@@ -272,8 +353,10 @@ pub async fn lease_once(node: &Arc<Node>) -> usize {
         if took == need {
             break;
         }
-        if let Some(until) = ask(node, relay, p).await {
-            node.leased.set(relay, until, super::hlc::wall_ms());
+        if let Some((until, paid)) = ask(node, relay, p).await {
+            node.leased
+                .set(&node.store, relay, until, paid, super::hlc::wall_ms())
+                .await;
             took += 1;
         }
     }
@@ -390,36 +473,86 @@ mod tests {
         assert_eq!(sold(), Some(1.0));
     }
 
-    #[test]
-    fn a_lessee_renews_what_ends_within_five_minutes() {
+    async fn store() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn a_lessee_renews_what_ends_within_five_minutes() {
+        let (_d, s) = store().await;
         let l = Leased::default();
         let t = 1_000_000_000u64;
-        l.set(id(1), t + LEASE_MS, t);
-        l.set(id(2), t + RENEW_BEFORE_MS - 1, t);
+        l.set(&s, id(1), t + LEASE_MS, 0, t).await;
+        l.set(&s, id(2), t + RENEW_BEFORE_MS - 1, 0, t).await;
         assert_eq!(l.relays(t), [id(1), id(2)]);
         assert_eq!(l.keep(t), [id(1)], "2 is due a renewal");
         assert_eq!(l.relays(t + RENEW_BEFORE_MS), [id(1)], "2 ran out");
-        assert!(l.forget(&id(1)) && !l.forget(&id(1)));
+        assert!(l.forget(&s, &id(1)).await && !l.forget(&s, &id(1)).await);
         assert!(l.relays(t).is_empty());
+    }
+
+    /// `set` keeps a lease in the store, `forget` drops it, a prune drops
+    /// the ended ones: exactly the live leases are left.
+    #[tokio::test]
+    async fn the_store_keeps_exactly_the_live_leases() {
+        let (_d, s) = store().await;
+        let l = Leased::default();
+        let t = 1_000_000_000u64;
+        l.set(&s, id(1), t + LEASE_MS, 120, t).await;
+        l.set(&s, id(2), t + 60_000, 0, t).await;
+        l.set(&s, id(3), t + LEASE_MS, 50, t).await;
+        // Not a lease: another key, and an unreadable one.
+        s.intel_set("relay.leasedX", "1@1").await.unwrap();
+        s.intel_set(&format!("{LEASED_KEY}zz"), "1@1")
+            .await
+            .unwrap();
+        assert_eq!(
+            leased_kept(&s).await,
+            [
+                (id(1), t + LEASE_MS, 120),
+                (id(2), t + 60_000, 0),
+                (id(3), t + LEASE_MS, 50)
+            ]
+        );
+        assert_eq!(
+            l.leases(t + 60_000),
+            [(id(1), t + LEASE_MS, 120), (id(3), t + LEASE_MS, 50)]
+        );
+        assert!(l.forget(&s, &id(3)).await);
+        prune_kept(&s, t + 60_000).await;
+        assert_eq!(leased_kept(&s).await, [(id(1), t + LEASE_MS, 120)]);
+        let keys: Vec<String> = s
+            .intel_prefix("relay.leased")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(keys, [leased_key(&id(1)), "relay.leasedX".to_string()]);
     }
 
     /// A relay's answer counts for an hour from the end of the lease held
     /// there, or from now, as a relay grants it: one answering a later end
     /// (forever) is still renewed, or replaced, in time.
-    #[test]
-    fn a_lease_lasts_no_longer_than_an_hour_whatever_the_relay_says() {
+    #[tokio::test]
+    async fn a_lease_lasts_no_longer_than_an_hour_whatever_the_relay_says() {
+        let (_d, s) = store().await;
         let l = Leased::default();
         let t = 1_000_000_000u64;
-        l.set(id(1), u64::MAX, t);
+        l.set(&s, id(1), u64::MAX, 0, t).await;
         assert_eq!(l.keep(t + LEASE_MS - RENEW_BEFORE_MS), Vec::<NodeId>::new());
         assert!(l.relays(t + LEASE_MS).is_empty());
         // A renewal before the end adds an hour to it.
-        l.set(id(2), t + LEASE_MS, t);
+        l.set(&s, id(2), t + LEASE_MS, 0, t).await;
         let renewed = t + LEASE_MS - RENEW_BEFORE_MS;
-        l.set(id(2), t + 2 * LEASE_MS, renewed);
+        l.set(&s, id(2), t + 2 * LEASE_MS, 0, renewed).await;
         assert_eq!(l.keep(t + 2 * LEASE_MS - RENEW_BEFORE_MS - 1), [id(2)]);
         // A shorter answer stands.
-        l.set(id(3), t + 60_000, t);
+        l.set(&s, id(3), t + 60_000, 0, t).await;
         assert!(l.relays(t + 60_000).iter().all(|r| *r != id(3)));
     }
 }
