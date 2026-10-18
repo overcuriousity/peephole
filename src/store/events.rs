@@ -1,4 +1,4 @@
-//! One address's observations as a single stream, newest first: its
+//! One address's (or one campaign's) observations as a single stream, newest first: its
 //! requests, webshell commands, uploads, canaries, probes, scans, browser
 //! fingerprints and intel fetches (the IP page's Timeline).
 //!
@@ -105,6 +105,8 @@ impl Cursor {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Event {
     pub ts: String,
+    /// The member it is of, on a campaign's events; None on one address's.
+    pub ip: Option<String>,
     /// [`EventKind::key`]; read through [`Event::kind`].
     pub k: String,
     /// Of its own table (canaries: the rowid; intel: the hlc).
@@ -191,14 +193,61 @@ enum Bind {
     S(String),
 }
 
-/// One branch: `cols` and `from` with `ts`/`id` naming its time and id
-/// columns, `wheres` after `ip_id = ?`.
+/// One branch: its statement up to the cursor condition, with `ts`/`id`
+/// naming its time and id columns.
 struct Branch {
     sql: String,
     ts: &'static str,
     id: &'static str,
     /// The address condition binds the IP's text form, not its id.
     by_text: bool,
+}
+
+/// Whose events: one address, or every member of a campaign.
+#[derive(Clone, Copy)]
+enum Subject<'a> {
+    Ip { id: i64, ip: &'a str },
+    Campaign(&'a str),
+}
+
+impl Subject<'_> {
+    /// The condition on `alias`'s address: `alias.ip_id`, or the address
+    /// text `alias.ip` when `by_text`. One `?`, bound by [`Self::bind`].
+    fn cond(self, alias: &str, by_text: bool) -> String {
+        match (self, by_text) {
+            (Self::Ip { .. }, false) => format!("{alias}.ip_id = ?"),
+            (Self::Ip { .. }, true) => format!("{alias}.ip = ?"),
+            (Self::Campaign(_), false) => format!(
+                "{alias}.ip_id IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?)"
+            ),
+            (Self::Campaign(_), true) => format!(
+                "{alias}.ip IN (SELECT i.ip FROM campaign_members cm JOIN ips i ON i.id = cm.ip_id \
+                 WHERE cm.campaign_key = ?)"
+            ),
+        }
+    }
+
+    /// The `ip` column: the member's address on a campaign's events.
+    fn ip_col(self, alias: &str, by_text: bool) -> String {
+        match (self, by_text) {
+            (Self::Ip { .. }, _) => "NULL".into(),
+            (Self::Campaign(_), true) => format!("{alias}.ip"),
+            (Self::Campaign(_), false) => format!("(SELECT ip FROM ips WHERE id = {alias}.ip_id)"),
+        }
+    }
+
+    fn bind(self, by_text: bool) -> Bind {
+        match self {
+            Self::Ip { id, ip } => {
+                if by_text {
+                    Bind::S(ip.to_string())
+                } else {
+                    Bind::I(id)
+                }
+            }
+            Self::Campaign(key) => Bind::S(key.to_string()),
+        }
+    }
 }
 
 const NO_REQ: &str = "NULL AS method, NULL AS path, NULL AS query, NULL AS labels_json, NULL AS owasp_json, \
@@ -211,8 +260,9 @@ fn node(a: Audience, alias: &str) -> String {
     }
 }
 
-fn branch(kind: EventKind, a: Audience) -> Branch {
+fn branch(kind: EventKind, a: Audience, who: Subject) -> Branch {
     let admin = a == Audience::Admin;
+    let w = |alias: &str| (who.ip_col(alias, false), who.cond(alias, false));
     let req = |webshell: bool| {
         let (served, used, from) = if admin {
             (
@@ -224,10 +274,12 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
             ("0".into(), "NULL".into(), "NULL".into())
         };
         format!(
-            "SELECT r.ts, '{k}' AS k, r.id, r.severity, {summary} AS summary, {node} AS node, \
+            "SELECT r.ts, {ip} AS ip, '{k}' AS k, r.id, r.severity, {summary} AS summary, {node} AS node, \
              NULL AS ref, r.method, r.path, {query} AS query, r.labels_json, r.owasp_json, \
              {served} AS canary_served, ({used}) AS canary_used, ({from}) AS canary_from \
-             FROM requests r WHERE r.ip_id = ? AND {answer}{released}",
+             FROM requests r WHERE {cond} AND {answer}{released}",
+            ip = w("r").0,
+            cond = w("r").1,
             k = kind.key(),
             summary = if webshell { "r.cmd" } else { "NULL" },
             node = node(a, "r"),
@@ -245,11 +297,13 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         EventKind::Webshell => (req(true), "r.ts", "r.id", false),
         EventKind::Upload => (
             format!(
-                "SELECT u.ts, 'upload' AS k, u.id, NULL AS severity, \
+                "SELECT u.ts, {ip} AS ip, 'upload' AS k, u.id, NULL AS severity, \
                  u.kind || ': ' || COALESCE(u.filename || ' ', '') || u.sniffed_type || ', ' \
                  || u.size || ' bytes' AS summary, {} AS node, u.uid AS ref, {NO_REQ} \
-                 FROM uploads u WHERE u.ip_id = ?",
-                node(a, "u")
+                 FROM uploads u WHERE {cond}",
+                node(a, "u"),
+                ip = w("u").0,
+                cond = w("u").1
             ),
             "u.ts",
             "u.id",
@@ -257,9 +311,11 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         ),
         EventKind::Canary => (
             format!(
-                "SELECT c.ts, 'canary' AS k, c.rowid AS id, NULL AS severity, c.kind AS summary, \
-                 NULL AS node, CAST(c.request_id AS TEXT) AS ref, {NO_REQ} \
-                 FROM canaries c WHERE c.ip_id = ?"
+                "SELECT c.ts, {ip} AS ip, 'canary' AS k, c.rowid AS id, NULL AS severity, \
+                 c.kind AS summary, NULL AS node, CAST(c.request_id AS TEXT) AS ref, {NO_REQ} \
+                 FROM canaries c WHERE {cond}",
+                ip = w("c").0,
+                cond = w("c").1
             ),
             "c.ts",
             "c.rowid",
@@ -267,9 +323,9 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         ),
         EventKind::Probe => (
             format!(
-                "SELECT p.started_at AS ts, 'probe' AS k, p.id, NULL AS severity, \
+                "SELECT p.started_at AS ts, {ip} AS ip, 'probe' AS k, p.id, NULL AS severity, \
                  {} AS summary, {} AS node, NULL AS ref, {NO_REQ} \
-                 FROM probes p WHERE p.ip_id = ?{}",
+                 FROM probes p WHERE {cond}{}",
                 if admin { "p.vantage_ip" } else { "NULL" },
                 node(a, "p"),
                 // The public sees a probe once the publication delay has
@@ -279,7 +335,9 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
                 } else {
                     " AND p.finished_at <= datetime('now', '-' || \
                      (SELECT delay_s FROM publish_cfg WHERE id = 1) || ' seconds')"
-                }
+                },
+                ip = w("p").0,
+                cond = w("p").1
             ),
             "p.started_at",
             "p.id",
@@ -287,11 +345,13 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         ),
         EventKind::Scan => (
             format!(
-                "SELECT s.started_at AS ts, 'scan' AS k, s.id, NULL AS severity, \
+                "SELECT s.started_at AS ts, {ip} AS ip, 'scan' AS k, s.id, NULL AS severity, \
                  'level ' || s.level AS summary, {} AS node, NULL AS ref, {NO_REQ} \
-                 FROM scans s WHERE s.ip_id = ?{}",
+                 FROM scans s WHERE {cond}{}",
                 node(a, "s"),
-                a.scans("s")
+                a.scans("s"),
+                ip = w("s").0,
+                cond = w("s").1
             ),
             "s.started_at",
             "s.id",
@@ -299,10 +359,12 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         ),
         EventKind::Fingerprint => (
             format!(
-                "SELECT f.ts, 'fingerprint' AS k, f.id, NULL AS severity, f.fp_hash AS summary, \
+                "SELECT f.ts, {ip} AS ip, 'fingerprint' AS k, f.id, NULL AS severity, f.fp_hash AS summary, \
                  {} AS node, f.fp_hash AS ref, {NO_REQ} \
-                 FROM fingerprints f WHERE f.ip_id = ?",
-                node(a, "f")
+                 FROM fingerprints f WHERE {cond}",
+                node(a, "f"),
+                ip = w("f").0,
+                cond = w("f").1
             ),
             "f.ts",
             "f.id",
@@ -311,10 +373,12 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
         // Keyed by address text: the log's primary key leads with `ip`.
         EventKind::Intel => (
             format!(
-                "SELECT l.fetched_at AS ts, 'intel' AS k, l.hlc AS id, NULL AS severity, \
-                 l.provider AS summary, {} AS node, NULL AS ref, {NO_REQ} \
-                 FROM ip_intel_log l WHERE l.ip = ?",
-                node(a, "l")
+                "SELECT l.fetched_at AS ts, {ip} AS ip, 'intel' AS k, l.hlc AS id, \
+                 NULL AS severity, l.provider AS summary, {} AS node, NULL AS ref, {NO_REQ} \
+                 FROM ip_intel_log l WHERE {cond}",
+                node(a, "l"),
+                ip = who.ip_col("l", true),
+                cond = who.cond("l", true)
             ),
             "l.fetched_at",
             "l.hlc",
@@ -332,8 +396,7 @@ fn branch(kind: EventKind, a: Audience) -> Branch {
 /// The statement for `kinds` (in `ALL` order, deduplicated) and its binds;
 /// None when no kind is left.
 fn events_sql(
-    ip_id: i64,
-    ip: &str,
+    who: Subject,
     kinds: &[EventKind],
     a: Audience,
     cursor: Option<&Cursor>,
@@ -345,13 +408,9 @@ fn events_sql(
         if !kinds.contains(&kind) || (a == Audience::Public && !EventKind::PUBLIC.contains(&kind)) {
             continue;
         }
-        let b = branch(kind, a);
+        let b = branch(kind, a, who);
         let mut sql = b.sql;
-        binds.push(if b.by_text {
-            Bind::S(ip.to_string())
-        } else {
-            Bind::I(ip_id)
-        });
+        binds.push(who.bind(b.by_text));
         if let Some(c) = cursor {
             // Rows after `c` in `(ts DESC, k, id DESC)`: earlier seconds,
             // and in `c`'s second the kinds sorting after it, or its own
@@ -405,7 +464,6 @@ impl Store {
         cursor: Option<&Cursor>,
         limit: i64,
     ) -> Result<EventPage> {
-        let limit = limit.clamp(1, MAX_LIMIT);
         let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM ips WHERE id = ?")
             .bind(ip_id)
             .fetch_optional(&self.read)
@@ -413,7 +471,35 @@ impl Store {
         let Some(ip) = ip else {
             return Ok(EventPage::default());
         };
-        let Some((sql, binds)) = events_sql(ip_id, &ip, kinds, a, cursor, limit + 1) else {
+        let who = Subject::Ip { id: ip_id, ip: &ip };
+        self.events(who, kinds, a, cursor, limit).await
+    }
+
+    /// The same over every member of the campaign `key`, for an admin:
+    /// each event carries its member's address in `ip`. Every branch reads
+    /// the members' `ip_id` index, so a page costs members × kinds probes
+    /// at most, bounded by the per-branch limit.
+    pub async fn campaign_events(
+        &self,
+        key: &str,
+        cursor: Option<&Cursor>,
+        limit: i64,
+    ) -> Result<EventPage> {
+        let who = Subject::Campaign(key);
+        self.events(who, &EventKind::ALL, Audience::Admin, cursor, limit)
+            .await
+    }
+
+    async fn events(
+        &self,
+        who: Subject<'_>,
+        kinds: &[EventKind],
+        a: Audience,
+        cursor: Option<&Cursor>,
+        limit: i64,
+    ) -> Result<EventPage> {
+        let limit = limit.clamp(1, MAX_LIMIT);
+        let Some((sql, binds)) = events_sql(who, kinds, a, cursor, limit + 1) else {
             return Ok(EventPage::default());
         };
         let mut q = sqlx::query_as::<_, Event>(sqlx::AssertSqlSafe(sql.as_str()));
@@ -715,7 +801,14 @@ mod tests {
 
     #[test]
     fn the_public_statement_reads_only_its_tables() {
-        let (sql, _) = events_sql(1, IP, &EventKind::ALL, Audience::Public, None, 51).unwrap();
+        let (sql, _) = events_sql(
+            Subject::Ip { id: 1, ip: IP },
+            &EventKind::ALL,
+            Audience::Public,
+            None,
+            51,
+        )
+        .unwrap();
         for t in [
             "uploads",
             "canaries",
@@ -726,8 +819,26 @@ mod tests {
         ] {
             assert!(!sql.contains(t), "{t}: {sql}");
         }
-        assert!(events_sql(1, IP, &[], Audience::Admin, None, 51).is_none());
-        assert!(events_sql(1, IP, &[EventKind::Upload], Audience::Public, None, 51).is_none());
+        assert!(
+            events_sql(
+                Subject::Ip { id: 1, ip: IP },
+                &[],
+                Audience::Admin,
+                None,
+                51
+            )
+            .is_none()
+        );
+        assert!(
+            events_sql(
+                Subject::Ip { id: 1, ip: IP },
+                &[EventKind::Upload],
+                Audience::Public,
+                None,
+                51
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -745,17 +856,22 @@ mod tests {
         }
     }
 
-    /// Every branch reads its `ip_id` (intel: `ip`) index, never the table.
+    /// Every branch reads its `ip_id` (intel: `ip`) index, never the table,
+    /// for one address and for a campaign's members.
     #[tokio::test]
     async fn every_branch_searches_an_index() {
         let (s, ip, _) = seeded().await;
         let c = Cursor::parse(Some("2026-10-01 10:00:05"), Some("request.3"));
-        for (a, cur) in [
-            (Audience::Admin, None),
-            (Audience::Admin, c.as_ref()),
-            (Audience::Public, c.as_ref()),
+        let one = Subject::Ip { id: ip, ip: IP };
+        let campaign = Subject::Campaign(IP);
+        for (who, a, cur) in [
+            (one, Audience::Admin, None),
+            (one, Audience::Admin, c.as_ref()),
+            (one, Audience::Public, c.as_ref()),
+            (campaign, Audience::Admin, None),
+            (campaign, Audience::Admin, c.as_ref()),
         ] {
-            let (sql, binds) = events_sql(ip, IP, &EventKind::ALL, a, cur, 51).unwrap();
+            let (sql, binds) = events_sql(who, &EventKind::ALL, a, cur, 51).unwrap();
             let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
                 "EXPLAIN QUERY PLAN {sql}"
             )));
@@ -778,10 +894,14 @@ mod tests {
             for line in plan.lines().filter(|l| l.starts_with("SCAN ")) {
                 assert!(line.starts_with("SCAN (subquery-"), "{a:?}: {line}\n{plan}");
             }
-            for t in [
-                "r USING INDEX idx_requests_ip_ts",
-                "u USING INDEX idx_uploads_ip",
-            ] {
+            // A campaign's branches read each member through an `ip_id`
+            // index (SQLite may pick `idx_requests_ip_severity`: the IN
+            // list needs the sort either way).
+            let req = match who {
+                Subject::Ip { .. } => "SEARCH r USING INDEX idx_requests_ip_ts",
+                Subject::Campaign(_) => "SEARCH r USING INDEX idx_requests_ip_",
+            };
+            for t in [req, "SEARCH u USING INDEX idx_uploads_ip"] {
                 assert!(a == Audience::Public || plan.contains(t), "{t}\n{plan}");
             }
         }
