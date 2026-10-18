@@ -35,6 +35,16 @@ pub struct Target {
 }
 
 impl Target {
+    /// Where an `AS{n}` badge leads: the network's page for an admin, the
+    /// filtered IP list for the public (the page needs a session).
+    pub fn asn_href(&self, asn: &i64) -> String {
+        if self.admin.is_some() {
+            crate::admin::asn::asn_href(*asn)
+        } else {
+            format!("/ips?asn={asn}")
+        }
+    }
+
     /// `[group, node, state]` of every probe, for the live stream.
     pub fn probe_states(&self) -> String {
         crate::admin::probes::states_json(&self.probes)

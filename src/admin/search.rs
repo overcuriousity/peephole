@@ -126,7 +126,7 @@ async fn search(
             format!("/admin/lookup?ip={}", urlencode(&ip.to_string()))
         }),
         Input::Net(n) => Some(format!("/ips?q={}", urlencode(&n.to_string()))),
-        Input::Asn(n) => Some(format!("/ips?asn={n}")),
+        Input::Asn(n) => Some(crate::admin::asn::asn_href(n.into())),
         Input::Number(n) => {
             if st.store.request_by_id(n).await?.is_some() {
                 found.push(("Request", format!("/admin/requests/{n}")));

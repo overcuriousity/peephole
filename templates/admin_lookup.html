@@ -101,7 +101,7 @@
   {% for x in n.rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{% let country = x.country.clone() %}{% include "_country.html" %}</td><td>{% if let Some(a) = x.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ x.request_count }}</td><td>{% let sev = x.max_severity %}{% include "_severity.html" %}</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
   {% if let Some(a) = n.asn %}
-  <h3>Same ASN · <a href="/ips?asn={{ a }}">AS{{ a }}</a></h3>
+  <h3>Same ASN · <a href="/admin/asn/{{ a }}">AS{{ a }}</a></h3>
   {% if n.asn_rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
   <p class="muted small">{{ crate::admin::views::thousands(n.asn_count) }} recorded{% if n.asn_count > n.asn_rows.len() as i64 %}, the first {{ n.asn_rows.len() }} shown{% endif %}</p>
   <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>

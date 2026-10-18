@@ -1643,6 +1643,40 @@ show_labels = {show_labels}
             .unwrap()
     }
 
+    /// An admin's `AS{n}` badges lead to the network's page; the public
+    /// ones keep the filtered list (the page needs a session).
+    #[tokio::test]
+    async fn asn_badges_lead_admins_to_the_network_page() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            admin.matches("href=\"/admin/asn/64500\"").count(),
+            2,
+            "{admin}"
+        );
+        assert!(!admin.contains("/ips?asn="), "{admin}");
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            public.matches("href=\"/ips?asn=64500\"").count(),
+            2,
+            "{public}"
+        );
+        assert!(!public.contains("/admin/asn/"), "{public}");
+        // The list itself is unchanged: no roll-up on it.
+        for cookie in [Some(cookie.as_str()), None] {
+            let (status, list) = get_with(&app, "/ips?asn=64500", cookie).await;
+            assert_eq!(status, 200);
+            assert!(list.contains("href=\"/ip/203.0.113.2\""), "{list}");
+            assert!(!list.contains("/admin/asn/"), "{list}");
+            assert!(!list.contains("Open ports"), "{list}");
+        }
+    }
+
     #[tokio::test]
     async fn the_ip_page_lists_uploads_and_webshell_commands_to_the_admin_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;

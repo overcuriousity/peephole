@@ -7043,7 +7043,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     );
     assert!(unknown.contains("Not kept: the cluster does not record it."));
     assert!(
-        unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
+        unknown.contains("Same ASN") && unknown.contains("/admin/asn/64500"),
         "{unknown}"
     );
     // Only the Counter-scan card, whose buy adds the address unseen

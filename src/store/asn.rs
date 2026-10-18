@@ -95,13 +95,18 @@ pub(crate) mod tests {
     use super::*;
     use crate::store::requests::NewRequest;
 
-    /// Two IPs in AS 64500 (labelled requests, one open port on the first,
-    /// both in one campaign) and one in AS 64501.
     pub(crate) async fn seeded() -> Store {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         std::mem::forget(dir);
         let s = Store::connect(&path).await.unwrap();
+        seed(&s).await;
+        s
+    }
+
+    /// Two IPs in AS 64500 (labelled requests, one open port on the first,
+    /// both in one campaign) and one in AS 64501.
+    pub(crate) async fn seed(s: &Store) {
         let req = |ip_id, sev, labels: &str| NewRequest {
             ip_id,
             method: "GET".into(),
@@ -162,13 +167,14 @@ pub(crate) mod tests {
         .await
         .unwrap();
         for ip in [a.id, b.id] {
-            sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.1')")
-                .bind(ip)
-                .execute(&s.pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.1')",
+            )
+            .bind(ip)
+            .execute(&s.pool)
+            .await
+            .unwrap();
         }
-        s
     }
 
     #[tokio::test]
