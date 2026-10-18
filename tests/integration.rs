@@ -990,6 +990,40 @@ async fn admin_pages_and_deletes_with_session() {
         "method chip keeps path, drops page"
     );
     assert!(rows.contains("class=\"chip\" href=\"/requests?method=GET\""));
+    // A webshell command opens exactly the requests that sent it.
+    let mut shell = Vec::new();
+    for q in ["cmd=ls+-la", "cmd=id"] {
+        shell.push(
+            store
+                .insert_request(&peephole::store::requests::NewRequest {
+                    ip_id: ip78.id,
+                    method: "GET".into(),
+                    path: "/up/shell.php".into(),
+                    query: Some(q.into()),
+                    answer: Some("webshell".into()),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let rows = get("/requests?cmd=ls%20-la")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rows.contains(&format!("/admin/requests/{}\"", shell[0]))
+            && !rows.contains(&format!("/admin/requests/{}\"", shell[1])),
+        "the command filter finds only its requests"
+    );
+    assert!(
+        rows.contains("Webshell command: <span class=\"mono\">ls -la</span>"),
+        "command chip"
+    );
     let rows = get("/requests").await.unwrap().text().await.unwrap();
     assert!(!rows.contains("class=\"chip\""), "no filter, no chips");
     // Quick filters are always there and apply in one click.

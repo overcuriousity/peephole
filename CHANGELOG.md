@@ -5,6 +5,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Added
+
+- The command sent to a dropped webshell is stored in a column of its own
+  (migration 0042, `requests.cmd`), set at insert and backfilled in the
+  background for older rows. Admins filter the requests search by it with
+  `/requests?cmd=` (chip "Webshell command").
+
 ## [0.17.0] - 2026-10-18
 
 Campaign clustering v2 and upload lures. One database migration (0041),
