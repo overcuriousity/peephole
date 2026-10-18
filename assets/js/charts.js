@@ -370,11 +370,11 @@
       if (dsHost) {
         var dem = pts.map(function (p) { return p.demand; }), sup = pts.map(function (p) { return p.supply; });
         hourChart(dsHost, xs, [{ cls: "line supply", values: sup }, { cls: "line demand", values: dem }], function (i) {
-          return hourLabel(xs[i]) + "<br>demand <b>" + dem[i].toFixed(1) + "</b> · supply <b>" + sup[i].toFixed(1) + "</b> per hour";
+          return hourLabel(xs[i]) + "<br>sold here <b>" + dem[i].toFixed(1) + "</b> · offered here <b>" + sup[i].toFixed(1) + "</b> per hour";
         }, { height: 120, fmt: function (v) { return compact(Math.round(v)); } });
       }
       if (twin) {
-        var t = "<table><caption>" + esc(series.label) + ": price per hour (UTC)</caption><tr><th>Hour</th><th>This node</th><th>Members, lowest</th><th>Median</th><th>Highest</th><th>Demand</th><th>Supply</th></tr>";
+        var t = "<table><caption>" + esc(series.label) + ": price per hour (UTC)</caption><tr><th>Hour</th><th>This node</th><th>Members, lowest</th><th>Median</th><th>Highest</th><th>Sold here</th><th>Offered here</th></tr>";
         pts.forEach(function (p, i) { t += "<tr><td>" + hourLabel(p.hour) + "</td><td>" + cr(own[i]) + "</td><td>" + cr(lo[i]) + "</td><td>" + cr(med[i]) + "</td><td>" + cr(hi[i]) + "</td><td>" + p.demand.toFixed(1) + "</td><td>" + p.supply.toFixed(1) + "</td></tr>"; });
         twin.innerHTML = t + "</table>";
       }

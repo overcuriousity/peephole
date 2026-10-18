@@ -187,7 +187,8 @@ fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
 }
 
 /// One good in the price table: this node's price, its move over 24
-/// hours, what members announce, and its demand and supply now.
+/// hours, what members announce, what sells and is offered here, and
+/// the same across the cluster.
 struct GoodRow {
     key: String,
     label: String,
@@ -197,8 +198,14 @@ struct GoodRow {
     change: Option<(String, &'static str)>,
     /// Lowest–highest that members announce; empty: nobody does.
     band: String,
+    /// Sold and offered by this node, per hour.
     demand: String,
     supply: String,
+    /// Sold across the cluster (receipts in the replicated ledger) and
+    /// offered by members (announced capacity), per hour; a dash before
+    /// the cluster figures are known.
+    cluster_demand: String,
+    cluster_supply: String,
     /// Prices over 7 days, in credits, for the sparkline.
     spark: String,
 }
@@ -245,6 +252,11 @@ fn shown_change(pct: f64) -> (String, &'static str) {
 }
 
 /// What a good is called on the page.
+/// A rate per hour with one decimal; a dash when it is not known.
+fn per_hour(v: Option<f64>) -> String {
+    v.map_or("\u{2014}".to_string(), |v| format!("{v:.1}"))
+}
+
 fn good_label(good: &str) -> String {
     match good {
         credits::price::SCAN => "Scan job".into(),
@@ -564,6 +576,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
                 },
                 demand: format!("{:.1}", last.demand),
                 supply: format!("{:.1}", last.supply),
+                cluster_demand: per_hour(last.cluster_demand),
+                cluster_supply: per_hour(last.cluster_supply),
                 spark: serde_json::to_string(
                     &pts.iter()
                         .filter_map(charted)
@@ -722,6 +736,13 @@ async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cluster_rate_shows_a_dash_until_it_is_known() {
+        assert_eq!(per_hour(None), "\u{2014}");
+        assert_eq!(per_hour(Some(3.0)), "3.0");
+        assert_eq!(per_hour(Some(2.46)), "2.5");
+    }
 
     #[test]
     fn days_and_times_read_as_utc() {
