@@ -1046,9 +1046,28 @@ pub struct IpAdminData {
     pub decoys: (i64, i64, i64),
     /// Names looked up or seen in scans (`ip_names`).
     pub names: Vec<crate::store::probes::NameRow>,
+    /// Its newest uploads and webshell commands, up to [`IP_DROPS`] each
+    /// (one more is loaded, to tell there are more).
+    pub uploads: Vec<crate::store::uploads::UploadRow>,
+    pub webshell: Vec<crate::store::inspect::WebshellHit>,
 }
 
+/// Uploads and webshell commands the IP page lists before linking on.
+pub const IP_DROPS: usize = 10;
+
 impl IpAdminData {
+    /// The uploads to list, and whether there are more.
+    pub fn uploads_shown(&self) -> (&[crate::store::uploads::UploadRow], bool) {
+        let n = self.uploads.len().min(IP_DROPS);
+        (&self.uploads[..n], self.uploads.len() > IP_DROPS)
+    }
+
+    /// The webshell commands to list, and whether there are more.
+    pub fn webshell_shown(&self) -> (&[crate::store::inspect::WebshellHit], bool) {
+        let n = self.webshell.len().min(IP_DROPS);
+        (&self.webshell[..n], self.webshell.len() > IP_DROPS)
+    }
+
     /// The most other IPs any one host key or certificate links this IP to.
     pub fn linked_ips(&self) -> i64 {
         self.host_keys
@@ -1602,6 +1621,150 @@ show_labels = {show_labels}
             home.contains(&format!("/admin/api/recent?after={max}\"")),
             "{home}"
         );
+    }
+
+    /// A webshell command from `ip`; its request id.
+    async fn webshell_cmd(st: &AdminState, ip: &str, cmd: &str) -> i64 {
+        let ip = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+        st.store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/s.php".into(),
+                query: Some(format!("cmd={cmd}")),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: Some("webshell".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_ip_page_lists_uploads_and_webshell_commands_to_the_admin_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let uid =
+            crate::store::uploads::seed_upload(&st.store, "203.0.113.30", "/s.php", b"<?php x")
+                .await;
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.31", "/t.php", b"other").await;
+        webshell_cmd(&st, "203.0.113.30", "whoami").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(html.contains("Uploads and webshell commands"), "{html}");
+        assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
+        assert!(html.contains(">whoami</td>"), "{html}");
+        assert!(!html.contains("All its uploads"), "{html}");
+        assert!(!html.contains("All its webshell requests"), "{html}");
+        // The public page has none of it.
+        let (status, public) = get_with(&app, "/ip/203.0.113.30", None).await;
+        assert_eq!(status, 200);
+        assert!(
+            !public.contains("Uploads and webshell commands"),
+            "{public}"
+        );
+        assert!(!public.contains("/admin/uploads/"), "{public}");
+        assert!(!public.contains("whoami"), "{public}");
+        // An address with neither: no section.
+        let (_, none) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
+        assert!(!none.contains("Uploads and webshell commands"), "{none}");
+    }
+
+    #[tokio::test]
+    async fn the_ip_page_caps_uploads_and_commands_and_links_on() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        for i in 0..=IP_DROPS {
+            let path = format!("/s{i}.php");
+            crate::store::uploads::seed_upload(&st.store, "203.0.113.30", &path, path.as_bytes())
+                .await;
+            webshell_cmd(&st, "203.0.113.30", "id").await;
+        }
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.31", "/t.php", b"other").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
+        assert_eq!(html.matches("\">upload</a>").count(), IP_DROPS, "{html}");
+        assert_eq!(html.matches(">id</td>").count(), IP_DROPS, "{html}");
+        assert!(html.contains("/admin/uploads?ip=203.0.113.30\""), "{html}");
+        assert!(
+            html.contains("/requests?ip=203.0.113.30&amp;answer=webshell\""),
+            "{html}"
+        );
+        // The full list holds this address's uploads only.
+        let (status, list) = get_with(&app, "/admin/uploads?ip=203.0.113.30", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            list.matches("href=\"/ip/203.0.113.30\">203.0.113.30</a></td>")
+                .count(),
+            IP_DROPS + 1,
+            "{list}"
+        );
+        assert!(!list.contains("203.0.113.31"), "{list}");
+    }
+
+    #[tokio::test]
+    async fn the_request_page_shows_its_upload_command_and_campaign() {
+        let (st, _d) = state(true).await;
+        let uid =
+            crate::store::uploads::seed_upload(&st.store, "203.0.113.30", "/s.php", b"<?php x")
+                .await;
+        let (up_id,): (i64,) = sqlx::query_as(
+            "SELECT r.id FROM requests r JOIN uploads u ON u.request_uid = r.uid WHERE u.uid = ?",
+        )
+        .bind(&uid)
+        .fetch_one(&st.store.pool)
+        .await
+        .unwrap();
+        let cmd_id = webshell_cmd(&st, "203.0.113.30", "uname%20-a").await;
+        let ip = st.store.ip_by_addr("203.0.113.30").await.unwrap().unwrap();
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.30', 7, ?, 2, '', '', 1, 0, 1, '')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.30')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, up) = get_with(&app, &format!("/admin/requests/{up_id}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(up.contains(&format!("/admin/uploads/{uid}\"")), "{up}");
+        assert!(up.contains("member of campaign #7"), "{up}");
+        assert!(!up.contains("Webshell command"), "{up}");
+        let (_, cmd) = get_with(&app, &format!("/admin/requests/{cmd_id}"), Some(&cookie)).await;
+        assert!(cmd.contains("<pre class=\"panel\">uname -a</pre>"), "{cmd}");
+        assert!(cmd.contains("member of campaign #7"), "{cmd}");
+        assert!(!cmd.contains("/admin/uploads/"), "{cmd}");
+        // Without a session the page is not served at all.
+        for id in [up_id, cmd_id] {
+            let (status, body) = get_with(&app, &format!("/admin/requests/{id}"), None).await;
+            assert_ne!(status, 200);
+            assert!(
+                !body.contains("campaign #7") && !body.contains("uname"),
+                "{body}"
+            );
+        }
+        // A request with neither: no section, no chip.
+        let other = st.store.ip_by_addr("203.0.113.9").await.unwrap().unwrap();
+        let (plain,): (i64,) = sqlx::query_as("SELECT id FROM requests WHERE ip_id = ?")
+            .bind(other.id)
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        let (_, plain) = get_with(&app, &format!("/admin/requests/{plain}"), Some(&cookie)).await;
+        assert!(!plain.contains("id=\"drops\""), "{plain}");
+        assert!(!plain.contains("member of campaign"), "{plain}");
     }
 
     async fn admin_cookie(st: &AdminState) -> String {

@@ -54,6 +54,25 @@
   <p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">Show the decoy requests</a></p>
 </section>
 {% endif %}
+{% if !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
+<section class="card" id="drops" data-section="drops">
+  <div class="card-head"><h2>Uploads and webshell commands</h2></div>
+  {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
+  <h3>Uploads</h3>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Type</th><th></th></tr></thead><tbody>
+  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono" title="{{ u.hash() }}">{{ u.hash()[..12] }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
+  </tbody></table></div>
+  {% if more_ups %}<p><a href="/admin/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
+  {% endif %}
+  {% let (cmds, more_cmds) = adm.webshell_shown() %}{% if !cmds.is_empty() %}
+  <h3>Webshell commands</h3>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>Verb</th><th></th></tr></thead><tbody>
+  {% for w in cmds %}<tr><td class="mono">{{ w.ts }}</td><td class="mono" title="{{ w.command }}">{{ w.verb() }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ w.request_id }}">inspect</a></td></tr>{% endfor %}
+  </tbody></table></div>
+  {% if more_cmds %}<p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=webshell">All its webshell requests →</a></p>{% endif %}
+  {% endif %}
+</section>
+{% endif %}
 {% endif %}
 
 <section class="card" data-section="activity">

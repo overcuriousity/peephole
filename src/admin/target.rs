@@ -3,7 +3,7 @@
 //! aggregation added here appears in both.
 use crate::admin::AdminState;
 use crate::admin::error::AppResult;
-use crate::admin::public::{IntelCard, IpAdminData, ScanWithPorts, intel_cards};
+use crate::admin::public::{IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards};
 use crate::store::browse::{Audience, IpOverview, Page, RequestListRow};
 use crate::store::requests::IpRow;
 use std::sync::Arc;
@@ -146,6 +146,14 @@ pub async fn load(
             canary_links: state.store.canary_links_for_ip(ip.id).await?,
             decoys: state.store.decoy_counts_for_ip(ip.id).await?,
             names: state.store.names_for_ip(ip.id).await?,
+            uploads: state
+                .store
+                .uploads_for_ip(ip.id, IP_DROPS as i64 + 1)
+                .await?,
+            webshell: state
+                .store
+                .webshell_hits_for_ip(ip.id, IP_DROPS as i64 + 1)
+                .await?,
         })
     } else {
         None
