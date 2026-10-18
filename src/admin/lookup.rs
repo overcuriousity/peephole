@@ -636,7 +636,7 @@ pub async fn run(
     let held = async {
         let row = state.store.ip_by_addr(&ip.to_string()).await?;
         let target = match &row {
-            Some(r) => crate::admin::target::load(state, r, true, 1, false).await?,
+            Some(r) => crate::admin::target::load(state, r, true, None, false).await?,
             None => None,
         };
         let near = match target {

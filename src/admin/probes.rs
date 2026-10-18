@@ -1281,7 +1281,7 @@ secure_cookies = false
         use askama::Template;
         let (state, _c, _id, _d) = state(Some(8080), "").await;
         let row = state.store.ip_by_addr(IP).await.unwrap().unwrap();
-        let mut t = crate::admin::target::load(&state, &row, true, 1, true)
+        let mut t = crate::admin::target::load(&state, &row, true, None, true)
             .await
             .unwrap()
             .unwrap();
@@ -1429,7 +1429,7 @@ secure_cookies = false
         use askama::Template;
         let (state, _c, _id, _d) = state(Some(8080), "").await;
         let row = state.store.ip_by_addr(IP).await.unwrap().unwrap();
-        let t = crate::admin::target::load(&state, &row, true, 1, true)
+        let t = crate::admin::target::load(&state, &row, true, None, true)
             .await
             .unwrap()
             .unwrap();
@@ -1485,7 +1485,7 @@ secure_cookies = false
         );
 
         // While a probe waits, its button says how far it got.
-        let mut t = crate::admin::target::load(&state, &row, true, 1, true)
+        let mut t = crate::admin::target::load(&state, &row, true, None, true)
             .await
             .unwrap()
             .unwrap();

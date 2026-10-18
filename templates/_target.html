@@ -76,7 +76,7 @@
 {% endif %}
 
 <section class="card" data-section="activity">
-  <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span>{% if t.window_days > 0 %}<span class="muted">this node keeps {{ t.window_days }} days</span>{% endif %}</div>
+  <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span>{% if t.window_days > 0 %}<span class="muted">this node keeps {{ t.window_days }} days</span>{% endif %}{% if chrome.authed %}<a href="/requests?ip={{ t.ov.ip.ip|urlencode }}">All requests →</a>{% endif %}</div>
   <div class="ip-activity">
     <div>
       <span class="label">Last 7 days</span>
@@ -89,6 +89,7 @@
     <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
     <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in t.ov.calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
   </div>
+  {% include "_events.html" %}
 </section>
 
 {% if t.labels && !t.ov.families.is_empty() %}
@@ -144,27 +145,5 @@
   <div class="card-head"><h2>False-positive claims</h2></div>
   {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
   {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
-</section>
-{% endif %}
-
-{% if chrome.authed %}
-<section class="card" data-section="requests">
-  <div class="card-head"><h2>Requests</h2></div>
-  <div class="table-wrap wide"><table>
-    <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th><th></th></tr></thead>
-    <tbody>
-    {% for r in t.page.items %}
-      <tr data-sev="{{ r.severity }}">
-        <td class="ts">{{ r.ts }}</td><td class="mono">{{ r.method }}</td>
-        <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
-        <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-        <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
-        <td class="nowrap">{% include "_canary_marks.html" %}<a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>
-      </tr>
-    {% endfor %}
-    {% if t.page.items.is_empty() %}<tr><td colspan="6" class="empty">No requests recorded.</td></tr>{% endif %}
-    </tbody>
-  </table></div>
-  {% if t.paged %}{% let page = t.page %}{% let qs = "" %}{% include "_pagination.html" %}{% else if t.page.has_next %}<p class="muted"><a href="/ip/{{ t.ov.ip.ip }}">All requests on its page →</a></p>{% endif %}
 </section>
 {% endif %}

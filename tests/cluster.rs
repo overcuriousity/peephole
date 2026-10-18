@@ -6978,7 +6978,13 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         .unwrap();
     let on_ip_page = sections(&ip_page);
     assert!(
-        on_ip_page.contains(&"scans".to_string()) && on_ip_page.contains(&"requests".to_string())
+        on_ip_page.contains(&"scans".to_string())
+            && on_ip_page.contains(&"activity".to_string())
+            && !on_ip_page.contains(&"requests".to_string())
+    );
+    // The Timeline replaced the Requests table on both (MIK-497).
+    assert!(
+        ip_page.contains("<table class=\"events\">") && result.contains("<table class=\"events\">")
     );
     assert_eq!(sections(&result), on_ip_page, "one source for both pages");
     assert!(result.contains("Asked now") && result.contains("node-bravo"));
