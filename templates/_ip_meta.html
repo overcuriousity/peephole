@@ -1,9 +1,10 @@
 {# Country, network and first/last seen of a recorded address (`t`: admin::target::Target). #}
 <div class="meta">
-  {% if t.ov.ip.unseen %}<span>{% include "_unseen.html" %} <span class="muted">added by an operator for a counter-scan; no traffic recorded</span></span>{% endif %}
+  {% if t.ov.ip.unseen %}<span>{% include "_unseen.html" %}</span>{% endif %}
   {% if let Some(c) = t.ov.ip.country %}<a href="/ips?country={{ c }}">{{ crate::admin::countries::flag(c) }} {{ crate::admin::countries::country_name(c) }}</a>{% else %}<span class="muted">country unknown</span>{% endif %}
-  {% if let Some(a) = t.ov.ip.asn %}<a href="{{ t.asn_href(a) }}">{{ t.ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span></a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
+  {% if let Some(a) = t.ov.ip.asn %}<a href="{{ t.asn_href(a) }}">{{ t.ov.ip.asn_org.as_deref().unwrap_or("") }} <span class="mono muted">AS{{ a }}</span> · {{ crate::admin::views::thousands(t.asn_ips()) }} IP{% if t.asn_ips() != 1 %}s{% endif %}</a>{% else %}<span class="muted">ASN unknown</span>{% endif %}
   {% if let Some((key, num)) = t.campaign %}<a class="chip" href="/admin/campaigns/{{ key }}">member of campaign #{{ num }}</a>{% endif %}
+  {% if t.admin.is_some() %}<a class="chip" href="{{ crate::admin::views::link_href("ip", t.ov.ip.ip.as_str()) }}">link graph</a>{% endif %}
   {% if t.ov.ip.unseen %}<span>added <span class="mono">{{ crate::admin::views::minute(t.ov.ip.first_seen) }}</span> UTC</span>{% else %}
   <span>first seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.first_seen) }}</span> UTC</span>
   <span>last seen <span class="mono">{{ crate::admin::views::minute(t.ov.ip.last_seen) }}</span> UTC</span>{% endif %}

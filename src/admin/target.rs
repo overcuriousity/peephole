@@ -59,6 +59,12 @@ impl Target {
         }
     }
 
+    /// Recorded IPs in its ASN, itself included when it has traffic (the
+    /// count in the overview is of the others).
+    pub fn asn_ips(&self) -> i64 {
+        self.ov.asn_count + i64::from(self.ov.request_count > 0)
+    }
+
     /// `[group, node, state]` of every probe, for the live stream.
     pub fn probe_states(&self) -> String {
         crate::admin::probes::states_json(&self.probes)
