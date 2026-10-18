@@ -207,6 +207,10 @@ mod tests {
         ] {
             assert!(list.contains(want), "{want} missing:\n{list}");
         }
+        // Short strings (MIK-494): the edge rules live on /admin/links only.
+        assert!(list.contains("recomputed hourly. <a href=\"/admin/links\">What counts →</a>"));
+        assert!(list.contains("· no edge</span>"));
+        assert!(!list.contains("not one operator"), "{list}");
         let (_, _, few) = send(&app, get("/admin/campaigns?min=3", true), Body::empty()).await;
         assert!(few.contains("/admin/campaigns/192.0.2.3"));
         assert!(!few.contains("/admin/campaigns/198.51.100.10"));
@@ -224,6 +228,19 @@ mod tests {
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
+        for want in [
+            "<a href=\"/admin/campaigns\">← All campaigns</a>",
+            "soft · <a href=\"/admin/links\">what counts →</a>",
+            "<span class=\"muted\">per day, last 26 weeks, UTC</span>",
+        ] {
+            assert!(a.contains(want), "{want} missing:\n{a}");
+        }
+        for gone in [
+            "Computed from the stored rows",
+            "only ever support a path edge",
+        ] {
+            assert!(!a.contains(gone), "{gone} still there:\n{a}");
+        }
         let at = |s: &str| a.find(s).unwrap_or_else(|| panic!("{s} missing"));
         assert!(at("<h2>Members</h2>") < at("data-link-graph"));
         assert!(at("data-link-graph") < at("<h2>Evidence</h2>"));
@@ -235,6 +252,8 @@ mod tests {
         .await;
         assert!(b.contains("131 shared shapes"), "{b}");
         assert!(b.contains("/.env"), "shapes listed:\n{b}");
+        assert!(b.contains("<th class=\"num\">IPs in dataset</th>"), "{b}");
+        assert!(!b.contains("normalized paths most members"), "{b}");
         let (_, _, d) = send(
             &app,
             get("/admin/campaigns/198.51.100.30", true),

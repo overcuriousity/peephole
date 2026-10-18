@@ -6984,7 +6984,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     assert!(result.contains("Asked now") && result.contains("node-bravo"));
     assert!(result.contains(&format!("charged {}", peephole::credits::show(cost as u64))));
     assert!(
-        result.contains("kept in the dataset"),
+        result.contains("Kept: the cluster records this address."),
         "the cluster recorded this address"
     );
 
@@ -7041,7 +7041,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         unknown.contains("198.51.100.0/24") && unknown.contains("198.51.100.77"),
         "{unknown}"
     );
-    assert!(unknown.contains("not kept"));
+    assert!(unknown.contains("Not kept: the cluster does not record it."));
     assert!(
         unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
         "{unknown}"
@@ -7049,10 +7049,7 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     // Only the Counter-scan card, whose buy adds the address unseen
     // (MIK-329).
     assert_eq!(sections(&unknown), ["actions"], "{unknown}");
-    assert!(
-        unknown.contains("Buying a scan adds the address"),
-        "{unknown}"
-    );
+    assert!(unknown.contains("buying a scan adds it"), "{unknown}");
 }
 
 /// The Credits page: where credits come from, what this node holds, what

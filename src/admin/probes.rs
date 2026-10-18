@@ -1318,6 +1318,13 @@ secure_cookies = false
             html.contains("location claim contradicted by 1 of 1 vantages"),
             "{html}"
         );
+        // Short heading notes (MIK-494).
+        assert!(html.contains("<div class=\"card-head\"><h2>Probes</h2></div>"));
+        assert!(
+            html.contains("Location <span class=\"muted\">· RTT vs claimed geolocation</span>")
+        );
+        assert!(html.contains("Fingerprints <span class=\"muted\">· per vantage</span>"));
+        assert!(!html.contains("before a restart"), "{html}");
     }
 
     #[tokio::test]
@@ -1468,6 +1475,14 @@ secure_cookies = false
         assert!(html.contains("<b>L4</b><span>no scanner</span>"), "{html}");
         assert!(html.contains("balance <span class=\"num\">515.46</span>"));
         assert!(html.contains("data-flash-here"));
+        assert!(html.contains(
+            "<h3 class=\"action-label\" title=\"read what the ports present\">Probe</h3>"
+        ));
+        assert!(html.contains("<h3 class=\"action-label\">Counter-scan</h3>"));
+        assert!(
+            !html.contains("less than a day old is shown instead"),
+            "{html}"
+        );
 
         // While a probe waits, its button says how far it got.
         let mut t = crate::admin::target::load(&state, &row, true, 1, true)
@@ -1500,7 +1515,7 @@ secure_cookies = false
             scans: vec![],
         };
         let html = ActionsCard { t, a, first: true }.render().unwrap();
-        assert!(html.contains("Probing · 1 of 3 in"), "{html}");
+        assert!(html.contains("Probing 1/3"), "{html}");
         assert!(
             !html.contains("data-busy=\"Asking…\""),
             "no second probe meanwhile"

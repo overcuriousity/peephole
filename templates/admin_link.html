@@ -29,7 +29,6 @@
       <dt>Sightings</dt><dd>{{ crate::admin::views::thousands(it.sightings) }}</dd>
       <dt>First seen</dt><dd>{{ crate::admin::views::when(it.first_seen.as_deref()) }}</dd>
       <dt>Last seen</dt><dd>{{ crate::admin::views::when(it.last_seen.as_deref()) }}</dd>
-      {% if !it.countries.is_empty() %}<dt>Countries</dt><dd>{{ it.countries.join(", ") }}</dd>{% endif %}
       {% if !it.nodes.is_empty() %}<dt>Nodes</dt><dd>{{ it.nodes.join(", ") }}</dd>{% endif %}
       {% if !it.detail.is_empty() %}<dt>Detail</dt><dd class="plain">{{ it.detail }}</dd>{% endif %}
     {% else %}

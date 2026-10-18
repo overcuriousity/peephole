@@ -2,7 +2,7 @@
 {% block title %}peephole — uploads{% endblock %}
 {% block content %}
 {% let sub = "uploads" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Uploads</h1><p class="muted">Files dropped on the trap. Content is kept by hash and never served, run, shown or unpacked; it leaves only as a zip encrypted with the password <span class="mono">infected</span>.</p></div></div>
+<div class="page-head"><div><h1>Uploads</h1><p class="muted">Files dropped on the trap, kept by hash; download only as a zip (password <span class="mono">infected</span>).</p></div></div>
 <div class="stack">
 <section class="card">
   {% if let Some(a) = ip %}<div class="card-head"><h2>From <a class="mono" href="/ip/{{ a }}">{{ a }}</a></h2><a href="/admin/uploads">all uploads</a></div>{% endif %}
