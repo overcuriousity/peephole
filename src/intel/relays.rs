@@ -316,7 +316,7 @@ impl Relays {
             Err(e) => {
                 static WARNED: Mutex<Option<(PathBuf, SystemTime, u64)>> = Mutex::new(None);
                 let key = (path.clone(), stamp.0, stamp.1);
-                let mut w = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+                let mut w = crate::lock::MutexExt::lock_or_recover(&WARNED);
                 if w.as_ref() != Some(&key) {
                     tracing::warn!(
                         file = %path.display(),
