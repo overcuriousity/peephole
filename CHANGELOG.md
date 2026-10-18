@@ -69,7 +69,8 @@ and exports and `/api/v1` gain `is_tor_relay`.
   collapsed section. The
   edge rules are on `/admin/links` only. The node page shows a member's
   credit balance as the member itself counts it.
-- Dependency updates (MIK-518): #96, #97, #98, #99, #101, #102, #103, #104.
+- Dependency updates (MIK-518, #148): zstd, uuid, toml, hyper, serde_json
+  and the CI actions (#96–#99, #101–#104).
 
 ### Fixed
 
