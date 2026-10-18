@@ -325,6 +325,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let pool = store.pool.clone();
         async move { store::webshell_cmd::backfill(&pool).await }
     });
+    background.backfill("rdap networks", "derived stored intel rows", {
+        let pool = store.pool.clone();
+        async move { store::rdap_net::backfill(&pool).await }
+    });
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();
