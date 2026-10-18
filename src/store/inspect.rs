@@ -217,6 +217,50 @@ pub struct IpIntelRow {
 /// Lookups per provider shown on the IP page.
 pub const INTEL_HISTORY_PER_PROVIDER: i64 = 50;
 
+/// A command sent to a webshell the trap answered as dropped (MIK-121).
+#[derive(Debug, Clone)]
+pub struct WebshellHit {
+    pub request_id: i64,
+    pub ts: String,
+    /// The command as sent (attacker text), cut to the trap's limit.
+    pub command: String,
+}
+
+impl WebshellHit {
+    /// Its verb, as the public dashboard tallies it.
+    pub fn verb(&self) -> &'static str {
+        crate::model::webshell::verb(&self.command)
+    }
+}
+
+impl Store {
+    /// Up to `limit` of the commands an address sent dropped webshells,
+    /// newest first. A request without a readable command is left out.
+    pub async fn webshell_hits_for_ip(&self, ip_id: i64, limit: i64) -> Result<Vec<WebshellHit>> {
+        type Row = (i64, String, Option<String>, Option<Vec<u8>>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT r.id, r.ts, r.query, r.body FROM requests r
+             WHERE r.ip_id = ? AND r.answer = 'webshell' ORDER BY r.ts DESC, r.id DESC LIMIT ?",
+        )
+        .bind(ip_id)
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(request_id, ts, query, body)| {
+                let command =
+                    crate::model::webshell::extract_command(query.as_deref(), body.as_deref())?;
+                Some(WebshellHit {
+                    request_id,
+                    ts,
+                    command,
+                })
+            })
+            .collect())
+    }
+}
+
 impl Store {
     /// Every provider's results for one IP from the lookup history, newest
     /// first per provider (at most [`INTEL_HISTORY_PER_PROVIDER`] each), with
