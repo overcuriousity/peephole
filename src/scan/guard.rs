@@ -31,55 +31,61 @@ pub enum TorStatus {
     Unknown,
 }
 
-/// The scanner's own view of the exit list file (`<data_dir>/tor-exit.txt`,
-/// fetched or copied from the cluster by the intel scheduler), reloaded when
-/// the file changes. A list that fails the sanity check, or whose file is
-/// older than [`tor::MAX_AGE`] (fetching kept failing), counts as none.
+/// The scanner's own view of the exit list file (`<data_dir>/tor-exit.txt`)
+/// and the Onionoo relay index (`tor-relays.json`), fetched or copied from
+/// the cluster by the intel scheduler, reloaded when either file changes.
+/// A bulk list that fails the sanity check, or whose file is older than
+/// [`tor::MAX_AGE`] (fetching kept failing), counts as none; so does an
+/// index that fails its own check (`relays::Relays::load`). With neither,
+/// the Tor status of an IP is unknown.
 pub struct TorView {
-    path: PathBuf,
-    stamp: Option<(SystemTime, u64)>,
-    list: Option<TorExitList>,
-    /// The loaded list went stale (warned once).
-    stale: bool,
+    dir: PathBuf,
+    stamps: Option<[Option<(SystemTime, u64)>; 2]>,
+    list: TorExitList,
+}
+
+fn stamp(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
 }
 
 impl TorView {
     pub fn new(data_dir: &std::path::Path) -> Self {
         Self {
-            path: data_dir.join("tor-exit.txt"),
-            stamp: None,
-            list: None,
-            stale: false,
+            dir: data_dir.to_path_buf(),
+            stamps: None,
+            list: TorExitList::default(),
         }
     }
 
     fn refresh(&mut self) {
-        let stamp = std::fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| Some((m.modified().ok()?, m.len())));
-        if stamp != self.stamp {
-            self.stamp = stamp;
-            self.list = stamp
-                .and_then(|_| TorExitList::load(self.path.parent()?).ok())
-                .filter(|l| l.len() as u64 > MIN_EXITS);
+        let bulk = stamp(&self.dir.join("tor-exit.txt"));
+        let stamps = [bulk, stamp(&crate::intel::relays::file(&self.dir))];
+        if Some(stamps) != self.stamps {
+            self.stamps = Some(stamps);
+            self.list = TorExitList::load(&self.dir).unwrap_or_default();
+            if self.list.len() as u64 <= MIN_EXITS {
+                self.list = self.list.without_bulk();
+            }
         }
-        // On every call: an unchanged file still ages.
-        let stale = self.list.is_some() && stamp.is_some_and(|(t, _)| tor::too_old(t));
-        if stale && !self.stale {
+        // On every call: an unchanged file still ages. Warned once: the
+        // bulk list is dropped until the file changes.
+        if self.list.len() > 0 && bulk.is_some_and(|(t, _)| tor::too_old(t)) {
             tracing::warn!(
-                file = %self.path.display(),
-                "tor exit list older than {} h: the Tor status of IPs is unknown \
-                 until a fresh list loads (see scan.tor_unknown)",
+                file = %self.dir.join("tor-exit.txt").display(),
+                "tor exit list older than {} h: not used until a fresh list loads; \
+                 without a relay index the Tor status of IPs is unknown (see scan.tor_unknown)",
                 tor::MAX_AGE.as_secs() / 3600
             );
+            self.list = self.list.without_bulk();
         }
-        self.stale = stale;
     }
 
-    /// The list, if a sane and fresh one is loaded.
+    /// The list, if a sane and fresh bulk list or relay index is loaded.
     fn current(&mut self) -> Option<&TorExitList> {
         self.refresh();
-        self.list.as_ref().filter(|_| !self.stale)
+        Some(&self.list).filter(|l| !l.is_empty())
     }
 
     /// Whether a sane, fresh list is loaded.
@@ -682,7 +688,8 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        v.stamp = Some((old, v.stamp.unwrap().1));
+        let s = v.stamps.as_mut().unwrap();
+        s[0] = Some((old, s[0].unwrap().1));
         assert!(!v.loaded());
         assert_eq!(v.local(&"198.18.0.7".parse().unwrap()), None, "unknown");
         // Loaded stale from the start: none either.

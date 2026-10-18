@@ -47,9 +47,12 @@ pub fn stale(data_dir: &Path) -> bool {
         .is_ok_and(too_old)
 }
 
+/// The bulk list, and the Onionoo relay index when a sane one is loaded
+/// (`super::relays`): an address is an exit if either says so.
 #[derive(Clone, Default)]
 pub struct TorExitList {
     set: BTreeSet<IpAddr>,
+    relays: Option<std::sync::Arc<super::relays::Relays>>,
 }
 
 fn file(data_dir: &Path) -> PathBuf {
@@ -57,9 +60,17 @@ fn file(data_dir: &Path) -> PathBuf {
 }
 
 impl TorExitList {
-    /// The list file in `data_dir`; empty when there is none or it is
-    /// [`stale`].
+    /// The list file in `data_dir`, empty when there is none or it is
+    /// [`stale`], and the relay index there if it is sane.
     pub fn load(data_dir: &Path) -> Result<Self> {
+        let relays = super::relays::Relays::load(data_dir).map(std::sync::Arc::new);
+        Ok(Self {
+            relays,
+            ..Self::load_bulk(data_dir)?
+        })
+    }
+
+    fn load_bulk(data_dir: &Path) -> Result<Self> {
         let path = file(data_dir);
         if !path.exists() {
             return Ok(Self::default());
@@ -74,21 +85,48 @@ impl TorExitList {
         }
         let text = std::fs::read_to_string(&path).context("reading tor exit list")?;
         let set = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
-        Ok(Self { set })
+        Ok(Self { set, relays: None })
     }
 
-    /// Whether no list is loaded (so nothing can be said about any IP).
+    /// Whether neither a bulk list nor a relay index is loaded (so nothing
+    /// can be said about any IP).
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.set.is_empty() && self.relays().is_none()
     }
 
-    /// Addresses in the list.
+    /// Addresses in the bulk list.
     pub fn len(&self) -> usize {
         self.set.len()
     }
 
+    /// Whether `ip` is an exit: on the bulk list, or one by the relay index.
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.set.contains(ip)
+        self.set.contains(ip) || self.relays().is_some_and(|r| r.is_exit(ip))
+    }
+
+    /// Where the exit status of `ip` comes from: "bulk list", "Onionoo".
+    pub fn exit_sources(&self, ip: &IpAddr) -> Vec<&'static str> {
+        let mut out = vec![];
+        if self.set.contains(ip) {
+            out.push("bulk list");
+        }
+        if self.relays().is_some_and(|r| r.is_exit(ip)) {
+            out.push("Onionoo");
+        }
+        out
+    }
+
+    /// The relay index, while it is not older than [`MAX_AGE`].
+    pub fn relays(&self) -> Option<&super::relays::Relays> {
+        self.relays.as_deref().filter(|r| !r.too_old())
+    }
+
+    /// The same without the bulk list (gone stale), keeping the index.
+    pub fn without_bulk(&self) -> Self {
+        Self {
+            set: BTreeSet::new(),
+            relays: self.relays.clone(),
+        }
     }
 
     /// Download a fresh list; on failure the old file is left untouched.

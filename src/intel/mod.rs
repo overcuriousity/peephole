@@ -7,6 +7,7 @@ pub mod provider;
 pub mod rdap;
 pub mod rdap_check;
 pub mod rdns;
+pub mod relays;
 pub mod share;
 pub mod shodan;
 pub mod tor;
@@ -14,6 +15,8 @@ pub mod tor;
 /// Provider names in `ip_intel` records.
 pub const MAXMIND: &str = "maxmind-geolite2";
 pub const TOR: &str = "tor-exits";
+/// The Onionoo relay index (GH #138); `TOR` keeps meaning "exit".
+pub const TOR_RELAYS: &str = "tor-relays";
 pub const ABUSEIPDB: &str = "abuseipdb";
 pub const SHODAN: &str = "shodan";
 pub const INTERNETDB: &str = "shodan-internetdb";
@@ -47,6 +50,17 @@ pub const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         public: true,
         api: false,
         tag_prefix: "tor",
+        redistributable: true,
+        ipv6: true,
+    },
+    // Public: anonymous visitors see "Tor exit" / "Tor relay (roles)" only;
+    // nickname, fingerprint and the rest are admin-only (`intel_facts`).
+    ProviderInfo {
+        name: TOR_RELAYS,
+        label: "Tor relays (Onionoo)",
+        public: true,
+        api: false,
+        tag_prefix: "tor-relay",
         redistributable: true,
         ipv6: true,
     },
@@ -118,6 +132,7 @@ pub fn tags(provider: &str, data: &serde_json::Map<String, serde_json::Value>) -
         ABUSEIPDB => abuseipdb::tags(data),
         SHODAN | INTERNETDB => shodan::tags(data),
         RDAP => rdap::tags(data),
+        TOR_RELAYS => relays::tags(data),
         _ => vec![],
     }
 }
@@ -163,6 +178,7 @@ pub fn providers(
     let mut out: Providers = vec![
         Arc::new(provider::MaxMind(geo.clone())),
         Arc::new(provider::TorExits(tor.clone())),
+        Arc::new(provider::TorRelays(tor.clone())),
         Arc::new(rdap::Rdap::with_shared(rdap.clone())),
     ];
     if let Some(a) = &cfg.abuseipdb {
@@ -198,7 +214,7 @@ pub fn providers(
             refresh,
         )));
     }
-    let api: Vec<&str> = out.iter().skip(3).map(|p| p.name()).collect();
+    let api: Vec<&str> = out.iter().skip(4).map(|p| p.name()).collect();
     if !api.is_empty() {
         info!(providers = ?api, "API enrichment providers configured");
     }
@@ -865,14 +881,16 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
 /// that. Without a list their Tor status is unknown (`scan.tor_unknown`);
 /// IPs already recorded as exits stay exits.
 fn drop_stale_tor(tor: &SharedTor, cfg: &Config) {
-    if tor.read_or_recover().is_empty() || !tor::stale(&cfg.data_dir) {
+    if tor.read_or_recover().len() == 0 || !tor::stale(&cfg.data_dir) {
         return;
     }
     warn!(
         "tor exit list older than {} h: unloaded until a fresh one is fetched",
         tor::MAX_AGE.as_secs() / 3600
     );
-    *tor.write_or_recover() = tor::TorExitList::default();
+    // The relay index stays: it ages on its own (`TorExitList::relays`).
+    let kept = tor.read_or_recover().without_bulk();
+    *tor.write_or_recover() = kept;
 }
 
 /// Warn, at most hourly, while no Tor exit list is loaded: Tor exits cannot
@@ -907,6 +925,12 @@ pub async fn run_scheduler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let store = rec.store().clone();
+    tokio::spawn(relays_loop(
+        rec.clone(),
+        cfg.clone(),
+        tor.clone(),
+        shutdown.clone(),
+    ));
     if let Recorder::Cluster(node) = &rec {
         return run_cluster(node.clone(), cfg, geo, tor, rdap, shutdown).await;
     }
@@ -970,6 +994,76 @@ pub async fn run_scheduler(
         }
         tokio::select! {
             _ = tokio::time::sleep_until(tor_next.min(mm_next).min(rdap_next)) => {}
+            _ = shutdown.changed() => { break; }
+        }
+    }
+}
+
+/// The Onionoo relay index (GH #138), in a task of its own: the answer is
+/// tens of megabytes, and a slow fetch must not hold up the exit list or
+/// the MaxMind refresh. Standalone it is fetched daily like the exit list;
+/// in a cluster when it is this node's turn ([`share::due`]), and members
+/// copy it in the main loop. A 304 from Onionoo counts as a fetch.
+async fn relays_loop(
+    rec: Recorder,
+    cfg: Config,
+    tor: SharedTor,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut backoff = TOR_BACKOFF;
+    let mut next = tokio::time::Instant::now();
+    loop {
+        let now = tokio::time::Instant::now();
+        let due = match &rec {
+            Recorder::Cluster(node) => {
+                let age = share::manifests(&node.store)
+                    .await
+                    .ok()
+                    .and_then(|m| m.get(share::RELAYS).map(share::Manifest::age_hours))
+                    .unwrap_or(f64::INFINITY);
+                let members = node.members();
+                let all: Vec<_> = node
+                    .live_members(LIVE_WINDOW)
+                    .iter()
+                    .map(|id| (*id, members.get(id).is_some_and(|m| m.address.is_some())))
+                    .collect();
+                (node.started.elapsed() > ELECTION_GRACE || members.len() <= 1)
+                    && share::rank(node.id(), &all).is_some_and(|r| share::due(r, age))
+            }
+            _ => true,
+        };
+        if due && now >= next {
+            match relays::Relays::refresh(&cfg.data_dir).await {
+                Ok(r) => {
+                    if let relays::Refreshed::Updated(n) = r {
+                        info!(n, "tor relay index refreshed");
+                        reload(&[share::RELAYS.to_string()], &cfg, &tor);
+                    }
+                    backoff.reset();
+                    next = now + Duration::from_secs(24 * 3600);
+                    if let Recorder::Cluster(node) = &rec
+                        && relays::file(&cfg.data_dir).exists()
+                        && let Err(e) = share::publish(node, &cfg.data_dir, &[share::RELAYS]).await
+                    {
+                        let wait = backoff.fail();
+                        warn!(?e, retry_in_secs = wait.as_secs(), "announcing tor relay index failed");
+                        next = now + wait;
+                    }
+                }
+                Err(e) => {
+                    let wait = backoff.fail();
+                    warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "tor relay index refresh failed; keeping previous");
+                    next = now + wait;
+                }
+            }
+        }
+        // In a cluster the turn can come any time; standalone only `next`.
+        let wake = match &rec {
+            Recorder::Cluster(_) => now + INTEL_TICK,
+            _ => next,
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(wake) => {}
             _ = shutdown.changed() => { break; }
         }
     }
@@ -1039,7 +1133,7 @@ pub async fn note_cluster_intel(
 pub const MAXMIND_CLUSTER_SEEN: &str = "maxmind_cluster_seen";
 
 fn reload(kinds: &[String], cfg: &Config, tor: &SharedTor) {
-    if kinds.iter().any(|k| k == share::TOR) {
+    if kinds.iter().any(|k| k == share::TOR || k == share::RELAYS) {
         match tor::TorExitList::load(&cfg.data_dir) {
             Ok(l) => *tor.write_or_recover() = l,
             Err(e) => warn!(?e, "tor exit list reload failed"),
