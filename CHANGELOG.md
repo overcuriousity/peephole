@@ -5,6 +5,57 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-18
+
+Campaign clustering v2 and upload lures. One database migration (0041),
+applied on start; every node recomputes its campaigns on the first start of
+this version. No protocol change, no new setting.
+
+### Added
+
+- Upload lures (MIK-486): file POSTs to the upload scripts bots use
+  (UEditor `action_upload.php`, `UploadFile.php`, `api.ali.php`,
+  `metadatauploader`, the wp-file-manager and laravel-filemanager
+  connectors) are taken as script uploads; `admin-ajax.php` is not. A
+  file-manager decoy (`wp_filemanager.php`, elFinder's landing pages,
+  wp-file-manager's admin page) answers its landing probes with an upload
+  form posting to a taken script, so the probe goes on to the upload
+  (`DECOY_V` 4).
+- Admin IP and request pages (MIK-480): the IP page gets an admin-only
+  "Uploads and webshell commands" section (newest ten of each, with their
+  upload kind), linking on to `/admin/uploads?ip=` and
+  `/requests?ip=&answer=webshell`; the request page links the uploads it
+  carried, shows the command it sent a webshell, and the campaign chip of
+  its IP.
+- `peephole store campaigns-eval [CONFIG]` (MIK-484) compares the campaign
+  parameters on the stored rows and prints the result. It derives path
+  shapes into the database it is given: run it on a copy.
+
+### Changed
+
+- Campaign clustering v2 (MIK-483, MIK-485; `CAMPAIGN_V` 2): a soft edge
+  also weighs request order. Two IPs that first asked for their shared rare
+  path shapes in the same order (agreement at or above 0.5) count like a
+  JA4 and JA4H match, and the edge's reason ends in "order agrees" on the
+  campaign page and in the link graph. A chaining guard merges two groups
+  of two or more IPs over soft edges only when at least two soft edges join
+  them, so one look-alike pair no longer chains two campaigns into one;
+  soft edges between groups that stay apart are withheld. The
+  `recompute-campaigns` report gains one line counting withheld soft
+  edges, vetoed pairs and the candidate pairs with a known order.
+  Migration 0041 adds `campaign_edges.agreement`. A new version can split a
+  campaign and give the split-off parts new keys: join dataset exports
+  made by the same version.
+- A tarpitted source's upload is taken, not held (MIK-486): the upload
+  skips the tarpit before a hold is taken, so the source's next request is
+  still held. The per-source, daily and store gates are unchanged.
+
+### Security
+
+- `zip` 8 → 9.0.5 (MIK-488) clears the read-side advisories
+  RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369. The export
+  writer is unchanged.
+
 ## [0.16.0] - 2026-10-16
 
 Campaign clustering (roadmap item 2): source IPs tied together by shared
