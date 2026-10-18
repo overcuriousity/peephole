@@ -373,6 +373,28 @@ fn compile_ci(pattern: &str) -> Result<Regex> {
 /// however often it looked.
 const WEAK_LABELS: [&str; 3] = ["probe", "path-scanner", "php-probe"];
 
+/// Labels the classifier gives without a rule having matched: the weak
+/// labels and the behaviour labels (method, proxy, bot tells). A request
+/// carrying only these, or none at all, hit no rule.
+pub const UNMATCHED_LABELS: [&str; 9] = [
+    WEAK_LABELS[0],
+    WEAK_LABELS[1],
+    WEAK_LABELS[2],
+    "form-interaction",
+    "write-method",
+    "proxy-probe",
+    "unusual-method",
+    "automation",
+    "inhuman-behavior",
+];
+
+/// Whether no rule matched a request with these labels.
+pub fn is_unmatched(labels: &[impl AsRef<str>]) -> bool {
+    labels
+        .iter()
+        .all(|l| UNMATCHED_LABELS.contains(&l.as_ref()))
+}
+
 /// Label families, in the order the pages show them: what a request was
 /// after, coarsest first.
 pub const FAMILIES: [&str; 8] = [
@@ -480,6 +502,24 @@ mod tests {
             &BotTells::default(),
         );
         assert!(plain.owasp.is_empty(), "{:?}", plain.owasp);
+    }
+
+    #[test]
+    fn unmatched_means_no_rule_label() {
+        let named = classifier().classify(
+            &view("GET", "/.env", None, "curl/8", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(!is_unmatched(&named.labels), "{:?}", named.labels);
+        let plain = classifier().classify(
+            &view("GET", "/nonexistent", None, "Mozilla/5.0", None),
+            &hist(1, 1),
+            &BotTells::default(),
+        );
+        assert!(is_unmatched(&plain.labels), "{:?}", plain.labels);
+        assert!(is_unmatched(&["form-interaction"]));
+        assert!(is_unmatched(&[] as &[&str]));
     }
 
     #[test]
