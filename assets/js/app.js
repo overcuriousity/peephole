@@ -278,7 +278,9 @@
       var tr = document.createElement("tr"), sev = Math.max(0, Math.min(4, r.severity | 0));
       tr.setAttribute("data-sev", sev); tr.className = "is-new";
       var chips = (r.labels || []).map(function (l, i) { var f = (r.families || [])[i]; return '<span class="badge badge-label' + (f && f !== "other" ? " badge-cat-" + resc(f) : "") + '">' + resc(l) + "</span>"; }).join("") +
-        (r.owasp || []).map(function (o) { return '<span class="badge badge-owasp">' + resc(o) + "</span>"; }).join("");
+        (r.owasp || []).map(function (o) { return '<span class="badge badge-owasp">' + resc(o) + "</span>"; }).join("") +
+        (r.new_shape ? '<span class="badge badge-new" title="path shape first seen in the last 24 h">new</span>' : "") +
+        (r.wave ? '<span class="badge badge-wave" title="path shape formed an exploit wave">wave</span>' : "");
       tr.innerHTML = '<td class="ts">' + resc(r.ts) + '</td><td class="ip"><a href="/ip/' + resc(r.ip) + '">' + resc(r.ip) + "</a>" + (r.country ? ' <span class="flag" title="' + resc(region(r.country)) + '">' + flag(r.country) + "</span>" : "") +
         '</td><td class="mono">' + resc(r.method) + '</td><td class="path"><a href="/admin/requests/' + resc(r.id) + '">' + resc(r.path) + "</a></td>" +
         '<td><span class="sev sev-' + sev + '" title="severity ' + sev + '">' + sev + '</span></td><td><span class="chips">' + chips + "</span></td>";

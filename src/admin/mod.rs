@@ -19,6 +19,7 @@ pub mod lookup;
 pub mod overview;
 pub mod pages;
 pub mod password;
+pub mod paths;
 pub mod probes;
 pub mod public;
 pub mod scan_buy;
@@ -181,6 +182,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(paths::routes())
         .merge(asn::routes())
         .merge(decoys::routes())
         .merge(search::routes())

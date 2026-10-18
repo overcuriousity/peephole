@@ -341,6 +341,72 @@ license_key = "k"
     }
 
     #[tokio::test]
+    async fn recent_rows_flag_new_shapes() {
+        use crate::cluster::record::{Record, RequestRec};
+        use crate::store::data::{Ctx, apply};
+        use axum::response::IntoResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, store) = admin(&dir).await;
+        let at = |ago: chrono::Duration| {
+            (chrono::Utc::now() - ago)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let mut conn = store.pool.acquire().await.unwrap();
+        for (uid, ts, path) in [
+            ("a", at(chrono::Duration::days(2)), "/old/shape"),
+            ("b", at(chrono::Duration::zero()), "/old/shape"),
+            ("c", at(chrono::Duration::zero()), "/fresh/shape"),
+        ] {
+            let r = Record::Request(Box::new(RequestRec {
+                uid: uid.into(),
+                ts,
+                ip: "192.0.2.1".into(),
+                method: "GET".into(),
+                path: path.into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            }));
+            let ctx = Ctx {
+                origin: None,
+                hlc: 1,
+            };
+            apply(&mut conn, ctx, &r).await.unwrap();
+        }
+        drop(conn);
+        let state = Arc::new(AdminState::public_only(store, cfg));
+        let body = sse(recent_events(state, 1, None))
+            .into_response()
+            .into_body();
+        let mut chunks = body.into_data_stream();
+        let event = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let c = chunks.next().await.unwrap().unwrap();
+                let c = String::from_utf8_lossy(&c).into_owned();
+                if c.contains("event: requests") {
+                    return c;
+                }
+            }
+        })
+        .await
+        .expect("a requests event");
+        let data = event
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(data).unwrap();
+        assert_eq!(rows.len(), 2, "{data}");
+        assert!(data.contains("\"new_shape\":true"), "{data}");
+        assert!(data.contains("\"new_shape\":false"), "{data}");
+        for r in rows {
+            let fresh = r["path"] == "/fresh/shape";
+            assert_eq!(r["new_shape"], fresh, "{r}");
+            assert_eq!(r["wave"], false, "{r}");
+        }
+    }
+
+    #[tokio::test]
     async fn store_error_yields_comment_not_empty_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, store) = admin(&dir).await;
