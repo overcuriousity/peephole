@@ -138,7 +138,6 @@ IPs page shows.
       "asn": 6805,
       "asn_org": "Telefonica Germany",
       "is_tor": false,
-  "is_tor_relay": null,
       "is_tor_relay": null,
       "first_seen": "2026-10-03T14:02:11Z",
       "last_seen": "2026-10-10T08:41:57Z",
