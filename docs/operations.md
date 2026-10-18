@@ -478,7 +478,7 @@ peephole owner show                       # this node's owner and the nodes that
 peephole owner forget-key [--force]       # this node no longer keeps the key; it stays owned
 peephole owner release                    # this node has no owner afterwards
 peephole credits                          # this node's credits, by day
-peephole credits log [--days N]           # earned, spent, sent, received (up to 7 days)
+peephole credits log [--days N]           # earned, spent, sent, received, sold per day and good (up to 7 days)
 peephole credits members                  # every member's balance and whether it earns here
 peephole credits uptime                  # members' reported hours up, 7 days
 peephole credits send <node> <amount>     # send credits to a member

@@ -420,9 +420,25 @@ disputed with every answer. The other providers show the newest result.
 - **Every node counts for itself**, from its own copy of the log. There is no
   vote and no shared chain; `Cluster › Credits` shows the market as this node
   sees it: each good's price over 7 days beside the spread members announce,
-  its demand and supply, this node's daily income by source and spending,
-  every member's holdings and reported hours up. Prices are kept hourly in
-  `price_history` (local, 8 days; the last refresh of an hour stands for it).
+  this node's daily income by source and spending, every member's holdings
+  and reported hours up. Prices are kept hourly in `price_history` (local,
+  8 days; the last refresh of an hour stands for it).
+- **Sold and offered, per hour.** The price table has two column pairs.
+  *Sold here* and *Cluster sold* both count charged receipts in the
+  replicated ledger (amount above 0, payer not the payee) in the hour:
+  sold here those paid to this node, cluster sold all of them. A late
+  receipt still lands in its hour: each refresh recounts the previous one
+  too. *Offered here* is this node's own capacity per hour; *Cluster
+  offered* is, for scans, the summed capacity of the live scanners, and
+  for a provider this node's daily allowance plus the `on_demand` that
+  live members announce, per hour. A good members announce nothing for
+  (name resolution, reverse names, probes, relays) shows "—", as does a
+  cluster column before its first refresh. Audits have no row of their
+  own: an audit is bought like a scan and counts under scan.
+- **Relays leased.** A node that cannot be dialled (no `advertise`) lists
+  on the Credits page, and `peephole credits` after the balance, the
+  relay leases it holds: relay, until when, and the price in credits per
+  hour.
   The scanner table shows, per level, what one delivered result costs with
   each scanner, the cheapest in bold. The balance itself is on the Overview
   and the Lookup page.
