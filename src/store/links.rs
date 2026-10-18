@@ -347,6 +347,9 @@ pub struct LinkIp {
     pub asn: Option<i64>,
     pub sightings: i64,
     pub last_seen: Option<String>,
+    /// The campaign the address is a member of: its key and number.
+    pub campaign_key: Option<String>,
+    pub campaign_num: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -438,8 +441,11 @@ impl Store {
             return Ok(None);
         }
         let mut q = sqlx::query_as::<_, LinkIp>(sqlx::AssertSqlSafe(format!(
-            "SELECT i.ip, i.country, i.asn, COUNT(*) AS sightings, MAX(s.ts) AS last_seen
+            "SELECT i.ip, i.country, i.asn, COUNT(*) AS sightings, MAX(s.ts) AS last_seen,
+                    c.key AS campaign_key, c.num AS campaign_num
              FROM ({s}) s JOIN ips i ON i.id = s.ip_id
+             LEFT JOIN campaign_members m ON m.ip_id = s.ip_id
+             LEFT JOIN campaigns c ON c.key = m.campaign_key
              GROUP BY s.ip_id ORDER BY sightings DESC, i.ip LIMIT {ITEM_IPS}"
         )));
         for b in &binds {

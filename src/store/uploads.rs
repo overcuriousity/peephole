@@ -592,22 +592,33 @@ const UPLOAD_COLS: &str = "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type
     (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
     FROM uploads u JOIN ips i ON i.id = u.ip_id";
 
-/// One page of uploads, newest first; with `ip`, only that address's.
+/// One page of uploads, newest first; with `ip`, only that address's;
+/// with `sha256`, only that content's (an equality on
+/// `idx_uploads_sha256`, so the clause is left out when it is unset).
 pub async fn list(
     conn: &mut SqliteConnection,
     page: u32,
     ip: Option<&str>,
+    sha256: Option<&[u8]>,
 ) -> Result<super::browse::Page<UploadRow>> {
     use super::browse::{PAGE_SIZE, Page, offset};
     let page = page.max(1);
-    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {UPLOAD_COLS} WHERE ?1 IS NULL OR i.ip = ?1 ORDER BY u.id DESC LIMIT ?2 OFFSET ?3"
+    let by_hash = if sha256.is_some() {
+        " AND u.sha256 = ?4"
+    } else {
+        ""
+    };
+    let mut q = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} WHERE (?1 IS NULL OR i.ip = ?1){by_hash}
+         ORDER BY u.id DESC LIMIT ?2 OFFSET ?3"
     )))
     .bind(ip)
     .bind(PAGE_SIZE + 1)
-    .bind(offset(page))
-    .fetch_all(&mut *conn)
-    .await?;
+    .bind(offset(page));
+    if let Some(h) = sha256 {
+        q = q.bind(h);
+    }
+    let rows = q.fetch_all(&mut *conn).await?;
     Ok(Page::from_rows(rows, page))
 }
 
@@ -1321,12 +1332,30 @@ mod tests {
         assert_eq!((sha, bytes), (held.sha256.clone(), b"kept".to_vec()));
         assert!(content_for_export(&mut c, "g").await.unwrap().is_none());
         assert!(content_for_export(&mut c, "nope").await.unwrap().is_none());
-        let page = list(&mut c, 1, None).await.unwrap();
+        let page = list(&mut c, 1, None, None).await.unwrap();
         let got: Vec<_> = page
             .items
             .iter()
             .map(|u| (u.uid.as_str(), u.held))
             .collect();
         assert_eq!(got, [("g", false), ("h", true)]);
+
+        // The sha256 pivot (MIK-498): only that content, through its index.
+        let page = list(&mut c, 1, None, Some(&held.sha256)).await.unwrap();
+        let got: Vec<_> = page.items.iter().map(|u| u.uid.as_str()).collect();
+        assert_eq!(got, ["h"]);
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT u.id FROM uploads u JOIN ips i ON i.id = u.ip_id
+             WHERE (?1 IS NULL OR i.ip = ?1) AND u.sha256 = ?2",
+        )
+        .bind(None::<&str>)
+        .bind(&held.sha256)
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter().any(|r| r.3.contains("idx_uploads_sha256")),
+            "{plan:?}"
+        );
     }
 }
