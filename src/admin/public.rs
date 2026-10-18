@@ -776,6 +776,9 @@ pub(crate) fn intel_facts(provider: &str, data: &serde_json::Value, admin: bool)
     if let Some(fields) = api_fields(provider) {
         return api_facts(fields, obj, admin && provider == crate::intel::RDAP);
     }
+    if provider == crate::intel::TOR_RELAYS {
+        return tor_relay_facts(obj, admin);
+    }
     // Known fields first, in reading order; the map itself is sorted by key.
     const ORDER: [&str; 4] = ["exit", "country", "asn", "asn_org"];
     let mut fields: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
@@ -825,6 +828,169 @@ pub(crate) fn intel_facts(provider: &str, data: &serde_json::Value, admin: bool)
         out.push(fact("Result", "nothing known about this address", false));
     }
     out
+}
+
+/// The relay page on Tor Metrics, for a well-formed fingerprint (the data
+/// may come from any member).
+fn relay_link(fp: &str) -> Option<String> {
+    (fp.len() == 40 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("https://metrics.torproject.org/rs.html#details/{fp}"))
+}
+
+fn strs(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|x| match x {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// A `tor-relays` result: one line saying what the address is, then (admin
+/// only) each relay. The public sees "Tor exit" or "Tor relay (roles)",
+/// never which relay (MIK-507).
+fn tor_relay_facts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    admin: bool,
+) -> Vec<IntelFact> {
+    let exit = obj.get("exit").and_then(|e| e.as_bool()) == Some(true);
+    let relays: Vec<&serde_json::Map<String, serde_json::Value>> = obj
+        .get("relays")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_object())
+        .collect();
+    let text = |r: &serde_json::Map<String, serde_json::Value>, k: &str| {
+        r.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let summary = if exit {
+        match admin {
+            true => format!(
+                "Tor exit ({}, source: {})",
+                obj.get("family").and_then(|f| f.as_str()).unwrap_or("?"),
+                strs(obj.get("exit_sources")).join(" / ")
+            ),
+            false => "Tor exit".into(),
+        }
+    } else if let Some(r) = relays.first() {
+        let roles = strs(r.get("roles"));
+        match admin {
+            true => format!(
+                "{} relay {}, non-exit",
+                roles.first().map_or("middle", String::as_str),
+                text(r, "nickname")
+            ),
+            false => {
+                let mut all: Vec<String> = vec![];
+                for x in relays.iter().flat_map(|r| strs(r.get("roles"))) {
+                    if !all.contains(&x) {
+                        all.push(x);
+                    }
+                }
+                format!("Tor relay ({})", all.join(", "))
+            }
+        }
+    } else {
+        "not a Tor relay".into()
+    };
+    let mut out = vec![fact("Tor", summary, false)];
+    if !admin {
+        return out;
+    }
+    for r in relays {
+        let fp = text(r, "fingerprint");
+        let link = relay_link(&fp);
+        out.push(IntelFact {
+            href: link.clone(),
+            ..fact("Relay", text(r, "nickname"), false)
+        });
+        out.push(IntelFact {
+            href: link,
+            ..fact("Fingerprint", fp, true)
+        });
+        out.push(fact("Roles", strs(r.get("roles")).join(", "), false));
+        let exits = r.get("exit").and_then(|e| e.as_bool()) == Some(true);
+        out.push(fact(
+            "Exit",
+            if exits { "exits" } else { "non-exit" },
+            false,
+        ));
+        out.push(fact("ORPort", strs(r.get("or_ports")).join(", "), true));
+        let since = text(r, "first_seen");
+        if !since.is_empty() {
+            out.push(fact("Since", since.get(..10).unwrap_or(&since), true));
+        }
+        if let Some(n) = r.get("family_size").and_then(|n| n.as_u64()) {
+            let s = if n == 1 { "" } else { "s" };
+            out.push(fact("Family", format!("{n} relay{s}"), false));
+        }
+        let version = text(r, "version");
+        if !version.is_empty() {
+            out.push(fact("Version", version, true));
+        }
+    }
+    out
+}
+
+/// Admin: what other sources say that fits the relay, for the `tor-relays`
+/// card: a Shodan `tor` tag, its ORPort open in Shodan's view or in this
+/// node's counter-scans (`open_ports`). None when there is no relay or
+/// nothing fits.
+fn tor_consistency(rows: &[IpIntelRow], open_ports: &[u16]) -> Option<String> {
+    let newest = |p: &str| {
+        rows.iter()
+            .find(|r| r.provider == p)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.data_json).ok())
+    };
+    let tor = newest(crate::intel::TOR_RELAYS)?;
+    let or_ports: Vec<u64> = tor
+        .get("relays")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.get("or_ports")?.as_array())
+        .flatten()
+        .filter_map(|p| p.as_u64())
+        .collect();
+    let mut said = vec![];
+    for (p, name) in [
+        (crate::intel::SHODAN, "Shodan"),
+        (crate::intel::INTERNETDB, "Shodan InternetDB"),
+    ] {
+        let Some(d) = newest(p) else { continue };
+        if strs(d.get("tags")).iter().any(|t| t == "tor") {
+            said.push(format!("{name} tags it tor"));
+        }
+        let open: Vec<String> = d
+            .get("ports")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_u64())
+            .filter(|p| or_ports.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        if !open.is_empty() {
+            said.push(format!("ORPort {} open in {name}", open.join(", ")));
+        }
+    }
+    let scanned: Vec<String> = open_ports
+        .iter()
+        .filter(|p| or_ports.contains(&u64::from(**p)))
+        .map(|p| p.to_string())
+        .collect();
+    if !scanned.is_empty() {
+        said.push(format!(
+            "ORPort {} open in a counter-scan",
+            scanned.join(", ")
+        ));
+    }
+    (!said.is_empty()).then(|| format!("consistent: {}", said.join("; ")))
 }
 
 /// `(key, label, monospaced)` of an API provider's fields, in reading order.
@@ -970,6 +1136,18 @@ fn api_facts(
 /// no node names; an admin sees every provider and every node's result.
 /// A known provider without a result still gets a card, saying so.
 pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
+    intel_cards_with_ports(rows, admin, &[])
+}
+
+/// [`intel_cards`], where an admin's `tor-relays` card also says whether
+/// the ports this node's counter-scans found open (`open_ports`) and the
+/// Shodan results fit the relay.
+pub fn intel_cards_with_ports(
+    rows: Vec<IpIntelRow>,
+    admin: bool,
+    open_ports: &[u16],
+) -> Vec<IntelCard> {
+    let consistent = admin.then(|| tor_consistency(&rows, open_ports)).flatten();
     let mut by_provider: Vec<(String, Vec<IpIntelRow>)> = Vec::new();
     for r in rows {
         match by_provider.iter_mut().find(|(p, _)| *p == r.provider) {
@@ -1006,7 +1184,12 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
                     node: if admin { r.node.clone() } else { None },
                 }
             });
-            let newest = results.next();
+            let mut newest = results.next();
+            if name == crate::intel::TOR_RELAYS
+                && let (Some(n), Some(c)) = (newest.as_mut(), &consistent)
+            {
+                n.facts.push(fact("Cross-check", c.clone(), false));
+            }
             let others = if admin { results.collect() } else { vec![] };
             IntelCard {
                 label,
@@ -2719,7 +2902,7 @@ show_labels = {show_labels}
         // Providers without a result share one line, each named.
         let pending = html.split("No result yet: ").nth(1).unwrap();
         let pending = &pending[..pending.find('<').unwrap()];
-        assert_eq!(pending.split(", ").count(), 2, "{pending}");
+        assert_eq!(pending.split(", ").count(), 3, "{pending}");
     }
 
     fn row(provider: &str, data: &str, node: Option<&str>) -> IpIntelRow {
@@ -2730,6 +2913,93 @@ show_labels = {show_labels}
             data_json: data.into(),
             node: node.map(str::to_string),
         }
+    }
+
+    /// GH #138: BEEzar on both its addresses, from the Onionoo fixture.
+    #[test]
+    fn the_tor_relays_card_names_the_guard_and_cross_checks_its_orport() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::intel::relays::write_fixture(dir.path());
+        let list = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
+        let data = |ip: &str| crate::intel::provider::TorRelays::data(&list, ip).to_string();
+        let facts = |f: &[IntelFact]| -> Vec<(String, String)> {
+            f.iter()
+                .map(|f| (f.label.clone(), f.value.clone()))
+                .collect()
+        };
+        for ip in ["144.76.159.218", "2a01:4f8:200:32e6::2"] {
+            let rows = vec![
+                row(crate::intel::TOR_RELAYS, &data(ip), Some("a")),
+                row(
+                    crate::intel::SHODAN,
+                    r#"{"tags":["tor"],"ports":[8443]}"#,
+                    None,
+                ),
+            ];
+            let cards = intel_cards_with_ports(rows.clone(), true, &[8443, 22]);
+            let card = cards
+                .iter()
+                .find(|c| c.name == crate::intel::TOR_RELAYS)
+                .unwrap();
+            let newest = card.newest.as_ref().unwrap();
+            let got = facts(&newest.facts);
+            let want = |l: &str, v: &str| (l.to_string(), v.to_string());
+            assert_eq!(got[0], want("Tor", "guard relay BEEzar, non-exit"), "{ip}");
+            for w in [
+                want("Relay", "BEEzar"),
+                want("Fingerprint", "7EEDD54E5457DA009E46C91BBF1F443DCEE01968"),
+                want("Roles", "guard, hsdir"),
+                want("Exit", "non-exit"),
+                want("ORPort", "8443"),
+                want("Since", "2024-01-01"),
+                want("Family", "1 relay"),
+                want("Version", "0.4.9.9"),
+                want(
+                    "Cross-check",
+                    "consistent: Shodan tags it tor; ORPort 8443 open in Shodan; \
+                     ORPort 8443 open in a counter-scan",
+                ),
+            ] {
+                assert!(got.contains(&w), "{ip}: {w:?} in {got:?}");
+            }
+            let link = "https://metrics.torproject.org/rs.html#details/\
+                        7EEDD54E5457DA009E46C91BBF1F443DCEE01968";
+            let fp = newest
+                .facts
+                .iter()
+                .find(|f| f.label == "Fingerprint")
+                .unwrap();
+            assert_eq!(fp.href.as_deref(), Some(link));
+            // The public: the role, never which relay.
+            let public = intel_cards(rows, false);
+            let card = public
+                .iter()
+                .find(|c| c.name == crate::intel::TOR_RELAYS)
+                .unwrap();
+            let got = facts(&card.newest.as_ref().unwrap().facts);
+            assert_eq!(got, [want("Tor", "Tor relay (guard, hsdir)")]);
+        }
+        // Exits say so, with the family and where it comes from.
+        let exit = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("2001:db8:6::1")).unwrap(),
+            true,
+        );
+        assert_eq!(exit[0].value, "Tor exit (IPv6, source: Onionoo)");
+        let public = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("2001:db8:6::1")).unwrap(),
+            false,
+        );
+        assert_eq!(facts(&public), [("Tor".into(), "Tor exit".into())]);
+        let none = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("192.0.2.99")).unwrap(),
+            true,
+        );
+        assert_eq!(none[0].value, "not a Tor relay");
+        // A malformed fingerprint from a member is shown, not linked.
+        assert_eq!(relay_link("x\"onmouseover"), None);
     }
 
     #[test]
@@ -2747,13 +3017,13 @@ show_labels = {show_labels}
             ]
         };
         let public = intel_cards(rows(), false);
-        assert_eq!(public.len(), 2);
+        assert_eq!(public.len(), 3);
         let tor = &public[0];
         let newest = tor.newest.as_ref().unwrap();
         assert_eq!(newest.facts[0].value, "not listed");
         assert_eq!(newest.node, None);
         assert!(tor.others.is_empty());
-        let geo = public[1].newest.as_ref().unwrap();
+        let geo = public[2].newest.as_ref().unwrap();
         let labels: Vec<_> = geo.facts.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["Country", "ASN", "Organisation"]);
         assert!(geo.facts.iter().any(|f| f.value == "AS64500"));

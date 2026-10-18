@@ -11,6 +11,21 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   (migration 0042, `requests.cmd`), set at insert and backfilled in the
   background for older rows. Admins filter the requests search by it with
   `/requests?cmd=` (chip "Webshell command").
+- Tor relay enrichment from Onionoo (#138): a new `tor-relays` provider says
+  for any IPv4 or IPv6 address whether it is a Tor relay, in which roles
+  and which relay. The admin intel card shows nickname, fingerprint (linked
+  to Tor Metrics), ORPort, first seen, family size and version, and says
+  when a Shodan `tor` tag or an open port matches the ORPort; the public IP
+  page shows only "Tor exit" or "Tor relay (roles)". The relay index is
+  fetched conditionally, sanity-checked like the exit list and shared in the
+  cluster (`tor-relays.json`). Exports and `/api/v1` gain `is_tor_relay`.
+
+### Fixed
+
+- IPv6 Tor exits are refused for counter-scans like IPv4 ones (#138). The
+  bulk exit list holds IPv4 addresses only; Onionoo exit addresses and the
+  ORPorts of exiting relays now count too. See `docs/detection.md` for what
+  the rule covers.
 
 ## [0.17.0] - 2026-10-18
 

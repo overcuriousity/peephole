@@ -2154,6 +2154,41 @@ license_key = "k"
         std::fs::write(dir.join("tor-exit.txt"), list).unwrap();
     }
 
+    /// GH #138: the bulk list holds IPv4 exits only; an IPv6 exit from the
+    /// Onionoo relay index is refused as well, a guard is not. The index
+    /// alone is enough to know (no `tor_unknown` deferral).
+    #[tokio::test]
+    async fn an_ipv6_tor_exit_from_onionoo_is_refused_a_guard_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(dir.path(), "verify_crawlers = false\n");
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        crate::intel::relays::write_fixture(dir.path());
+        let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
+        let source = Source::new(store.local(), cfg.clone(), p, Classifier::builtin());
+        let exit = store
+            .upsert_ip("2001:db8:6::1".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(exit.id, 2, 24).await.unwrap();
+        assert!(source.acquire(&[]).await.unwrap().is_none());
+        let (status, _, error) = status_of(&store, "2001:db8:6::1").await;
+        assert_eq!(
+            (status.as_str(), error.as_deref()),
+            ("refused", Some("Tor exit"))
+        );
+        let guard = store
+            .upsert_ip("2a01:4f8:200:32e6::2".parse().unwrap())
+            .await
+            .unwrap();
+        store.enqueue_scan(guard.id, 2, 24).await.unwrap();
+        let job = source
+            .acquire(&[])
+            .await
+            .unwrap()
+            .expect("a guard is scanned");
+        assert_eq!(job.ip().to_string(), "2a01:4f8:200:32e6::2");
+    }
+
     /// Without an exit list a job waits (default `tor_unknown = "defer"`);
     /// once a list is there it runs, unless the IP is an exit; and after
     /// `tor_wait_hours` without a list it is refused.

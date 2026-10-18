@@ -146,6 +146,7 @@ fn summary_json(s: &IpSummary) -> Value {
         "asn": s.asn,
         "asn_org": s.asn_org,
         "is_tor": s.is_tor,
+        "is_tor_relay": null,
         "first_seen": rfc3339(&s.first_seen),
         "last_seen": rfc3339(&s.last_seen),
         "request_count": s.request_count,
@@ -153,6 +154,30 @@ fn summary_json(s: &IpSummary) -> Value {
         "abuse_score": s.abuse_score,
         "unseen": s.unseen,
     })
+}
+
+/// [`summary_json`] of each, with `is_tor_relay` (GH #138): null while no
+/// node has a `tor-relays` result for the address (or reading them failed;
+/// it is information only).
+async fn summaries_json(state: &AdminState, rows: &[IpSummary]) -> Vec<Value> {
+    let ips: Vec<&str> = rows.iter().map(|s| s.ip.as_str()).collect();
+    let relay = state
+        .store
+        .tor_relay_flags(&ips)
+        .await
+        .inspect_err(
+            |e| tracing::warn!(error = %format!("{e:#}"), "reading tor relay flags failed"),
+        )
+        .unwrap_or_default();
+    rows.iter()
+        .map(|s| {
+            let mut v = summary_json(s);
+            if let Some(r) = relay.get(&s.ip) {
+                v["is_tor_relay"] = (*r).into();
+            }
+            v
+        })
+        .collect()
 }
 
 /// One upload's metadata (MIK-121). Never its content: there is no field
@@ -432,7 +457,7 @@ async fn ips(
         })
     });
     Json(json!({
-        "items": rows.iter().map(summary_json).collect::<Vec<_>>(),
+        "items": summaries_json(&state, &rows).await,
         "next_cursor": next_cursor,
     }))
     .into_response()
@@ -499,10 +524,16 @@ async fn ip_detail(
             .into_iter()
             .map(|n| json!({"name": n.name, "source": n.source, "agreed": n.agreed}))
             .collect();
+        let is_tor_relay = intel
+            .get(crate::intel::TOR_RELAYS)
+            .and_then(|v| v.get("data")?.get("relay"))
+            .cloned()
+            .unwrap_or(Value::Null);
         Ok(Some(json!({
             "ip": ip.ip,
             "geo": {"country": ip.country, "asn": ip.asn, "asn_org": ip.asn_org},
             "is_tor": ip.is_tor_exit,
+            "is_tor_relay": is_tor_relay,
             "severity": ov.max_severity,
             "first_seen": rfc3339(ov.ip.first_seen),
             "last_seen": rfc3339(ov.ip.last_seen),
@@ -567,7 +598,7 @@ async fn lookup(
         Err(e) => return internal(e),
     };
     Json(json!({
-        "results": read.rows.iter().map(summary_json).collect::<Vec<_>>(),
+        "results": summaries_json(&state, &read.rows).await,
         "missing": read.missing,
         "unreadable": read.unreadable,
         "capped": read.capped,
@@ -606,7 +637,7 @@ async fn read_addrs(
 ) -> anyhow::Result<(Vec<Value>, Vec<String>)> {
     let addrs: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
     let r = crate::admin::lookup::bulk_read(state, addrs.iter().map(String::as_str)).await?;
-    Ok((r.rows.iter().map(summary_json).collect(), r.missing))
+    Ok((summaries_json(state, &r.rows).await, r.missing))
 }
 
 async fn name_json(
@@ -2047,6 +2078,26 @@ mod tests {
         assert!(v["intel"].get("tor-exits").is_none(), "tor is not an entry");
         assert_eq!(v["neighbours"]["net"], "203.0.113.0/24");
         assert!(v["rank"].as_i64().unwrap() >= 1);
+        assert!(v["is_tor_relay"].is_null(), "never checked: {v}");
+        // GH #138: a guard relay is a relay, not an exit.
+        state
+            .store
+            .local()
+            .record_intel(
+                "203.0.113.9",
+                crate::intel::TOR_RELAYS,
+                None,
+                serde_json::json!({"relay": true, "exit": false}),
+            )
+            .await
+            .unwrap();
+        let (_, v) = send(&app, authed("GET", "/api/v1/ips/203.0.113.9", &token)).await;
+        assert_eq!(
+            (&v["is_tor"], &v["is_tor_relay"]),
+            (&false.into(), &true.into())
+        );
+        let (_, v) = send(&app, authed("GET", "/api/v1/ips", &token)).await;
+        assert_eq!(v["items"][0]["is_tor_relay"], true, "{v}");
         // Not an address: 400. Not in the dataset: 404.
         let (st, v) = send(&app, authed("GET", "/api/v1/ips/not-an-ip", &token)).await;
         assert_eq!(st, 400);

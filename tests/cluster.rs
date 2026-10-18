@@ -2442,6 +2442,74 @@ async fn only_the_tor_list_is_shared_as_a_file() {
     assert_eq!(share::manifests(&nb.store).await.unwrap().len(), 1);
 }
 
+/// The Onionoo fixture as a `tor-relays.json`, published now, padded with
+/// `pad` middle relays (a sane index needs `relays::MIN_RELAYS`).
+fn relay_index(pad: usize) -> Vec<u8> {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read("tests/fixtures/onionoo-details.json").unwrap())
+            .unwrap();
+    v["relays_published"] = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+        .into();
+    let relays = v["relays"].as_array_mut().unwrap();
+    for i in 0..pad {
+        relays.push(serde_json::json!({
+            "nickname": format!("pad{i}"),
+            "fingerprint": format!("{i:040X}"),
+            "or_addresses": [format!("10.{}.{}.1:9001", i / 256, i % 256)],
+            "exit_policy_summary": {"reject": ["1-65535"]},
+        }));
+    }
+    peephole::intel::relays::Relays::from_onionoo(&serde_json::to_vec(&v).unwrap(), None)
+        .unwrap()
+        .to_json()
+}
+
+/// GH #138: the relay index travels like the exit list. A member copies it
+/// without fetching Onionoo itself, and knows the IPv6 exits from it; a
+/// truncated index is not copied.
+#[tokio::test]
+async fn a_member_copies_the_tor_relay_index_without_its_own_fetch() {
+    use peephole::intel::relays;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    std::fs::write(relays::file(na.dir.path()), relay_index(0)).unwrap();
+    share::publish(&na, na.dir.path(), &[share::RELAYS])
+        .await
+        .unwrap();
+    eventually("b knows the manifest", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 1
+    })
+    .await;
+    assert!(
+        share::sync_files(&nb, nb.dir.path())
+            .await
+            .unwrap()
+            .is_empty(),
+        "too few relays: not copied"
+    );
+    assert!(!relays::file(nb.dir.path()).exists());
+    std::fs::write(relays::file(na.dir.path()), relay_index(relays::MIN_RELAYS)).unwrap();
+    share::publish(&na, na.dir.path(), &[share::RELAYS])
+        .await
+        .unwrap();
+    let sha = share::file_hash(&relays::file(na.dir.path())).unwrap().0;
+    eventually("b knows the new manifest", || async {
+        share::manifests(&nb.store).await.unwrap()[share::RELAYS].sha256 == sha
+    })
+    .await;
+    assert_eq!(
+        share::sync_files(&nb, nb.dir.path()).await.unwrap(),
+        [share::RELAYS]
+    );
+    let list = peephole::intel::tor::TorExitList::load(nb.dir.path()).unwrap();
+    assert!(list.contains(&"2001:db8:6::1".parse().unwrap()));
+    assert!(!list.contains(&"2a01:4f8:200:32e6::2".parse().unwrap()));
+}
+
 /// An exit list with `n` addresses.
 fn tor_list(n: u32) -> String {
     (0..n)

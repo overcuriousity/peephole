@@ -1,0 +1,11 @@
+{"version":"8.0",
+"build_revision":"fixture",
+"relays_published":"2026-10-18 10:00:00",
+"relays":[
+{"nickname":"BEEzar","fingerprint":"7EEDD54E5457DA009E46C91BBF1F443DCEE01968","or_addresses":["144.76.159.218:8443","[2a01:4f8:200:32e6::2]:8443"],"flags":["Fast","Guard","HSDir","Running","Stable","V2Dir","Valid"],"first_seen":"2024-01-01 00:00:00","effective_family":["7EEDD54E5457DA009E46C91BBF1F443DCEE01968"],"exit_policy_summary":{"reject":["1-65535"]},"version":"0.4.9.9"},
+{"nickname":"SixExit","fingerprint":"0123456789ABCDEF0123456789ABCDEF01234567","or_addresses":["198.51.100.20:9001","[2001:db8:6::1]:443"],"exit_addresses":["203.0.113.77","2001:db8:6::99"],"flags":["Exit","Fast","Running","Valid"],"first_seen":"2025-03-04 05:06:07","effective_family":["0123456789ABCDEF0123456789ABCDEF01234567","89ABCDEF0123456789ABCDEF0123456789ABCDEF"],"exit_policy_summary":{"accept":["80","443"]},"exit_policy_v6_summary":{"accept":["80","443"]},"version":"0.4.8.12"},
+{"nickname":"QuietMiddle","fingerprint":"FEDCBA9876543210FEDCBA9876543210FEDCBA98","or_addresses":["192.0.2.30:9001","[2001:db8:30::1]:9001"],"flags":["Fast","Running","Valid"],"first_seen":"2025-06-01 00:00:00","exit_policy_summary":{"reject":["1-65535"]},"version":"0.4.8.12"},
+{"nickname":"V6Exit","fingerprint":"AAAABBBBCCCCDDDDEEEEFFFF0000111122223333","or_addresses":["192.0.2.40:9001","[2001:db8:40::1]:9001"],"flags":["Fast","Running","Valid"],"first_seen":"2025-07-01 00:00:00","exit_policy_summary":{"reject":["1-65535"]},"exit_policy_v6_summary":{"accept":["443"]},"version":"0.4.8.12"}
+],
+"bridges_published":"2026-10-18 10:00:00",
+"bridges":[]}
