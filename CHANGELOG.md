@@ -3,6 +3,34 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.18.2] - unreleased
+
+Credits visibility (#75): the Credits page says whose figures it shows
+and adds the cluster's. One database migration (0044, additive), applied
+on start. No protocol change, no new setting; prices are unchanged.
+
+### Added
+- The Credits price table gains *Cluster sold / h* (charged receipts in
+  the replicated ledger) and *Cluster offered / h* (live scanners'
+  capacity for scans, members' announced `on_demand` for providers; "—"
+  where members announce nothing) (MIK-528, MIK-531).
+- Relays leased (MIK-529): a node that cannot be dialled lists the relay
+  leases it holds, with their end and price, on the Credits page and in
+  `peephole credits`.
+- `peephole credits log` lists this node's sales: one `sold` line per day
+  and good, with total, count and payers (MIK-530).
+
+### Changed
+- The price table's *Demand / h* and *Supply / h* read *Sold here / h* and
+  *Offered here / h*; the chart tooltip says the same (MIK-531).
+- *Sold here* counts the charged receipts of the hour in the ledger
+  instead of the last refresh's rate, and the previous hour is recounted
+  for late receipts (MIK-528).
+
+### Database
+- Migration 0044: `price_history` gains `cluster_demand` and
+  `cluster_supply` (additive).
+
 ## [0.18.1] - 2026-10-18
 
 ### Fixed

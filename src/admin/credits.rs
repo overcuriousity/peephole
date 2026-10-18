@@ -251,12 +251,12 @@ fn shown_change(pct: f64) -> (String, &'static str) {
     (format!("{pct:+.0} %"), trend)
 }
 
-/// What a good is called on the page.
 /// A rate per hour with one decimal; a dash when it is not known.
 fn per_hour(v: Option<f64>) -> String {
     v.map_or("\u{2014}".to_string(), |v| format!("{v:.1}"))
 }
 
+/// What a good is called on the page.
 fn good_label(good: &str) -> String {
     match good {
         credits::price::SCAN => "Scan job".into(),
