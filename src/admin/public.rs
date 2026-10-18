@@ -376,6 +376,8 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         product: None,
         os: None,
         name: None,
+        net: None,
+        net_name: None,
     }
 }
 
@@ -397,6 +399,8 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("product", f.product.clone()),
         ("os", f.os.clone()),
         ("name", f.name.clone()),
+        ("net", f.net.clone()),
+        ("net_name", f.net_name.clone()),
     ]
 }
 
@@ -498,6 +502,8 @@ fn filter_label(k: &str) -> &'static str {
         "product" => "Product",
         "os" => "OS guess",
         "name" => "Name",
+        "net" => "Network",
+        "net_name" => "Network name",
         _ => "Filter",
     }
 }
@@ -726,6 +732,8 @@ pub struct IntelFact {
     pub label: String,
     pub value: String,
     pub mono: bool,
+    /// Admin only: the page the value opens (an RDAP handle's network).
+    pub href: Option<String>,
 }
 
 /// One node's result from one provider.
@@ -754,18 +762,19 @@ fn fact(label: &str, value: impl Into<String>, mono: bool) -> IntelFact {
         label: label.to_string(),
         value: value.into(),
         mono,
+        href: None,
     }
 }
 
 /// A provider's data as labelled facts. Known fields get a readable form;
 /// anything else is listed under its own key, so a new provider shows up
 /// without template changes.
-fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
+pub(crate) fn intel_facts(provider: &str, data: &serde_json::Value, admin: bool) -> Vec<IntelFact> {
     let Some(obj) = data.as_object() else {
         return vec![fact("Data", data.to_string(), true)];
     };
     if let Some(fields) = api_fields(provider) {
-        return api_facts(fields, obj);
+        return api_facts(fields, obj, admin && provider == crate::intel::RDAP);
     }
     // Known fields first, in reading order; the map itself is sorted by key.
     const ORDER: [&str; 4] = ["exit", "country", "asn", "asn_org"];
@@ -915,7 +924,12 @@ fn fact_text(key: &str, v: &serde_json::Value) -> String {
     }
 }
 
-fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -> Vec<IntelFact> {
+/// `net_link`: the RDAP handle links to its network's page (admin only).
+fn api_facts(
+    fields: Fields,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    net_link: bool,
+) -> Vec<IntelFact> {
     let mut out: Vec<IntelFact> = fields
         .iter()
         .filter_map(|(k, label, mono)| {
@@ -929,7 +943,15 @@ fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -
             {
                 text = format!("{n}: {text}");
             }
-            Some(fact(label, text, *mono))
+            let mut f = fact(label, text, *mono);
+            if net_link && *k == "handle" {
+                f.href = v
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(crate::admin::asn::net_href);
+            }
+            Some(f)
         })
         .collect();
     // Fields this version does not know yet (a newer node's), as they are.
@@ -978,7 +1000,7 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
             let mut results = rows.iter().map(|r| {
                 let data = serde_json::from_str(&r.data_json).unwrap_or(serde_json::Value::Null);
                 IntelResult {
-                    facts: intel_facts(&name, &data),
+                    facts: intel_facts(&name, &data, admin),
                     fetched_at: r.fetched_at.clone(),
                     source_version: r.source_version.clone(),
                     node: if admin { r.node.clone() } else { None },
@@ -999,13 +1021,21 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
 
 /// The RDAP card as `data::pick_rdap` decides when the nodes' answers
 /// differ: the chosen answer first, or every answer marked disputed.
-pub fn apply_rdap_pick(cards: &mut [IntelCard], pick: Option<crate::store::data::RdapPick>) {
+pub fn apply_rdap_pick(
+    cards: &mut [IntelCard],
+    pick: Option<crate::store::data::RdapPick>,
+    admin: bool,
+) {
     use crate::store::data::RdapPick;
     let Some(card) = cards.iter_mut().find(|c| c.name == crate::intel::RDAP) else {
         return;
     };
     let result = |a: crate::store::data::RdapAnswer| IntelResult {
-        facts: intel_facts(crate::intel::RDAP, &serde_json::Value::Object(a.data)),
+        facts: intel_facts(
+            crate::intel::RDAP,
+            &serde_json::Value::Object(a.data),
+            admin,
+        ),
         fetched_at: a.fetched_at,
         source_version: None,
         node: a.node,
@@ -1794,6 +1824,48 @@ show_labels = {show_labels}
             assert!(list.contains("href=\"/ip/203.0.113.2\""), "{list}");
             assert!(!list.contains("/admin/asn/"), "{list}");
             assert!(!list.contains("Open ports"), "{list}");
+        }
+    }
+
+    /// The RDAP card's Handle links an admin to the network's page, and
+    /// `/ips?net=` / `net_name=` filter an admin's list (MIK-503).
+    #[tokio::test]
+    async fn rdap_networks_link_and_filter_for_admins_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            admin.contains(r#"<dd><a href="/admin/net/NET-1">NET-1</a></dd>"#),
+            "{admin}"
+        );
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert!(!public.contains("/admin/net/"), "{public}");
+
+        let (status, list) = get_with(&app, "/ips?net=NET-1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains("Network: <span class=\"mono\">NET-1</span>"),
+            "{list}"
+        );
+        assert!(list.contains("href=\"/ip/203.0.113.2\""), "{list}");
+        assert!(!list.contains("href=\"/ip/198.51.100.1\""), "{list}");
+        let (status, list) = get_with(&app, "/ips?net_name=Example%20RDAP", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains("Network name: <span class=\"mono\">Example RDAP</span>"),
+            "{list}"
+        );
+        assert!(list.contains("href=\"/ip/198.51.100.1\""), "{list}");
+        // The public list ignores both.
+        for q in ["net=NET-1", "net_name=nope"] {
+            let (status, list) = get_with(&app, &format!("/ips?{q}"), None).await;
+            assert_eq!(status, 200);
+            assert!(list.contains("href=\"/ip/198.51.100.1\""), "{q}: {list}");
+            assert!(!list.contains("Network: "), "{q}: {list}");
         }
     }
 
@@ -2673,6 +2745,7 @@ show_labels = {show_labels}
             crate::intel::ABUSEIPDB,
             &serde_json::json!({"score": 87, "reports": 41, "categories": ["SSH", "Port Scan"],
                                 "whitelisted": false, "future_field": 1}),
+            false,
         );
         let got: Vec<_> = f
             .iter()
@@ -2693,6 +2766,7 @@ show_labels = {show_labels}
             &serde_json::json!({"services": [{"port": 22, "transport": "tcp", "product": "OpenSSH",
                                               "version": "8.9p1"}, {"port": 443}],
                                 "vulns": ["CVE-1", "CVE-2"]}),
+            false,
         );
         assert_eq!(f[0].value, "22/tcp OpenSSH 8.9p1 · 443/tcp");
         assert_eq!(f[1].value, "2: CVE-1, CVE-2");
@@ -2703,19 +2777,21 @@ show_labels = {show_labels}
         let f = intel_facts(
             crate::intel::ABUSEIPDB,
             &serde_json::json!({"last_reported_at": "2026-10-04T02:07:49+00:00"}),
+            false,
         );
         assert_eq!(f[0].value, "2026-10-04 02:07 UTC");
         // A plain date stays as it is.
         let f = intel_facts(
             crate::intel::RDAP,
             &serde_json::json!({"registered": "2017-10-18"}),
+            false,
         );
         assert_eq!(f[0].value, "2017-10-18");
     }
 
     #[test]
     fn an_empty_result_says_nothing_is_known() {
-        let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}));
+        let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}), false);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].label, "Result");
     }

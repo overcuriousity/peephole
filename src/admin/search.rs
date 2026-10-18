@@ -1,12 +1,14 @@
 //! The top bar's search box: works out what was typed and opens its page.
 //! An IP, a network, `AS123`, `#<request or campaign number>`, `C12`, a
 //! path, an upload's sha256, a label, or a linking value (fingerprint,
-//! host key, JA4…), or a host name (the Lookup page).
+//! host key, JA4…), an RDAP network's handle or name, or a host name (the
+//! Lookup page).
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppResult, render};
 use crate::admin::public::urlencode;
 use crate::admin::views::{Chrome, link_href};
+use crate::store::rdap_net::NetHit;
 use askama::Template;
 use axum::{
     Router,
@@ -166,7 +168,15 @@ async fn search(
         }
         Input::Value(v) => {
             values(&st, &v, &mut found).await?;
-            None
+            // Nothing else holds it: an RDAP network's handle or name.
+            if found.is_empty() {
+                st.store.net_by_handle_or_name(&v).await?.map(|n| match n {
+                    NetHit::Handle(h) => crate::admin::asn::net_href(&h),
+                    NetHit::Name(n) => format!("/ips?net_name={}", urlencode(&n)),
+                })
+            } else {
+                None
+            }
         }
     };
     let to = to.or_else(|| match found.as_slice() {
@@ -350,6 +360,32 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("No campaign #99."), "{body}");
         let (status, _, body) = go(&app, &cookie, &"0".repeat(64)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Nothing found"), "{body}");
+    }
+
+    /// A handle, or a name only one network carries, opens the network's
+    /// page; a name several carry opens the list of their IPs (MIK-503).
+    #[tokio::test]
+    async fn finds_rdap_networks_by_handle_and_name() {
+        let (st, cookie, app, _d) = app().await;
+        for (ip, handle, name) in [
+            ("192.0.2.1", "NET-1", "Solo Net"),
+            ("192.0.2.2", "NET-2", "Shared Net"),
+            ("192.0.2.3", "NET-3", "Shared Net"),
+        ] {
+            st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            crate::store::rdap_net::tests::rdap(&st.store, ip, None, 1, handle, name).await;
+        }
+        for (q, want) in [
+            ("NET-1", "/admin/net/NET-1"),
+            ("Solo Net", "/admin/net/NET-1"),
+            ("Shared Net", "/ips?net_name=Shared%20Net"),
+        ] {
+            let (status, to, _) = go(&app, &cookie, q).await;
+            assert_eq!((status, to.as_str()), (StatusCode::SEE_OTHER, want), "{q}");
+        }
+        let (status, _, body) = go(&app, &cookie, "No Such Net").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Nothing found"), "{body}");
     }

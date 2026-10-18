@@ -4,16 +4,16 @@
   {% if !c.disputed.is_empty() %}
     <p class="intel-src"><span class="intel-badge" data-source="disputed" title="the nodes' answers differ; none is shown as the answer">Disputed</span></p>
     {% for o in c.disputed %}
-    <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+    <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{% if let Some(h) = f.href %}<a href="{{ h }}">{{ f.value }}</a>{% else %}{{ f.value }}{% endif %}</dd>{% endfor %}</dl>
     <p class="intel-src"><span class="mono">{{ crate::admin::views::when(Some(o.fetched_at.as_str())) }}</span>{% if let Some(n) = o.node %} · {{ n }}{% endif %}</p>
     {% endfor %}
   {% else if let Some(x) = c.newest %}
-    <dl class="kv">{% for f in x.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+    <dl class="kv">{% for f in x.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{% if let Some(h) = f.href %}<a href="{{ h }}">{{ f.value }}</a>{% else %}{{ f.value }}{% endif %}</dd>{% endfor %}</dl>
     <p class="intel-src">{{ verb }} <time datetime="{{ crate::admin::views::stamp(x.fetched_at.as_str()) }}" data-ago title="{{ x.fetched_at }}">{{ crate::admin::views::ago(x.fetched_at.as_str()) }}</time> ago{% if let Some(v) = x.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = x.node %} · {{ n }}{% endif %}</p>
     {% if !c.others.is_empty() %}
     <details class="intel-older"><summary>{{ c.others.len() }} older or other-node result{% if c.others.len() != 1 %}s{% endif %}</summary>
       {% for o in c.others %}
-      <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{{ f.value }}</dd>{% endfor %}</dl>
+      <dl class="kv">{% for f in o.facts %}<dt>{{ f.label }}</dt><dd{% if !f.mono %} class="plain"{% endif %}>{% if let Some(h) = f.href %}<a href="{{ h }}">{{ f.value }}</a>{% else %}{{ f.value }}{% endif %}</dd>{% endfor %}</dl>
       <p class="intel-src"><span class="mono">{{ crate::admin::views::when(Some(o.fetched_at.as_str())) }}</span>{% if let Some(v) = o.source_version %} · data <span class="mono">{{ v }}</span>{% endif %}{% if let Some(n) = o.node %} · {{ n }}{% endif %}</p>
       {% endfor %}
     </details>
