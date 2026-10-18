@@ -12,7 +12,7 @@
       {% if o.price.is_empty() %}
       <button class="btn level-btn" type="button" disabled title="L{{ o.level }}: {{ o.about }}. No live scanner announces a price"><b>L{{ o.level }}</b><span>no scanner</span></button>
       {% else %}
-      <button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>
+      {% if s.standalone %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>{% else %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" data-quote="/admin/lookup/scan/quote" data-quote-title="Level {{ o.level }} counter-scan of {{ r.ip }}" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.about }}</span></button>{% endif %}
       {% endif %}
       {% endfor %}
     </div>

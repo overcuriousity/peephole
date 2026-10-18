@@ -11,6 +11,7 @@ use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::AppResult;
 use crate::admin::pages::{redirect_with_error, redirect_with_notice};
+use crate::admin::web_quote::WebBuyer;
 use crate::cluster::identity::NodeId;
 use crate::intel::geo::{Coords, haversine_km};
 use crate::lock::MutexExt;
@@ -105,11 +106,13 @@ impl ActionsView {
     }
 }
 
-/// The form: the address and repeated `vantage=` node ids.
+/// The form: the address and repeated `vantage=` node ids; in a cluster,
+/// the price the dialog showed, in millicredits (`admin::web_quote`).
 #[derive(Debug, Default, PartialEq)]
 pub struct ProbeForm {
     pub ip: String,
     pub vantage: Vec<String>,
+    pub price_mc: Option<u64>,
 }
 
 impl ProbeForm {
@@ -120,6 +123,7 @@ impl ProbeForm {
             match k.as_str() {
                 "ip" => f.ip = v,
                 "vantage" => f.vantage.push(v),
+                "price_mc" => f.price_mc = v.trim().parse().ok(),
                 _ => {}
             }
         }
@@ -618,7 +622,7 @@ async fn guard_line(state: &AdminState, ip: &IpAddr) -> Result<String, String> {
 }
 
 /// The balance in credits (the fleet's, when this node has an owner).
-async fn balance(node: &crate::cluster::Node) -> Option<String> {
+pub(crate) async fn balance(node: &crate::cluster::Node) -> Option<String> {
     async {
         let book = crate::credits::book(node).await?;
         let siblings = crate::cluster::owner::fleet::siblings(&node.store).await?;
@@ -812,9 +816,11 @@ pub async fn start(
 }
 
 /// POST /admin/lookup/probe: offer and ask (cluster) or run here
-/// (standalone), then back to the IP page's Probes section.
+/// (standalone), then back to the IP page's Probes section. With the price
+/// the dialog showed (always in a cluster) a higher price now is refused
+/// and the probe is audited as the machine API's.
 async fn request(
-    _u: SessionUser,
+    WebBuyer(buyer): WebBuyer,
     State(state): State<Arc<AdminState>>,
     body: Bytes,
 ) -> AppResult<Response> {
@@ -830,7 +836,43 @@ async fn request(
             "No probe: the address is not in the dataset.",
         ));
     };
-    match start(&state, ip, row.id, Some(&form.vantage)).await {
+    if form.price_mc.is_none() && state.recorder.node().is_some() {
+        return Ok(redirect_with_error(
+            &back,
+            "No probe: get its price first (the Probe button opens it).",
+        ));
+    }
+    if let Some(shown) = form.price_mc {
+        let now = price_mc(&state, Some(&form.vantage));
+        if now > shown {
+            return Ok(redirect_with_error(
+                &back,
+                &format!(
+                    "No probe: the price changed, to {} credits from the {} shown. Nothing was charged.",
+                    crate::credits::show(now),
+                    crate::credits::show(shown)
+                ),
+            ));
+        }
+    }
+    let started = start(&state, ip, row.id, Some(&form.vantage)).await;
+    if let (Ok(s), Some(_)) = (&started, form.price_mc) {
+        let mc: u64 = s.asked.iter().map(|v| v.price_mc as u64).sum();
+        let job_id = format!("p_{}", s.group);
+        if let Err(r) =
+            crate::admin::api_v1::audit(&state, &buyer, "probe", &ip.to_string(), mc, &job_id).await
+        {
+            tracing::error!(job_id, "probe asked but not audited");
+            return Ok(redirect_with_error(
+                &back,
+                &format!(
+                    "Probe asked, but its audit entry was not written: {}",
+                    crate::admin::api_v1::message_of(*r).await
+                ),
+            ));
+        }
+    }
+    match started {
         Err(why) => Ok(redirect_with_error(&back, &format!("No probe: {why}"))),
         Ok(s) if s.asked.is_empty() => Ok(redirect_with_notice(
             &back,
@@ -1457,13 +1499,16 @@ secure_cookies = false
         };
         let html = ActionsCard { t, a, first: true }.render().unwrap();
         assert!(
-            html.contains(r#"data-busy="Asking…">Probe · <span class="num" data-probe-total>0.05</span> credits"#),
-            "the probe button carries the ticked total: {html}"
+            html.contains(r#"data-quote="/admin/lookup/probe/quote" data-quote-kind="probe" data-quote-title="Probe 203.0.113.40">Probe · <span class="num" data-probe-total>0.05</span> credits"#),
+            "the probe button carries the ticked total and opens the price dialog: {html}"
         );
+        // MIK-505: a level says what it scans, no price range; its price
+        // is quoted in the dialog.
         assert!(
-            html.contains(r#"<b>L1</b><span>0.06–0.24 credits</span>"#),
+            html.contains(r#"data-quote="/admin/lookup/scan/quote" data-quote-title="Level 1 counter-scan of 203.0.113.40" title="L1: some ports"><b>L1</b><span>some ports</span>"#),
             "{html}"
         );
+        assert!(!html.contains("0.06–0.24"), "{html}");
         assert!(
             html.contains(r##"href="#scan-42""##) && html.contains("<b>L2 ✓</b><span>done "),
             "a fresh level links to its result: {html}"
@@ -1622,6 +1667,39 @@ secure_cookies = false
         assert!(html.contains(r#"data-section="probes""#), "{html}");
         assert!(html.contains("probe-test/1.0"), "{html}");
         assert!(html.contains(r#"data-section="actions""#));
+    }
+
+    /// MIK-505: a probe sent with the price the dialog showed is audited
+    /// as the machine API's, under the session.
+    #[tokio::test]
+    async fn a_priced_probe_is_audited_as_the_sessions() {
+        let server = web().await;
+        let (state, cookie, _id, _d) = state(Some(server.port()), "").await;
+        let app = crate::admin::full_router(state.clone());
+        let (status, headers, _) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/probe")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            &format!("ip={IP}&price_mc=0"),
+        )
+        .await;
+        assert_eq!(status, 303);
+        assert_eq!(headers["location"], format!("/ip/{IP}#actions").as_str());
+        let a = state.store.recent_device_actions(5).await.unwrap();
+        let owner = crate::admin::web_quote::buyer(cookie.split_once('=').unwrap().1).id;
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (
+                a[0].device_id.as_str(),
+                a[0].action.as_str(),
+                a[0].target.as_str(),
+                a[0].credits_mc
+            ),
+            (owner.as_str(), "probe", IP, 0)
+        );
+        assert!(a[0].job_id.starts_with("p_"), "{}", a[0].job_id);
     }
 
     #[tokio::test]

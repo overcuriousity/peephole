@@ -6,6 +6,7 @@ use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::public::{IntelCard, intel_cards};
 use crate::admin::views::Chrome;
+use crate::admin::web_quote::WebBuyer;
 use crate::store::inspect::IpIntelRow;
 use askama::Template;
 use axum::{
@@ -22,6 +23,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route("/admin/lookup", get(page).post(lookup))
         .route("/admin/lookup/bulk", axum::routing::post(bulk))
+        .route("/admin/lookup/answer", axum::routing::post(answer))
+        .route("/admin/lookup/name", axum::routing::post(name))
 }
 
 /// Addresses read from stored data only (no provider is asked).
@@ -276,11 +279,16 @@ pub struct LookupResult {
     /// For an address the dataset does not hold: the counter-scans on
     /// offer, whose buy adds it unseen (MIK-329), or why none is.
     pub scan: Option<UnrecordedScan>,
+    /// The providers still to ask: the page fills their cards one by one
+    /// (`POST /admin/lookup/answer`). Empty when the answers are in.
+    pub fills: Vec<String>,
 }
 
 /// The Counter-scan card of an address the dataset does not hold.
 pub struct UnrecordedScan {
     pub offers: Vec<crate::admin::scan_buy::ScanOffer>,
+    /// No cluster: free, bought at once without a price dialog.
+    pub standalone: bool,
     /// Why the address gets no scan (`scan_buy::scan_target`).
     pub refused: Option<String>,
 }
@@ -290,9 +298,39 @@ impl LookupResult {
         crate::admin::signals::of(self.grid.iter().map(|g| &g.card))
     }
 
-    /// Providers without a result, as "A, B".
+    /// Providers without a result and not being asked, as "A, B".
     pub fn pending(&self) -> String {
-        crate::admin::target::pending(self.grid.iter().map(|g| &g.card))
+        crate::admin::target::pending(
+            self.grid
+                .iter()
+                .map(|g| &g.card)
+                .filter(|c| !self.fills.contains(&c.name)),
+        )
+    }
+
+    /// Whether `provider`'s card is still to be filled.
+    pub fn filling(&self, provider: &str) -> bool {
+        self.fills.iter().any(|f| f == provider)
+    }
+
+    /// `(provider, label)` of the cards still to fill that have no card
+    /// with a result to stand in for them.
+    pub fn bare_fills(&self) -> Vec<(String, &'static str)> {
+        self.fills
+            .iter()
+            .filter(|f| {
+                !self
+                    .grid
+                    .iter()
+                    .any(|g| &g.card.name == *f && g.card.newest.is_some())
+            })
+            .map(|f| {
+                (
+                    f.clone(),
+                    crate::intel::provider_info(f).map_or("", |i| i.label),
+                )
+            })
+            .collect()
     }
 }
 
@@ -333,6 +371,8 @@ struct LookupPage {
     cluster: bool,
     offer: Offer,
     bulk: Option<Bulk>,
+    /// A name the page's script resolves (`POST /admin/lookup/name`).
+    resolving: Option<String>,
 }
 
 /// The lookup form. `ask` and `again` may repeat, which the plain form
@@ -344,6 +384,12 @@ pub struct IpForm {
     pub again: Option<String>,
     /// The paid providers to ask now (`*`: all of them).
     pub ask: Option<Vec<String>>,
+    /// The quote of `ask`/`again` the price dialog got
+    /// (`admin::web_quote`); a cluster asks no paid provider without one.
+    pub quote_id: Option<String>,
+    /// Set by the page's script: answer with what the dataset holds at
+    /// once and let the page fill the providers' cards as they answer.
+    pub live: bool,
 }
 
 impl IpForm {
@@ -355,6 +401,8 @@ impl IpForm {
                 "ip" => f.ip = Some(v),
                 "again" => f.again = Some(v),
                 "ask" => f.ask.get_or_insert_with(Vec::new).push(v),
+                "quote_id" if !v.is_empty() => f.quote_id = Some(v),
+                "live" => f.live = v == "1",
                 _ => {}
             }
         }
@@ -391,11 +439,12 @@ async fn page(
         cluster: state.recorder.node().is_some(),
         offer: offer(&state).await,
         bulk: None,
+        resolving: None,
     })
 }
 
 async fn lookup(
-    _u: SessionUser,
+    WebBuyer(buyer): WebBuyer,
     State(state): State<Arc<AdminState>>,
     body: axum::body::Bytes,
 ) -> AppResult<Html<String>> {
@@ -410,6 +459,20 @@ async fn lookup(
     let Some(crate::intel::dns::Host::Ip(ip)) = host else {
         // A URL shows as its host: its userinfo is not echoed back.
         let (names, results, error, text) = match host {
+            // Resolved by the page's script, which fills the result in.
+            Some(crate::intel::dns::Host::Name(name)) if f.live => {
+                return render(&LookupPage {
+                    chrome: chrome(),
+                    ip: name.clone(),
+                    error: None,
+                    names: None,
+                    results: vec![],
+                    cluster,
+                    offer: offer(&state).await,
+                    bulk: None,
+                    resolving: Some(name),
+                });
+            }
             Some(crate::intel::dns::Host::Name(name)) => {
                 match by_name(&state, &name, async |n: &str| {
                     crate::intel::dns::resolve_here(n).await
@@ -436,21 +499,156 @@ async fn lookup(
             cluster,
             offer: offer(&state).await,
             bulk: None,
+            resolving: None,
         });
     };
     let ip = crate::net::canonical(ip);
     let again: Vec<String> = f.again.into_iter().filter(|a| !a.is_empty()).collect();
-    let result = run(&state, ip, &ask, &again).await?;
+    let paid = !ask.is_empty() || !again.is_empty();
+    let (result, error) = match (paid, f.quote_id) {
+        // Bought as quoted, as the machine API buys it: the quote names
+        // the providers, the form only which of those to ask again.
+        (true, Some(q)) => match crate::admin::api_v1::spend_lookup(&state, &buyer, ip, &q).await {
+            Ok((bought, quoted)) => {
+                let again: Vec<String> = quoted.into_iter().filter(|p| again.contains(p)).collect();
+                let ask: Vec<String> = bought.into_iter().filter(|p| !again.contains(p)).collect();
+                (run(&state, ip, &ask, &again).await?, None)
+            }
+            Err(r) => (
+                run_stored(&state, ip).await?,
+                Some(format!(
+                    "Nothing asked: {}. Nothing was charged.",
+                    crate::admin::api_v1::message_of(*r).await
+                )),
+            ),
+        },
+        (true, None) if cluster => (
+            run_stored(&state, ip).await?,
+            Some("Nothing asked: get its price first (the Ask button opens it).".to_string()),
+        ),
+        (false, _) if f.live => (run_stored(&state, ip).await?, None),
+        _ => (run(&state, ip, &ask, &again).await?, None),
+    };
     render(&LookupPage {
         chrome: chrome(),
         ip: ip.to_string(),
-        error: None,
+        error,
         names: None,
         results: vec![result],
         cluster,
         // After the lookup: the balance it left.
         offer: offer(&state).await,
         bulk: None,
+        resolving: None,
+    })
+}
+
+/// A provider's answer as the page fills it in: `ip` and `provider`.
+#[derive(serde::Deserialize)]
+pub struct AnswerForm {
+    ip: String,
+    provider: String,
+}
+
+/// One provider card of a lookup result, alone (`_lookup_answer.html`).
+#[derive(Template)]
+#[template(path = "_lookup_answer.html")]
+struct AnswerCard {
+    card_ip: String,
+    provider: String,
+    label: &'static str,
+    grid: Vec<GridCard>,
+    /// Some card of `grid` has a result.
+    answered: bool,
+    /// `(node, why)` when it did not answer.
+    declined: Vec<(String, String)>,
+    charges: Vec<(String, String)>,
+    offer: Offer,
+}
+
+/// POST /admin/lookup/answer: what `provider` says about `ip` now, or its
+/// stored answer under 24 hours old, as the card the page puts in place of
+/// its spinner. Only what a lookup asks unbidden (nothing paid).
+async fn answer(
+    _u: SessionUser,
+    State(state): State<Arc<AdminState>>,
+    Form(a): Form<AnswerForm>,
+) -> AppResult<Html<String>> {
+    let (Ok(ip), Some(info)) = (
+        a.ip.trim().parse::<IpAddr>(),
+        crate::intel::provider_info(&a.provider),
+    ) else {
+        return Err(AppError::BadRequest("not an address or provider".into()));
+    };
+    let ip = crate::net::canonical(ip);
+    let out = crate::intel::lookup::run_one(&state.recorder, &state.providers, ip, info.name).await;
+    let fresh = cards_of(&out);
+    let grid = merge_grid(fresh.cards, fresh.stored, vec![]);
+    render(&AnswerCard {
+        answered: grid.iter().any(|g| g.card.newest.is_some()),
+        card_ip: ip.to_string(),
+        provider: info.name.to_string(),
+        label: info.label,
+        grid,
+        declined: fresh
+            .declined
+            .into_iter()
+            .map(|(_, node, why)| (node, why))
+            .collect(),
+        charges: fresh.charges,
+        offer: offer(&state).await,
+    })
+}
+
+/// The resolved name and its results, alone (`_lookup_body.html`).
+#[derive(Template)]
+#[template(
+    source = r#"{% if let Some(e) = error %}<p class="muted">{{ e }}</p>{% endif %}{% include "_lookup_body.html" %}"#,
+    ext = "html"
+)]
+struct NameBody {
+    chrome: Chrome,
+    names: Option<NamesView>,
+    results: Vec<LookupResult>,
+    error: Option<String>,
+    cluster: bool,
+    offer: Offer,
+}
+
+/// POST /admin/lookup/name: resolve `ip` (a host name or URL) as the
+/// lookup form does, the addresses with what the dataset holds; the page
+/// fills their providers' cards in.
+async fn name(
+    _u: SessionUser,
+    State(state): State<Arc<AdminState>>,
+    Form(f): Form<BulkForm>,
+) -> AppResult<Html<String>> {
+    let text = f.ips.unwrap_or_default();
+    let Some(crate::intel::dns::Host::Name(name)) = crate::intel::dns::host_of(text.trim()) else {
+        return Err(AppError::BadRequest("not a host name".into()));
+    };
+    let resolved = resolve_name(&state, &name, async |n: &str| {
+        crate::intel::dns::resolve_here(n).await
+    })
+    .await;
+    let (names, results, error) = match resolved {
+        Ok((view, followed)) => {
+            let results =
+                futures::future::join_all(followed.iter().map(|ip| run_stored(&state, *ip)))
+                    .await
+                    .into_iter()
+                    .collect::<AppResult<Vec<_>>>()?;
+            (Some(view), results, None)
+        }
+        Err(e) => (None, vec![], Some(e)),
+    };
+    render(&NameBody {
+        chrome: chrome(),
+        names,
+        results,
+        error,
+        cluster: state.recorder.node().is_some(),
+        offer: offer(&state).await,
     })
 }
 
@@ -581,6 +779,52 @@ pub async fn run(
     again: &[String],
 ) -> AppResult<LookupResult> {
     let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, ask, again).await;
+    arrange(state, ip, out, vec![]).await
+}
+
+/// [`run`] without asking any provider: what the dataset holds, at once,
+/// and the providers a lookup asks unbidden left to fill
+/// ([`LookupResult::fills`]).
+pub async fn run_stored(state: &AdminState, ip: IpAddr) -> AppResult<LookupResult> {
+    let plan = crate::intel::lookup::plan(&state.recorder, &state.providers, ip, &[], &[]).await;
+    let mut r = arrange(
+        state,
+        ip,
+        crate::intel::lookup::Outcome {
+            stored: plan.stored,
+            ..Default::default()
+        },
+        plan.wanted,
+    )
+    .await?;
+    // Standalone, a lookup names the providers this node lacks.
+    if state.recorder.node().is_none() {
+        r.declined.extend(
+            crate::intel::KNOWN_PROVIDERS
+                .iter()
+                .filter(|i| !r.fills.iter().any(|f| f == i.name))
+                .map(|i| {
+                    (
+                        i.label.to_string(),
+                        "this node".to_string(),
+                        "no reachable node serves this provider".to_string(),
+                    )
+                }),
+        );
+    }
+    Ok(r)
+}
+
+/// The cards of a lookup's answers: those asked now and those from the
+/// dataset, with who declined (`(label, node, why)`) and who charged.
+struct Answers {
+    cards: Vec<IntelCard>,
+    stored: Vec<StoredView>,
+    declined: Vec<(String, String, String)>,
+    charges: Vec<(String, String)>,
+}
+
+fn cards_of(out: &crate::intel::lookup::Outcome) -> Answers {
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let label = |p: &str| {
         crate::intel::provider_info(p)
@@ -631,6 +875,28 @@ pub async fn run(
                 })
         })
         .collect();
+    Answers {
+        cards,
+        stored,
+        declined,
+        charges,
+    }
+}
+
+/// [`run`]'s page part of the outcome `out`; `fills` the providers still
+/// to ask.
+async fn arrange(
+    state: &AdminState,
+    ip: IpAddr,
+    out: crate::intel::lookup::Outcome,
+    fills: Vec<String>,
+) -> AppResult<LookupResult> {
+    let Answers {
+        cards,
+        stored,
+        declined,
+        charges,
+    } = cards_of(&out);
     // The answers are paid for: what the dataset adds is shown when it can
     // be read, and its failure does not throw them away.
     let held = async {
@@ -668,10 +934,12 @@ pub async fn run(
         None => match crate::admin::scan_buy::scan_target(state, ip).await {
             Ok(Ok(None)) => Some(UnrecordedScan {
                 offers: crate::admin::scan_buy::offers_for(state, None).await,
+                standalone: state.recorder.node().is_none(),
                 refused: None,
             }),
             Ok(Err(why)) => Some(UnrecordedScan {
                 offers: vec![],
+                standalone: state.recorder.node().is_none(),
                 refused: Some(why),
             }),
             // Recorded meanwhile, or not readable: no card.
@@ -692,6 +960,7 @@ pub async fn run(
         declined,
         kept: out.kept,
         scan,
+        fills,
     })
 }
 
@@ -782,6 +1051,7 @@ async fn bulk_page(state: &AdminState, text: String) -> AppResult<Html<String>> 
             unreadable,
             capped,
         }),
+        resolving: None,
     })
 }
 
@@ -896,6 +1166,7 @@ secure_cookies = false
             cluster: false,
             offer: Offer::default(),
             bulk: None,
+            resolving: None,
         }
         .render()
         .unwrap();
@@ -1068,5 +1339,198 @@ secure_cookies = false
         assert!(every.contains(&crate::intel::TOR.to_string()));
         assert!(every.contains(&crate::intel::ABUSEIPDB.to_string()));
         assert!(every.contains(&crate::intel::SHODAN.to_string()));
+    }
+
+    /// A provider that takes `0` to answer.
+    struct Slow(std::time::Duration);
+    impl crate::intel::provider::Provider for Slow {
+        fn name(&self) -> &'static str {
+            crate::intel::SHODAN
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn lookup<'a>(
+            &'a self,
+            ips: &'a [String],
+        ) -> futures::future::BoxFuture<'a, Vec<crate::intel::provider::Finding>> {
+            Box::pin(async move {
+                tokio::time::sleep(self.0).await;
+                ips.iter()
+                    .map(|ip| crate::intel::provider::Finding {
+                        ip: ip.clone(),
+                        source_version: None,
+                        data: serde_json::json!({"ports": [22]}),
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// MIK-505: with the page's script (`live`), a lookup answers with what
+    /// the dataset holds at once, however slow a provider; each provider's
+    /// card is then filled in by its own request.
+    #[tokio::test]
+    async fn a_live_lookup_answers_at_once_and_fills_each_card_in() {
+        let (mut state, cookie, _d) = state().await;
+        let slow: crate::intel::Providers = vec![Arc::new(Slow(std::time::Duration::from_secs(5)))];
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .providers
+            .extend(slow.iter().cloned());
+        let app = crate::admin::full_router(state);
+        let post = |path: &str, body: &str| {
+            axum::http::Request::post(path.to_string())
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let started = std::time::Instant::now();
+        let r = app
+            .clone()
+            .oneshot(post("/admin/lookup", "ip=203.0.113.9&live=1"))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(r.status(), 200);
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the first answer took {took:?}"
+        );
+        let html = String::from_utf8_lossy(
+            &axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"data-fill-ip="203.0.113.9""#), "{html}");
+        for p in [
+            crate::intel::SHODAN,
+            crate::intel::TOR,
+            crate::intel::MAXMIND,
+        ] {
+            assert!(html.contains(&format!(r#"data-fill="{p}""#)), "{p}: {html}");
+        }
+        assert!(html.contains("Asking now…") && html.contains("in the dataset"));
+        // What this node lacks is named at once, as the full lookup does.
+        assert!(
+            html.contains("no reachable node serves this provider"),
+            "{html}"
+        );
+        assert!(!html.contains("No result yet: Shodan"), "{html}");
+        // Standalone: no price dialog; everything is free.
+        assert!(!html.contains("data-quote"), "{html}");
+
+        // One card: the answer now, or why there is none.
+        let (status, card) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/answer")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            &format!("ip=203.0.113.9&provider={}", crate::intel::TOR),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            card.contains("Tor exit list") && card.contains("Asked now"),
+            "{card}"
+        );
+        assert!(card.contains("not listed"), "{card}");
+        let (_, card) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/answer")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            &format!("ip=203.0.113.9&provider={}", crate::intel::MAXMIND),
+        )
+        .await;
+        assert!(
+            card.contains("data-declined") && card.contains("not available on this node"),
+            "{card}"
+        );
+        let (status, _) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/answer")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            "ip=203.0.113.9&provider=nope",
+        )
+        .await;
+        assert_eq!(status, 400);
+        // Without a session: the session gate's redirect.
+        let (status, _) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/answer")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            "ip=203.0.113.9&provider=tor",
+        )
+        .await;
+        assert_eq!(status, 303);
+
+        // A name is resolved by the page's script: the page answers at once.
+        let started = std::time::Instant::now();
+        let r = app
+            .clone()
+            .oneshot(post("/admin/lookup", "ip=www.example.com&live=1"))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let html = String::from_utf8_lossy(
+            &axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            html.contains(r#"data-fill-name="www.example.com""#),
+            "{html}"
+        );
+        let (status, _) = send(
+            &app,
+            axum::http::Request::post("/admin/lookup/name")
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded"),
+            "ips=203.0.113.9",
+        )
+        .await;
+        assert_eq!(status, 400, "an address is no name");
+    }
+
+    /// The fragment of a resolved name: its votes and its addresses'
+    /// results, with their cards left to fill.
+    #[tokio::test]
+    async fn a_name_body_shows_the_votes_and_cards_to_fill() {
+        let (state, _cookie, _d) = state().await;
+        let (view, followed) = resolve_name(&state, "www.example.com", async |_: &str| {
+            Ok(vec!["203.0.113.9".parse().unwrap()])
+        })
+        .await
+        .unwrap();
+        let mut results = vec![];
+        for ip in followed {
+            results.push(run_stored(&state, ip).await.unwrap());
+        }
+        let html = NameBody {
+            chrome: chrome(),
+            names: Some(view),
+            results,
+            error: None,
+            cluster: false,
+            offer: Offer::default(),
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("agreed by 1 of 1"), "{html}");
+        assert!(html.contains(r#"data-fill-ip="203.0.113.9""#), "{html}");
+        assert!(
+            html.contains(&format!(r#"data-fill="{}""#, crate::intel::TOR)),
+            "{html}"
+        );
     }
 }

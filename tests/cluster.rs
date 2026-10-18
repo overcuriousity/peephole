@@ -7003,15 +7003,44 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     assert!(!cheap.contains("charged"), "nothing paid yet");
 
     let ip_page = text(&admin, format!("{base}/ip/198.51.100.77")).await;
-    let result = admin
-        .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.77"), ("ask", "abuseipdb")])
+    let ask = |quote_id: Option<&str>| {
+        let mut fields = vec![("ip", "198.51.100.77"), ("ask", "abuseipdb")];
+        fields.extend(quote_id.map(|q| ("quote_id", q)));
+        let req = admin.post(format!("{base}/admin/lookup")).form(&fields);
+        async move { req.send().await.unwrap().text().await.unwrap() }
+    };
+    // MIK-505: no paid provider is asked without a quote.
+    let refused = ask(None).await;
+    assert!(
+        refused.contains("Nothing asked: get its price first") && !refused.contains("Asked now"),
+        "{refused}"
+    );
+    // The "Ask" button's price dialog: one firm price, the one offered.
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.77&ask=abuseipdb"
+        ))
         .send()
         .await
         .unwrap()
-        .text()
+        .json()
         .await
         .unwrap();
+    assert_eq!(q["credits_mc"], cost as u64, "{q}");
+    assert!(
+        q["balance"].is_string() && q["expires_in"].is_number(),
+        "{q}"
+    );
+    let result = ask(q["quote_id"].as_str()).await;
+    assert_eq!(
+        count(
+            &na,
+            "SELECT COUNT(*) FROM device_actions WHERE action = 'lookup' AND device_id LIKE 'web:%'"
+        )
+        .await,
+        1,
+        "audited as the session's"
+    );
     let on_ip_page = sections(&ip_page);
     assert!(
         on_ip_page.contains(&"scans".to_string())
@@ -7054,6 +7083,47 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         "{second}"
     );
     assert!(!second.contains("Asked now"));
+    // The page's script asks for the stored answers at once; the paid
+    // one is among them, and "Ask again" opens the price dialog.
+    let live = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77"), ("live", "1")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        live.contains("From the dataset")
+            && live.contains(r#"data-quote="/admin/lookup/quote" data-quote-title="Ask "#),
+        "{live}"
+    );
+    // "Ask again" through its quote: asked now, although stored.
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.77&again=abuseipdb"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let again = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[
+            ("ip", "198.51.100.77"),
+            ("again", "abuseipdb"),
+            ("quote_id", q["quote_id"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(again.contains("Asked now"), "{again}");
 
     // An address the dataset does not hold: said so, with what is near it,
     // by network and, since an answer names its ASN, by ASN.
@@ -7069,9 +7139,23 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     .execute(&na.store.pool)
     .await
     .unwrap();
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.78&ask=abuseipdb"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let unknown = admin
         .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.78"), ("ask", "abuseipdb")])
+        .form(&[
+            ("ip", "198.51.100.78"),
+            ("ask", "abuseipdb"),
+            ("quote_id", q["quote_id"].as_str().unwrap()),
+        ])
         .send()
         .await
         .unwrap()
@@ -8885,17 +8969,20 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     // Far above any budget a fresh node holds.
     const DEAR: u32 = 1_000_000_000;
     assert!((balance().await as u64) < DEAR as u64);
-    // The Actions card's buy button: where it lands and the error it
-    // flashes there (a cookie the page's script shows).
-    let form = |level: u8| {
+    // The Actions card's buy button, with the quote its price dialog got
+    // (MIK-505; `None`: no quote): where it lands and the error it flashes
+    // there (a cookie the page's script shows).
+    let post_form = |level: u8, quote_id: Option<String>| {
         let admin = admin.clone();
         let base = base.clone();
         let jar = jar.clone();
         async move {
             use reqwest::cookie::CookieStore;
+            let mut fields = vec![("ip", ip.to_string()), ("level", level.to_string())];
+            fields.extend(quote_id.map(|q| ("quote_id", q)));
             let r = admin
                 .post(format!("{base}/admin/lookup/scan"))
-                .form(&[("ip", ip.to_string()), ("level", level.to_string())])
+                .form(&fields)
                 .send()
                 .await
                 .unwrap();
@@ -8911,6 +8998,27 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
             let mut m: Vec<(String, String)> =
                 serde_urlencoded::from_str(&format!("m={flash}")).unwrap();
             m.pop().unwrap().1
+        }
+    };
+    // The price dialog's quote of a level: its id, or the refusal the
+    // dialog shows.
+    let web_quote = |level: u8| {
+        let admin = admin.clone();
+        let base = base.clone();
+        async move {
+            let r = admin
+                .get(format!(
+                    "{base}/admin/lookup/scan/quote?ip={ip}&level={level}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            let ok = r.status().is_success();
+            let v: serde_json::Value = r.json().await.unwrap();
+            match ok {
+                true => Ok(v["quote_id"].as_str().unwrap().to_string()),
+                false => Err(v["error"]["message"].as_str().unwrap().to_string()),
+            }
         }
     };
     let quote = |level: u8| {
@@ -8946,7 +9054,15 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
 
     // No live scanner announces a price.
     price(None);
-    assert_eq!(form(2).await, "No scan: no live scanner announces a price.");
+    assert_eq!(
+        web_quote(2).await,
+        Err("no live scanner announces a price".to_string())
+    );
+    // In a cluster the form buys nothing without a quote.
+    assert_eq!(
+        post_form(2, None).await,
+        "No scan: get its price first (the level button opens it)."
+    );
     price(None);
     let (st, v) = quote(2).await;
     assert_eq!(
@@ -8958,8 +9074,8 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     // A price, but the budget does not cover it.
     price(Some(DEAR));
     assert_eq!(
-        form(2).await,
-        "No scan: the scan budget does not cover this."
+        web_quote(2).await,
+        Err("the scan budget does not cover this".to_string())
     );
     price(Some(DEAR));
     let (st, v) = quote(2).await;
@@ -8970,7 +9086,22 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     );
 
     // A quote taken while the scan was free, bought after the scanners
-    // went away or the price rose past the budget: the buy checks again.
+    // went away or the price rose past the budget: the buy checks again,
+    // on the form as on the API.
+    price(Some(0));
+    let q = web_quote(2).await.unwrap();
+    price(None);
+    assert_eq!(
+        post_form(2, Some(q)).await,
+        "No scan: no live scanner announces a price. Nothing was charged."
+    );
+    price(Some(0));
+    let q = web_quote(2).await.unwrap();
+    price(Some(DEAR));
+    assert_eq!(
+        post_form(2, Some(q)).await,
+        "No scan: the scan budget does not cover this. Nothing was charged."
+    );
     price(Some(0));
     let (st, q) = quote(2).await;
     assert_eq!(st, reqwest::StatusCode::OK, "{q}");

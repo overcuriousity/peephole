@@ -712,7 +712,7 @@ fn credits(mc: u64) -> (String, u64) {
 
 /// Log what `device` queued; a failed write is an internal error, so no
 /// act call answers 202 without its audit entry.
-async fn audit(
+pub(crate) async fn audit(
     state: &AdminState,
     device: &Device,
     action: &str,
@@ -902,7 +902,7 @@ fn not_sold(n: NotSold) -> Response {
 }
 
 /// The level of a query or body: 1-5, else a 400.
-fn level_of(v: Option<&str>) -> Result<u8, Box<Response>> {
+pub(crate) fn level_of(v: Option<&str>) -> Result<u8, Box<Response>> {
     v.and_then(|l| l.trim().parse::<i64>().ok())
         .and_then(crate::scan::valid_level)
         .ok_or_else(|| Box::new(err(StatusCode::BAD_REQUEST, "invalid", "level must be 1-5")))
@@ -961,26 +961,34 @@ async fn scan_quote(
         Ok(l) => l,
         Err(r) => return *r,
     };
-    let (ip, ip_id) = match scan_row(&state, &addr).await {
-        Ok(r) => r,
-        Err(r) => return *r,
-    };
-    let price = match crate::admin::scan_buy::sale(&state, ip_id, level).await {
+    match quote_scan(&state, &device.id, &addr, level).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// A level-`level` scan quote of `addr` for `owner` (a device id, or a web
+/// session's `web:` key): the body of `GET …/scan/quote`.
+pub(crate) async fn quote_scan(
+    state: &AdminState,
+    owner: &str,
+    addr: &str,
+    level: u8,
+) -> Result<Value, Box<Response>> {
+    let (ip, ip_id) = scan_row(state, addr).await?;
+    let price = match crate::admin::scan_buy::sale(state, ip_id, level).await {
         Ok(Ok(p)) => p,
-        Ok(Err(n)) => return not_sold(n),
-        Err(e) => return internal(e),
+        Ok(Err(n)) => return Err(Box::new(not_sold(n))),
+        Err(e) => return Err(Box::new(internal(e))),
     };
-    let quote = match state
+    let quote = state
         .store
-        .create_quote(&device.id, &ip.to_string(), level, price.floor_mc)
+        .create_quote(owner, &ip.to_string(), level, price.floor_mc)
         .await
-    {
-        Ok(q) => q,
-        Err(e) => return internal(e),
-    };
+        .map_err(|e| Box::new(internal(e)))?;
     let (floor, floor_mc) = credits(price.floor_mc);
     let (max, max_mc) = credits(price.max_mc);
-    Json(json!({
+    Ok(json!({
         "quote_id": quote.id,
         "credits": floor,
         "credits_mc": floor_mc,
@@ -989,7 +997,6 @@ async fn scan_quote(
         "expires_at": rfc3339(quote.expires_at.as_str()),
         "offer": {"level": level, "about": crate::admin::scan_buy::about(level)},
     }))
-    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1022,77 +1029,81 @@ async fn scan_buy(
         Ok(g) => g,
         Err(r) => return *r,
     };
-    let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
+    match buy_scan(&state, &device, &ip, &b.quote_id).await {
+        Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// Buy the scan of `buyer`'s quote `quote_id` for `ip` (canonical), and
+/// audit it: the body of `POST …/scan` past the spend cap (`{job_id,
+/// credits, credits_mc}`). The quote is spent first; every refusal after
+/// that queues and charges nothing.
+pub(crate) async fn buy_scan(
+    state: &AdminState,
+    buyer: &Device,
+    ip: &str,
+    quote_id: &str,
+) -> Result<Value, Box<Response>> {
+    let refuse = |status, code, message| Err(Box::new(err(status, code, message)));
+    let quote = match state.store.spend_quote(quote_id, &buyer.id).await {
         Ok(Some(q)) => q,
         Ok(None) => {
-            return err(
+            return refuse(
                 StatusCode::CONFLICT,
                 "quote_invalid",
                 "unknown, expired or already used quote",
             );
         }
-        Err(e) => return internal(e),
+        Err(e) => return Err(Box::new(internal(e))),
     };
     if quote.addr != ip {
-        return err(
+        return refuse(
             StatusCode::CONFLICT,
             "quote_mismatch",
             "the quote is for another address",
         );
     }
     let Some(level) = crate::scan::valid_level(quote.level) else {
-        return err(
+        return refuse(
             StatusCode::CONFLICT,
             "quote_invalid",
             "the quote is unreadable",
         );
     };
-    let (addr, ip_id) = match scan_row(&state, &ip).await {
-        Ok(r) => r,
-        Err(r) => return *r,
-    };
-    match crate::admin::scan_buy::sale(&state, ip_id, level).await {
+    let (addr, ip_id) = scan_row(state, ip).await?;
+    match crate::admin::scan_buy::sale(state, ip_id, level).await {
         Ok(Ok(p)) if p.floor_mc == quote.credits_mc as u64 => {}
-        Ok(Ok(_)) => {
-            return err(
-                StatusCode::CONFLICT,
-                "price_changed",
-                "the price moved since the quote: get a new one",
-            );
-        }
-        Ok(Err(n)) => return not_sold(n),
-        Err(e) => return internal(e),
+        Ok(Ok(_)) => return Err(Box::new(price_changed())),
+        Ok(Err(n)) => return Err(Box::new(not_sold(n))),
+        Err(e) => return Err(Box::new(internal(e))),
     }
-    let id = match crate::admin::scan_buy::enqueue(&state, addr, level).await {
+    let id = match crate::admin::scan_buy::enqueue(state, addr, level).await {
         Ok(Ok(id)) => id,
-        Ok(Err(Some(n))) => return not_sold(n),
+        Ok(Err(Some(n))) => return Err(Box::new(not_sold(n))),
         Ok(Err(None)) => {
-            return err(
+            return refuse(
                 StatusCode::CONFLICT,
                 "not_queued",
                 "the scan queue did not take the job",
             );
         }
-        Err(e) => return internal(e),
+        Err(e) => return Err(Box::new(internal(e))),
     };
     let job_id = format!("s_{id}");
     let mc = quote.credits_mc as u64;
     // The job and its audit entry are written apart (in a cluster the job
     // goes to the replication log): without the entry, the job goes too.
-    if let Err(r) = audit(&state, &device, "scan", &ip, mc, &job_id).await {
+    if let Err(r) = audit(state, buyer, "scan", ip, mc, &job_id).await {
         match state.recorder.withdraw_job(id, "audit write failed").await {
             Ok(true) => {}
             Ok(false) => tracing::error!(job_id, "unaudited scan job already taken; not withdrawn"),
             Err(e) => tracing::error!(job_id, "unaudited scan job not withdrawn: {e:#}"),
         }
-        return *r;
+        return Err(r);
     }
     let (credits, credits_mc) = credits(mc);
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"job_id": job_id, "credits": credits, "credits_mc": credits_mc})),
-    )
-        .into_response()
+    Ok(json!({"job_id": job_id, "credits": credits, "credits_mc": credits_mc}))
 }
 
 /// One provider a fresh lookup asks, by whom and at what price.
@@ -1256,24 +1267,40 @@ async fn lookup_quote(
         .filter(|p| !p.is_empty())
         .map(String::from)
         .collect();
-    let lines = match pick(&offered(&state), &chosen) {
+    match quote_lookup(&state, &device.id, &ip, &chosen).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// A fresh lookup quote of `ip` (canonical) for `owner` (a device id, or a
+/// web session's `web:` key) asking `chosen` (empty: every provider
+/// offered): the body of `GET …/lookup/quote`.
+pub(crate) async fn quote_lookup(
+    state: &AdminState,
+    owner: &str,
+    ip: &str,
+    chosen: &[String],
+) -> Result<Value, Box<Response>> {
+    let refuse = |status, code, message: String| Err(Box::new(err(status, code, message)));
+    let lines = match pick(&offered(state), chosen) {
         Ok(l) if !l.is_empty() => l,
         Ok(_) => {
-            return err(
+            return refuse(
                 StatusCode::CONFLICT,
                 "no_provider",
-                "no provider can be asked now",
+                "no provider can be asked now".into(),
             );
         }
         Err(Unpicked::Unknown(p)) => {
-            return err(
+            return refuse(
                 StatusCode::BAD_REQUEST,
                 "invalid",
                 format!("no provider {p}"),
             );
         }
         Err(Unpicked::NotOffered(p)) => {
-            return err(
+            return refuse(
                 StatusCode::CONFLICT,
                 "not_offered",
                 format!("nobody offers {p} now"),
@@ -1281,23 +1308,19 @@ async fn lookup_quote(
         }
     };
     let total: u64 = lines.iter().map(|p| p.mc).sum();
-    let quote = match state
+    let quote = state
         .store
-        .create_quote_at(&device.id, &ip, lookup_level(&lines), total)
+        .create_quote_at(owner, ip, lookup_level(&lines), total)
         .await
-    {
-        Ok(q) => q,
-        Err(e) => return internal(e),
-    };
+        .map_err(|e| Box::new(internal(e)))?;
     let (c, mc) = credits(total);
-    Json(json!({
+    Ok(json!({
         "quote_id": quote.id,
         "credits": c,
         "credits_mc": mc,
         "expires_at": rfc3339(quote.expires_at.as_str()),
         "providers": lines_json(&lines),
     }))
-    .into_response()
 }
 
 /// POST /api/v1/ips/{addr}/lookup {quote_id}: ask the quoted providers
@@ -1325,52 +1348,10 @@ async fn lookup_buy(
         Ok(g) => g,
         Err(r) => return *r,
     };
-    let quote = match state.store.spend_quote(&b.quote_id, &device.id).await {
-        Ok(Some(q)) => q,
-        Ok(None) => {
-            return err(
-                StatusCode::CONFLICT,
-                "quote_invalid",
-                "unknown, expired or already used quote",
-            );
-        }
-        Err(e) => return internal(e),
+    let bought = match spend_lookup(&state, &device, ip, &b.quote_id).await {
+        Ok((b, _)) => b,
+        Err(r) => return *r,
     };
-    let Some(bought) = lookup_bought(quote.level) else {
-        return err(
-            StatusCode::CONFLICT,
-            "quote_invalid",
-            "the quote is for a scan",
-        );
-    };
-    if quote.addr != ip.to_string() {
-        return err(
-            StatusCode::CONFLICT,
-            "quote_mismatch",
-            "the quote is for another address",
-        );
-    }
-    // Asked as quoted, or not at all: a provider gone or a price moved.
-    let now = match pick(&offered(&state), &bought) {
-        Ok(l) if lookup_level(&l) == quote.level => l,
-        _ => return price_changed(),
-    };
-    if now.iter().map(|p| p.mc).sum::<u64>() != quote.credits_mc as u64 {
-        return price_changed();
-    }
-    let quoted = quote.credits_mc as u64;
-    if let Err(r) = audit(
-        &state,
-        &device,
-        "lookup",
-        &ip.to_string(),
-        quoted,
-        &quote.id,
-    )
-    .await
-    {
-        return *r;
-    }
     // Counted from here on: the providers are not asked under the lock.
     drop(spend);
     let out = crate::intel::lookup::run(&state.recorder, &state.providers, ip, &bought, &[]).await;
@@ -1421,6 +1402,54 @@ async fn lookup_buy(
         "kept": out.kept,
     }))
     .into_response()
+}
+
+/// Spend `buyer`'s lookup quote `quote_id` for `ip` and audit it (with the
+/// quoted credits, the most the lookup may charge), before any provider
+/// is asked: the bought (paid) providers to ask, and every provider the
+/// quote priced (this node's own included). Every refusal asks and
+/// charges nothing.
+pub(crate) async fn spend_lookup(
+    state: &AdminState,
+    buyer: &Device,
+    ip: IpAddr,
+    quote_id: &str,
+) -> Result<(Vec<String>, Vec<String>), Box<Response>> {
+    let refuse = |code, message| Err(Box::new(err(StatusCode::CONFLICT, code, message)));
+    let quote = match state.store.spend_quote(quote_id, &buyer.id).await {
+        Ok(Some(q)) => q,
+        Ok(None) => return refuse("quote_invalid", "unknown, expired or already used quote"),
+        Err(e) => return Err(Box::new(internal(e))),
+    };
+    let Some(bought) = lookup_bought(quote.level) else {
+        return refuse("quote_invalid", "the quote is for a scan");
+    };
+    if quote.addr != ip.to_string() {
+        return refuse("quote_mismatch", "the quote is for another address");
+    }
+    // Asked as quoted, or not at all: a provider gone or a price moved.
+    let now = match pick(&offered(state), &bought) {
+        Ok(l) if lookup_level(&l) == quote.level => l,
+        _ => return Err(Box::new(price_changed())),
+    };
+    if now.iter().map(|p| p.mc).sum::<u64>() != quote.credits_mc as u64 {
+        return Err(Box::new(price_changed()));
+    }
+    let quoted = quote.credits_mc as u64;
+    audit(state, buyer, "lookup", &ip.to_string(), quoted, &quote.id).await?;
+    Ok((bought, now.into_iter().map(|p| p.provider).collect()))
+}
+
+/// The message of an `/api/v1` error answer (`{error:{message}}`), for a
+/// page that shares the API's checks to say why it refused.
+pub(crate) async fn message_of(r: Response) -> String {
+    let body = axum::body::to_bytes(r.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(String::from))
+        .unwrap_or_else(|| "internal error".into())
 }
 
 fn price_changed() -> Response {
@@ -3239,5 +3268,340 @@ mod tests {
             (StatusCode::CONFLICT, "quote_invalid".into())
         );
         assert_eq!(jobs_and_actions(&state).await, (0, 1));
+    }
+
+    /// What a web form answered: the status, where it redirects, the
+    /// flash it set (`peephole_flash` or `_error`, decoded) and the body.
+    async fn web(app: &axum::Router, req: Request<Body>) -> (StatusCode, String, String, String) {
+        let r = app.clone().oneshot(req).await.unwrap();
+        let status = r.status();
+        let header = |n| {
+            r.headers()
+                .get(n)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let location = header(axum::http::header::LOCATION);
+        let flash = header(axum::http::header::SET_COOKIE)
+            .split_once('=')
+            .map(|(name, v)| {
+                let v = v.split(';').next().unwrap_or_default();
+                let m: Vec<(String, String)> =
+                    serde_urlencoded::from_str(&format!("m={v}")).unwrap_or_default();
+                format!("{name}: {}", m.first().map(|x| x.1.as_str()).unwrap_or(""))
+            })
+            .unwrap_or_default();
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            location,
+            flash,
+            String::from_utf8_lossy(&b).into_owned(),
+        )
+    }
+
+    /// MIK-505: the web routes as [`a_quoted_lookup_asks_once_is_audited_and_refuses_a_stale_quote`]
+    /// and the scan buy: a web quote is the admin session's, so a device
+    /// cannot spend it and the session cannot spend a device's; a used,
+    /// expired or stale quote buys nothing; a purchase is audited as the
+    /// API's.
+    #[tokio::test]
+    async fn web_quotes_are_the_sessions_buy_once_and_are_audited() {
+        let (mut state, cookie, _id, _d) = crate::admin::scan_buy::tests::state().await;
+        Arc::get_mut(&mut state).unwrap().providers = vec![Arc::new(Fake)];
+        let app = crate::admin::full_router(state.clone());
+        let token = device(&state, "read,act", "Pixel 8").await;
+        let device_id = state
+            .store
+            .validate_device_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let owner = crate::admin::web_quote::buyer(cookie.split_once('=').unwrap().1).id;
+        assert!(owner.starts_with("web:") && owner != device_id);
+        let get = |path: String| {
+            Request::get(path)
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let form = |path: &str, body: String| {
+            Request::post(path)
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Without a session: the session gate's answer, nothing quoted.
+        for path in [
+            format!("/admin/lookup/scan/quote?ip={SCAN_IP}&level=2"),
+            format!("/admin/lookup/quote?ip={SCAN_IP}"),
+            format!("/admin/lookup/probe/quote?ip={SCAN_IP}&vantage=x"),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(r.headers()["location"], "/login", "{path}");
+        }
+        // A device token is no session.
+        let r = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/admin/lookup/scan/quote?ip={SCAN_IP}&level=2"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+        // A scan quote: one price, its lifetime, the API's shape.
+        let (st, q) = send(
+            &app,
+            get(format!("/admin/lookup/scan/quote?ip={SCAN_IP}&level=2")),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        assert_eq!(q["credits"], "0.00", "standalone costs nothing: {q}");
+        assert_eq!(q["expires_in"], crate::store::devices::QUOTE_SECS, "{q}");
+        assert_eq!(q["offer"]["level"], 2, "{q}");
+        let (st, v) = send(
+            &app,
+            get(format!("/admin/lookup/scan/quote?ip={SCAN_IP}&level=9")),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::BAD_REQUEST, "invalid".into()),
+            "the API's error shape"
+        );
+        // The device cannot spend the session's quote; it stays unspent.
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{SCAN_IP}/scan"),
+                &token,
+                serde_json::json!({"quote_id": q["quote_id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "quote_invalid".into())
+        );
+        let qid = q["quote_id"].as_str().unwrap().to_string();
+        assert!(
+            state
+                .store
+                .quote_credits(&qid, &owner)
+                .await
+                .unwrap()
+                .is_some(),
+            "not spent"
+        );
+        // The session buys it once, audited as the API's.
+        let buy = |quote: &str| {
+            form(
+                "/admin/lookup/scan",
+                format!("ip={SCAN_IP}&level=2&quote_id={quote}"),
+            )
+        };
+        let (st, to, flash, _) = web(&app, buy(&qid)).await;
+        assert_eq!(
+            (st, to.as_str()),
+            (
+                StatusCode::SEE_OTHER,
+                format!("/ip/{SCAN_IP}#actions").as_str()
+            )
+        );
+        assert!(
+            flash.starts_with("peephole_flash: Scan queued at 0.00 credits"),
+            "{flash}"
+        );
+        assert_eq!(jobs_and_actions(&state).await, (1, 1));
+        let a = state.store.recent_device_actions(1).await.unwrap();
+        assert_eq!(
+            (
+                a[0].device_id.as_str(),
+                a[0].action.as_str(),
+                a[0].target.as_str()
+            ),
+            (owner.as_str(), "scan", SCAN_IP)
+        );
+        assert!(a[0].job_id.starts_with("s_"), "{}", a[0].job_id);
+        // Used: refused, nothing queued.
+        let (_, _, flash, _) = web(&app, buy(&qid)).await;
+        assert!(
+            flash.starts_with(
+                "peephole_flash_error: No scan: unknown, expired or already used quote"
+            ),
+            "{flash}"
+        );
+        // A device's quote is not the session's: refused, and unspent.
+        let theirs = state
+            .store
+            .create_quote(&device_id, SCAN_IP, 3, 0)
+            .await
+            .unwrap();
+        let (_, _, flash, _) = web(&app, buy(&theirs.id)).await;
+        assert!(
+            flash.contains("unknown, expired or already used quote"),
+            "{flash}"
+        );
+        assert!(
+            state
+                .store
+                .quote_credits(&theirs.id, &device_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Expired: refused.
+        let old = state
+            .store
+            .create_quote(&owner, SCAN_IP, 3, 0)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE scan_quotes SET expires_at = datetime('now', '-1 seconds') WHERE id = ?",
+        )
+        .bind(&old.id)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let (_, _, flash, _) = web(&app, buy(&old.id)).await;
+        assert!(
+            flash.contains("unknown, expired or already used quote"),
+            "{flash}"
+        );
+        // Stale: the price moved since; nothing queued or charged.
+        let stale = state
+            .store
+            .create_quote(&owner, SCAN_IP, 3, 500)
+            .await
+            .unwrap();
+        let (_, _, flash, _) = web(&app, buy(&stale.id)).await;
+        assert!(
+            flash.contains("the price moved since the quote: get a new one. Nothing was charged."),
+            "{flash}"
+        );
+        assert_eq!(jobs_and_actions(&state).await, (1, 1));
+
+        // A lookup quote, asked as the "Ask" button's form asks.
+        let ip = "198.51.100.7";
+        let (st, q) = send(
+            &app,
+            get(format!(
+                "/admin/lookup/quote?ip={ip}&ask={}",
+                crate::intel::ABUSEIPDB
+            )),
+        )
+        .await;
+        assert_eq!(st, 200, "{q}");
+        assert_eq!(
+            q["providers"][0]["provider"],
+            crate::intel::ABUSEIPDB,
+            "{q}"
+        );
+        let ask = |quote: &str| {
+            form(
+                "/admin/lookup",
+                format!("ip={ip}&ask={}&quote_id={quote}", crate::intel::ABUSEIPDB),
+            )
+        };
+        let qid = q["quote_id"].as_str().unwrap().to_string();
+        let (st, _, _, html) = web(&app, ask(&qid)).await;
+        assert_eq!(st, 200);
+        assert!(html.contains("Asked now"), "the provider answered: {html}");
+        assert_eq!(jobs_and_actions(&state).await, (1, 2));
+        let a = state.store.recent_device_actions(1).await.unwrap();
+        assert_eq!(
+            (
+                a[0].device_id.as_str(),
+                a[0].action.as_str(),
+                a[0].job_id.as_str()
+            ),
+            (owner.as_str(), "lookup", qid.as_str())
+        );
+        // Used: nothing asked.
+        let (_, _, _, html) = web(&app, ask(&qid)).await;
+        assert!(
+            html.contains(
+                "Nothing asked: unknown, expired or already used quote. Nothing was charged."
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("Asked now"), "{html}");
+        // Stale, and a device's: nothing asked, nothing audited.
+        let stale = state
+            .store
+            .create_quote_at(&owner, ip, -1, 500)
+            .await
+            .unwrap();
+        let (_, _, _, html) = web(&app, ask(&stale.id)).await;
+        assert!(
+            html.contains("Nothing asked: the price moved since the quote"),
+            "{html}"
+        );
+        let theirs = state
+            .store
+            .create_quote_at(&device_id, ip, -1, 0)
+            .await
+            .unwrap();
+        let (_, _, _, html) = web(&app, ask(&theirs.id)).await;
+        assert!(
+            html.contains("Nothing asked: unknown, expired or already used quote"),
+            "{html}"
+        );
+        // And the device cannot spend a web lookup quote.
+        let (_, q) = send(&app, get(format!("/admin/lookup/quote?ip={ip}"))).await;
+        let (st, v) = send(
+            &app,
+            authed_json(
+                "POST",
+                &format!("/api/v1/ips/{ip}/lookup"),
+                &token,
+                serde_json::json!({"quote_id": q["quote_id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].clone()),
+            (StatusCode::CONFLICT, "quote_invalid".into())
+        );
+        assert_eq!(jobs_and_actions(&state).await, (1, 2));
+
+        // Standalone: a scan needs no quote, as before.
+        let (st, to, flash, _) = web(
+            &app,
+            form("/admin/lookup/scan", format!("ip={SCAN_IP}&level=4")),
+        )
+        .await;
+        assert_eq!(
+            (st, to.as_str()),
+            (
+                StatusCode::SEE_OTHER,
+                format!("/ip/{SCAN_IP}#actions").as_str()
+            )
+        );
+        assert!(
+            flash.starts_with("peephole_flash: Level 4 scan queued"),
+            "{flash}"
+        );
+        assert_eq!(
+            jobs_and_actions(&state).await,
+            (2, 2),
+            "free: not audited, as before"
+        );
     }
 }
