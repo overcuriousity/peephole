@@ -1,0 +1,29 @@
+{# The Timeline of `t` (`store::events`): one row per observation, newest first. Request rows keep the old Requests table's columns; the public cut (requests, scans, probes) reads like the wall's "Recent requests" (minute, cut path) and has no node, query, vantage IP, admin link or older pages. #}
+{% let adm = chrome.authed %}
+<div class="table-wrap wide"><table class="events">
+  <thead><tr><th>Time (UTC)</th><th>What</th><th>Path or detail</th><th>Sev</th>{% if t.labels %}<th>Labels</th>{% endif %}{% if adm %}<th>Node</th><th></th>{% endif %}</tr></thead>
+  <tbody>
+  {% for ev in t.events.items %}
+    <tr data-kind="{{ ev.k }}"{% if let Some(s) = ev.severity %} data-sev="{{ s }}"{% endif %}>
+      <td class="ts">{% if adm %}{{ ev.ts }}{% else %}{{ crate::admin::views::minute(ev.ts) }}{% endif %}</td>
+      {% if ev.is_request() %}
+      <td class="mono">{% if ev.k == "webshell" %}<span class="badge badge-status">command</span>{% else %}{{ ev.method.as_deref().unwrap_or("") }}{% endif %}</td>
+      <td class="path">{% if ev.k == "webshell" %}<span class="mono">{{ ev.summary.as_deref().unwrap_or("") }}</span> <span class="muted">{{ ev.method.as_deref().unwrap_or("") }} {{ ev.path.as_deref().unwrap_or("") }}</span>{% else %}{% if adm %}{{ ev.path.as_deref().unwrap_or("") }}{% else %}{{ crate::admin::views::public_path(ev.path.as_deref().unwrap_or("")) }}{% endif %}{% if let Some(q) = ev.query %}<span class="muted">?{{ q }}</span>{% endif %}{% endif %}</td>
+      <td>{% if let Some(sev) = ev.severity %}{% include "_severity.html" %}{% endif %}</td>
+      {% if t.labels %}<td><span class="chips">{% for l in ev.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in ev.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
+      {% else %}
+      <td><span class="badge badge-status">{% if ev.k == "scan" %}counter-scan{% else %}{{ ev.k }}{% endif %}</span></td>
+      <td>{% if ev.k == "probe" %}{% if let Some(v) = ev.summary %}<span class="muted">from</span> <span class="mono">{{ v }}</span>{% endif %}{% else %}<span class="{% if ev.k == "fingerprint" || ev.k == "upload" %}mono {% endif %}break">{{ ev.summary.as_deref().unwrap_or("") }}</span>{% endif %}</td>
+      <td></td>
+      {% if t.labels %}<td></td>{% endif %}
+      {% endif %}
+      {% if adm %}
+      <td class="muted">{{ ev.node.as_deref().unwrap_or("") }}</td>
+      <td class="nowrap">{% if ev.is_request() %}{% let r = ev %}{% include "_canary_marks.html" %}{% endif %}{% if let Some(h) = ev.href() %}<a class="btn btn-sm btn-ghost" href="{{ h }}">{% if ev.is_request() %}inspect{% else %}details{% endif %}</a>{% endif %}</td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  {% if t.events.items.is_empty() %}<tr><td colspan="{{ 4 + t.labels as usize + 2 * adm as usize }}" class="empty">Nothing recorded.</td></tr>{% endif %}
+  </tbody>
+</table></div>
+{% if t.paged && adm %}{% if let Some(q) = t.older_href() %}<p class="muted"><a href="/ip/{{ t.ov.ip.ip }}{{ q }}">Older →</a></p>{% endif %}{% endif %}

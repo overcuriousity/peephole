@@ -4,7 +4,8 @@
 use crate::admin::AdminState;
 use crate::admin::error::AppResult;
 use crate::admin::public::{IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards};
-use crate::store::browse::{Audience, IpOverview, Page, RequestListRow};
+use crate::store::browse::{Audience, IpOverview};
+use crate::store::events::{Cursor, EventKind, EventPage};
 use crate::store::requests::IpRow;
 use std::sync::Arc;
 
@@ -16,13 +17,16 @@ pub struct Target {
     pub calendar_json: String,
     /// Largest family count, for the bar widths.
     pub family_max: i64,
-    pub page: Page<RequestListRow>,
+    /// The Timeline: requests, commands, uploads, canaries, probes, scans,
+    /// fingerprints and intel fetches for an admin; released requests,
+    /// published scans and probes for the public.
+    pub events: EventPage,
     pub intel: Vec<IntelCard>,
     /// Admin-only sections; loaded only with a session.
     pub admin: Option<IpAdminData>,
     pub labels: bool,
-    /// The requests list links to further pages (the IP page; the lookup
-    /// result links to the IP page instead).
+    /// The Timeline links to older events (the IP page; the lookup result
+    /// links to all requests instead).
     pub paged: bool,
     /// Days of history this node keeps; 0: all of it.
     pub window_days: u32,
@@ -35,6 +39,16 @@ pub struct Target {
 }
 
 impl Target {
+    /// The Timeline's link to older events.
+    pub fn older_href(&self) -> Option<String> {
+        let n = self.events.next.as_ref()?;
+        let mut q = format!("?before={}", crate::admin::public::urlencode(&n.ts));
+        if let Some(at) = n.at_param() {
+            q.push_str(&format!("&at={}", crate::admin::public::urlencode(&at)));
+        }
+        Some(q)
+    }
+
     /// Where an `AS{n}` badge leads: the network's page for an admin, the
     /// filtered IP list for the public (the page needs a session).
     pub fn asn_href(&self, asn: &i64) -> String {
@@ -97,13 +111,16 @@ pub fn pending<'a>(cards: impl Iterator<Item = &'a IntelCard>) -> String {
         .join(", ")
 }
 
+/// Timeline rows per page.
+pub const TIMELINE_ROWS: i64 = 50;
+
 /// Load `ip`'s view. None: the address is in the table but has no
 /// overview (nothing recorded about it).
 pub async fn load(
     state: &AdminState,
     ip: &IpRow,
     authed: bool,
-    page: u32,
+    before: Option<&Cursor>,
     paged: bool,
 ) -> AppResult<Option<Target>> {
     // Anonymous views go through the cache; an admin always reads fresh.
@@ -115,19 +132,24 @@ pub async fn load(
     let Some(ov) = ov else {
         return Ok(None);
     };
-    // Per-request rows are admin-only: not even queried for the public.
-    let requests = if authed {
-        state
-            .store
-            .requests_for_ip(ip.id, page, Audience::Admin)
-            .await?
+    // The public cut never reads uploads, canaries, fingerprints, intel or
+    // webshell requests (owner, MIK-497).
+    let kinds: &[EventKind] = if authed {
+        &EventKind::ALL
     } else {
-        Page {
-            items: vec![],
-            page: 1,
-            has_next: false,
-        }
+        &EventKind::PUBLIC
     };
+    let events = state
+        .store
+        .ip_events(
+            ip.id,
+            kinds,
+            Audience::of(authed),
+            // The public sees the newest page only.
+            before.filter(|_| authed),
+            TIMELINE_ROWS,
+        )
+        .await?;
     let admin = if authed {
         let found = state.store.scans_for_ip(ip.id).await?;
         let ids: Vec<i64> = found.iter().map(|s| s.id).collect();
@@ -192,7 +214,7 @@ pub async fn load(
             crate::admin::public::apply_rdap_pick(&mut cards, state.store.rdap_pick(&ip.ip).await?);
             cards
         },
-        page: requests,
+        events,
         admin,
         labels: crate::admin::public::labels_shown(state, authed),
         paged,

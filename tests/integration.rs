@@ -1976,9 +1976,15 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         .execute(&store.pool)
         .await
         .unwrap();
+    // Released requests are on the public Timeline, as on the public
+    // request list (owner, MIK-497); their query, node and inspect link
+    // are not.
+    let events = &html[html
+        .find("<table class=\"events\">")
+        .expect("public Timeline")..];
+    assert!(events.contains("/wp-login.php"), "{events}");
+    assert!(!events.contains("inspect"), "{events}");
     for marker in [
-        // Per-request rows (path included) are admin-only now.
-        "/wp-login.php",
         // Fingerprints are never public.
         ja4h,
         "/admin/links",
@@ -2550,8 +2556,8 @@ async fn query_strings_are_admin_only() {
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
     // No public surface shows the query string. The wall's "Recent
-    // requests" list the path alone (not in the JSON); the IP pages show
-    // no request rows.
+    // requests" and the IP page's Timeline list the path alone (not in the
+    // JSON).
     for url in [
         format!("{base}/ip/203.0.113.200"),
         format!("{base}/ips"),
@@ -2562,12 +2568,16 @@ async fn query_strings_are_admin_only() {
         assert!(!body.contains("SECRET"), "{url} leaks the query string");
         assert!(!body.contains("api_key"), "{url} leaks the query string");
     }
-    for url in [format!("{base}/ip/203.0.113.200"), format!("{base}/ips")] {
-        assert!(
-            !get(url.clone()).await.contains("/api/v1/usres"),
-            "{url} leaks the request path"
-        );
-    }
+    assert!(
+        !get(format!("{base}/ips")).await.contains("/api/v1/usres"),
+        "/ips leaks the request path"
+    );
+    assert!(
+        get(format!("{base}/ip/203.0.113.200"))
+            .await
+            .contains("/api/v1/usres"),
+        "the public Timeline lists the path (MIK-497)"
+    );
     // The wall lists paths now, but its JSON keeps `recent` out.
     let stats = get(format!("{base}/api/stats?range=24h")).await;
     assert!(

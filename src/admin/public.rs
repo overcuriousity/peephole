@@ -1092,22 +1092,25 @@ struct IpPage {
     can_delete: bool,
 }
 
+/// The IP page's Timeline cursor: `before` must be `YYYY-MM-DD HH:MM:SS`
+/// (anything else is the first page), `at` `<kind>.<id>`.
 #[derive(serde::Deserialize, Default)]
-pub struct PageQuery {
-    #[serde(default, deserialize_with = "crate::store::browse::lenient_i64")]
-    pub page: Option<i64>,
+pub struct TimelineQuery {
+    pub before: Option<String>,
+    pub at: Option<String>,
 }
 
 async fn ip_page(
     MaybeUser(authed): MaybeUser,
     State(state): State<Arc<AdminState>>,
     Path(addr): Path<String>,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<TimelineQuery>,
 ) -> AppResult<Html<String>> {
     let Some(ip) = state.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    let Some(t) = crate::admin::target::load(&state, &ip, authed, page_num(q.page), true).await?
+    let before = crate::store::events::Cursor::parse(q.before.as_deref(), q.at.as_deref());
+    let Some(t) = crate::admin::target::load(&state, &ip, authed, before.as_ref(), true).await?
     else {
         return Err(AppError::NotFound);
     };
@@ -2451,5 +2454,198 @@ show_labels = {show_labels}
         let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].label, "Result");
+    }
+
+    /// 203.0.113.40 with a labelled request (query, canary served), a
+    /// webshell command, an upload, a scan and a probe; 203.0.113.41 holds
+    /// nothing but a request.
+    async fn timeline_state() -> (Arc<AdminState>, tempfile::TempDir) {
+        let (st, dir) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.40".parse().unwrap())
+            .await
+            .unwrap();
+        let req = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/wp-login.php".into(),
+                query: Some("secretq=1".into()),
+                headers_json: "[]".into(),
+                labels_json: "[\"wordpress\"]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO canaries (value_hash, kind, request_id, ts, ip_id)
+             VALUES (77, 'git-token', ?, datetime('now'), ?)",
+        )
+        .bind(req)
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        webshell_cmd(&st, "203.0.113.40", "whoami").await;
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.40", "/up.php", b"<?php").await;
+        st.store.enqueue_scan(ip.id, 2, 0).await.unwrap();
+        let job = st.store.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-hostkeys.xml"
+        ))
+        .unwrap();
+        st.store.finish_job(job.id, Some(&res), None).await.unwrap();
+        sqlx::query(
+            "INSERT INTO probes (uid, group_uid, ip_id, asker, vantage_ip, started_at, finished_at)
+             VALUES ('p1', 'g1', ?, x'00', '192.0.2.99', datetime('now', '-1 minute'), datetime('now', '-1 minute'))",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        (st, dir)
+    }
+
+    /// The events table of a page: from `<table class="events">` to its end.
+    fn events_table(html: &str) -> &str {
+        let a = html.find("<table class=\"events\">").expect("events table");
+        let b = a + html[a..].find("</table>").unwrap();
+        &html[a..b]
+    }
+
+    #[tokio::test]
+    async fn the_admin_ip_page_has_one_timeline_instead_of_the_requests_table() {
+        let (st, _d) = timeline_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.40", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(!html.contains("data-section=\"requests\""), "{html}");
+        let activity = &html[html.find("data-section=\"activity\"").unwrap()..];
+        let activity = &activity[..activity.find("</section>").unwrap()];
+        assert!(activity.contains("<table class=\"events\">"), "{activity}");
+        assert!(
+            activity.contains("href=\"/requests?ip=203.0.113.40\">All requests →</a>"),
+            "{activity}"
+        );
+        let ev = events_table(&html);
+        for kind in ["request", "webshell", "upload", "canary", "scan", "probe"] {
+            assert!(
+                ev.contains(&format!("data-kind=\"{kind}\"")),
+                "{kind}: {ev}"
+            );
+        }
+        // The request row is the old Requests row: labels, query, canary
+        // mark, inspect.
+        assert!(ev.contains(">wordpress</span>"), "{ev}");
+        assert!(ev.contains("?secretq=1"), "{ev}");
+        assert!(ev.contains("class=\"canary-mark\""), "{ev}");
+        assert!(ev.contains(">inspect</a>"), "{ev}");
+        assert!(ev.contains(">whoami</span>"), "{ev}");
+        assert!(ev.contains("/admin/uploads/"), "{ev}");
+        assert!(ev.contains("/admin/scans/"), "{ev}");
+        assert!(ev.contains("192.0.2.99"), "{ev}");
+        assert!(ev.contains("<th>Node</th>"), "{ev}");
+        // A bad cursor is the first page.
+        let (status, garbage) = get_with(
+            &app,
+            "/ip/203.0.113.40?before=garbage&at=x.1",
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(events_table(&garbage), ev);
+    }
+
+    #[tokio::test]
+    async fn the_public_timeline_is_requests_scans_and_probes_without_admin_detail() {
+        let (st, _d) = timeline_state().await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.40", None).await;
+        assert_eq!(status, 200);
+        let ev = events_table(&html);
+        assert!(ev.contains("data-kind=\"request\""), "{ev}");
+        assert!(ev.contains("/wp-login.php"), "{ev}");
+        assert!(ev.contains(">counter-scan</span>"), "{ev}");
+        assert!(ev.contains("level 2"), "{ev}");
+        assert!(ev.contains("data-kind=\"probe\""), "{ev}");
+        for absent in [
+            "data-kind=\"webshell\"",
+            "data-kind=\"upload\"",
+            "data-kind=\"canary\"",
+            "data-kind=\"fingerprint\"",
+            "data-kind=\"intel\"",
+            "whoami",
+            "/s.php",
+            "secretq",
+            "192.0.2.99",
+            "canary-mark",
+            "<th>Node</th>",
+            "inspect",
+            "href=",
+        ] {
+            assert!(!ev.contains(absent), "{absent}: {ev}");
+        }
+        assert!(!html.contains("/admin/"), "{html}");
+        assert!(!html.contains("whoami"), "{html}");
+        assert!(!html.contains("data-section=\"requests\""), "{html}");
+        // The request list needs a session; the public sees the newest page
+        // only, whatever the cursor says.
+        assert!(!html.contains("All requests"), "{html}");
+        let (_, paged) = get_with(
+            &app,
+            "/ip/203.0.113.40?before=2000-01-01%2000%3A00%3A00",
+            None,
+        )
+        .await;
+        assert_eq!(events_table(&paged), ev);
+    }
+
+    #[tokio::test]
+    async fn the_timeline_pages_older_by_its_cursor() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.42".parse().unwrap())
+            .await
+            .unwrap();
+        let n = crate::admin::target::TIMELINE_ROWS + 3;
+        for i in 0..n {
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: format!("/p{i}"),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // All in one second: the cursor still splits it exactly.
+        sqlx::query("UPDATE requests SET ts = '2026-10-01 10:00:00'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, first) = get_with(&app, "/ip/203.0.113.42", Some(&cookie)).await;
+        let rows = |h: &str| events_table(h).matches("data-kind=\"request\"").count() as i64;
+        assert_eq!(rows(&first), crate::admin::target::TIMELINE_ROWS);
+        let a = first.find("\">Older →</a>").expect("older link");
+        let href = &first[first[..a].rfind("href=\"").unwrap() + 6..a];
+        let href = href.replace("&#38;", "&");
+        assert!(
+            href.starts_with("/ip/203.0.113.42?before=2026-10-01%2010%3A00%3A00&at=request."),
+            "{href}"
+        );
+        let (status, older) = get_with(&app, &href, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(rows(&older), 3, "{older}");
+        assert!(older.contains(">/p0<"), "{older}");
+        assert!(!older.contains(">Older →</a>"), "{older}");
     }
 }
