@@ -1,4 +1,6 @@
 *, *::before, *::after { box-sizing: border-box; }
+/* The hidden attribute wins over component display rules (.btn, .filters, …). */
+[hidden] { display: none !important; }
 html { font-size: 16px; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 body {
   margin: 0; min-height: 100vh;

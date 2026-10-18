@@ -3,6 +3,11 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.18.1] - 2026-10-18
+
+### Fixed
+- Elements with the `hidden` attribute stay hidden: the firm-price dialog shows "Get a new price" only once the quote has expired or failed.
+
 ## [0.18.0] - 2026-10-18
 
 Observations: the admin pages correlate what peephole saw by address,
