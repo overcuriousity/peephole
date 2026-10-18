@@ -297,6 +297,24 @@ impl Store {
         .await?)
     }
 
+    /// Of `ips`, those with a `tor-relays` result: whether a node says it
+    /// is a Tor relay (any node's "relay" wins, as for exits).
+    pub async fn tor_relay_flags(
+        &self,
+        ips: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT ip, MAX(COALESCE(json_extract(data_json, '$.relay'), 0) = 1)
+             FROM ip_intel WHERE provider = ? AND ip IN (SELECT value FROM json_each(?))
+             GROUP BY ip",
+        )
+        .bind(crate::intel::TOR_RELAYS)
+        .bind(serde_json::to_string(ips)?)
+        .fetch_all(&self.read)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Which RDAP answer the IP page shows (`data::pick_rdap`).
     pub async fn rdap_pick(&self, ip: &str) -> Result<Option<super::data::RdapPick>> {
         let mut conn = self.read.acquire().await?;
