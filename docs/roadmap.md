@@ -32,41 +32,9 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 ## Next
 
-### 1. Stateful web decoys: wp-admin, upload sink, webshell commands
+### 1. New paths and exploit waves
 
-- **Cost:** M–L
-- **Benefit:** high. It captures the second stage (the dropped webshell and
-  the commands sent to it) without emulating a shell.
-
-- **Upload sink.** wp-admin plugin upload, `PUT` and the common upload
-  endpoints store the file, hashed and size-capped, and answer with a
-  plausible path. Every later request to that path is recorded and linked
-  to the upload; the commands are in its parameters.
-- **Canned replies.** A short fixed list (`id`, `uname -a`, `whoami`) to
-  draw out the next step. No further emulation.
-- **Hard rule:** an uploaded file is never served back, so peephole cannot
-  be used to host malware. It is exported by hash; the content is exported
-  only on request.
-
-**Shown:**
-
-- **Admin:** an Uploads page (hash, size, type, source IP) and per upload a
-  timeline of the requests sent to it.
-- **Public dashboard:** a "webshells dropped" tile and counts per command verb.
-
-### 2. Campaign clustering (shipped)
-
-Recomputed hourly and deterministically from replicated data, so every
-node arrives at the same campaigns: hard edges (SSH host key, TLS
-certificate, browser fingerprint, canary reuse) and soft edges (similar
-sets of normalized paths, JA4 with JA4H as support only). Shown in the
-admin area, as counts on the public dashboard ("Campaigns this period")
-and as the dataset's `campaign` column. See [Overview](overview.md) and
-[The dataset](dataset.md#campaign). v2: order agreement, chaining guard.
-
-### 3. New paths and exploit waves
-
-- **Cost:** M (the path normalization shipped with item 2)
+- **Cost:** M (the path normalization shipped with campaign clustering)
 - **Benefit:** high. It gives early warning when a new exploit starts
   spreading, often before CVE write-ups.
 
@@ -87,9 +55,9 @@ and as the dataset's `campaign` column. See [Overview](overview.md) and
 - **Public dashboard:** a count of new path shapes this period (paths themselves
   are request contents, so not public).
 
-### 4. Personas per node or hostname (opt-in)
+### 2. Personas per node or hostname (opt-in)
 
-- **Cost:** M (after item 1)
+- **Cost:** M
 - **Benefit:** medium–high. A controlled comparison of targeted versus spray
   traffic across the cluster.
 
@@ -119,7 +87,7 @@ nodes, and recorded like any persona. With a persona set they follow it.
 - **Public dashboard:** attack mix per persona.
 - **Dataset:** a `persona` column.
 
-### 5. AI agent detection
+### 3. AI agent detection
 
 - **Cost:** M
 - **Benefit:** high. It tells which traffic an LLM agent drives, a class of
@@ -159,7 +127,7 @@ an agent's own traces.
 - **Public dashboard:** share of sources with agent traces this period.
 - **Dataset:** the labels, in the existing `labels` column.
 
-### 6. AI discovery lures
+### 4. AI discovery lures
 
 - **Cost:** M–L
 - **Benefit:** high. Agents look for machine-readable descriptions first;
@@ -184,7 +152,7 @@ clustering, where address rotation otherwise breaks the chain.
 Rules that hold:
 
 - **No runtime LLM.** Documents are rendered from the node's identity and
-  persona (item 4), deterministic and cached.
+  persona (item 2), deterministic and cached.
 - **Nothing real.** The documents never name or link the operator's real
   sites, and never echo request content beyond the canary.
 - **Recorded like every decoy.** The answer is `decoy:discovery:<kind>`.
@@ -221,11 +189,6 @@ Rules that hold:
 - **Queue a counter-scan or block from the Lookup page.** S–M, low. The
   probe and vantage actions exist; the manual scan queue and the block
   action do not yet.
-- **Name lookups over `/api/v1`.** S, high for the Android app.
-  `/admin/lookup` already resolves a hostname with several nodes;
-  `/api/v1/lookup` takes IPs only. It should accept names, and URLs
-  reduced to their host, through the same code. That is the server half of
-  item 1 in the [app roadmap](https://github.com/overcuriousity/peephole-android/blob/main/docs/roadmap.md).
 - **Cluster log polish.** S–M, low. The owner found the cluster log
   "a bit un-polished" (feedback on the Android app, 2026-10-10). The admin
   cluster pages get a UX pass first, then the fixes.
@@ -250,6 +213,6 @@ Rules that hold:
   `/api/blocklist`, and a CrowdSec-compatible endpoint. Cost M.
 - **Weekly digest page.** A generated, permalinked public summary: new
   families, the largest campaign, new path shapes, top movers. Cost M; worth
-  it once items 3 and 4 exist.
+  it once items 1 and 2 exist.
 - **Hall of fame.** Oldest CVE still probed, strangest User-Agent, longest
   payload, as aggregates. Cost S–M.
