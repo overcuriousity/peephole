@@ -764,7 +764,9 @@ pub async fn inbox_loop(node: Arc<Node>, peer: NodeId, addr: String) {
             Err(e) => {
                 // The relay lost this node's lease (it restarted): lease
                 // another.
-                if format!("{e:#}").contains(super::relay::NO_LEASE) && node.leased.forget(&peer) {
+                if format!("{e:#}").contains(super::relay::NO_LEASE)
+                    && node.leased.forget(&node.store, &peer).await
+                {
                     debug!(relay = %peer.short(), "relay holds no lease of ours; dropped");
                     node.publish_status();
                 }
