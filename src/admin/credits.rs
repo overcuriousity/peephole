@@ -714,6 +714,8 @@ mod tests {
             hi_mc: median,
             demand: 0.0,
             supply: 0.0,
+            cluster_demand: None,
+            cluster_supply: None,
         }
     }
 

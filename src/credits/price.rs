@@ -521,6 +521,35 @@ pub fn traded(ledger: &super::ledger::Ledger, me: &NodeId) -> HashMap<String, Ta
     out
 }
 
+/// Units of each good sold in `hour` (Unix time / 3600, by the offer's
+/// clock): `(here, cluster)`, here being what `me` sold. One unit for each
+/// good a charged offer names, like [`traded`]; an audit is a scan sold.
+/// A node paying itself sells nothing, so it cannot inflate the figures.
+pub fn sold_in_hour(
+    ledger: &super::ledger::Ledger,
+    hour: i64,
+    me: &NodeId,
+) -> HashMap<String, (u64, u64)> {
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    for o in &ledger.offers {
+        if o.payer == o.to
+            || !matches!(o.state, super::ledger::OfferState::Charged { charged } if charged > 0)
+            || super::history::hour_of(crate::cluster::hlc::physical_ms(o.hlc)) != hour
+        {
+            continue;
+        }
+        for good in &o.answered {
+            let good = if good == AUDIT { SCAN } else { good.as_str() };
+            let t = out.entry(good.to_string()).or_default();
+            if o.to == *me {
+                t.0 += 1;
+            }
+            t.1 += 1;
+        }
+    }
+    out
+}
+
 /// One good in this node's market: its ask and bid as of its last price
 /// refresh, its trades as of the book.
 #[derive(Debug, Clone, PartialEq)]
@@ -809,6 +838,8 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     let me = node.id();
     let members = node.members();
     let mut announced: HashMap<String, Vec<u32>> = HashMap::new();
+    // What live members offer a day, per provider.
+    let mut members_on_demand: HashMap<String, f64> = HashMap::new();
     for id in node.live_members(intel::LIVE_WINDOW) {
         if id == me
             || left_out.contains(&id)
@@ -824,6 +855,9 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         };
         for (p, mc) in &k.hb.prices {
             announced.entry(p.clone()).or_default().push(*mc);
+        }
+        for (p, n) in &k.hb.on_demand {
+            *members_on_demand.entry(p.clone()).or_default() += f64::from(*n);
         }
         // A protocol-4 node's scan price is the old cluster-wide one.
         if let Some(mc) = k.hb.scan_price_mc.filter(|_| {
@@ -928,66 +962,52 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
     for good in FREE_GOODS {
         node.store.intel_delete(&price_key(good)).await?;
     }
-    // The hour's snapshot for the Credits page: demand and supply per hour.
-    let per_hour = |n: f64| if hours > 0.0 { n / hours } else { 0.0 };
-    let mut goods: Vec<(&str, Option<u32>, f64, f64)> = offers
+    // The hour's snapshot for the Credits page: sold, here and in the
+    // cluster, from the replicated ledger (recounted at every refresh, so
+    // a restart loses nothing); offered per hour.
+    let hour = super::history::hour_of(crate::cluster::hlc::wall_ms());
+    let sold = sold_in_hour(&book.ledger, hour, &me);
+    let mut goods: Vec<(&str, Option<u32>, f64)> = offers
         .iter()
         .map(|o| {
             (
                 o.provider.as_str(),
                 Some(o.price_mc),
-                per_hour(got(&o.provider)),
                 o.on_demand as f64 / 24.0,
             )
         })
         .collect();
     let mine = scanner_prices.iter().find(|s| s.node == me);
-    goods.push((
-        SCAN,
-        sell_mc,
-        mine.map_or(0.0, |s| s.paid),
-        mine.map_or(0.0, |s| s.supply),
-    ));
-    goods.push((
-        RESOLVE,
-        Some(resolve_mc),
-        per_hour(got(RESOLVE)),
-        offer_per_day as f64 / 24.0,
-    ));
-    goods.push((
-        RDNS,
-        Some(rdns_mc),
-        per_hour(got(RDNS)),
-        offer_per_day as f64 / 24.0,
-    ));
+    goods.push((SCAN, sell_mc, mine.map_or(0.0, |s| s.supply)));
+    goods.push((RESOLVE, Some(resolve_mc), offer_per_day as f64 / 24.0));
+    goods.push((RDNS, Some(rdns_mc), offer_per_day as f64 / 24.0));
     if let Some(pr) = node.prober() {
-        goods.push((
-            PROBE,
-            probe_mc,
-            per_hour(got(PROBE)),
-            pr.slots() as f64 * PROBES_PER_SLOT_HOUR,
-        ));
+        goods.push((PROBE, probe_mc, pr.slots() as f64 * PROBES_PER_SLOT_HOUR));
     }
     if relay_mc.is_some() {
-        goods.push((
-            RELAY,
-            relay_mc,
-            per_hour(got(RELAY)),
-            node.cfg.relay_slots as f64,
-        ));
+        goods.push((RELAY, relay_mc, node.cfg.relay_slots as f64));
     }
     // Goods only members announce (a provider this node does not serve);
     // a free good an older member still prices is no market here.
     for g in announced.keys().filter(|g| !is_free(g)) {
         if !goods.iter().any(|(x, ..)| x == g) {
-            goods.push((g.as_str(), None, 0.0, 0.0));
+            goods.push((g.as_str(), None, 0.0));
         }
     }
-    let hour = super::history::hour_of(crate::cluster::hlc::wall_ms());
+    // Offered in the cluster: the scanners' pace (the scan tile's figure),
+    // a provider's daily allowances here and at live members; not known
+    // for the goods no member announces an amount of.
+    let cluster_can_do: f64 = capacity.scanners.iter().map(|s| s.can_do).sum();
+    let cluster_supply = |good: &str, here: f64| match good {
+        SCAN => Some(cluster_can_do),
+        RESOLVE | RDNS | PROBE | RELAY => None,
+        g => Some(here + members_on_demand.get(g).copied().unwrap_or(0.0) / 24.0),
+    };
     let points: Vec<super::history::Point> = goods
         .into_iter()
-        .map(|(good, own, demand, supply)| {
+        .map(|(good, own, supply)| {
             let (lo_mc, median_mc, hi_mc) = super::history::spread(&ann(good));
+            let (here, cluster) = sold.get(good).copied().unwrap_or_default();
             super::history::Point {
                 hour,
                 good: good.to_string(),
@@ -995,13 +1015,24 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
                 lo_mc,
                 median_mc,
                 hi_mc,
-                demand,
+                demand: here as f64,
                 supply,
+                cluster_demand: Some(cluster as f64),
+                cluster_supply: cluster_supply(good, supply),
             }
         })
         .collect();
     if let Err(e) = super::history::record(&node.store.pool, &points).await {
         tracing::debug!(?e, "credits: price history not written");
+    }
+    // Receipts of the hour before that replicated since it was recorded.
+    let sold_before = sold_in_hour(&book.ledger, hour - 1, &me);
+    let before: Vec<(&str, f64, f64)> = sold_before
+        .iter()
+        .map(|(g, (here, cluster))| (g.as_str(), *here as f64, *cluster as f64))
+        .collect();
+    if let Err(e) = super::history::record_cluster(&node.store.pool, hour - 1, &before).await {
+        tracing::debug!(?e, "credits: last hour's sales not corrected");
     }
     let table = Arc::new(Table {
         at_ms: crate::cluster::hlc::wall_ms(),
@@ -1588,6 +1619,88 @@ mod tests {
         let answered: Vec<&str> = resp.findings.iter().map(|f| f.provider.as_str()).collect();
         assert_eq!(answered.len(), 3);
         assert!(answered.iter().all(|g| is_free(g)));
+    }
+
+    /// A charged offer from `payer` to `to` at `ms`, answering `goods`.
+    fn sale(
+        payer: u8,
+        to: u8,
+        ms: u64,
+        charged: Mc,
+        goods: &[&str],
+    ) -> super::super::ledger::Offer {
+        use super::super::ledger::{Offer, OfferState};
+        Offer {
+            payer: id(payer),
+            seq: 1,
+            hlc: ms << 16,
+            to: id(to),
+            offered: charged,
+            covered: charged,
+            held: vec![],
+            state: OfferState::Charged { charged },
+            answered: goods.iter().map(|g| g.to_string()).collect(),
+            job: None,
+            audit: None,
+        }
+    }
+
+    #[test]
+    fn sold_in_hour_counts_charged_sales_of_the_hour() {
+        use super::super::ledger::{Ledger, OfferState};
+        let h = 500_000i64;
+        let at = |min: u64| h as u64 * 3_600_000 + min * 60_000;
+        let mut lapsed = sale(2, 1, at(5), 0, &[RDNS]);
+        lapsed.state = OfferState::Lapsed;
+        let ledger = Ledger {
+            offers: vec![
+                sale(2, 1, at(1), 10, &[SCAN]),
+                sale(3, 1, at(2), 10, &[AUDIT]),
+                sale(3, 2, at(3), 10, &[intel::ABUSEIPDB, RDNS]),
+                // Paying itself, charged nothing, lapsed, or another hour: not sold.
+                sale(1, 1, at(4), 10, &[SCAN]),
+                sale(2, 1, at(4), 0, &[SCAN]),
+                lapsed,
+                sale(2, 1, at(60), 10, &[SCAN]),
+                sale(2, 1, at(0) - 1, 10, &[SCAN]),
+            ],
+            ..Default::default()
+        };
+        let sold = sold_in_hour(&ledger, h, &id(1));
+        assert_eq!(sold.get(SCAN), Some(&(2, 2)), "an audit is a scan");
+        assert_eq!(sold.get(intel::ABUSEIPDB), Some(&(0, 1)));
+        assert_eq!(sold.get(RDNS), Some(&(0, 1)));
+        assert_eq!(sold.len(), 3, "{sold:?}");
+        assert!(sold.values().all(|(here, cluster)| here <= cluster));
+        assert_eq!(
+            sold_in_hour(&ledger, h + 1, &id(1)).get(SCAN),
+            Some(&(1, 1))
+        );
+        assert_eq!(
+            sold_in_hour(&ledger, h - 1, &id(1)).get(SCAN),
+            Some(&(1, 1))
+        );
+    }
+
+    /// A node that does not scan sells no scans here, and records what
+    /// the cluster's scanners can do; resolve and rdns have no cluster
+    /// supply.
+    #[tokio::test]
+    async fn refresh_records_cluster_figures() {
+        let (_dir, node) = test_node().await;
+        let t = refresh(&node).await.unwrap();
+        let can_do: f64 = t.capacity.scanners.iter().map(|s| s.can_do).sum();
+        let hour = super::super::history::hour_of(crate::cluster::hlc::wall_ms());
+        let points = super::super::history::all_since(&node.store.pool, hour - 1)
+            .await
+            .unwrap();
+        let of = |g: &str| points.iter().find(|p| p.good == g).unwrap().clone();
+        let scan = of(SCAN);
+        assert_eq!(scan.demand, 0.0);
+        assert_eq!(scan.cluster_demand, Some(0.0));
+        assert_eq!(scan.cluster_supply, Some(can_do));
+        assert_eq!(of(RESOLVE).cluster_supply, None);
+        assert_eq!(of(RDNS).cluster_supply, None);
     }
 
     #[tokio::test]

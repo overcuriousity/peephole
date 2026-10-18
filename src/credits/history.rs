@@ -18,9 +18,12 @@ pub struct Point {
     pub lo_mc: Option<i64>,
     pub median_mc: Option<i64>,
     pub hi_mc: Option<i64>,
-    /// Asked for, and offered, per hour.
+    /// Sold here, and offered here, per hour.
     pub demand: f64,
     pub supply: f64,
+    /// Sold, and offered, in the whole cluster per hour; None: not known.
+    pub cluster_demand: Option<f64>,
+    pub cluster_supply: Option<f64>,
 }
 
 /// `(lowest, median, highest)` of announced prices; the median of an even
@@ -47,8 +50,9 @@ pub async fn record(pool: &SqlitePool, points: &[Point]) -> Result<()> {
     for p in points {
         sqlx::query(
             "INSERT OR REPLACE INTO price_history
-             (hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply,
+              cluster_demand, cluster_supply)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(p.hour)
         .bind(&p.good)
@@ -58,6 +62,8 @@ pub async fn record(pool: &SqlitePool, points: &[Point]) -> Result<()> {
         .bind(p.hi_mc)
         .bind(p.demand)
         .bind(p.supply)
+        .bind(p.cluster_demand)
+        .bind(p.cluster_supply)
         .execute(&mut *tx)
         .await?;
     }
@@ -71,10 +77,32 @@ pub async fn record(pool: &SqlitePool, points: &[Point]) -> Result<()> {
     Ok(())
 }
 
+/// Correct `hour`'s sales with what replicated since it was recorded:
+/// `(good, here, cluster)` replaces `demand` and `cluster_demand` of a point
+/// already there. An hour or good not recorded stays unrecorded.
+pub async fn record_cluster(pool: &SqlitePool, hour: i64, sold: &[(&str, f64, f64)]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (good, here, cluster) in sold {
+        sqlx::query(
+            "UPDATE price_history SET demand = ?, cluster_demand = ?
+             WHERE hour = ? AND good = ?",
+        )
+        .bind(here)
+        .bind(cluster)
+        .bind(hour)
+        .bind(good)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// `good`'s points from `since` (an hour), oldest first.
 pub async fn series(pool: &SqlitePool, good: &str, since: i64) -> Result<Vec<Point>> {
     Ok(sqlx::query_as(
-        "SELECT hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply
+        "SELECT hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply,
+                cluster_demand, cluster_supply
          FROM price_history WHERE good = ? AND hour >= ? ORDER BY hour",
     )
     .bind(good)
@@ -86,7 +114,8 @@ pub async fn series(pool: &SqlitePool, good: &str, since: i64) -> Result<Vec<Poi
 /// Every good's points from `since`, oldest first (the sparklines).
 pub async fn all_since(pool: &SqlitePool, since: i64) -> Result<Vec<Point>> {
     Ok(sqlx::query_as(
-        "SELECT hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply
+        "SELECT hour, good, own_mc, lo_mc, median_mc, hi_mc, demand, supply,
+                cluster_demand, cluster_supply
          FROM price_history WHERE hour >= ? ORDER BY good, hour",
     )
     .bind(since)
@@ -109,6 +138,8 @@ mod tests {
             hi_mc: Some(own + 1),
             demand: 2.0,
             supply: 4.0,
+            cluster_demand: Some(5.0),
+            cluster_supply: None,
         }
     }
 
@@ -148,5 +179,23 @@ mod tests {
         );
         assert_eq!(all_since(&store.pool, now - 1).await.unwrap().len(), 3);
         assert_eq!(hour_of(3_600_000 * 7 + 5), 7);
+    }
+
+    #[tokio::test]
+    async fn record_cluster_corrects_recorded_points_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        record(&store.pool, &[point(10, "scan", 1)]).await.unwrap();
+        record_cluster(&store.pool, 10, &[("scan", 3.0, 7.0), ("rdap", 1.0, 2.0)])
+            .await
+            .unwrap();
+        record_cluster(&store.pool, 9, &[("scan", 1.0, 1.0)])
+            .await
+            .unwrap();
+        let all = all_since(&store.pool, 0).await.unwrap();
+        assert_eq!(all.len(), 1, "a missing hour or good is not inserted");
+        let p = &all[0];
+        assert_eq!((p.hour, p.demand, p.cluster_demand), (10, 3.0, Some(7.0)));
+        assert_eq!((p.supply, p.cluster_supply, p.own_mc), (4.0, None, Some(1)));
     }
 }
