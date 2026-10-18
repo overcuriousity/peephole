@@ -289,7 +289,7 @@ mod tests {
             "no entry opens without the password"
         );
         let mut f = a.by_index_decrypt(0, b"infected").unwrap();
-        assert_eq!(f.name(), format!("{hash}.bin"));
+        assert_eq!(f.name().unwrap(), format!("{hash}.bin"));
         let mut got = vec![];
         std::io::Read::read_to_end(&mut f, &mut got).unwrap();
         assert_eq!(sha2::Sha256::digest(&got).to_vec(), r.sha256);
