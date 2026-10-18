@@ -12,7 +12,7 @@ use super::Store;
 use super::links::{LinkKind, all_sightings};
 use crate::model::shape::SHAPE_V;
 use anyhow::Result;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 /// Version of the algorithm and its constants; a change recomputes.
@@ -588,7 +588,7 @@ async fn signature(conn: &mut sqlx::SqliteConnection) -> Result<String> {
 
 /// The rows a pass reads, as read.
 #[derive(Default)]
-struct Input {
+pub(crate) struct Input {
     /// IP text by id.
     ips: HashMap<i64, String>,
     /// Hard sightings: kind, value, IP, time.
@@ -600,7 +600,7 @@ struct Input {
 }
 
 impl Input {
-    async fn read(conn: &mut sqlx::SqliteConnection) -> Result<Input> {
+    pub(crate) async fn read(conn: &mut sqlx::SqliteConnection) -> Result<Input> {
         let mut input = Input {
             ips: sqlx::query_as::<_, (i64, String)>("SELECT id, ip FROM ips")
                 .fetch_all(&mut *conn)
@@ -690,6 +690,17 @@ struct Output {
     vetoed: usize,
     candidates: usize,
     ordered: usize,
+    /// Every candidate pair, for [`evaluate`].
+    scored: Vec<Scored>,
+}
+
+/// A pair whose shape sets scored high enough for the order term.
+struct Scored {
+    /// ip ids.
+    a: i64,
+    b: i64,
+    score: f64,
+    agreement: Option<f64>,
 }
 
 /// An edge between nodes `a < b` (indexes in IP-text order).
@@ -899,6 +910,7 @@ fn compute(input: &Input, p: &Params) -> Output {
         }
     }
     let (mut vetoed, mut candidates, mut ordered) = (0, 0, 0);
+    let mut scored = vec![];
     for (a, b) in pairs {
         if apart(&path_active[a], &path_active[b]) {
             continue;
@@ -955,9 +967,14 @@ fn compute(input: &Input, p: &Params) -> Output {
             None
         };
         ordered += agreement.is_some() as usize;
-        if let (Some(veto), Some(agree)) = (p.veto, agreement)
-            && agree <= veto
-        {
+        let veto = matches!((p.veto, agreement), (Some(v), Some(x)) if x <= v);
+        scored.push(Scored {
+            a: nodes[a].1,
+            b: nodes[b].1,
+            score,
+            agreement,
+        });
+        if veto {
             vetoed += 1;
             continue;
         }
@@ -1112,6 +1129,357 @@ fn compute(input: &Input, p: &Params) -> Output {
         vetoed,
         candidates,
         ordered,
+        scored,
+    }
+}
+
+/// The tuning grid [`evaluate`] runs: `agree` × `veto` × K.
+const GRID_AGREE: [f64; 3] = [0.3, 0.5, 0.7];
+const GRID_VETO: [Option<f64>; 4] = [Some(-0.2), Some(-0.3), Some(-0.5), None];
+const GRID_K: [usize; 2] = [2, 3];
+/// Vetoed pairs [`evaluate`] prints, and shared shapes per pair.
+const EVAL_PAIRS: usize = 20;
+const EVAL_SHAPES: usize = 12;
+
+/// What `peephole store campaigns-eval` prints for one `input`: v1, the
+/// guard alone and the default v2 in full, the tuning grid against v1, the
+/// default run's order agreements, a sample of the pairs the loosest veto
+/// drops, and how the largest v1 campaigns are chained. Writes nothing.
+pub(crate) fn evaluate(input: &Input) -> String {
+    use std::fmt::Write;
+    let run = |p: &Params| {
+        let started = std::time::Instant::now();
+        let out = compute(input, p);
+        (out, started.elapsed().as_secs_f64())
+    };
+    let mut o = String::new();
+    let (v1, v1_s) = run(&Params::V1);
+    let v1_keys = keys_of(&v1);
+    let guard = Params {
+        guard: Some(K_SOFT_MERGE),
+        ..Params::V1
+    };
+    let (g, g_s) = run(&guard);
+    let (v2, v2_s) = run(&Params::V2);
+    block(&mut o, "V1", &v1, v1_s, &v1_keys);
+    block(&mut o, "guard only (order off, K = 2)", &g, g_s, &v1_keys);
+    block(
+        &mut o,
+        &format!("V2 default (K = {K_SOFT_MERGE}, agree {ORDER_AGREE}, veto {ORDER_VETO})"),
+        &v2,
+        v2_s,
+        &v1_keys,
+    );
+    let _ = writeln!(
+        o,
+        "\npass seconds: V1 {v1_s:.2}, V2 {v2_s:.2}, ratio {:.2}",
+        v2_s / v1_s.max(1e-9)
+    );
+
+    let _ = writeln!(o, "\n== grid (changed versus V1) ==");
+    let _ = writeln!(
+        o,
+        "| agree | veto | K | campaigns | edges | withheld | vetoed | changed % | seconds |"
+    );
+    let _ = writeln!(o, "|---|---|---|---|---|---|---|---|---|");
+    for agree in GRID_AGREE {
+        for veto in GRID_VETO {
+            for k in GRID_K {
+                let p = Params {
+                    order: true,
+                    agree,
+                    veto,
+                    guard: Some(k),
+                };
+                let (out, secs) = run(&p);
+                let _ = writeln!(
+                    o,
+                    "| {agree:.1} | {} | {k} | {} | {} | {} | {} | {:.2} | {secs:.2} |",
+                    veto.map_or("none".to_string(), |v| format!("{v:.1}")),
+                    out.campaigns.len(),
+                    out.edges.len(),
+                    out.withheld,
+                    out.vetoed,
+                    changed(&v1_keys, &out),
+                );
+            }
+        }
+    }
+    let v1_paths = v1.edges.iter().filter(|e| e.kind == PATHS).count();
+    let _ = writeln!(o, "V1 paths edges: {v1_paths}");
+
+    // Agreement over the default run's candidates, buckets of 0.2.
+    let _ = writeln!(o, "\n== agreement of the V2 default candidates ==");
+    let mut buckets = [0usize; 10];
+    let mut none = 0;
+    for s in &v2.scored {
+        match s.agreement {
+            Some(x) => buckets[(((x + 1.0) / 0.2).floor() as usize).min(9)] += 1,
+            None => none += 1,
+        }
+    }
+    for (i, n) in buckets.iter().enumerate() {
+        let lo = -1.0 + 0.2 * i as f64;
+        let close = if i == 9 { ']' } else { ')' };
+        let _ = writeln!(o, "[{lo:+.1}, {:+.1}{close} {n}", lo + 0.2);
+    }
+    let _ = writeln!(o, "None {none}");
+
+    // The pairs the loosest veto drops, spread evenly over their agreement.
+    let ip = |id: i64| input.ips.get(&id).map_or("?", String::as_str);
+    let loosest = GRID_VETO.iter().flatten().fold(f64::MIN, |m, &v| m.max(v));
+    let mut dropped: Vec<&Scored> = v2
+        .scored
+        .iter()
+        .filter(|s| s.agreement.is_some_and(|x| x <= loosest))
+        .collect();
+    dropped.sort_by(|x, y| {
+        x.agreement
+            .partial_cmp(&y.agreement)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| (ip(x.a), ip(x.b)).cmp(&(ip(y.a), ip(y.b))))
+    });
+    let picked: Vec<&Scored> = if dropped.len() <= EVAL_PAIRS {
+        dropped.clone()
+    } else {
+        (0..EVAL_PAIRS)
+            .map(|i| dropped[i * dropped.len() / EVAL_PAIRS])
+            .collect()
+    };
+    let _ = writeln!(
+        o,
+        "\n== vetoed pairs (agreement <= {loosest:.1}): {} of {} ==",
+        picked.len(),
+        dropped.len()
+    );
+    let wanted: HashSet<i64> = picked.iter().flat_map(|s| [s.a, s.b]).collect();
+    let mut firsts: HashMap<i64, BTreeMap<i64, &str>> = HashMap::new();
+    for (id, shape, first, _) in &input.shapes {
+        if wanted.contains(id) {
+            let e = firsts
+                .entry(*id)
+                .or_default()
+                .entry(*shape)
+                .or_insert(first);
+            *e = (*e).min(first.as_str());
+        }
+    }
+    let empty = BTreeMap::new();
+    for s in &picked {
+        let caught: Vec<String> = GRID_VETO
+            .iter()
+            .flatten()
+            .filter(|&&v| s.agreement.is_some_and(|x| x <= v))
+            .map(|v| format!("{v:.1}"))
+            .collect();
+        let _ = writeln!(
+            o,
+            "{} {} score {:.2} agreement {:+.2} vetoed at {}",
+            ip(s.a),
+            ip(s.b),
+            s.score,
+            s.agreement.unwrap_or_default(),
+            caught.join(" ")
+        );
+        let (fa, fb) = (
+            firsts.get(&s.a).unwrap_or(&empty),
+            firsts.get(&s.b).unwrap_or(&empty),
+        );
+        let mut shared: Vec<(&str, &str, i64)> = fa
+            .iter()
+            .filter_map(|(shape, a)| fb.get(shape).map(|b| (*a, *b, *shape)))
+            .collect();
+        shared.sort();
+        for (a, b, shape) in shared.iter().take(EVAL_SHAPES) {
+            let _ = writeln!(o, "  shape {shape} a {a} b {b}");
+        }
+    }
+
+    chaining(&mut o, input, &v1, &v2);
+    o
+}
+
+/// Campaign key by ip id.
+fn keys_of(out: &Output) -> HashMap<i64, &str> {
+    out.members
+        .iter()
+        .map(|(id, k)| (*id, k.as_str()))
+        .collect()
+}
+
+/// The share of IPs in either run whose campaign key differs, in percent.
+fn changed(v1: &HashMap<i64, &str>, out: &Output) -> f64 {
+    let other = keys_of(out);
+    let union: HashSet<i64> = v1.keys().chain(other.keys()).copied().collect();
+    if union.is_empty() {
+        return 0.0;
+    }
+    let diff = union
+        .iter()
+        .filter(|id| v1.get(id) != other.get(id))
+        .count();
+    100.0 * diff as f64 / union.len() as f64
+}
+
+/// One run in full.
+fn block(o: &mut String, title: &str, out: &Output, secs: f64, v1: &HashMap<i64, &str>) {
+    use std::fmt::Write;
+    let _ = writeln!(o, "\n== {title} ==");
+    let _ = writeln!(
+        o,
+        "campaigns {}, members {}",
+        out.campaigns.len(),
+        out.members.len()
+    );
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in &out.edges {
+        *kinds.entry(e.kind).or_default() += 1;
+    }
+    let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    let _ = writeln!(
+        o,
+        "edges: {}",
+        if kinds.is_empty() {
+            "none".to_string()
+        } else {
+            kinds.join(", ")
+        }
+    );
+    let _ = writeln!(o, "withheld {}, vetoed {}", out.withheld, out.vetoed);
+    let pct = if out.candidates == 0 {
+        "-".to_string()
+    } else {
+        format!(
+            "{:.1} %",
+            100.0 * out.ordered as f64 / out.candidates as f64
+        )
+    };
+    let _ = writeln!(
+        o,
+        "coverage: ordered {} of {} candidates ({pct})",
+        out.ordered, out.candidates
+    );
+    let _ = writeln!(o, "changed versus V1: {:.2} %", changed(v1, out));
+    let _ = writeln!(o, "seconds {secs:.2}");
+    let mut sizes = [0usize; 5];
+    for c in &out.campaigns {
+        sizes[match c.size {
+            ..=2 => 0,
+            3..=5 => 1,
+            6..=10 => 2,
+            11..=50 => 3,
+            _ => 4,
+        }] += 1;
+    }
+    let _ = writeln!(
+        o,
+        "sizes: 2: {}, 3-5: {}, 6-10: {}, 11-50: {}, 51+: {}",
+        sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]
+    );
+    let _ = writeln!(o, "largest (key size hard soft):");
+    for c in largest(out) {
+        let _ = writeln!(
+            o,
+            "  {} {} {} {}",
+            c.key, c.size, c.hard_edges, c.soft_edges
+        );
+    }
+}
+
+/// The ten largest campaigns, ties by key.
+fn largest(out: &Output) -> Vec<&CampaignOut> {
+    let mut v: Vec<&CampaignOut> = out.campaigns.iter().collect();
+    v.sort_by(|x, y| y.size.cmp(&x.size).then_with(|| x.key.cmp(&y.key)));
+    v.truncate(10);
+    v
+}
+
+/// For each of the largest v1 campaigns: its hard cores (components of two
+/// or more without its soft edges) and the soft edges between two cores,
+/// `CHAINED` where fewer than the largest grid K join them.
+fn chaining(o: &mut String, input: &Input, v1: &Output, v2: &Output) {
+    use std::fmt::Write;
+    let ip = |id: i64| input.ips.get(&id).map_or("?", String::as_str);
+    let v1_keys = keys_of(v1);
+    let v2_keys = keys_of(v2);
+    let k_max = GRID_K.iter().copied().max().unwrap_or(K_SOFT_MERGE);
+    let _ = writeln!(o, "\n== chaining of the largest V1 campaigns ==");
+    for c in largest(v1) {
+        let members: Vec<i64> = v1
+            .members
+            .iter()
+            .filter(|m| m.1 == c.key)
+            .map(|m| m.0)
+            .collect();
+        let at: HashMap<i64, usize> = members.iter().enumerate().map(|(i, &m)| (m, i)).collect();
+        let edges: Vec<&EdgeOut> = v1
+            .edges
+            .iter()
+            .filter(|e| v1_keys.get(&e.a) == Some(&c.key.as_str()))
+            .collect();
+        let mut parent: Vec<usize> = (0..members.len()).collect();
+        for e in edges.iter().filter(|e| e.kind != PATHS) {
+            let (ra, rb) = (find(&mut parent, at[&e.a]), find(&mut parent, at[&e.b]));
+            if ra != rb {
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+        // Per root: its members' IP text, smallest first.
+        let mut comps: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+        for (i, &m) in members.iter().enumerate() {
+            comps.entry(find(&mut parent, i)).or_default().push(ip(m));
+        }
+        for v in comps.values_mut() {
+            v.sort();
+        }
+        let cores = comps.values().filter(|v| v.len() >= 2).count();
+        let split: BTreeSet<&str> = members
+            .iter()
+            .filter_map(|m| v2_keys.get(m).copied())
+            .collect();
+        let gone = members.iter().filter(|m| !v2_keys.contains_key(m)).count();
+        let _ = writeln!(
+            o,
+            "{} size {} hard {} soft {}: {} cores, {} singletons; under V2 in {} campaigns, {} unclustered",
+            c.key,
+            c.size,
+            c.hard_edges,
+            c.soft_edges,
+            cores,
+            comps.len() - cores,
+            split.len(),
+            gone
+        );
+        let mut between: BTreeMap<(usize, usize), Vec<f64>> = BTreeMap::new();
+        for e in edges.iter().filter(|e| e.kind == PATHS) {
+            let (ra, rb) = (find(&mut parent, at[&e.a]), find(&mut parent, at[&e.b]));
+            if ra != rb && comps[&ra].len() >= 2 && comps[&rb].len() >= 2 {
+                between
+                    .entry((ra.min(rb), ra.max(rb)))
+                    .or_default()
+                    .push(e.score.unwrap_or_default());
+            }
+        }
+        for ((ra, rb), scores) in &between {
+            let flag = if scores.len() < K_SOFT_MERGE {
+                " CHAINED (K = 2 splits)"
+            } else if scores.len() < k_max {
+                " CHAINED at K = 3 (K = 2 merges)"
+            } else {
+                ""
+            };
+            let scores: Vec<String> = scores.iter().map(|s| format!("{s:.2}")).collect();
+            let _ = writeln!(
+                o,
+                "  core {} ({}) - core {} ({}): {} soft edges [{}]{flag}",
+                comps[ra][0],
+                comps[ra].len(),
+                comps[rb][0],
+                comps[rb].len(),
+                scores.len(),
+                scores.join(" ")
+            );
+        }
     }
 }
 
@@ -1933,5 +2301,56 @@ pub(crate) mod tests {
         // A–B first (two edges each way, A's root first), then C on three.
         assert_eq!(shape_of(&d), [(9, 5)]);
         assert_eq!(d, dump(&s2).await);
+    }
+
+    async fn evaluated(ops: Vec<Op>) -> String {
+        let (s, _d) = store().await;
+        feed(&s, ops).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        evaluate(&Input::read(&mut conn).await.unwrap())
+    }
+
+    /// The lines of the `== title… ==` block of `out`.
+    pub(crate) fn section<'a>(out: &'a str, title: &str) -> Vec<&'a str> {
+        out.lines()
+            .skip_while(|l| !l.starts_with(&format!("== {title}")))
+            .skip(1)
+            .take_while(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn evaluate_reports_a_chained_fixture() {
+        let out = evaluated(chain_fixture(false)).await;
+        let chain = section(&out, "chaining");
+        assert!(
+            chain[0].starts_with("192.0.2.80 size 6 hard 6 soft 1: 2 cores"),
+            "{out}"
+        );
+        assert!(chain[1].contains("CHAINED (K = 2 splits)"), "{out}");
+        assert!(
+            section(&out, "V2 default").contains(&"changed versus V1: 50.00 %"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_reports_coverage() {
+        let out = evaluated(order_fixture()).await;
+        let v2 = section(&out, "V2 default");
+        assert!(
+            v2.contains(&"coverage: ordered 2 of 2 candidates (100.0 %)"),
+            "{out}"
+        );
+        assert!(v2.contains(&"withheld 0, vetoed 1"), "{out}");
+        // The reversed pair is the one the veto drops, with its shapes.
+        let vetoed = section(&out, "vetoed pairs");
+        assert!(vetoed[0].starts_with("192.0.2.62 192.0.2.63 "), "{out}");
+        assert!(vetoed[0].ends_with("vetoed at -0.2 -0.3 -0.5"), "{out}");
+        assert_eq!(vetoed.len(), 1 + EVAL_SHAPES, "{out}");
+        assert!(
+            section(&out, "agreement").contains(&"[+0.8, +1.0] 1"),
+            "{out}"
+        );
     }
 }

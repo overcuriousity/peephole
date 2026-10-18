@@ -293,6 +293,7 @@ peephole admin login-method passkey|password|both # how the admin signs in
 peephole export -o data.parquet                   # the dataset (--format, --from, --redistributable, --help)
 peephole db vacuum                                # shrink the database file (stop the service first)
 peephole store recompute-campaigns                # recompute campaigns now and print the report
+peephole store campaigns-eval copy.toml           # compare campaign parameters (run on a copy: it writes to the database)
 ```
 
 Configuration lives in `/etc/peephole/config.toml`; restart after editing
