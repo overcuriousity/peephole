@@ -105,11 +105,98 @@ Per-IP version roulette is ruled out: scanners that use many source IPs
 would see the banner change from visit to visit, and that gives away the
 honeypot.
 
+**The AI decoys vary per node, persona or not.** Today every node's MCP
+decoy answers with the same `serverInfo` (`internal-ops 0.3.1`), the same
+resources and the same tools, and the LLM decoy with the same model list.
+One fingerprint of those identifies every member of the cluster. The
+server name and version, the tool and resource set, and the model list
+are derived from the node's identity: stable per node, different between
+nodes, and recorded like any persona. With a persona set they follow it.
+
 **Shown:**
 
 - **Admin:** Analytics follow-up rate and family mix per persona.
 - **Public dashboard:** attack mix per persona.
 - **Dataset:** a `persona` column.
+
+### 5. AI agent detection
+
+- **Cost:** M
+- **Benefit:** high. It tells which traffic an LLM agent drives, a class of
+  attacker that grows fast and that the dataset cannot name today.
+
+`rules/ai.toml` labels what is probed (`ai-infra-probe`, `mcp-probe`,
+`mcp-abuse`, `llm-key-use`), not who probes. An agent leaves traces of the
+model in what it sends, and these are checked on every request: body,
+query string and headers, not only on traffic to the AI decoys.
+
+- **Model artifacts.** Chat-template tokens (`<|im_start|>`, `[INST]`),
+  role and tool tags (`<tool_use>`, `<function_call>`, `<thinking>`),
+  tool-call JSON, and an LLM's self-description or refusal text in a
+  parameter. Label `ai-agent-artifact`.
+- **Agent tooling.** SDK and framework headers and User-Agents (OpenAI and
+  Anthropic SDK `X-Stainless-*` headers, LangChain, LlamaIndex, browser-use
+  and the like), and the `clientInfo` an MCP client sends in `initialize`.
+  Label `ai-agent-tooling`.
+
+Both are ordinary built-in rules: deterministic, from the signed request
+alone, so every node derives the same labels and nothing rests on a
+peer's claim. No weighted score and no timing heuristics: regular timing
+does not tell an agent from a scanner.
+
+**Precision first.** Before release the rules run over the full 30-day
+dataset; every hit is reviewed and every false positive becomes a negative
+test. Pattern matches inside payloads that merely carry such strings (a
+prompt-injection probe aimed at someone else's LLM) are kept apart from
+an agent's own traces.
+
+**Shown:**
+
+- **Admin:** a filter on the live feed and `/requests`, a badge on the IP
+  page, and an "agent-driven" mark on a campaign any of whose requests
+  carries the label. Analytics gives the share of agent-driven sources and
+  campaigns over time.
+- **Public dashboard:** share of sources with agent traces this period.
+- **Dataset:** the labels, in the existing `labels` column.
+
+### 6. AI discovery lures
+
+- **Cost:** M–L
+- **Benefit:** high. Agents look for machine-readable descriptions first;
+  answering them leads the agent into the MCP and LLM decoys and their
+  canaries instead of letting it leave.
+
+Requests for `/.well-known/ai-plugin.json` and `/openapi.json` are
+classified but get no answer of their own, so an agent that finds nothing
+there moves on. The trap answers the discovery documents agents read:
+
+- `/.well-known/ai-plugin.json`, `/.well-known/mcp.json`,
+  `/.well-known/agent.json` (A2A agent card), `/llms.txt`;
+- `/openapi.json`, `/swagger.json` and the common `api-docs` paths, with
+  a spec that describes only endpoints the existing decoys answer (MCP,
+  the LLM gateway, the upload sink).
+
+Each document points into the decoys and carries a canary derived for the
+request (an MCP endpoint path, an API key), so a follow-up from another
+address links back to the discovery request: a hard edge for campaign
+clustering, where address rotation otherwise breaks the chain.
+
+Rules that hold:
+
+- **No runtime LLM.** Documents are rendered from the node's identity and
+  persona (item 4), deterministic and cached.
+- **Nothing real.** The documents never name or link the operator's real
+  sites, and never echo request content beyond the canary.
+- **Recorded like every decoy.** The answer is `decoy:discovery:<kind>`.
+
+**Shown:**
+
+- **Admin:** a Discovery tab under Decoys: which documents were fetched,
+  and the funnel discovery → MCP `initialize` → tool call → canary reuse,
+  per source and per campaign.
+- **Public dashboard:** count of sources that followed a discovery
+  document into a decoy.
+- **Dataset:** the `answer` value, and the canary link in `campaign`.
 
 ## Small follow-ups
 
