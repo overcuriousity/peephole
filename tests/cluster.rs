@@ -2839,6 +2839,18 @@ async fn admin_cluster_page_and_private_attribution() {
         scans.contains("id=\"scanners\"") && scans.contains(&b.id.short()),
         "scanner pace on the Scans page"
     );
+    // MIK-501 (P31): the assignment rule is collapsed, verbatim.
+    let (_, rules) = scans
+        .split_once("<details class=\"muted\"><summary>How jobs are assigned</summary>")
+        .unwrap();
+    assert!(rules.contains("A job waits up to 30 min for a cheaper live scanner"));
+    // G18: short hints.
+    assert!(scans.contains("7-day mean") || scans.contains("assumed, nothing measured yet"));
+    assert!(!scans.contains("left the queue, last") && !scans.contains("backlog drains:"));
+    // P28: no paragraph under the h1 nor under the table.
+    assert!(
+        !members.contains("never appear on public pages") && !members.contains("open the node.")
+    );
     // Remote pace from the UI.
     let r = admin
         .post(format!("{base}/admin/cluster/pace"))
@@ -4221,6 +4233,24 @@ async fn admin_manages_a_sibling_from_its_page() {
         !html.contains("Remote configuration"),
         "the old line is gone"
     );
+    // MIK-501 (C11): one credits card, here and as b counts them.
+    let card = html
+        .split_once("<table class=\"node-credits\">")
+        .unwrap()
+        .1
+        .split_once("</table>")
+        .unwrap()
+        .0;
+    assert!(
+        card.contains("<th class=\"num\">Here</th>")
+            && card.contains("<th class=\"num\">As node-bravo counts them</th>")
+            && card.matches("<td class=\"num\">").count() == 2,
+        "{card}"
+    );
+    assert!(!html.contains("Credits there"), "{html}");
+    // C12, P32: the short lines.
+    assert!(html.contains("Web off removes its admin pages.</p>"));
+    assert!(!html.contains("reset roles.web") && !html.contains("Invites are created on the node"));
     // c is a member, not a sibling.
     let c_html = text(&admin, format!("{base}/admin/cluster/node/{}", c.id)).await;
     assert!(c_html.contains("Not one of your nodes"), "{c_html}");
@@ -4291,6 +4321,7 @@ async fn admin_manages_a_sibling_from_its_page() {
 
     // This node's own settings from its own page, as before.
     let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    assert!(!page.contains("This node's runtime settings."), "P34");
     let shown = na.settings.snapshot().version;
     assert!(
         page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
@@ -4525,6 +4556,11 @@ async fn a_rotation_leaves_out_the_nodes_named() {
         html.contains(&format!("name=\"skip\" value=\"{}\"", c.id)),
         "the dialog offers to leave c out"
     );
+    // MIK-501 (P30, G20): the short lines.
+    assert!(html.contains("One key claims all your nodes; nodes that keep it manage the others."));
+    assert!(html.contains("<summary>Claim with another key</summary>"));
+    assert!(html.contains("from managing nodes · newest first · UTC"));
+    assert!(!html.contains("best for scanners and exposed nodes"));
     let r = admin
         .post(format!("{page}/rotate"))
         .form(&[("skip", c.id.to_string())])
@@ -7108,6 +7144,28 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     assert!(html.contains("Resolving a name costs"));
     assert!(html.contains("Reverse names cost") && html.contains("Up today"));
     assert!(html.contains("also checks 5 % of other nodes' fresh scans unpaid"));
+    // MIK-501 (P29): one line under the h1, the rules verbatim in one
+    // collapsed <details> at the foot.
+    assert_eq!(
+        html.matches("<details class=\"muted\">").count(),
+        1,
+        "{html}"
+    );
+    let (top, rules) = html
+        .split_once("<summary>How credits work</summary>")
+        .unwrap();
+    assert!(top.contains("Every figure is this node's own count.</p>"));
+    for moved in [
+        "Every day 1000 credits are split evenly among the members anyone can reach",
+        "A credit can be used on the day it was earned and the 6 days after, whoever holds it by then.",
+    ] {
+        assert!(!top.contains(moved) && rules.contains(moved), "{moved}");
+    }
+    assert!(
+        !html.contains("as this node counts it"),
+        "G19: note removed"
+    );
+    assert!(html.contains("Money flow</h2><span class=\"muted\">7 days · UTC</span>"));
     // The market: the hourly refresh left a snapshot per good, with what b
     // announces for abuseipdb as the members' band (seen by now).
     price::refresh(&na.node).await.unwrap();
@@ -7289,7 +7347,12 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     let (admin, base) = admin_on(&na).await;
     let html = text(&admin, format!("{base}/admin")).await;
     // a, b, and the reporter `fund_listeners` made a member here.
-    assert!(html.contains("3 of 3 members earn here"), "{html}");
+    assert!(html.contains("3<span class=\"of\">/3</span>"), "{html}");
+    assert!(html.contains("<div class=\"hint\">lowest "), "G17: {html}");
+    assert!(
+        !html.contains("as this node counts it"),
+        "G17: note removed"
+    );
     let show = peephole::credits::show;
     let pool = peephole::credits::pool::POOL_PER_DAY;
     assert!(html.contains(&show(pool)), "credits in circulation");

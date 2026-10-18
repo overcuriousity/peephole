@@ -859,7 +859,7 @@ mod tests {
             "812.00",
             "0.05",
             "5 hours up today",
-            "12 hours earn today's pool share",
+            "12 h earns a pool share",
             "1000 credits are split evenly",
             "12 of the day's 24 hours",
             "14 h",
@@ -878,7 +878,7 @@ mod tests {
         assert!(html.contains(">0.10<"), "L2: 0.05 at half the success rate");
         assert!(html.contains("per delivered result"));
         assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));
-        assert!(html.contains("30 paid of 36 an hour"));
+        assert!(html.contains("30 paid of 36/h"));
         let mut page = page;
         page.price.scan = "–".into();
         assert!(page.render().unwrap().contains("not a scanner"));
