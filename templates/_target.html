@@ -39,24 +39,12 @@
   {% let keys = adm.host_keys %}{% include "_host_keys.html" %}
 </section>
 {% endif %}
-{% if adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}
-<section class="card" id="canaries" data-section="canaries">
-  <h2>Canaries</h2>
-  {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
-  {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
-  <p><a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">Show the reuses</a></p>
-</section>
-{% endif %}
-{% if adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}
-<section class="card" id="decoys" data-section="decoys">
-  <h2>Decoys</h2>
-  <p>MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }}</p>
-  <p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">Show the decoy requests</a></p>
-</section>
-{% endif %}
-{% if !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
+{% let canaries = adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}{% let decoys = adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}
+{% if canaries || decoys || !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
 <section class="card" id="drops" data-section="drops">
-  <div class="card-head"><h2>Uploads and webshell commands</h2></div>
+  <div class="card-head"><h2>Lures</h2></div>
+  {% if canaries %}<p><b>Canaries</b>{% if adm.canary_links.0 > 0 %} · credentials harvested here used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}{% endif %}{% if adm.canary_links.1 > 0 %} · used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}{% endif %} · <a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">the reuses →</a></p>{% endif %}
+  {% if decoys %}<p><b>Decoys</b> · MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }} · <a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">the decoy requests →</a></p>{% endif %}
   {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
   <h3>Uploads</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Kind</th><th>Type</th><th></th></tr></thead><tbody>
@@ -123,27 +111,23 @@
       </ol>
       {% else %}<p class="muted small">None yet.</p>{% endif %}
     </div>
-    <div>
-      <h3>Same ASN{% if let Some(a) = t.ov.ip.asn %} · <a href="{{ t.asn_href(a) }}">AS{{ a }}</a>{% endif %}</h3>
-      <div class="big-stat">{{ crate::admin::views::thousands(t.ov.asn_count) }}</div>
-      {% if t.ov.ip.asn.is_none() %}<p class="muted small">ASN unknown.</p>{% endif %}
-    </div>
   </div>
 </section>
 
 {% if let Some(adm) = t.admin %}
+{% if !adm.fingerprints.is_empty() %}
 <section class="card" data-section="fingerprints">
-  <div class="card-head"><h2>Fingerprints</h2><a href="{{ crate::admin::views::link_href("ip", t.ov.ip.ip.as_str()) }}">Link graph</a></div>
-  {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
+  <div class="card-head"><h2>Fingerprints</h2></div>
   {% for f in adm.fingerprints %}
     <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
       {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>
   {% endfor %}
 </section>
-
+{% endif %}
+{% if !adm.claims.is_empty() %}
 <section class="card" data-section="claims">
   <div class="card-head"><h2>False-positive claims</h2></div>
-  {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
   {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
 </section>
+{% endif %}
 {% endif %}

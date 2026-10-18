@@ -1775,7 +1775,7 @@ show_labels = {show_labels}
         assert_eq!(status, 200);
         assert_eq!(
             admin.matches("href=\"/admin/asn/64500\"").count(),
-            2,
+            1,
             "{admin}"
         );
         assert!(!admin.contains("/ips?asn="), "{admin}");
@@ -1783,7 +1783,7 @@ show_labels = {show_labels}
         assert_eq!(status, 200);
         assert_eq!(
             public.matches("href=\"/ips?asn=64500\"").count(),
-            2,
+            1,
             "{public}"
         );
         assert!(!public.contains("/admin/asn/"), "{public}");
@@ -1809,7 +1809,7 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (status, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(html.contains("Uploads and webshell commands"), "{html}");
+        assert!(html.contains("<h2>Lures</h2>"), "{html}");
         assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
         assert!(
             html.contains(r#"href="/requests?cmd=whoami" title="whoami">whoami</a></td>"#),
@@ -1822,15 +1822,130 @@ show_labels = {show_labels}
         // The public page has none of it.
         let (status, public) = get_with(&app, "/ip/203.0.113.30", None).await;
         assert_eq!(status, 200);
-        assert!(
-            !public.contains("Uploads and webshell commands"),
-            "{public}"
-        );
+        assert!(!public.contains("<h2>Lures</h2>"), "{public}");
         assert!(!public.contains("/admin/uploads/"), "{public}");
         assert!(!public.contains("whoami"), "{public}");
         // An address with neither: no section.
         let (_, none) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
-        assert!(!none.contains("Uploads and webshell commands"), "{none}");
+        assert!(!none.contains("<h2>Lures</h2>"), "{none}");
+    }
+
+    /// Canaries and decoys fold into the Lures card; empty claims and
+    /// fingerprints cards are gone; the head carries the ASN count and,
+    /// for an admin, the link graph (MIK-499).
+    #[tokio::test]
+    async fn the_ip_page_folds_lures_into_one_card_and_drops_empty_cards() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let a = st
+            .store
+            .upsert_ip("203.0.113.1".parse().unwrap())
+            .await
+            .unwrap();
+        let o = st
+            .store
+            .upsert_ip("198.51.100.1".parse().unwrap())
+            .await
+            .unwrap();
+        let req =
+            |ip_id, answer: Option<&str>, decoy: Option<&str>| crate::store::requests::NewRequest {
+                ip_id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: answer.map(Into::into),
+                decoy_in: decoy.map(Into::into),
+                ..Default::default()
+            };
+        // A canary served to 203.0.113.1, used by 198.51.100.1.
+        let served = st
+            .store
+            .insert_request(&req(a.id, None, None))
+            .await
+            .unwrap();
+        let used = st
+            .store
+            .insert_request(&req(o.id, None, None))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO canaries (value_hash, kind, request_id, ts, ip_id) VALUES (7, 'password', ?, datetime('now'), ?)")
+            .bind(served)
+            .bind(a.id)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO request_tokens (request_id, value_hash, place) VALUES (?, 7, 'body')",
+        )
+        .bind(used)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        st.store
+            .insert_request(&req(a.id, Some("decoy:mcp:tools/call"), Some("{}")))
+            .await
+            .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(html.matches("data-section=\"drops\"").count(), 1, "{html}");
+        assert!(html.contains("<h2>Lures</h2>"), "{html}");
+        assert!(
+            html.contains("credentials harvested here used by 1 other IP ·"),
+            "{html}"
+        );
+        assert!(html.contains("tool calls 1"), "{html}");
+        assert!(!html.contains("data-section=\"canaries\""), "{html}");
+        assert!(!html.contains("data-section=\"decoys\""), "{html}");
+        assert!(!html.contains("data-section=\"claims\""), "{html}");
+        assert!(!html.contains("data-section=\"fingerprints\""), "{html}");
+        assert!(!html.contains("Same ASN"), "{html}");
+        assert!(!html.contains("added by an operator"), "{html}");
+        assert!(
+            html.contains(r#"<a href="/admin/asn/64500">Example Net <span class="mono muted">AS64500</span> · 2 IPs</a>"#),
+            "{html}"
+        );
+        assert!(html.contains(">link graph</a>"), "{html}");
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert!(
+            public.contains(r#"<a href="/ips?asn=64500">Example Net <span class="mono muted">AS64500</span> · 2 IPs</a>"#),
+            "{public}"
+        );
+        assert!(!public.contains("link graph"), "{public}");
+        assert!(!public.contains("Lures"), "{public}");
+        // A claim and a fingerprint bring their cards back.
+        st.store
+            .insert_fp_claim(a.id, served, Some("x@example.org"), "UA")
+            .await
+            .unwrap();
+        st.store
+            .insert_fingerprint(Some(served), a.id, "fphash", None, "{}", "{}", b"")
+            .await
+            .unwrap();
+        let (_, html) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert!(html.contains("data-section=\"claims\""), "{html}");
+        assert!(html.contains("data-section=\"fingerprints\""), "{html}");
+        // The request page: the fingerprint is a row, the query only on
+        // the request line.
+        let shell = webshell_cmd(&st, "203.0.113.1", "id").await;
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{served}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(html.contains(">fphash</a>"), "{html}");
+        assert!(!html.contains("<h2>Fingerprint</h2>"), "{html}");
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{shell}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(!html.contains("Query string"), "{html}");
+        assert!(!html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(
+            html.contains("<span class=\"muted\">?cmd=id</span>"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
