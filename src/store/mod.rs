@@ -23,6 +23,7 @@ pub mod links;
 pub mod maintenance;
 pub mod probes;
 pub mod publish;
+pub mod rdap_net;
 pub mod rdns;
 pub mod recorder;
 pub mod requests;
@@ -88,6 +89,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0040_campaigns.sql"),
     include_str!("migrations/0041_campaign_agreement.sql"),
     include_str!("migrations/0042_webshell_cmd.sql"),
+    include_str!("migrations/0043_rdap_net.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

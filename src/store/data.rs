@@ -560,11 +560,21 @@ pub enum RdapPick {
     Disputed(Vec<RdapAnswer>),
 }
 
-/// The pick among `rows` (newest first). All with the same tags: the newest.
-/// Otherwise this node's own row, else the tags most origins agree on (the
-/// newest of them), else disputed. An empty origin is this node's.
+/// The pick among `rows` (newest first) by their tags ([`pick_rdap_by`]
+/// with `rdap::tags`): what the intel card shows.
 pub fn pick_rdap(rows: Vec<RdapAnswer>, me: Option<&[u8]>) -> Option<RdapPick> {
-    let tags = |a: &RdapAnswer| crate::intel::rdap::tags(&a.data);
+    pick_rdap_by(rows, me, |a| crate::intel::rdap::tags(&a.data))
+}
+
+/// The pick among `rows` (newest first), comparing them by `tags`. All
+/// with the same tags: the newest. Otherwise this node's own row, else the
+/// tags most origins agree on (the newest of them), else disputed. An empty
+/// origin is this node's.
+pub fn pick_rdap_by(
+    rows: Vec<RdapAnswer>,
+    me: Option<&[u8]>,
+    tags: impl Fn(&RdapAnswer) -> Vec<String>,
+) -> Option<RdapPick> {
     let first = rows.first()?;
     if rows.iter().all(|r| tags(r) == tags(first)) {
         return rows.into_iter().next().map(RdapPick::Chosen);
@@ -596,6 +606,16 @@ pub fn pick_rdap(rows: Vec<RdapAnswer>, me: Option<&[u8]>) -> Option<RdapPick> {
 
 /// The RDAP pick for `ip` from every origin's current row.
 pub(crate) async fn rdap_pick(conn: &mut SqliteConnection, ip: &str) -> Result<Option<RdapPick>> {
+    let (rows, me) = rdap_answers(conn, ip).await?;
+    Ok(pick_rdap(rows, me.as_deref()))
+}
+
+/// Every origin's current RDAP row for `ip` (newest first), and this
+/// node's origin when it is recorded.
+pub(crate) async fn rdap_answers(
+    conn: &mut SqliteConnection,
+    ip: &str,
+) -> Result<(Vec<RdapAnswer>, Option<Vec<u8>>)> {
     let me: Option<String> = sqlx::query_scalar("SELECT value FROM intel_meta WHERE key = ?")
         .bind(SELF_ORIGIN_KEY)
         .fetch_optional(&mut *conn)
@@ -624,11 +644,12 @@ pub(crate) async fn rdap_pick(conn: &mut SqliteConnection, ip: &str) -> Result<O
             })
         })
         .collect();
-    Ok(pick_rdap(rows, me.as_deref()))
+    Ok((rows, me))
 }
 
 /// Set the facts shown for an IP (country, ASN, Tor flag) from the newest
-/// result of each provider. Does nothing while the IP has no row yet.
+/// result of each provider, and its RDAP network (`rdap_net`). Does
+/// nothing while the IP has no row yet.
 pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Result<()> {
     let geo = newest_intel(conn, ip, crate::intel::MAXMIND)
         .await?
@@ -655,6 +676,7 @@ pub(crate) async fn refresh_ip_view(conn: &mut SqliteConnection, ip: &str) -> Re
         .bind(ip)
         .execute(&mut *conn)
         .await?;
+    super::rdap_net::refresh(conn, ip).await?;
     sqlx::query("DELETE FROM ip_intel_tags WHERE ip = ?")
         .bind(ip)
         .execute(&mut *conn)

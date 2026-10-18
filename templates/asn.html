@@ -3,37 +3,7 @@
 {% block content %}
 <div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} {% endif %}{% endif %}<span class="mono">AS{{ asn }}</span></h1></div></div>
 {% if let Some(r) = r %}
-<div class="stack">
-<div class="tiles kpis">
-  <div class="tile"><span class="label">IPs</span><div class="value">{{ crate::admin::views::thousands(r.ips) }}</div></div>
-  <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(r.requests) }}</div></div>
-  <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = r.max_severity %}{% include "_severity.html" %}</div></div>
-  <div class="tile"><span class="label">First seen</span><div class="value ts">{{ crate::admin::views::minute(r.first_seen.as_str()) }}</div></div>
-  <div class="tile"><span class="label">Last seen</span><div class="value ts">{{ crate::admin::views::minute(r.last_seen.as_str()) }}</div></div>
-</div>
-{% if !r.labels.is_empty() || !r.open_ports.is_empty() || !r.campaigns.is_empty() %}
-<section class="card">
-  {% if !r.labels.is_empty() %}<h3>Labels</h3>
-  <div class="chips">{% for (l, n) in r.labels %}<a class="badge badge-label {{ crate::admin::views::label_class(l) }}" href="/ips?asn={{ asn }}&amp;label={{ crate::admin::public::urlencode(l) }}">{{ l }} <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
-  {% if !r.open_ports.is_empty() %}<h3>Open ports</h3>
-  <div class="chips">{% for (p, n) in r.open_ports %}<a class="chip" href="/ips?asn={{ asn }}&amp;port={{ p }}"><span class="mono">{{ p }}</span> <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
-  {% if !r.campaigns.is_empty() %}<h3>Campaigns</h3>
-  <div class="chips">{% for (key, num, n) in r.campaigns %}<a class="chip" href="/admin/campaigns/{{ key }}">#{{ num }} <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
-</section>
-{% endif %}
-<section class="card">
-  <div class="card-head"><h2>IPs</h2>{% if r.ips > ips.len() as i64 %}<span class="muted">top {{ ips.len() }} by requests</span>{% endif %}</div>
-  <div class="table-wrap wide"><table>
-    <thead><tr><th>IP</th><th>Country</th><th>Network</th><th class="num">Requests</th><th>Max sev</th><th class="num">Abuse</th><th>First seen</th><th>Last seen</th></tr></thead>
-    <tbody>
-    {% for i in ips %}
-      {% include "_ip_row.html" %}
-    {% endfor %}
-    </tbody>
-  </table></div>
-  <p><a href="/ips?asn={{ asn }}">All IPs →</a></p>
-</section>
-</div>
+{% include "_rollup.html" %}
 {% else %}
 <p class="empty">No IP recorded in AS{{ asn }}.</p>
 {% endif %}

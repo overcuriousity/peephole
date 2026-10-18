@@ -120,6 +120,7 @@ mod tests {
                         label: l.to_string(),
                         value: v.to_string(),
                         mono: false,
+                        href: None,
                     })
                     .collect(),
                 fetched_at: String::new(),
