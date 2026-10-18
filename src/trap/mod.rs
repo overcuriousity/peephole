@@ -903,11 +903,13 @@ async fn trap(
     };
     // A canary presented is answered as always: its trace is worth more.
     // So is an AI decoy: `mcp-abuse` is severity 4, and the tarpit would
-    // cut the session it marks short. An upload from a tarpitted source is
-    // kept as its request row only (to `MAX_BODY`), not as an upload: the
-    // source is severity 4 already, and its file is not worth the store.
+    // cut the session it marks short. So is an upload: the bots that drop
+    // files are mostly severity 4 already, and their files are what the
+    // sink is for (its per-source, daily and store gates still hold). The
+    // hold is left for the source's next request.
     if presented == decoy::Presented::default()
         && ai.is_none()
+        && upload.is_none()
         && let Some(hold) = state.tarpit.take(ip)
     {
         return tarpit_answer(
