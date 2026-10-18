@@ -428,6 +428,27 @@ two-edge rule held back, the pairs dropped for a reversed order (none under
 the default parameters), and how many candidate pairs had enough shared
 shapes for an order to count.
 
+**New paths and exploit waves.** `/admin/paths` ("New paths") lists the path
+shapes this node has seen, newest first: the shape, when it was first and
+last seen, how many distinct IPs asked for it, whether a rule matched it,
+its wave and the campaigns of the IPs that asked (`?since=24h|7d|30d|all`,
+default `7d`; `?unknown=1` keeps only the shapes no rule knows). First seen
+means first seen on this node: with `retention_days` set, or on a node that
+joined late, it is at best the start of the kept window, and the page says
+so. A shape no rule knows that `[waves] min_ips` distinct IPs (default 10)
+ask for within `[waves] window_minutes` (default 60) is an exploit wave;
+detection runs every 5 minutes on every node and fires once per shape. The
+live feed badges a request whose shape is new or part of a wave, and a
+campaign's page names the waves its members started. To be told, set
+`[notify]`: `url` (https, or http to a loopback or private address), `kind`
+(`webhook` for a JSON POST, `ntfy` for a text push) and an optional bearer
+`token`. One push per pass carries at most 10 waves, with three attempts
+each, no redirects and a 10 s timeout; without `[notify]` peephole makes no
+outbound connection for it. The push contains the shape text, which is
+request content: send it only to a destination you control. The public
+dashboard and `/api/stats` show only the count of new shapes
+(`new_shapes`), never a path.
+
 ### Public pages are delayed
 
 The public dashboard, the IP directory, IP pages, `/api/stats`, `/api/map` and

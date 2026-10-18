@@ -146,6 +146,9 @@ pub struct Stats {
     pub previous: Option<Previous>,
     /// IPs first seen in the range.
     pub new_ips: i64,
+    /// Path shapes first seen in the range: a count only, the shape text
+    /// is request content and stays on the admin pages.
+    pub new_shapes: i64,
     /// The newest request's time (UTC), in the whole dataset.
     pub last_request: Option<String>,
     /// Requests per label family (`classify::FAMILIES` order, non-zero
@@ -544,6 +547,19 @@ impl Store {
                 .await?
             }
         };
+        // A shape counts once one of its requests is visible to the audience,
+        // so a fresh path cannot reveal a pending row before its delay.
+        let new_shapes = self
+            .count_where(
+                &format!(
+                    "SELECT COUNT(*) FROM shapes s WHERE 1=1{}
+                     AND EXISTS (SELECT 1 FROM requests r WHERE r.shape = s.hash{})",
+                    r.ts_clause("s.first_seen").0,
+                    a.released("r")
+                ),
+                since,
+            )
+            .await?;
         let last_request: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT MAX(r.ts) FROM requests r WHERE 1=1{}",
             a.released("r")
@@ -619,6 +635,7 @@ impl Store {
             heatmap,
             previous,
             new_ips,
+            new_shapes,
             last_request,
             families,
             owasp,
@@ -1898,6 +1915,31 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn new_shapes_wait_for_a_released_request() {
+        let (s, _d) = delayed().await;
+        // Only shape 7, carried by the pending "/new" alone.
+        sqlx::query("DELETE FROM shapes; UPDATE requests SET shape = NULL")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO shapes (hash, text, first_seen, last_seen, ips) VALUES (7, '/new', datetime('now'), datetime('now'), 1)")
+            .execute(&s.pool).await.unwrap();
+        sqlx::query("UPDATE requests SET shape = 7 WHERE path = '/new'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let p = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        assert_eq!(p.new_shapes, 0, "only request still pending");
+        let a = s.stats_as(Range::H24, Audience::Admin).await.unwrap();
+        assert_eq!(a.new_shapes, 1);
+        sqlx::query("UPDATE requests SET public_at = datetime('now', '-1 seconds') WHERE public_at IS NOT NULL")
+            .execute(&s.pool).await.unwrap();
+        s.release_due().await.unwrap();
+        let p = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        assert_eq!(p.new_shapes, 1);
     }
 
     #[tokio::test]
