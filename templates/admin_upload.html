@@ -19,7 +19,7 @@
   </dl>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Timeline</h2><span class="muted">later requests to where the file was told it landed</span></div>
+  <div class="card-head"><h2>Timeline</h2><span class="muted">requests to its reported location</span></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Request</th><th>Answer</th><th class="num">Status</th></tr></thead><tbody>
   {% for r in timeline %}<tr><td class="mono"><a href="/admin/requests/{{ r.id }}">{{ r.ts }}</a></td><td class="mono"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td class="path"><span class="mono muted">{{ r.method }}</span> {{ r.path }}{% if let Some(q) = r.query %}?{{ q }}{% endif %}</td><td class="mono">{% if let Some(a) = r.answer %}{{ a }}{% endif %}</td><td class="num">{% if let Some(s) = r.status %}{{ s }}{% endif %}</td></tr>{% endfor %}
   {% if timeline.is_empty() %}<tr><td colspan="5" class="empty">No request there since.</td></tr>{% endif %}

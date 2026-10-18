@@ -2,7 +2,7 @@
 {% block title %}peephole — campaigns{% endblock %}
 {% block content %}
 {% let sub = "campaigns" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Campaigns</h1><p class="muted">Source IPs tied together by evidence: a shared SSH host key, TLS certificate, browser fingerprint or canary, or near-identical path sets. Computed on this node every hour from the replicated rows; read-only.</p></div></div>
+<div class="page-head"><div><h1>Campaigns</h1><p class="muted">IPs tied together by shared keys, certificates, fingerprints, canaries or path sets; recomputed hourly. <a href="/admin/links">What counts →</a></p></div></div>
 <div class="stack">
 <section class="card">
   <form class="filters" method="get" action="/admin/campaigns">
@@ -26,7 +26,7 @@
   </tbody></table></div>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs: shared infrastructure, not one operator; they form no edge</span></div>
+  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs · no edge</span></div>
   {% if let Some(r) = report %}
   {% if r.excluded.is_empty() %}<p class="empty">None.</p>{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">IPs</th></tr></thead><tbody>

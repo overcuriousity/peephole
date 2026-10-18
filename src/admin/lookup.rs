@@ -982,7 +982,7 @@ secure_cookies = false
         // MIK-329: a counter-scan is on offer all the same; its buy adds
         // the address, unseen.
         assert!(html.contains(r#"action="/admin/lookup/scan""#), "{html}");
-        assert!(html.contains("Buying a scan adds the address") && html.contains(">unseen<"));
+        assert!(html.contains("buying a scan adds it") && html.contains(">unseen<"));
         // A non-global address is not offered one.
         let (_, html) = send(&app, post(), "ip=10.0.0.1").await;
         assert!(!html.contains(r#"action="/admin/lookup/scan""#), "{html}");

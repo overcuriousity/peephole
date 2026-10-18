@@ -6,7 +6,7 @@
 
   <form class="action-block" method="post" action="/admin/lookup/probe" data-probe-form>
     <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    <h3 class="action-label">Probe <span class="muted">· read what the ports present{% if a.standalone %}, from this node{% endif %}</span></h3>
+    <h3 class="action-label" title="read what the ports present{% if a.standalone %}, from this node{% endif %}">Probe</h3>
     {% if !a.standalone %}
     <div class="vantage-chips">
       {% for v in a.vantages %}
@@ -16,7 +16,7 @@
     {% endif %}
     <div class="action-row">
       {% if let Some((done, asked)) = t.probe_progress() %}
-      <button class="btn action-btn busy" type="button" disabled><span class="spin" aria-hidden="true"></span>Probing · {{ done }} of {{ asked }} in</button>
+      <button class="btn action-btn busy" type="button" disabled><span class="spin" aria-hidden="true"></span>Probing {{ done }}/{{ asked }}</button>
       {% else if !a.allowed %}
       <button class="btn action-btn" type="button" disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}">Probe</button>
       {% else %}
@@ -28,7 +28,7 @@
 
   <form class="action-block" method="post" action="/admin/lookup/scan">
     <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    <h3 class="action-label">Counter-scan <span class="muted">· {% if a.standalone %}from this node; {% endif %}a result of the same level less than a day old is shown instead</span></h3>
+    <h3 class="action-label"{% if a.standalone %} title="from this node"{% endif %}>Counter-scan</h3>
     <div class="level-grid">
       {% for o in a.scans %}
       {% if let Some(w) = o.waiting %}

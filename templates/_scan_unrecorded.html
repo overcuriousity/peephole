@@ -4,7 +4,7 @@
   {% if let Some(why) = s.refused %}
   <p class="text-warning small" data-guard>No scan: {{ why }}</p>
   {% else %}
-  <p class="muted small">Not in the dataset. Buying a scan adds the address, marked {% include "_unseen.html" %}: added by an operator for a counter-scan, no traffic recorded.</p>
+  <p class="muted small">Not in the dataset; buying a scan adds it, marked {% include "_unseen.html" %}.</p>
   <form class="action-block" method="post" action="/admin/lookup/scan">
     <input type="hidden" name="ip" value="{{ r.ip }}">
     <div class="level-grid">
