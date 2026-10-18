@@ -372,7 +372,7 @@ fn request_row_select(a: Audience) -> String {
 /// The first canary a request presented that another request (or a light
 /// row) was served: (value hash, serving request) as in
 /// `canaries::REUSE_SELECT`. A full row that served it ranks first.
-const CANARY_USED: &str =
+pub(crate) const CANARY_USED: &str =
     "SELECT {} FROM request_tokens t JOIN canaries c ON c.value_hash = t.value_hash
      WHERE t.request_id = r.id AND (c.request_id IS NULL OR c.request_id != r.id)
      ORDER BY c.request_id IS NULL, c.ts LIMIT 1";
