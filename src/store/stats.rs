@@ -146,6 +146,9 @@ pub struct Stats {
     pub previous: Option<Previous>,
     /// IPs first seen in the range.
     pub new_ips: i64,
+    /// Path shapes first seen in the range: a count only, the shape text
+    /// is request content and stays on the admin pages.
+    pub new_shapes: i64,
     /// The newest request's time (UTC), in the whole dataset.
     pub last_request: Option<String>,
     /// Requests per label family (`classify::FAMILIES` order, non-zero
@@ -544,6 +547,15 @@ impl Store {
                 .await?
             }
         };
+        let new_shapes = self
+            .count_where(
+                &format!(
+                    "SELECT COUNT(*) FROM shapes WHERE 1=1{}",
+                    r.ts_clause("first_seen").0
+                ),
+                since,
+            )
+            .await?;
         let last_request: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT MAX(r.ts) FROM requests r WHERE 1=1{}",
             a.released("r")
@@ -619,6 +631,7 @@ impl Store {
             heatmap,
             previous,
             new_ips,
+            new_shapes,
             last_request,
             families,
             owasp,

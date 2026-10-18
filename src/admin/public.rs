@@ -1726,6 +1726,7 @@ show_labels = {show_labels}
         assert!(tile.contains("6 sources · largest 2"), "{tile}");
         let card = between(&html, "What the campaigns were after", "</section>");
         assert!(card.contains("fam-recon"), "{card}");
+        let shapes = between(&html, "New path shapes", "</div></div>");
         let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let c = &v["campaigns"];
@@ -1753,10 +1754,45 @@ show_labels = {show_labels}
             "campaignpath".into(),
             "campaignja4".into(),
         ]);
-        for part in [tile, card, &c.to_string()] {
+        for part in [
+            tile,
+            card,
+            shapes,
+            &c.to_string(),
+            &v["new_shapes"].to_string(),
+        ] {
             for x in &secrets {
                 assert!(!part.contains(x.as_str()), "{x:?} in {part}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_counts_new_shapes_without_text() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        // Only the two seeded shapes, not the one of the fixture's request.
+        sqlx::query("DELETE FROM shapes")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO shapes (hash, text, first_seen, last_seen, ips) VALUES
+             (1, '/newshape/{n}', datetime('now', '-1 hours'), datetime('now'), 1),
+             (2, '/oldshape/{n}', datetime('now', '-30 days'), datetime('now'), 1)",
+        )
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        let tile = between(&html, "New path shapes", "</div></div>");
+        assert!(tile.contains(">1<"), "{tile}");
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["new_shapes"].as_i64(), Some(1));
+        for x in ["newshape", "oldshape"] {
+            assert!(!html.contains(x), "{x:?} on the wall");
+            assert!(!json.contains(x), "{x:?} in /api/stats");
         }
     }
 
