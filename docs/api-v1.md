@@ -138,6 +138,8 @@ IPs page shows.
       "asn": 6805,
       "asn_org": "Telefonica Germany",
       "is_tor": false,
+  "is_tor_relay": null,
+      "is_tor_relay": null,
       "first_seen": "2026-10-03T14:02:11Z",
       "last_seen": "2026-10-10T08:41:57Z",
       "request_count": 1284,
@@ -203,9 +205,13 @@ in the dataset (a lookup that asks providers is an
 
 - `intel` — newest stored answer per provider, keyed by the provider's
   stored name (`abuseipdb`, `maxmind-geolite2`, `shodan`,
-  `shodan-internetdb`, `rdap`; a known provider that never answered is
-  `null`). `data` is the provider's parsed JSON as stored. Tor is not an
-  entry here: `is_tor` comes from the exit list the node loads.
+  `shodan-internetdb`, `rdap`, `tor-relays`; a known provider that never
+  answered is `null`). `data` is the provider's parsed JSON as stored. The
+  exit list is not an entry here: `is_tor` comes from the exit list the
+  node loads.
+- `is_tor` means "Tor exit"; `is_tor_relay` (here and in every IP summary)
+  means a running Tor relay of any role by the Onionoo index (`tor-relays`),
+  `null` while no node has checked the address against it (GH #138).
 - `scans` — newest first: ports found open by nmap scans of the address.
 - `names` — names for the address (rDNS, resolved lookups, scan banners),
   each with its source and whether several resolvers agreed.
@@ -228,7 +234,7 @@ credits are spent on `ips`. Host names and URLs go in `names` (below).
 {
   "results": [
     { "ip": "203.0.113.9", "country": "DE", "asn": 6805, "asn_org": "…",
-      "is_tor": false, "first_seen": "…", "last_seen": "…",
+      "is_tor": false, "is_tor_relay": null, "first_seen": "…", "last_seen": "…",
       "request_count": 1284, "max_severity": 4, "abuse_score": 87 }
   ],
   "missing": ["2001:db8::1"],

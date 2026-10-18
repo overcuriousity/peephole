@@ -71,7 +71,7 @@ impl TorView {
         }
         // On every call: an unchanged file still ages. Warned once: the
         // bulk list is dropped until the file changes.
-        if self.list.len() > 0 && bulk.is_some_and(|(t, _)| tor::too_old(t)) {
+        if self.list.has_bulk() && bulk.is_some_and(|(t, _)| tor::too_old(t)) {
             tracing::warn!(
                 file = %self.dir.join("tor-exit.txt").display(),
                 "tor exit list older than {} h: not used until a fresh list loads; \

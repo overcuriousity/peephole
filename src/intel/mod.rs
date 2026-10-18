@@ -881,7 +881,7 @@ async fn refresh_maxmind(store: &Store, cfg: &Config, geo: &SharedGeo) -> anyhow
 /// that. Without a list their Tor status is unknown (`scan.tor_unknown`);
 /// IPs already recorded as exits stay exits.
 fn drop_stale_tor(tor: &SharedTor, cfg: &Config) {
-    if tor.read_or_recover().len() == 0 || !tor::stale(&cfg.data_dir) {
+    if !tor.read_or_recover().has_bulk() || !tor::stale(&cfg.data_dir) {
         return;
     }
     warn!(
@@ -1046,7 +1046,11 @@ async fn relays_loop(
                         && let Err(e) = share::publish(node, &cfg.data_dir, &[share::RELAYS]).await
                     {
                         let wait = backoff.fail();
-                        warn!(?e, retry_in_secs = wait.as_secs(), "announcing tor relay index failed");
+                        warn!(
+                            ?e,
+                            retry_in_secs = wait.as_secs(),
+                            "announcing tor relay index failed"
+                        );
                         next = now + wait;
                     }
                 }

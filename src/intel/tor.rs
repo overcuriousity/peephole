@@ -94,6 +94,11 @@ impl TorExitList {
         self.set.is_empty() && self.relays().is_none()
     }
 
+    /// Whether a bulk list is loaded (whatever the relay index says).
+    pub fn has_bulk(&self) -> bool {
+        !self.set.is_empty()
+    }
+
     /// Addresses in the bulk list.
     pub fn len(&self) -> usize {
         self.set.len()

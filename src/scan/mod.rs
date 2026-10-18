@@ -2165,7 +2165,10 @@ license_key = "k"
         crate::intel::relays::write_fixture(dir.path());
         let p = pace::SharedPace::new(pace::Pace::from_config(&cfg.scan));
         let source = Source::new(store.local(), cfg.clone(), p, Classifier::builtin());
-        let exit = store.upsert_ip("2001:db8:6::1".parse().unwrap()).await.unwrap();
+        let exit = store
+            .upsert_ip("2001:db8:6::1".parse().unwrap())
+            .await
+            .unwrap();
         store.enqueue_scan(exit.id, 2, 24).await.unwrap();
         assert!(source.acquire(&[]).await.unwrap().is_none());
         let (status, _, error) = status_of(&store, "2001:db8:6::1").await;
@@ -2178,7 +2181,11 @@ license_key = "k"
             .await
             .unwrap();
         store.enqueue_scan(guard.id, 2, 24).await.unwrap();
-        let job = source.acquire(&[]).await.unwrap().expect("a guard is scanned");
+        let job = source
+            .acquire(&[])
+            .await
+            .unwrap()
+            .expect("a guard is scanned");
         assert_eq!(job.ip().to_string(), "2a01:4f8:200:32e6::2");
     }
 

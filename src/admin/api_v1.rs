@@ -165,7 +165,9 @@ async fn summaries_json(state: &AdminState, rows: &[IpSummary]) -> Vec<Value> {
         .store
         .tor_relay_flags(&ips)
         .await
-        .inspect_err(|e| tracing::warn!(error = %format!("{e:#}"), "reading tor relay flags failed"))
+        .inspect_err(
+            |e| tracing::warn!(error = %format!("{e:#}"), "reading tor relay flags failed"),
+        )
         .unwrap_or_default();
     rows.iter()
         .map(|s| {
@@ -2090,7 +2092,10 @@ mod tests {
             .await
             .unwrap();
         let (_, v) = send(&app, authed("GET", "/api/v1/ips/203.0.113.9", &token)).await;
-        assert_eq!((&v["is_tor"], &v["is_tor_relay"]), (&false.into(), &true.into()));
+        assert_eq!(
+            (&v["is_tor"], &v["is_tor_relay"]),
+            (&false.into(), &true.into())
+        );
         let (_, v) = send(&app, authed("GET", "/api/v1/ips", &token)).await;
         assert_eq!(v["items"][0]["is_tor_relay"], true, "{v}");
         // Not an address: 400. Not in the dataset: 404.

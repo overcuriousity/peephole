@@ -432,8 +432,11 @@ pub fn fixture_index() -> Relays {
             "exit_policy_summary": {"reject": ["1-65535"]},
         }));
     }
-    Relays::from_onionoo(&serde_json::to_vec(&v).unwrap(), Some("Sun, 18 Oct 2026 10:00:00 GMT".into()))
-        .unwrap()
+    Relays::from_onionoo(
+        &serde_json::to_vec(&v).unwrap(),
+        Some("Sun, 18 Oct 2026 10:00:00 GMT".into()),
+    )
+    .unwrap()
 }
 
 /// Test support: [`fixture_index`] written to `data_dir`.
@@ -469,7 +472,12 @@ mod tests {
     fn exits_are_or_addresses_of_exiting_relays_and_their_exit_addresses() {
         let r = fixture_index();
         // Exit flag and accepting policies: both ORPorts, both exit addresses.
-        for a in ["198.51.100.20", "2001:db8:6::1", "203.0.113.77", "2001:db8:6::99"] {
+        for a in [
+            "198.51.100.20",
+            "2001:db8:6::1",
+            "203.0.113.77",
+            "2001:db8:6::99",
+        ] {
             assert!(r.is_exit(&ip(a)), "{a}");
             assert_eq!(r.at(&ip(a))[0].nickname, "SixExit");
         }

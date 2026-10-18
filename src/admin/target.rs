@@ -3,7 +3,9 @@
 //! aggregation added here appears in both.
 use crate::admin::AdminState;
 use crate::admin::error::AppResult;
-use crate::admin::public::{IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards_with_ports};
+use crate::admin::public::{
+    IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards_with_ports,
+};
 use crate::store::browse::{Audience, IpOverview};
 use crate::store::events::{Cursor, EventKind, EventPage};
 use crate::store::requests::IpRow;
@@ -236,11 +238,8 @@ pub async fn load(
                 .filter(|p| p.state == "open")
                 .filter_map(|p| u16::try_from(p.port).ok())
                 .collect();
-            let mut cards = intel_cards_with_ports(
-                state.store.intel_for_ip(&ip.ip).await?,
-                authed,
-                &open,
-            );
+            let mut cards =
+                intel_cards_with_ports(state.store.intel_for_ip(&ip.ip).await?, authed, &open);
             crate::admin::public::apply_rdap_pick(
                 &mut cards,
                 state.store.rdap_pick(&ip.ip).await?,

@@ -285,15 +285,24 @@ mod tests {
             .await;
         assert!(found[0].source_version.is_some());
         let beezar = &found[0].data;
-        assert_eq!((&beezar["relay"], &beezar["exit"]), (&true.into(), &false.into()));
+        assert_eq!(
+            (&beezar["relay"], &beezar["exit"]),
+            (&true.into(), &false.into())
+        );
         let r = &beezar["relays"][0];
         assert_eq!(r["nickname"], "BEEzar");
         assert_eq!(r["roles"], serde_json::json!(["guard", "hsdir"]));
         assert_eq!(r["or_ports"], serde_json::json!([8443]));
         assert!(beezar.get("contact").is_none() && r.get("contact").is_none());
         let exit = &found[1].data;
-        assert_eq!(exit["exit_sources"], serde_json::json!(["bulk list", "Onionoo"]));
+        assert_eq!(
+            exit["exit_sources"],
+            serde_json::json!(["bulk list", "Onionoo"])
+        );
         assert_eq!(exit["family"], "IPv4");
-        assert_eq!(found[2].data, serde_json::json!({"relay": false, "exit": false}));
+        assert_eq!(
+            found[2].data,
+            serde_json::json!({"relay": false, "exit": false})
+        );
     }
 }

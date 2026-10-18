@@ -2492,11 +2492,7 @@ async fn a_member_copies_the_tor_relay_index_without_its_own_fetch() {
         "too few relays: not copied"
     );
     assert!(!relays::file(nb.dir.path()).exists());
-    std::fs::write(
-        relays::file(na.dir.path()),
-        relay_index(relays::MIN_RELAYS),
-    )
-    .unwrap();
+    std::fs::write(relays::file(na.dir.path()), relay_index(relays::MIN_RELAYS)).unwrap();
     share::publish(&na, na.dir.path(), &[share::RELAYS])
         .await
         .unwrap();
