@@ -586,7 +586,8 @@ pub struct TimelineRow {
 /// Most requests an upload's timeline shows.
 pub const TIMELINE_MAX: i64 = 500;
 
-const UPLOAD_COLS: &str = "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type, u.size,
+pub(super) const UPLOAD_COLS: &str =
+    "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type, u.size,
     u.truncated, u.sha256, u.answered_path, u.path_is_prefix, u.content_state,
     EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256) AS held,
     (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin

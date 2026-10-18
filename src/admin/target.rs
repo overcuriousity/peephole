@@ -39,8 +39,21 @@ pub struct Target {
 }
 
 impl Target {
-    /// The Timeline's link to older events.
-    pub fn older_href(&self) -> Option<String> {
+    /// The Timeline's link to older events, on the IP page only.
+    pub fn older_link(&self) -> Option<String> {
+        self.paged
+            .then(|| self.older_href())
+            .flatten()
+            .map(|q| format!("/ip/{}{q}", self.ov.ip.ip))
+    }
+
+    /// One address: the Timeline needs no IP column.
+    pub fn ip_column(&self) -> bool {
+        false
+    }
+
+    /// The query of [`Self::older_link`].
+    fn older_href(&self) -> Option<String> {
         let n = self.events.next.as_ref()?;
         let mut q = format!("?before={}", crate::admin::public::urlencode(&n.ts));
         if let Some(at) = n.at_param() {
