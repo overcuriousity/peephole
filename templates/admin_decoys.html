@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "decoys" %}{% include "_admin_nav.html" %}
 {% let subtab = tab.to_string() %}{% let tabs_label = "Decoy kinds" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Decoys</h1><p class="muted">What the fake MCP server and LLM gateway drew out. Nothing they ask for is ever executed.</p></div><nav class="seg" aria-label="Time range">
+<div class="page-head"><div><h1>Decoys</h1><p class="muted">What the fake MCP server and LLM gateway drew out.</p></div><nav class="seg" aria-label="Time range">
   {% for r in crate::store::stats::Range::ALL %}
   <a href="/admin/decoys?tab={{ tab }}&amp;range={{ r.key() }}"{% if r.key() == range.key() %} aria-current="true"{% endif %}>{{ r.key() }}</a>
   {% endfor %}
@@ -13,7 +13,7 @@
 <section class="card">
   <div class="card-head"><h2>Funnel</h2><span class="muted">per session</span></div>
   <div class="tiles">
-    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/admin/decoys?tab=mcp&amp;range={{ range.key() }}#sessions">{{ funnel.sessions }}</a></div><div class="hint">distinct sessions, as listed below</div></div>
+    <div class="tile"><span class="label">Sessions started</span><div class="value"><a href="/admin/decoys?tab=mcp&amp;range={{ range.key() }}#sessions">{{ funnel.sessions }}</a></div><div class="hint">distinct sessions</div></div>
     <div class="tile"><span class="label">Listed tools</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Flist">{{ funnel.listed }}</a></div></div>
     <div class="tile"><span class="label">Called a tool</span><div class="value"><a href="/requests?answer=decoy%3Amcp%3Atools%2Fcall">{{ funnel.called }}</a></div></div>
     <div class="tile"><span class="label">Credentials reused</span><div class="value"><a href="/admin/links/canaries">{{ funnel.reused }}</a></div></div>
@@ -43,7 +43,7 @@
   <ul class="shares">{% for n in llm.by_api %}<li><span class="mono">{{ n.name }}</span><span class="num">{{ crate::admin::views::thousands(n.count) }}</span></li>{% endfor %}</ul>
   <div class="tiles">
     <div class="tile"><span class="label">Listed models</span><div class="value">{{ llm.listings }}</div></div>
-    <div class="tile"><span class="label">Chat calls</span><div class="value">{{ llm.calls }}</div><div class="hint">{{ llm.listed }} for a model we list · {{ llm.unlisted }} for one we do not</div></div>
+    <div class="tile"><span class="label">Chat calls</span><div class="value">{{ llm.calls }}</div><div class="hint">{{ llm.listed }} listed model · {{ llm.unlisted }} other</div></div>
     <div class="tile"><span class="label">Pulls</span><div class="value"><a href="/requests?answer=decoy%3Allm%3Apull">{{ llm.pulls }}</a></div></div>
   </div>
 </section>

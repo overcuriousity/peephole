@@ -86,6 +86,11 @@ pub struct IpFilter {
     /// Admin only: an agreed name of the address (looked up, PTR or
     /// reverse DNS) contains this text.
     pub name: Option<String>,
+    /// Admin only: in the RDAP network with this handle, exactly.
+    pub net: Option<String>,
+    /// Admin only: in an RDAP network with this name, exactly (names are
+    /// not unique: one can cover several handles).
+    pub net_name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -129,6 +134,8 @@ pub struct RequestFilter {
     pub method: Option<String>,
     /// Admin only: the User-Agent, exactly (`(none)`: without one).
     pub ua: Option<String>,
+    /// Admin only: the command sent to a dropped webshell, exactly.
+    pub cmd: Option<String>,
     /// Admin only: `http`, `https`, …; `unknown` for a row without one.
     pub transport: Option<String>,
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
@@ -370,7 +377,7 @@ fn request_row_select(a: Audience) -> String {
 /// The first canary a request presented that another request (or a light
 /// row) was served: (value hash, serving request) as in
 /// `canaries::REUSE_SELECT`. A full row that served it ranks first.
-const CANARY_USED: &str =
+pub(crate) const CANARY_USED: &str =
     "SELECT {} FROM request_tokens t JOIN canaries c ON c.value_hash = t.value_hash
      WHERE t.request_id = r.id AND (c.request_id IS NULL OR c.request_id != r.id)
      ORDER BY c.request_id IS NULL, c.ts LIMIT 1";
@@ -502,6 +509,14 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
             );
             binds.push(format!("%{}%", like_escape(&v.to_ascii_lowercase())));
         }
+        if let Some(v) = nonempty(&f.net) {
+            wheres.push("i.rdap_handle = ?".into());
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.net_name) {
+            wheres.push("i.rdap_name = ?".into());
+            binds.push(v);
+        }
     }
     let where_sql = if wheres.is_empty() {
         String::new()
@@ -592,6 +607,10 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         }
         if let Some(v) = nonempty(&f.ua) {
             sql.push_str(" AND r.user_agent = ?");
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.cmd) {
+            sql.push_str(" AND r.cmd = ?");
             binds.push(v);
         }
         if let Some(v) = nonempty(&f.session) {
@@ -694,6 +713,16 @@ impl Count {
 }
 
 impl Store {
+    /// Whether some IP carries `label` (admin count, as `/ips?label=`).
+    pub async fn label_exists(&self, label: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ip_labels WHERE label = ? AND count > 0)",
+        )
+        .bind(label)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Stored IPs among `addrs` or inside `nets`, by address, at most
     /// `limit` (admin bulk lookup).
     pub async fn ips_matching(
@@ -1891,5 +1920,60 @@ mod tests {
             }
         );
         assert_eq!(few.to_string(), "3");
+    }
+
+    /// `net` and `net_name` filter admins' lists by the RDAP network, through
+    /// `idx_ips_rdap_handle` for the handle; the public list ignores both.
+    #[tokio::test]
+    async fn the_rdap_network_filters_admin_lists_only() {
+        let s = crate::store::asn::tests::seeded().await;
+        let ips = |f: IpFilter, a: Audience| {
+            let s = s.clone();
+            async move {
+                let mut v: Vec<String> = s
+                    .list_ips_as(&f, a)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|i| i.ip)
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        let net = |h: &str| IpFilter {
+            net: Some(h.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ips(net("NET-1"), Audience::Admin).await,
+            ["203.0.113.1", "203.0.113.2"]
+        );
+        assert_eq!(ips(net("NET-2"), Audience::Admin).await, ["198.51.100.1"]);
+        assert_eq!(ips(net("NET-1"), Audience::Public).await.len(), 3);
+        let by_name = IpFilter {
+            net_name: Some("Example RDAP".into()),
+            ..Default::default()
+        };
+        assert_eq!(ips(by_name.clone(), Audience::Admin).await.len(), 3);
+        assert_eq!(s.count_ips(&net("NET-1")).await.unwrap(), 2);
+
+        let fs = ip_filter_sql(&net("NET-1"), Audience::Admin).unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}{} ORDER BY i.request_count DESC, i.last_seen DESC",
+            ip_summary_select(Audience::Admin),
+            fs.where_sql
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(sql));
+        for b in &fs.binds {
+            q = q.bind(b);
+        }
+        let plan = q.fetch_all(&s.pool).await.unwrap();
+        assert!(
+            plan.iter().any(|p| p.3.contains("idx_ips_rdap_handle")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|p| p.3.starts_with("SCAN i")), "{plan:?}");
     }
 }

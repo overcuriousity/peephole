@@ -69,6 +69,19 @@ impl PortRow {
             .join(" ")
     }
 
+    /// Product and version as the `/ips?product=` filter matches them, for
+    /// an open port with a product (the filter looks at open ports only).
+    pub fn product_key(&self) -> Option<String> {
+        if self.state != "open" {
+            return None;
+        }
+        let p = self.product.as_deref()?;
+        Some(match &self.version {
+            Some(v) => format!("{p} {v}"),
+            None => p.to_string(),
+        })
+    }
+
     /// OS type, device type and announced host name, the ones set, joined.
     pub fn system(&self) -> String {
         [&self.ostype, &self.devicetype, &self.hostname]
@@ -282,6 +295,24 @@ impl Store {
         .bind(INTEL_HISTORY_PER_PROVIDER)
         .fetch_all(&self.read)
         .await?)
+    }
+
+    /// Of `ips`, those with a `tor-relays` result: whether a node says it
+    /// is a Tor relay (any node's "relay" wins, as for exits).
+    pub async fn tor_relay_flags(
+        &self,
+        ips: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT ip, MAX(COALESCE(json_extract(data_json, '$.relay'), 0) = 1)
+             FROM ip_intel WHERE provider = ? AND ip IN (SELECT value FROM json_each(?))
+             GROUP BY ip",
+        )
+        .bind(crate::intel::TOR_RELAYS)
+        .bind(serde_json::to_string(ips)?)
+        .fetch_all(&self.read)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Which RDAP answer the IP page shows (`data::pick_rdap`).

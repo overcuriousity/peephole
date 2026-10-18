@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod asn;
 pub mod auth;
 mod backfill;
 pub mod blocklist;
@@ -10,6 +11,7 @@ pub mod data;
 pub mod decoys;
 pub mod delete;
 pub mod devices;
+pub mod events;
 pub mod export;
 pub mod facts;
 pub mod fingerprints;
@@ -21,6 +23,7 @@ pub mod links;
 pub mod maintenance;
 pub mod probes;
 pub mod publish;
+pub mod rdap_net;
 pub mod rdns;
 pub mod recorder;
 pub mod requests;
@@ -29,6 +32,7 @@ pub mod shapes;
 pub mod stats;
 pub mod uploads;
 pub mod useragent;
+pub mod webshell_cmd;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -84,6 +88,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0039_shapes.sql"),
     include_str!("migrations/0040_campaigns.sql"),
     include_str!("migrations/0041_campaign_agreement.sql"),
+    include_str!("migrations/0042_webshell_cmd.sql"),
+    include_str!("migrations/0043_rdap_net.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

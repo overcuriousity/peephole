@@ -376,6 +376,8 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         product: None,
         os: None,
         name: None,
+        net: None,
+        net_name: None,
     }
 }
 
@@ -397,6 +399,8 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("product", f.product.clone()),
         ("os", f.os.clone()),
         ("name", f.name.clone()),
+        ("net", f.net.clone()),
+        ("net_name", f.net_name.clone()),
     ]
 }
 
@@ -420,6 +424,7 @@ fn request_pairs(f: &RequestFilter) -> Vec<(&'static str, Option<String>)> {
         ("ja4h", f.ja4h.clone()),
         ("ja4", f.ja4.clone()),
         ("ua", f.ua.clone()),
+        ("cmd", f.cmd.clone()),
         ("method", f.method.clone()),
         ("transport", f.transport.clone()),
         ("answer", f.answer.clone()),
@@ -483,6 +488,7 @@ fn filter_label(k: &str) -> &'static str {
         "ja4" => "JA4",
         "ja4h" => "JA4H",
         "ua" => "User agent",
+        "cmd" => "Webshell command",
         "method" => "Method",
         "transport" => "Transport",
         "answer" => "Answer",
@@ -496,6 +502,8 @@ fn filter_label(k: &str) -> &'static str {
         "product" => "Product",
         "os" => "OS guess",
         "name" => "Name",
+        "net" => "Network",
+        "net_name" => "Network name",
         _ => "Filter",
     }
 }
@@ -724,6 +732,8 @@ pub struct IntelFact {
     pub label: String,
     pub value: String,
     pub mono: bool,
+    /// Admin only: the page the value opens (an RDAP handle's network).
+    pub href: Option<String>,
 }
 
 /// One node's result from one provider.
@@ -752,18 +762,22 @@ fn fact(label: &str, value: impl Into<String>, mono: bool) -> IntelFact {
         label: label.to_string(),
         value: value.into(),
         mono,
+        href: None,
     }
 }
 
 /// A provider's data as labelled facts. Known fields get a readable form;
 /// anything else is listed under its own key, so a new provider shows up
 /// without template changes.
-fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
+pub(crate) fn intel_facts(provider: &str, data: &serde_json::Value, admin: bool) -> Vec<IntelFact> {
     let Some(obj) = data.as_object() else {
         return vec![fact("Data", data.to_string(), true)];
     };
     if let Some(fields) = api_fields(provider) {
-        return api_facts(fields, obj);
+        return api_facts(fields, obj, admin && provider == crate::intel::RDAP);
+    }
+    if provider == crate::intel::TOR_RELAYS {
+        return tor_relay_facts(obj, admin);
     }
     // Known fields first, in reading order; the map itself is sorted by key.
     const ORDER: [&str; 4] = ["exit", "country", "asn", "asn_org"];
@@ -814,6 +828,169 @@ fn intel_facts(provider: &str, data: &serde_json::Value) -> Vec<IntelFact> {
         out.push(fact("Result", "nothing known about this address", false));
     }
     out
+}
+
+/// The relay page on Tor Metrics, for a well-formed fingerprint (the data
+/// may come from any member).
+fn relay_link(fp: &str) -> Option<String> {
+    (fp.len() == 40 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("https://metrics.torproject.org/rs.html#details/{fp}"))
+}
+
+fn strs(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|x| match x {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// A `tor-relays` result: one line saying what the address is, then (admin
+/// only) each relay. The public sees "Tor exit" or "Tor relay (roles)",
+/// never which relay (MIK-507).
+fn tor_relay_facts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    admin: bool,
+) -> Vec<IntelFact> {
+    let exit = obj.get("exit").and_then(|e| e.as_bool()) == Some(true);
+    let relays: Vec<&serde_json::Map<String, serde_json::Value>> = obj
+        .get("relays")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_object())
+        .collect();
+    let text = |r: &serde_json::Map<String, serde_json::Value>, k: &str| {
+        r.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let summary = if exit {
+        match admin {
+            true => format!(
+                "Tor exit ({}, source: {})",
+                obj.get("family").and_then(|f| f.as_str()).unwrap_or("?"),
+                strs(obj.get("exit_sources")).join(" / ")
+            ),
+            false => "Tor exit".into(),
+        }
+    } else if let Some(r) = relays.first() {
+        let roles = strs(r.get("roles"));
+        match admin {
+            true => format!(
+                "{} relay {}, non-exit",
+                roles.first().map_or("middle", String::as_str),
+                text(r, "nickname")
+            ),
+            false => {
+                let mut all: Vec<String> = vec![];
+                for x in relays.iter().flat_map(|r| strs(r.get("roles"))) {
+                    if !all.contains(&x) {
+                        all.push(x);
+                    }
+                }
+                format!("Tor relay ({})", all.join(", "))
+            }
+        }
+    } else {
+        "not a Tor relay".into()
+    };
+    let mut out = vec![fact("Tor", summary, false)];
+    if !admin {
+        return out;
+    }
+    for r in relays {
+        let fp = text(r, "fingerprint");
+        let link = relay_link(&fp);
+        out.push(IntelFact {
+            href: link.clone(),
+            ..fact("Relay", text(r, "nickname"), false)
+        });
+        out.push(IntelFact {
+            href: link,
+            ..fact("Fingerprint", fp, true)
+        });
+        out.push(fact("Roles", strs(r.get("roles")).join(", "), false));
+        let exits = r.get("exit").and_then(|e| e.as_bool()) == Some(true);
+        out.push(fact(
+            "Exit",
+            if exits { "exits" } else { "non-exit" },
+            false,
+        ));
+        out.push(fact("ORPort", strs(r.get("or_ports")).join(", "), true));
+        let since = text(r, "first_seen");
+        if !since.is_empty() {
+            out.push(fact("Since", since.get(..10).unwrap_or(&since), true));
+        }
+        if let Some(n) = r.get("family_size").and_then(|n| n.as_u64()) {
+            let s = if n == 1 { "" } else { "s" };
+            out.push(fact("Family", format!("{n} relay{s}"), false));
+        }
+        let version = text(r, "version");
+        if !version.is_empty() {
+            out.push(fact("Version", version, true));
+        }
+    }
+    out
+}
+
+/// Admin: what other sources say that fits the relay, for the `tor-relays`
+/// card: a Shodan `tor` tag, its ORPort open in Shodan's view or in this
+/// node's counter-scans (`open_ports`). None when there is no relay or
+/// nothing fits.
+fn tor_consistency(rows: &[IpIntelRow], open_ports: &[u16]) -> Option<String> {
+    let newest = |p: &str| {
+        rows.iter()
+            .find(|r| r.provider == p)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.data_json).ok())
+    };
+    let tor = newest(crate::intel::TOR_RELAYS)?;
+    let or_ports: Vec<u64> = tor
+        .get("relays")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.get("or_ports")?.as_array())
+        .flatten()
+        .filter_map(|p| p.as_u64())
+        .collect();
+    let mut said = vec![];
+    for (p, name) in [
+        (crate::intel::SHODAN, "Shodan"),
+        (crate::intel::INTERNETDB, "Shodan InternetDB"),
+    ] {
+        let Some(d) = newest(p) else { continue };
+        if strs(d.get("tags")).iter().any(|t| t == "tor") {
+            said.push(format!("{name} tags it tor"));
+        }
+        let open: Vec<String> = d
+            .get("ports")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_u64())
+            .filter(|p| or_ports.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        if !open.is_empty() {
+            said.push(format!("ORPort {} open in {name}", open.join(", ")));
+        }
+    }
+    let scanned: Vec<String> = open_ports
+        .iter()
+        .filter(|p| or_ports.contains(&u64::from(**p)))
+        .map(|p| p.to_string())
+        .collect();
+    if !scanned.is_empty() {
+        said.push(format!(
+            "ORPort {} open in a counter-scan",
+            scanned.join(", ")
+        ));
+    }
+    (!said.is_empty()).then(|| format!("consistent: {}", said.join("; ")))
 }
 
 /// `(key, label, monospaced)` of an API provider's fields, in reading order.
@@ -913,7 +1090,12 @@ fn fact_text(key: &str, v: &serde_json::Value) -> String {
     }
 }
 
-fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -> Vec<IntelFact> {
+/// `net_link`: the RDAP handle links to its network's page (admin only).
+fn api_facts(
+    fields: Fields,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    net_link: bool,
+) -> Vec<IntelFact> {
     let mut out: Vec<IntelFact> = fields
         .iter()
         .filter_map(|(k, label, mono)| {
@@ -927,7 +1109,15 @@ fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -
             {
                 text = format!("{n}: {text}");
             }
-            Some(fact(label, text, *mono))
+            let mut f = fact(label, text, *mono);
+            if net_link && *k == "handle" {
+                f.href = v
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(crate::admin::asn::net_href);
+            }
+            Some(f)
         })
         .collect();
     // Fields this version does not know yet (a newer node's), as they are.
@@ -946,6 +1136,18 @@ fn api_facts(fields: Fields, obj: &serde_json::Map<String, serde_json::Value>) -
 /// no node names; an admin sees every provider and every node's result.
 /// A known provider without a result still gets a card, saying so.
 pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
+    intel_cards_with_ports(rows, admin, &[])
+}
+
+/// [`intel_cards`], where an admin's `tor-relays` card also says whether
+/// the ports this node's counter-scans found open (`open_ports`) and the
+/// Shodan results fit the relay.
+pub fn intel_cards_with_ports(
+    rows: Vec<IpIntelRow>,
+    admin: bool,
+    open_ports: &[u16],
+) -> Vec<IntelCard> {
+    let consistent = admin.then(|| tor_consistency(&rows, open_ports)).flatten();
     let mut by_provider: Vec<(String, Vec<IpIntelRow>)> = Vec::new();
     for r in rows {
         match by_provider.iter_mut().find(|(p, _)| *p == r.provider) {
@@ -976,13 +1178,18 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
             let mut results = rows.iter().map(|r| {
                 let data = serde_json::from_str(&r.data_json).unwrap_or(serde_json::Value::Null);
                 IntelResult {
-                    facts: intel_facts(&name, &data),
+                    facts: intel_facts(&name, &data, admin),
                     fetched_at: r.fetched_at.clone(),
                     source_version: r.source_version.clone(),
                     node: if admin { r.node.clone() } else { None },
                 }
             });
-            let newest = results.next();
+            let mut newest = results.next();
+            if name == crate::intel::TOR_RELAYS
+                && let (Some(n), Some(c)) = (newest.as_mut(), &consistent)
+            {
+                n.facts.push(fact("Cross-check", c.clone(), false));
+            }
             let others = if admin { results.collect() } else { vec![] };
             IntelCard {
                 label,
@@ -997,13 +1204,21 @@ pub fn intel_cards(rows: Vec<IpIntelRow>, admin: bool) -> Vec<IntelCard> {
 
 /// The RDAP card as `data::pick_rdap` decides when the nodes' answers
 /// differ: the chosen answer first, or every answer marked disputed.
-pub fn apply_rdap_pick(cards: &mut [IntelCard], pick: Option<crate::store::data::RdapPick>) {
+pub fn apply_rdap_pick(
+    cards: &mut [IntelCard],
+    pick: Option<crate::store::data::RdapPick>,
+    admin: bool,
+) {
     use crate::store::data::RdapPick;
     let Some(card) = cards.iter_mut().find(|c| c.name == crate::intel::RDAP) else {
         return;
     };
     let result = |a: crate::store::data::RdapAnswer| IntelResult {
-        facts: intel_facts(crate::intel::RDAP, &serde_json::Value::Object(a.data)),
+        facts: intel_facts(
+            crate::intel::RDAP,
+            &serde_json::Value::Object(a.data),
+            admin,
+        ),
         fetched_at: a.fetched_at,
         source_version: None,
         node: a.node,
@@ -1090,22 +1305,25 @@ struct IpPage {
     can_delete: bool,
 }
 
+/// The IP page's Timeline cursor: `before` must be `YYYY-MM-DD HH:MM:SS`
+/// (anything else is the first page), `at` `<kind>.<id>`.
 #[derive(serde::Deserialize, Default)]
-pub struct PageQuery {
-    #[serde(default, deserialize_with = "crate::store::browse::lenient_i64")]
-    pub page: Option<i64>,
+pub struct TimelineQuery {
+    pub before: Option<String>,
+    pub at: Option<String>,
 }
 
 async fn ip_page(
     MaybeUser(authed): MaybeUser,
     State(state): State<Arc<AdminState>>,
     Path(addr): Path<String>,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<TimelineQuery>,
 ) -> AppResult<Html<String>> {
     let Some(ip) = state.store.ip_by_addr(&addr).await? else {
         return Err(AppError::NotFound);
     };
-    let Some(t) = crate::admin::target::load(&state, &ip, authed, page_num(q.page), true).await?
+    let before = crate::store::events::Cursor::parse(q.before.as_deref(), q.at.as_deref());
+    let Some(t) = crate::admin::target::load(&state, &ip, authed, before.as_ref(), true).await?
     else {
         return Err(AppError::NotFound);
     };
@@ -1641,6 +1859,230 @@ show_labels = {show_labels}
             .unwrap()
     }
 
+    /// The request page's path and command are pivots to the requests with
+    /// the same (MIK-498), and so is the list's path; its user agent opens
+    /// the UA's Links page, which leads on to those requests (MIK-504).
+    #[tokio::test]
+    async fn request_values_pivot_to_the_requests_with_the_same() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.50".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/wp-login.php".into(),
+                headers_json: r#"[["User-Agent","Mozilla/5.0 (X11)"]]"#.into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let shell = webshell_cmd(&st, "203.0.113.50", "id%20-a").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+
+        let (status, html) = get_with(&app, &format!("/admin/requests/{id}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
+            "{html}"
+        );
+        let item = "/admin/links/ua/Mozilla%2F5.0%20%28X11%29";
+        assert!(
+            html.contains(&format!(r#"href="{item}">Mozilla/5.0 (X11)</a>"#)),
+            "{html}"
+        );
+        let (status, page) = get_with(&app, item, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let ua = "/requests?ua=Mozilla%2F5.0%20%28X11%29";
+        assert!(
+            page.contains("User agent")
+                && page.contains(r#"href="/ip/203.0.113.50""#)
+                && page.contains(&format!(r#"href="{ua}""#)),
+            "{page}"
+        );
+        // One IP: listed only with `shared=0`, under its own tab.
+        let (_, index) = get_with(&app, "/admin/links?kind=ua", Some(&cookie)).await;
+        assert!(!index.contains(item), "{index}");
+        let (status, index) = get_with(&app, "/admin/links?kind=ua&shared=0", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            index.contains(item) && index.contains(" aria-current=\"true\">User agent</a>"),
+            "{index}"
+        );
+        // Search resolves a pasted UA to its page.
+        let r = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/admin/search?q=Mozilla%2F5.0%20%28X11%29")
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.headers().get(axum::http::header::LOCATION).unwrap(), item);
+        let (status, list) = get_with(&app, ua, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(list.contains(&format!("/admin/requests/{id}\"")), "{list}");
+        assert!(
+            !list.contains(&format!("/admin/requests/{shell}\"")),
+            "{list}"
+        );
+
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{shell}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains(r#"href="/requests?cmd=id%20-a">id -a</a>"#),
+            "{html}"
+        );
+
+        let (status, list) = get_with(&app, "/requests", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
+            "{list}"
+        );
+        // The list has no public render: it asks for a session, so no
+        // pivot on it reaches a visitor.
+        let (status, public) = get_with(&app, "/requests", None).await;
+        assert_eq!(status, 303);
+        assert!(!public.contains("/admin/"), "{public}");
+    }
+
+    /// A link item's IP rows carry the campaign each address is a member
+    /// of (MIK-498), read in the rows' own query, and its AS badge.
+    #[tokio::test]
+    async fn link_item_rows_show_the_campaign_of_each_ip() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ja4 = "t13d1516h2_8daaf6152771_02713d6af862";
+        let mut ids = vec![];
+        for ip in ["203.0.113.60", "203.0.113.61"] {
+            let ip = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: "/".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ja4: Some(ja4.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            ids.push(ip.id);
+        }
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.60', 7, ?, 2, '2026-10-01 00:00:00', '2026-10-01 00:00:00',
+                1, 0, 2, '2026-10-01 00:00:00')",
+        )
+        .bind(ids[0])
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.60')",
+        )
+        .bind(ids[0])
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) =
+            get_with(&app, &format!("/admin/links/ja4/{ja4}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let badge = r#"href="/admin/campaigns/203.0.113.60">member of campaign #7</a>"#;
+        assert_eq!(html.matches(badge).count(), 1, "{html}");
+        assert_eq!(html.matches("member of campaign").count(), 1, "{html}");
+        assert!(html.contains("203.0.113.61"), "{html}");
+    }
+
+    /// An admin's `AS{n}` badges lead to the network's page; the public
+    /// ones keep the filtered list (the page needs a session).
+    #[tokio::test]
+    async fn asn_badges_lead_admins_to_the_network_page() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            admin.matches("href=\"/admin/asn/64500\"").count(),
+            1,
+            "{admin}"
+        );
+        assert!(!admin.contains("/ips?asn="), "{admin}");
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            public.matches("href=\"/ips?asn=64500\"").count(),
+            1,
+            "{public}"
+        );
+        assert!(!public.contains("/admin/asn/"), "{public}");
+        // The list itself is unchanged: no roll-up on it.
+        for cookie in [Some(cookie.as_str()), None] {
+            let (status, list) = get_with(&app, "/ips?asn=64500", cookie).await;
+            assert_eq!(status, 200);
+            assert!(list.contains("href=\"/ip/203.0.113.2\""), "{list}");
+            assert!(!list.contains("/admin/asn/"), "{list}");
+            assert!(!list.contains("Open ports"), "{list}");
+        }
+    }
+
+    /// The RDAP card's Handle links an admin to the network's page, and
+    /// `/ips?net=` / `net_name=` filter an admin's list (MIK-503).
+    #[tokio::test]
+    async fn rdap_networks_link_and_filter_for_admins_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            admin.contains(r#"<dd><a href="/admin/net/NET-1">NET-1</a></dd>"#),
+            "{admin}"
+        );
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert!(!public.contains("/admin/net/"), "{public}");
+
+        let (status, list) = get_with(&app, "/ips?net=NET-1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains("Network: <span class=\"mono\">NET-1</span>"),
+            "{list}"
+        );
+        assert!(list.contains("href=\"/ip/203.0.113.2\""), "{list}");
+        assert!(!list.contains("href=\"/ip/198.51.100.1\""), "{list}");
+        let (status, list) = get_with(&app, "/ips?net_name=Example%20RDAP", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains("Network name: <span class=\"mono\">Example RDAP</span>"),
+            "{list}"
+        );
+        assert!(list.contains("href=\"/ip/198.51.100.1\""), "{list}");
+        // The public list ignores both.
+        for q in ["net=NET-1", "net_name=nope"] {
+            let (status, list) = get_with(&app, &format!("/ips?{q}"), None).await;
+            assert_eq!(status, 200);
+            assert!(list.contains("href=\"/ip/198.51.100.1\""), "{q}: {list}");
+            assert!(!list.contains("Network: "), "{q}: {list}");
+        }
+    }
+
     #[tokio::test]
     async fn the_ip_page_lists_uploads_and_webshell_commands_to_the_admin_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
@@ -1653,9 +2095,12 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (status, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(html.contains("Uploads and webshell commands"), "{html}");
+        assert!(html.contains("<h2>Lures</h2>"), "{html}");
         assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
-        assert!(html.contains(">whoami</td>"), "{html}");
+        assert!(
+            html.contains(r#"href="/requests?cmd=whoami" title="whoami">whoami</a></td>"#),
+            "{html}"
+        );
         // The kind is the stored string, whatever it is.
         assert!(html.contains("<td class=\"mono\">put</td>"), "{html}");
         assert!(!html.contains("All its uploads"), "{html}");
@@ -1663,15 +2108,130 @@ show_labels = {show_labels}
         // The public page has none of it.
         let (status, public) = get_with(&app, "/ip/203.0.113.30", None).await;
         assert_eq!(status, 200);
-        assert!(
-            !public.contains("Uploads and webshell commands"),
-            "{public}"
-        );
+        assert!(!public.contains("<h2>Lures</h2>"), "{public}");
         assert!(!public.contains("/admin/uploads/"), "{public}");
         assert!(!public.contains("whoami"), "{public}");
         // An address with neither: no section.
         let (_, none) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
-        assert!(!none.contains("Uploads and webshell commands"), "{none}");
+        assert!(!none.contains("<h2>Lures</h2>"), "{none}");
+    }
+
+    /// Canaries and decoys fold into the Lures card; empty claims and
+    /// fingerprints cards are gone; the head carries the ASN count and,
+    /// for an admin, the link graph (MIK-499).
+    #[tokio::test]
+    async fn the_ip_page_folds_lures_into_one_card_and_drops_empty_cards() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let a = st
+            .store
+            .upsert_ip("203.0.113.1".parse().unwrap())
+            .await
+            .unwrap();
+        let o = st
+            .store
+            .upsert_ip("198.51.100.1".parse().unwrap())
+            .await
+            .unwrap();
+        let req =
+            |ip_id, answer: Option<&str>, decoy: Option<&str>| crate::store::requests::NewRequest {
+                ip_id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: answer.map(Into::into),
+                decoy_in: decoy.map(Into::into),
+                ..Default::default()
+            };
+        // A canary served to 203.0.113.1, used by 198.51.100.1.
+        let served = st
+            .store
+            .insert_request(&req(a.id, None, None))
+            .await
+            .unwrap();
+        let used = st
+            .store
+            .insert_request(&req(o.id, None, None))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO canaries (value_hash, kind, request_id, ts, ip_id) VALUES (7, 'password', ?, datetime('now'), ?)")
+            .bind(served)
+            .bind(a.id)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO request_tokens (request_id, value_hash, place) VALUES (?, 7, 'body')",
+        )
+        .bind(used)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        st.store
+            .insert_request(&req(a.id, Some("decoy:mcp:tools/call"), Some("{}")))
+            .await
+            .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(html.matches("data-section=\"drops\"").count(), 1, "{html}");
+        assert!(html.contains("<h2>Lures</h2>"), "{html}");
+        assert!(
+            html.contains("credentials harvested here used by 1 other IP ·"),
+            "{html}"
+        );
+        assert!(html.contains("tool calls 1"), "{html}");
+        assert!(!html.contains("data-section=\"canaries\""), "{html}");
+        assert!(!html.contains("data-section=\"decoys\""), "{html}");
+        assert!(!html.contains("data-section=\"claims\""), "{html}");
+        assert!(!html.contains("data-section=\"fingerprints\""), "{html}");
+        assert!(!html.contains("Same ASN"), "{html}");
+        assert!(!html.contains("added by an operator"), "{html}");
+        assert!(
+            html.contains(r#"<a href="/admin/asn/64500">Example Net <span class="mono muted">AS64500</span> · 2 IPs</a>"#),
+            "{html}"
+        );
+        assert!(html.contains(">link graph</a>"), "{html}");
+        let (status, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert_eq!(status, 200);
+        assert!(
+            public.contains(r#"<a href="/ips?asn=64500">Example Net <span class="mono muted">AS64500</span> · 2 IPs</a>"#),
+            "{public}"
+        );
+        assert!(!public.contains("link graph"), "{public}");
+        assert!(!public.contains("Lures"), "{public}");
+        // A claim and a fingerprint bring their cards back.
+        st.store
+            .insert_fp_claim(a.id, served, Some("x@example.org"), "UA")
+            .await
+            .unwrap();
+        st.store
+            .insert_fingerprint(Some(served), a.id, "fphash", None, "{}", "{}", b"")
+            .await
+            .unwrap();
+        let (_, html) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert!(html.contains("data-section=\"claims\""), "{html}");
+        assert!(html.contains("data-section=\"fingerprints\""), "{html}");
+        // The request page: the fingerprint is a row, the query only on
+        // the request line.
+        let shell = webshell_cmd(&st, "203.0.113.1", "id").await;
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{served}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(html.contains(">fphash</a>"), "{html}");
+        assert!(!html.contains("<h2>Fingerprint</h2>"), "{html}");
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{shell}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(!html.contains("Query string"), "{html}");
+        assert!(!html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(
+            html.contains("<span class=\"muted\">?cmd=id</span>"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
@@ -1688,7 +2248,7 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (_, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(html.matches("\">upload</a>").count(), IP_DROPS, "{html}");
-        assert_eq!(html.matches(">id</td>").count(), IP_DROPS, "{html}");
+        assert_eq!(html.matches(">id</a></td>").count(), IP_DROPS, "{html}");
         assert!(html.contains("/admin/uploads?ip=203.0.113.30\""), "{html}");
         assert!(
             html.contains("/requests?ip=203.0.113.30&amp;answer=webshell\""),
@@ -1749,7 +2309,12 @@ show_labels = {show_labels}
         assert!(up.contains("member of campaign #7"), "{up}");
         assert!(!up.contains("Webshell command"), "{up}");
         let (_, cmd) = get_with(&app, &format!("/admin/requests/{cmd_id}"), Some(&cookie)).await;
-        assert!(cmd.contains("<pre class=\"panel\">uname -a</pre>"), "{cmd}");
+        assert!(
+            cmd.contains(
+                r#"<pre class="panel"><a href="/requests?cmd=uname%20-a">uname -a</a></pre>"#
+            ),
+            "{cmd}"
+        );
         assert!(cmd.contains("member of campaign #7"), "{cmd}");
         assert!(!cmd.contains("/admin/uploads/"), "{cmd}");
         // Without a session the page is not served at all.
@@ -1819,6 +2384,30 @@ show_labels = {show_labels}
             ),
             "{html}"
         );
+    }
+
+    /// An open port and its product are pivots to the IPs with the same
+    /// (MIK-498), on the scan page and the IP page, and each lands on a list
+    /// that holds the scanned address.
+    #[tokio::test]
+    async fn ports_and_products_pivot_to_the_ips_with_the_same() {
+        let (st, _d, id) = scanned_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let port = r#"href="/ips?port=22""#;
+        let product = r#"href="/ips?product=OpenSSH%209.6p1""#;
+        for page in [format!("/admin/scans/{id}"), "/ip/203.0.113.9".into()] {
+            let (status, html) = get_with(&app, &page, Some(&cookie)).await;
+            assert_eq!(status, 200, "{page}");
+            assert!(html.contains(port), "{page}: {html}");
+            assert!(html.contains(product), "{page}: {html}");
+            assert!(html.contains("Ubuntu Linux; protocol 2.0"), "{page}");
+        }
+        for list in ["/ips?port=22", "/ips?product=OpenSSH%209.6p1"] {
+            let (status, html) = get_with(&app, list, Some(&cookie)).await;
+            assert_eq!(status, 200, "{list}");
+            assert!(html.contains("203.0.113.9"), "{list}: {html}");
+        }
     }
 
     #[tokio::test]
@@ -2313,7 +2902,7 @@ show_labels = {show_labels}
         // Providers without a result share one line, each named.
         let pending = html.split("No result yet: ").nth(1).unwrap();
         let pending = &pending[..pending.find('<').unwrap()];
-        assert_eq!(pending.split(", ").count(), 2, "{pending}");
+        assert_eq!(pending.split(", ").count(), 3, "{pending}");
     }
 
     fn row(provider: &str, data: &str, node: Option<&str>) -> IpIntelRow {
@@ -2324,6 +2913,93 @@ show_labels = {show_labels}
             data_json: data.into(),
             node: node.map(str::to_string),
         }
+    }
+
+    /// GH #138: BEEzar on both its addresses, from the Onionoo fixture.
+    #[test]
+    fn the_tor_relays_card_names_the_guard_and_cross_checks_its_orport() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::intel::relays::write_fixture(dir.path());
+        let list = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
+        let data = |ip: &str| crate::intel::provider::TorRelays::data(&list, ip).to_string();
+        let facts = |f: &[IntelFact]| -> Vec<(String, String)> {
+            f.iter()
+                .map(|f| (f.label.clone(), f.value.clone()))
+                .collect()
+        };
+        for ip in ["144.76.159.218", "2a01:4f8:200:32e6::2"] {
+            let rows = vec![
+                row(crate::intel::TOR_RELAYS, &data(ip), Some("a")),
+                row(
+                    crate::intel::SHODAN,
+                    r#"{"tags":["tor"],"ports":[8443]}"#,
+                    None,
+                ),
+            ];
+            let cards = intel_cards_with_ports(rows.clone(), true, &[8443, 22]);
+            let card = cards
+                .iter()
+                .find(|c| c.name == crate::intel::TOR_RELAYS)
+                .unwrap();
+            let newest = card.newest.as_ref().unwrap();
+            let got = facts(&newest.facts);
+            let want = |l: &str, v: &str| (l.to_string(), v.to_string());
+            assert_eq!(got[0], want("Tor", "guard relay BEEzar, non-exit"), "{ip}");
+            for w in [
+                want("Relay", "BEEzar"),
+                want("Fingerprint", "7EEDD54E5457DA009E46C91BBF1F443DCEE01968"),
+                want("Roles", "guard, hsdir"),
+                want("Exit", "non-exit"),
+                want("ORPort", "8443"),
+                want("Since", "2024-01-01"),
+                want("Family", "1 relay"),
+                want("Version", "0.4.9.9"),
+                want(
+                    "Cross-check",
+                    "consistent: Shodan tags it tor; ORPort 8443 open in Shodan; \
+                     ORPort 8443 open in a counter-scan",
+                ),
+            ] {
+                assert!(got.contains(&w), "{ip}: {w:?} in {got:?}");
+            }
+            let link = "https://metrics.torproject.org/rs.html#details/\
+                        7EEDD54E5457DA009E46C91BBF1F443DCEE01968";
+            let fp = newest
+                .facts
+                .iter()
+                .find(|f| f.label == "Fingerprint")
+                .unwrap();
+            assert_eq!(fp.href.as_deref(), Some(link));
+            // The public: the role, never which relay.
+            let public = intel_cards(rows, false);
+            let card = public
+                .iter()
+                .find(|c| c.name == crate::intel::TOR_RELAYS)
+                .unwrap();
+            let got = facts(&card.newest.as_ref().unwrap().facts);
+            assert_eq!(got, [want("Tor", "Tor relay (guard, hsdir)")]);
+        }
+        // Exits say so, with the family and where it comes from.
+        let exit = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("2001:db8:6::1")).unwrap(),
+            true,
+        );
+        assert_eq!(exit[0].value, "Tor exit (IPv6, source: Onionoo)");
+        let public = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("2001:db8:6::1")).unwrap(),
+            false,
+        );
+        assert_eq!(facts(&public), [("Tor".into(), "Tor exit".into())]);
+        let none = intel_facts(
+            crate::intel::TOR_RELAYS,
+            &serde_json::from_str(&data("192.0.2.99")).unwrap(),
+            true,
+        );
+        assert_eq!(none[0].value, "not a Tor relay");
+        // A malformed fingerprint from a member is shown, not linked.
+        assert_eq!(relay_link("x\"onmouseover"), None);
     }
 
     #[test]
@@ -2341,13 +3017,13 @@ show_labels = {show_labels}
             ]
         };
         let public = intel_cards(rows(), false);
-        assert_eq!(public.len(), 2);
+        assert_eq!(public.len(), 3);
         let tor = &public[0];
         let newest = tor.newest.as_ref().unwrap();
         assert_eq!(newest.facts[0].value, "not listed");
         assert_eq!(newest.node, None);
         assert!(tor.others.is_empty());
-        let geo = public[1].newest.as_ref().unwrap();
+        let geo = public[2].newest.as_ref().unwrap();
         let labels: Vec<_> = geo.facts.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["Country", "ASN", "Organisation"]);
         assert!(geo.facts.iter().any(|f| f.value == "AS64500"));
@@ -2370,6 +3046,7 @@ show_labels = {show_labels}
             crate::intel::ABUSEIPDB,
             &serde_json::json!({"score": 87, "reports": 41, "categories": ["SSH", "Port Scan"],
                                 "whitelisted": false, "future_field": 1}),
+            false,
         );
         let got: Vec<_> = f
             .iter()
@@ -2390,6 +3067,7 @@ show_labels = {show_labels}
             &serde_json::json!({"services": [{"port": 22, "transport": "tcp", "product": "OpenSSH",
                                               "version": "8.9p1"}, {"port": 443}],
                                 "vulns": ["CVE-1", "CVE-2"]}),
+            false,
         );
         assert_eq!(f[0].value, "22/tcp OpenSSH 8.9p1 · 443/tcp");
         assert_eq!(f[1].value, "2: CVE-1, CVE-2");
@@ -2400,20 +3078,225 @@ show_labels = {show_labels}
         let f = intel_facts(
             crate::intel::ABUSEIPDB,
             &serde_json::json!({"last_reported_at": "2026-10-04T02:07:49+00:00"}),
+            false,
         );
         assert_eq!(f[0].value, "2026-10-04 02:07 UTC");
         // A plain date stays as it is.
         let f = intel_facts(
             crate::intel::RDAP,
             &serde_json::json!({"registered": "2017-10-18"}),
+            false,
         );
         assert_eq!(f[0].value, "2017-10-18");
     }
 
     #[test]
     fn an_empty_result_says_nothing_is_known() {
-        let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}));
+        let f = intel_facts(crate::intel::MAXMIND, &serde_json::json!({}), false);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].label, "Result");
+    }
+
+    /// 203.0.113.40 with a labelled request (query, canary served), a
+    /// webshell command, an upload, a scan and a probe; 203.0.113.41 holds
+    /// nothing but a request.
+    async fn timeline_state() -> (Arc<AdminState>, tempfile::TempDir) {
+        let (st, dir) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.40".parse().unwrap())
+            .await
+            .unwrap();
+        let req = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/wp-login.php".into(),
+                query: Some("secretq=1".into()),
+                headers_json: "[]".into(),
+                labels_json: "[\"wordpress\"]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO canaries (value_hash, kind, request_id, ts, ip_id)
+             VALUES (77, 'git-token', ?, datetime('now'), ?)",
+        )
+        .bind(req)
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        webshell_cmd(&st, "203.0.113.40", "whoami").await;
+        crate::store::uploads::seed_upload(&st.store, "203.0.113.40", "/up.php", b"<?php").await;
+        st.store.enqueue_scan(ip.id, 2, 0).await.unwrap();
+        let job = st.store.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-hostkeys.xml"
+        ))
+        .unwrap();
+        st.store.finish_job(job.id, Some(&res), None).await.unwrap();
+        sqlx::query(
+            "INSERT INTO probes (uid, group_uid, ip_id, asker, vantage_ip, started_at, finished_at)
+             VALUES ('p1', 'g1', ?, x'00', '192.0.2.99', datetime('now', '-1 minute'), datetime('now', '-1 minute'))",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        (st, dir)
+    }
+
+    /// The events table of a page: from `<table class="events">` to its end.
+    fn events_table(html: &str) -> &str {
+        let a = html.find("<table class=\"events\">").expect("events table");
+        let b = a + html[a..].find("</table>").unwrap();
+        &html[a..b]
+    }
+
+    #[tokio::test]
+    async fn the_admin_ip_page_has_one_timeline_instead_of_the_requests_table() {
+        let (st, _d) = timeline_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.40", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(!html.contains("data-section=\"requests\""), "{html}");
+        let activity = &html[html.find("data-section=\"activity\"").unwrap()..];
+        let activity = &activity[..activity.find("</section>").unwrap()];
+        assert!(activity.contains("<table class=\"events\">"), "{activity}");
+        assert!(
+            activity.contains("href=\"/requests?ip=203.0.113.40\">All requests →</a>"),
+            "{activity}"
+        );
+        let ev = events_table(&html);
+        for kind in ["request", "webshell", "upload", "canary", "scan", "probe"] {
+            assert!(
+                ev.contains(&format!("data-kind=\"{kind}\"")),
+                "{kind}: {ev}"
+            );
+        }
+        // The request row is the old Requests row: labels, query, canary
+        // mark, inspect.
+        assert!(ev.contains(">wordpress</span>"), "{ev}");
+        assert!(ev.contains("?secretq=1"), "{ev}");
+        assert!(ev.contains("class=\"canary-mark\""), "{ev}");
+        assert!(ev.contains(">inspect</a>"), "{ev}");
+        // The command is a pivot (MIK-498), here and in the drops card.
+        assert!(
+            ev.contains(r#"href="/requests?cmd=whoami">whoami</a>"#),
+            "{ev}"
+        );
+        let drops = &html[html.find("data-section=\"drops\"").unwrap()..];
+        let drops = &drops[..drops.find("</section>").unwrap()];
+        assert!(drops.contains(r#"href="/requests?cmd=whoami""#), "{drops}");
+        let (status, cmd) = get_with(&app, "/requests?cmd=whoami", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(cmd.contains("/s.php"), "{cmd}");
+        assert!(ev.contains("/admin/uploads/"), "{ev}");
+        assert!(ev.contains("/admin/scans/"), "{ev}");
+        assert!(ev.contains("192.0.2.99"), "{ev}");
+        assert!(ev.contains("<th>Node</th>"), "{ev}");
+        // A bad cursor is the first page.
+        let (status, garbage) = get_with(
+            &app,
+            "/ip/203.0.113.40?before=garbage&at=x.1",
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(events_table(&garbage), ev);
+    }
+
+    #[tokio::test]
+    async fn the_public_timeline_is_requests_scans_and_probes_without_admin_detail() {
+        let (st, _d) = timeline_state().await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) = get_with(&app, "/ip/203.0.113.40", None).await;
+        assert_eq!(status, 200);
+        let ev = events_table(&html);
+        assert!(ev.contains("data-kind=\"request\""), "{ev}");
+        assert!(ev.contains("/wp-login.php"), "{ev}");
+        assert!(ev.contains(">counter-scan</span>"), "{ev}");
+        assert!(ev.contains("level 2"), "{ev}");
+        assert!(ev.contains("data-kind=\"probe\""), "{ev}");
+        for absent in [
+            "data-kind=\"webshell\"",
+            "data-kind=\"upload\"",
+            "data-kind=\"canary\"",
+            "data-kind=\"fingerprint\"",
+            "data-kind=\"intel\"",
+            "whoami",
+            "/s.php",
+            "secretq",
+            "192.0.2.99",
+            "canary-mark",
+            "<th>Node</th>",
+            "inspect",
+            "href=",
+        ] {
+            assert!(!ev.contains(absent), "{absent}: {ev}");
+        }
+        assert!(!html.contains("/admin/"), "{html}");
+        assert!(!html.contains("whoami"), "{html}");
+        assert!(!html.contains("data-section=\"requests\""), "{html}");
+        // The request list needs a session; the public sees the newest page
+        // only, whatever the cursor says.
+        assert!(!html.contains("All requests"), "{html}");
+        let (_, paged) = get_with(
+            &app,
+            "/ip/203.0.113.40?before=2000-01-01%2000%3A00%3A00",
+            None,
+        )
+        .await;
+        assert_eq!(events_table(&paged), ev);
+    }
+
+    #[tokio::test]
+    async fn the_timeline_pages_older_by_its_cursor() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.42".parse().unwrap())
+            .await
+            .unwrap();
+        let n = crate::admin::target::TIMELINE_ROWS + 3;
+        for i in 0..n {
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: format!("/p{i}"),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // All in one second: the cursor still splits it exactly.
+        sqlx::query("UPDATE requests SET ts = '2026-10-01 10:00:00'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, first) = get_with(&app, "/ip/203.0.113.42", Some(&cookie)).await;
+        let rows = |h: &str| events_table(h).matches("data-kind=\"request\"").count() as i64;
+        assert_eq!(rows(&first), crate::admin::target::TIMELINE_ROWS);
+        let a = first.find("\">Older →</a>").expect("older link");
+        let href = &first[first[..a].rfind("href=\"").unwrap() + 6..a];
+        let href = href.replace("&#38;", "&");
+        assert!(
+            href.starts_with("/ip/203.0.113.42?before=2026-10-01%2010%3A00%3A00&at=request."),
+            "{href}"
+        );
+        let (status, older) = get_with(&app, &href, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(rows(&older), 3, "{older}");
+        assert!(older.contains(">/p0<"), "{older}");
+        assert!(!older.contains(">Older →</a>"), "{older}");
     }
 }

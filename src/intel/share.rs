@@ -1,4 +1,5 @@
-//! Intel sharing in a cluster: one node fetches the Tor exit list,
+//! Intel sharing in a cluster: one node fetches the Tor exit list and the
+//! Onionoo relay index,
 //! announces each file version with a signed manifest, and every other node
 //! copies the file from any peer that holds that exact version (verified by
 //! SHA-256). GeoLite2 databases are never shared: their licence does not
@@ -24,7 +25,9 @@ use std::time::SystemTime;
 use tracing::{info, warn};
 
 pub const TOR: &str = "tor-exits";
-pub const KINDS: [&str; 1] = [TOR];
+/// The Onionoo relay index (`intel::relays`).
+pub const RELAYS: &str = "tor-relays";
+pub const KINDS: [&str; 2] = [TOR, RELAYS];
 
 /// Bytes per chunk request.
 pub const CHUNK: u64 = 4 * 1024 * 1024;
@@ -38,6 +41,7 @@ pub const MAX_INTEL_SIZE: u64 = 256 * 1024 * 1024;
 pub fn file_name(kind: &str) -> Option<&'static str> {
     match kind {
         TOR => Some("tor-exit.txt"),
+        RELAYS => Some(crate::intel::relays::FILE),
         _ => None,
     }
 }
@@ -249,9 +253,12 @@ async fn download(node: &Node, data_dir: &Path, m: &Manifest) -> Result<()> {
         // The hash only proves the copy matches what its fetcher announced;
         // hold a peer's list to the same sanity check as our own download,
         // so a truncated or bogus list cannot replace a good one.
-        if m.kind == TOR
-            && let Err(e) = crate::intel::tor::sane_count(&out)
-        {
+        let sane = match m.kind.as_str() {
+            TOR => crate::intel::tor::sane_count(&out).map(drop),
+            RELAYS => crate::intel::relays::Relays::check(&out).map(drop),
+            _ => Ok(()),
+        };
+        if let Err(e) = sane {
             bail!(
                 "{name} announced by {}: {e}",
                 m.origin.map_or("?".into(), |o| o.short())

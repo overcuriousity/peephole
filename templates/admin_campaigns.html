@@ -2,7 +2,7 @@
 {% block title %}peephole — campaigns{% endblock %}
 {% block content %}
 {% let sub = "campaigns" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Campaigns</h1><p class="muted">Source IPs tied together by evidence: a shared SSH host key, TLS certificate, browser fingerprint or canary, or near-identical path sets. Computed on this node every hour from the replicated rows; read-only.</p></div></div>
+<div class="page-head"><div><h1>Campaigns</h1><p class="muted">IPs tied together by shared keys, certificates, fingerprints, canaries or path sets; recomputed hourly. <a href="/admin/links">What counts →</a></p></div></div>
 <div class="stack">
 <section class="card">
   <form class="filters" method="get" action="/admin/campaigns">
@@ -18,7 +18,7 @@
     <td><a href="/admin/campaigns/{{ c.row.key }}">#{{ c.row.num }}</a> <span class="mono muted">{{ c.row.key }}</span></td>
     <td class="num">{{ c.row.size }}</td>
     <td class="ts">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</td>
-    <td>{% for (asn, org, n) in c.asns.iter().take(crate::admin::campaigns::SPREAD_TOP) %}<a href="/ips?asn={{ asn }}" title="{{ org.as_deref().unwrap_or_default() }}: {{ n }}"><span class="mono">AS{{ asn }}</span></a>{% if !loop.last %}, {% endif %}{% endfor %}{% if c.asns.len() > crate::admin::campaigns::SPREAD_TOP %} <span class="muted">+{{ c.asns.len() - crate::admin::campaigns::SPREAD_TOP }}</span>{% endif %}{% if c.asns.is_empty() %}<span class="muted">—</span>{% endif %}</td>
+    <td>{% for (asn, org, n) in c.asns.iter().take(crate::admin::campaigns::SPREAD_TOP) %}<a href="/admin/asn/{{ asn }}" title="{{ org.as_deref().unwrap_or_default() }}: {{ n }}"><span class="mono">AS{{ asn }}</span></a>{% if !loop.last %}, {% endif %}{% endfor %}{% if c.asns.len() > crate::admin::campaigns::SPREAD_TOP %} <span class="muted">+{{ c.asns.len() - crate::admin::campaigns::SPREAD_TOP }}</span>{% endif %}{% if c.asns.is_empty() %}<span class="muted">—</span>{% endif %}</td>
     <td>{% for (cc, n) in c.countries.iter().take(crate::admin::campaigns::SPREAD_TOP) %}<span title="{{ crate::admin::countries::country_name(cc) }}: {{ n }}">{{ crate::admin::countries::flag(cc) }}</span> {% endfor %}{% if c.countries.len() > crate::admin::campaigns::SPREAD_TOP %}<span class="muted">+{{ c.countries.len() - crate::admin::campaigns::SPREAD_TOP }}</span>{% endif %}{% if c.countries.is_empty() %}<span class="muted">—</span>{% endif %}</td>
     <td class="num">{{ c.row.hard_edges }}</td><td class="num">{{ c.row.soft_edges }}</td>
   </tr>{% endfor %}
@@ -26,7 +26,7 @@
   </tbody></table></div>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs: shared infrastructure, not one operator; they form no edge</span></div>
+  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs · no edge</span></div>
   {% if let Some(r) = report %}
   {% if r.excluded.is_empty() %}<p class="empty">None.</p>{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">IPs</th></tr></thead><tbody>

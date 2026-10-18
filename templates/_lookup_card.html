@@ -1,0 +1,6 @@
+{# One provider card of a lookup result (lookup::GridCard `g`) for the address `card_ip`, priced from `offer`. #}
+{% let c = g.card %}{% match g.source %}
+{% when crate::admin::lookup::GridSource::Fresh %}{% let badge = "Asked now" %}{% let verb = "looked up" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}
+{% when crate::admin::lookup::GridSource::Stored with { provider, age } %}{% let badge = "From the dataset" %}{% let verb = "fetched" %}{% let again = provider.as_str() %}{% let again_ip = card_ip %}{% let again_price = offer.price_of(provider) %}{% include "_intel_card.html" %}
+{% when crate::admin::lookup::GridSource::Held %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}
+{% endmatch %}

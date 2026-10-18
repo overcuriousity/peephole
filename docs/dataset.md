@@ -124,7 +124,8 @@ Treat them as weak labels, or re-label from `method`, `path`, `query`,
 | `country` | string? | ISO 3166-1 alpha-2 from GeoLite2: the newest lookup at or before `ts`, or the earliest one when none precedes it |
 | `asn` | int? | Autonomous system number, same rule |
 | `asn_org` | string? | AS organisation, same rule |
-| `is_tor` | bool? | Listed as a Tor exit, same rule (the exit list is IPv4-only); null when never checked |
+| `is_tor` | bool? | A Tor exit, same rule: on the bulk exit list, or an exit by the Onionoo relay index (which covers IPv6); null when never checked |
+| `is_tor_relay` | bool? | A running Tor relay of any role (guard, middle, exit) by the Onionoo index (`tor-relays`), same rule; null when never checked |
 
 ### Everything else known about the address
 
@@ -161,7 +162,11 @@ split-off parts get new keys: join across exports made by the same version.
   "data": {"abuseConfidenceScore": 100, "totalReports": 42, "...": "the provider's answer, trimmed to 16 KiB"}}]
 ```
 
-Providers: `tor-exits` (`{"exit": true|false}`), `maxmind-geolite2`,
+Providers: `tor-exits` (`{"exit": true|false}`), `tor-relays`
+(`{"relay": bool, "exit": bool, "exit_sources": ["bulk list", "Onionoo"],
+"family": "IPv4|IPv6", "relays": [{"nickname", "fingerprint", "roles",
+"or_ports", "exit", "family_size", "first_seen", "version"}]}`, from
+Onionoo; no contact information), `maxmind-geolite2`,
 `abuseipdb`, `shodan`, `shodan-internetdb`. `data`
 for an API provider is the service's own JSON, so its fields follow that
 service's documentation; an empty object means the service knew nothing.

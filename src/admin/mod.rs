@@ -1,4 +1,5 @@
 pub mod api_v1;
+pub mod asn;
 pub mod assets;
 pub mod auth;
 pub mod blocklist;
@@ -29,6 +30,7 @@ pub mod system;
 pub mod target;
 pub mod uploads;
 pub mod views;
+pub mod web_quote;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -179,6 +181,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(asn::routes())
         .merge(decoys::routes())
         .merge(search::routes())
         .merge(system::routes())
@@ -187,6 +190,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(lookup::routes())
         .merge(probes::routes())
         .merge(scan_buy::routes())
+        .merge(web_quote::routes())
         .merge(cluster::routes())
         .merge(cluster_access::routes())
         .merge(cluster_owner::routes())

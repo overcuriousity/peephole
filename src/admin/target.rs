@@ -3,8 +3,11 @@
 //! aggregation added here appears in both.
 use crate::admin::AdminState;
 use crate::admin::error::AppResult;
-use crate::admin::public::{IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards};
-use crate::store::browse::{Audience, IpOverview, Page, RequestListRow};
+use crate::admin::public::{
+    IP_DROPS, IntelCard, IpAdminData, ScanWithPorts, intel_cards_with_ports,
+};
+use crate::store::browse::{Audience, IpOverview};
+use crate::store::events::{Cursor, EventKind, EventPage};
 use crate::store::requests::IpRow;
 use std::sync::Arc;
 
@@ -16,13 +19,16 @@ pub struct Target {
     pub calendar_json: String,
     /// Largest family count, for the bar widths.
     pub family_max: i64,
-    pub page: Page<RequestListRow>,
+    /// The Timeline: requests, commands, uploads, canaries, probes, scans,
+    /// fingerprints and intel fetches for an admin; released requests,
+    /// published scans and probes for the public.
+    pub events: EventPage,
     pub intel: Vec<IntelCard>,
     /// Admin-only sections; loaded only with a session.
     pub admin: Option<IpAdminData>,
     pub labels: bool,
-    /// The requests list links to further pages (the IP page; the lookup
-    /// result links to the IP page instead).
+    /// The Timeline links to older events (the IP page; the lookup result
+    /// links to all requests instead).
     pub paged: bool,
     /// Days of history this node keeps; 0: all of it.
     pub window_days: u32,
@@ -35,6 +41,45 @@ pub struct Target {
 }
 
 impl Target {
+    /// The Timeline's link to older events, on the IP page only.
+    pub fn older_link(&self) -> Option<String> {
+        self.paged
+            .then(|| self.older_href())
+            .flatten()
+            .map(|q| format!("/ip/{}{q}", self.ov.ip.ip))
+    }
+
+    /// One address: the Timeline needs no IP column.
+    pub fn ip_column(&self) -> bool {
+        false
+    }
+
+    /// The query of [`Self::older_link`].
+    fn older_href(&self) -> Option<String> {
+        let n = self.events.next.as_ref()?;
+        let mut q = format!("?before={}", crate::admin::public::urlencode(&n.ts));
+        if let Some(at) = n.at_param() {
+            q.push_str(&format!("&at={}", crate::admin::public::urlencode(&at)));
+        }
+        Some(q)
+    }
+
+    /// Where an `AS{n}` badge leads: the network's page for an admin, the
+    /// filtered IP list for the public (the page needs a session).
+    pub fn asn_href(&self, asn: &i64) -> String {
+        if self.admin.is_some() {
+            crate::admin::asn::asn_href(*asn)
+        } else {
+            format!("/ips?asn={asn}")
+        }
+    }
+
+    /// Recorded IPs in its ASN, itself included when it has traffic (the
+    /// count in the overview is of the others).
+    pub fn asn_ips(&self) -> i64 {
+        self.ov.asn_count + i64::from(self.ov.request_count > 0)
+    }
+
     /// `[group, node, state]` of every probe, for the live stream.
     pub fn probe_states(&self) -> String {
         crate::admin::probes::states_json(&self.probes)
@@ -87,13 +132,16 @@ pub fn pending<'a>(cards: impl Iterator<Item = &'a IntelCard>) -> String {
         .join(", ")
 }
 
+/// Timeline rows per page.
+pub const TIMELINE_ROWS: i64 = 50;
+
 /// Load `ip`'s view. None: the address is in the table but has no
 /// overview (nothing recorded about it).
 pub async fn load(
     state: &AdminState,
     ip: &IpRow,
     authed: bool,
-    page: u32,
+    before: Option<&Cursor>,
     paged: bool,
 ) -> AppResult<Option<Target>> {
     // Anonymous views go through the cache; an admin always reads fresh.
@@ -105,19 +153,24 @@ pub async fn load(
     let Some(ov) = ov else {
         return Ok(None);
     };
-    // Per-request rows are admin-only: not even queried for the public.
-    let requests = if authed {
-        state
-            .store
-            .requests_for_ip(ip.id, page, Audience::Admin)
-            .await?
+    // The public cut never reads uploads, canaries, fingerprints, intel or
+    // webshell requests (owner, MIK-497).
+    let kinds: &[EventKind] = if authed {
+        &EventKind::ALL
     } else {
-        Page {
-            items: vec![],
-            page: 1,
-            has_next: false,
-        }
+        &EventKind::PUBLIC
     };
+    let events = state
+        .store
+        .ip_events(
+            ip.id,
+            kinds,
+            Audience::of(authed),
+            // The public sees the newest page only.
+            before.filter(|_| authed),
+            TIMELINE_ROWS,
+        )
+        .await?;
     let admin = if authed {
         let found = state.store.scans_for_ip(ip.id).await?;
         let ids: Vec<i64> = found.iter().map(|s| s.id).collect();
@@ -178,11 +231,23 @@ pub async fn load(
         calendar_json: serde_json::to_string(&ov.calendar).unwrap_or_else(|_| "[]".into()),
         family_max: ov.families.iter().map(|f| f.count).max().unwrap_or(0),
         intel: {
-            let mut cards = intel_cards(state.store.intel_for_ip(&ip.ip).await?, authed);
-            crate::admin::public::apply_rdap_pick(&mut cards, state.store.rdap_pick(&ip.ip).await?);
+            let open: Vec<u16> = admin
+                .iter()
+                .flat_map(|a| &a.scans)
+                .flat_map(|s| &s.ports)
+                .filter(|p| p.state == "open")
+                .filter_map(|p| u16::try_from(p.port).ok())
+                .collect();
+            let mut cards =
+                intel_cards_with_ports(state.store.intel_for_ip(&ip.ip).await?, authed, &open);
+            crate::admin::public::apply_rdap_pick(
+                &mut cards,
+                state.store.rdap_pick(&ip.ip).await?,
+                authed,
+            );
             cards
         },
-        page: requests,
+        events,
         admin,
         labels: crate::admin::public::labels_shown(state, authed),
         paged,

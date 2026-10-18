@@ -55,6 +55,12 @@ a.tile:hover .label { color: var(--color-accent); }
 /* Columns, not grid rows: a short card does not wait for the tallest. */
 .intel-grid { display: block; columns: 17rem; column-gap: 0.75rem; }
 .intel { background: var(--color-bg-inset); border-color: var(--color-border-subtle); padding: 0.8rem 0.95rem 0.75rem; break-inside: avoid; margin-bottom: 0.75rem; }
+/* A card the Lookup page is still filling in (MIK-505): spinner, then its answer or why none. */
+.intel-fill { break-inside: avoid; }
+.intel-asking { display: flex; align-items: center; gap: 0.4rem; margin: -0.4rem 0 0.75rem; font-size: var(--text-xs); color: var(--color-fg-muted); }
+.intel.intel-fill .intel-asking { margin: 0.4rem 0 0; }
+/* The firm-price dialog of a paid button (MIK-505). */
+.quote-dialog .quote-price { margin: 0.5rem 0 0.25rem; font-size: var(--text-lg); }
 .intel-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.15rem 0.5rem; margin-bottom: 0.6rem; }
 .intel-head h3 { margin: 0; font-size: var(--text-sm); }
 .intel-id { color: var(--color-fg-muted); font-size: var(--text-xs); }

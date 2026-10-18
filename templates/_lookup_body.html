@@ -1,0 +1,87 @@
+{# The resolved name (`names`) and one result per address (`results`) of the Lookup page; `cluster`, `offer` as there. #}
+{% if let Some(n) = names %}
+<section class="card" id="resolved">
+  <div class="card-head"><h2>Resolved: <span class="mono">{{ n.name }}</span></h2>{% if let Some(note) = n.note %}<span class="muted">{{ note }}</span>{% endif %}</div>
+  {% if n.rows.is_empty() %}<p class="muted">No public address.</p>{% else %}
+  <ul class="small">
+    {% for v in n.rows %}<li>{% if v.agreed %}<a class="mono" href="/admin/lookup?ip={{ v.ip }}">{{ v.ip }}</a>{% else %}<span class="mono">{{ v.ip }}</span>{% endif %} — {{ v.verdict }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if !n.resolvers.is_empty() %}<p class="muted small">Asked: {{ n.resolvers.join(", ") }}</p>{% endif %}
+  {% if !n.errors.is_empty() %}
+  <ul class="small">{% for (node, why) in n.errors %}<li><strong>{{ node }}</strong>: {{ why }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if !n.also.is_empty() %}<p class="small"><strong>Also resolves to</strong> <span class="mono">{{ n.also.join(", ") }}</span> <span class="muted">(first {{ crate::intel::dns::MAX_FOLLOWED }} only)</span></p>{% endif %}
+</section>
+{% endif %}
+{% if !results.is_empty() %}
+<nav class="section-nav" data-section-nav aria-label="On this page"></nav>
+<div class="stack">
+{% for r in results %}
+<section class="card lookup-result"{% if loop.first %} id="answers"{% endif %}{% if !r.fills.is_empty() %} data-fill-ip="{{ r.ip }}"{% endif %}{% if r.target.is_some() %} data-section="intel"{% endif %}>
+  <div class="lookup-id">
+    <div class="lookup-id-main">
+      <h2 class="lookup-ip">{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2>
+      {% if let Some(t) = r.target %}{% include "_ip_meta.html" %}{% else %}<p class="meta muted">Not recorded here: not in the dataset.</p>{% endif %}
+    </div>
+    {% if r.target.is_some() %}<a class="btn btn-sm" href="/ip/{{ r.ip }}">in the dataset →</a>{% endif %}
+  </div>
+  {% let signals = r.signals() %}{% include "_signals.html" %}
+  <div class="intel-grid">
+  {% for g in r.grid %}{% if g.card.newest.is_some() %}{% let card_ip = r.ip.as_str() %}
+    {% if r.filling(g.card.name.as_str()) %}<div class="intel-fill" data-fill="{{ g.card.name }}">{% include "_lookup_card.html" %}<p class="intel-asking" data-fill-state><span class="spin" aria-hidden="true"></span>Asking now…</p></div>
+    {% else %}{% include "_lookup_card.html" %}{% endif %}
+  {% endif %}{% endfor %}
+  {% for (p, label) in r.bare_fills() %}<div class="intel intel-fill" data-fill="{{ p }}"><div class="intel-head"><h3>{{ label }}</h3><span class="intel-id mono">{{ p }}</span></div><p class="intel-asking" data-fill-state><span class="spin" aria-hidden="true"></span>Asking now…</p></div>{% endfor %}
+  </div>
+  {% let pending = r.pending() %}{% if !pending.is_empty() %}<p class="intel-pending">No result yet: {{ pending }}</p>{% endif %}
+  {% if r.grid.is_empty() && r.fills.is_empty() %}<p class="muted">No provider answered.</p>{% endif %}
+  {% if r.asked || !r.charges.is_empty() || !r.declined.is_empty() %}
+  <div class="lookup-notes">
+    {% for (node, amount) in r.charges %}<span>{{ node }} charged {{ amount }} credits.</span>{% endfor %}
+    {% if cluster && r.asked %}<span class="muted">{% if r.kept %}Kept: the cluster records this address.{% else %}Not kept: the cluster does not record it.{% endif %}</span>{% endif %}
+  </div>
+  {% if !r.declined.is_empty() %}
+  <details class="small"><summary>{{ r.declined.len() }} not answered</summary>
+  <ul>{% for (label, node, why) in r.declined %}<li><strong>{{ label }}</strong> <span class="muted">({{ node }})</span>: {{ why }}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+  {% endif %}
+  {% if let Some(t) = r.target %}{% if let Some(a) = t.admin %}{% if !a.names.is_empty() %}{% let names = a.names %}{% include "_names.html" %}{% endif %}{% endif %}{% endif %}
+</section>
+{% if !offer.paid.is_empty() %}
+<section class="card"{% if loop.first %} id="ask-more"{% endif %}>
+  <div class="card-head"><h2>Ask for more</h2>{% if let Some(b) = offer.balance %}<span class="muted">balance <b>{{ b }}</b></span>{% endif %}</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Provider</th><th>Node</th><th class="num">Price (credits)</th><th></th></tr></thead>
+    <tbody>{% for q in offer.paid %}<tr><td>{{ q.label }}</td><td>{{ q.node }}</td><td class="num">{{ q.price }}</td><td><form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="{{ q.provider }}"><button class="btn btn-sm" type="submit" data-busy="Asking…" data-quote="/admin/lookup/quote" data-quote-title="Ask {{ q.label }} about {{ r.ip }}">Ask</button></form></td></tr>{% endfor %}</tbody>
+  </table></div>
+  <form method="post" action="/admin/lookup"><input type="hidden" name="ip" value="{{ r.ip }}"><input type="hidden" name="ask" value="*"><button class="btn btn-sm" type="submit" data-busy="Asking…" data-quote="/admin/lookup/quote" data-quote-title="Ask every provider about {{ r.ip }}">Ask all</button></form>
+  <p class="muted small">The cheapest node answers per provider; an answer under 24 h old is reused free. Ask shows the firm price before anything is spent.</p>
+</section>
+{% endif %}
+{% if let Some(t) = r.target %}
+{% let first = loop.first %}{% include "_target.html" %}
+{% endif %}
+{% if let Some(s) = r.scan %}
+{% let first = loop.first %}{% include "_scan_unrecorded.html" %}
+{% endif %}
+{% if let Some(n) = r.near %}
+<section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a>{% if let Some(a) = n.asn %} · AS{{ a }}{% endif %}</span></div>
+  {% if n.rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
+  {% for x in n.rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{% let country = x.country.clone() %}{% include "_country.html" %}</td><td>{% if let Some(a) = x.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ x.request_count }}</td><td>{% let sev = x.max_severity %}{% include "_severity.html" %}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+  {% if let Some(a) = n.asn %}
+  <h3>Same ASN · <a href="/admin/asn/{{ a }}">AS{{ a }}</a></h3>
+  {% if n.asn_rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  <p class="muted small">{{ crate::admin::views::thousands(n.asn_count) }} recorded{% if n.asn_count > n.asn_rows.len() as i64 %}, the first {{ n.asn_rows.len() }} shown{% endif %}</p>
+  <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
+  {% for x in n.asn_rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{% let country = x.country.clone() %}{% include "_country.html" %}</td><td class="num">{{ x.request_count }}</td><td>{% let sev = x.max_severity %}{% include "_severity.html" %}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+  {% endif %}
+</section>
+{% endif %}
+{% endfor %}
+</div>
+{% endif %}

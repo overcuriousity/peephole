@@ -3,7 +3,81 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
-## [Unreleased]
+## [0.18.0] - 2026-10-18
+
+Observations: the admin pages correlate what peephole saw by address,
+network, campaign and artifact. Two database migrations (0042, 0043),
+applied on start; their backfills run in the background. No new setting,
+no protocol change; the cluster's intel share gains the kind `tor-relays`,
+and exports and `/api/v1` gain `is_tor_relay`.
+
+### Added
+
+- The command sent to a dropped webshell is stored in a column of its own
+  (MIK-493; migration 0042, `requests.cmd`), set at insert and backfilled
+  in the background for older rows. Admins filter the requests search by
+  it with `/requests?cmd=` (chip "Webshell command").
+- Tor relay enrichment from Onionoo (MIK-507, #138): a new `tor-relays`
+  provider says for any IPv4 or IPv6 address whether it is a Tor relay, in
+  which roles and which relay. The admin intel card shows nickname,
+  fingerprint (linked to Tor Metrics), ORPort, first seen, family size and
+  version, and says when a Shodan `tor` tag or an open port matches the
+  ORPort; the public IP page shows only "Tor exit" or "Tor relay (roles)".
+  The relay index is fetched conditionally, sanity-checked like the exit
+  list and shared in the cluster (`tor-relays.json`). Exports and
+  `/api/v1` gain `is_tor_relay`.
+- IP page Timeline (MIK-497): every observation of an address (requests,
+  webshell commands, uploads, canaries, probes, scans, fingerprints,
+  intel), newest first and paged, replaces the Requests table. The public
+  IP page shows only released requests, published scans and probes,
+  without older pages.
+- Network pages (MIK-496, MIK-503): `/admin/asn/{n}` rolls up an AS (tiles,
+  label, port and campaign pivots, its 50 busiest IPs) and every admin AS
+  badge links to it. `/admin/net/{handle}` does the same for an RDAP
+  network: migration 0043 adds `ips.rdap_handle` and `ips.rdap_name`,
+  backfilled for stored IPs; the RDAP handle on the intel card links to it,
+  and `/ips` filters by `net=` and `net_name=`.
+- Pivot links (MIK-498): a user agent, path, webshell command, open port,
+  product, OS, upload sha256 and campaign link to the list filtered to that
+  value, on the request, IP, scan, upload and link pages, the requests list
+  and the Timeline. `/admin/uploads?sha256=` takes 64 hex digits.
+- Campaign artifacts (MIK-500): the campaign page lists its members'
+  uploads and webshell commands and a merged Timeline with an IP column.
+- Search (MIK-495) finds an upload sha256, a campaign by `#N` or `C12`, and
+  a label. An RDAP handle or network name opens its network (MIK-503).
+- User agent as a link kind (MIK-504): a user agent opens its Links page,
+  which leads on to its requests. It is not campaign evidence.
+- Firm-price quotes in the admin area (MIK-505): in a cluster, the scan
+  level and the Lookup's Ask and Ask again buttons show a price dialog and
+  buy only with a quote, through the same quote store and pricing as
+  `/api/v1`, audited the same way. The Lookup page answers from the
+  dataset at once and fills each provider's card as it answers. Standalone
+  nodes stay free and immediate.
+
+### Changed
+
+- IP and request pages consolidated (MIK-499): Canaries and Decoys fold into
+  one Lures card; the same-ASN count moves into the AS link; empty
+  Fingerprints and False-positive claims cards are gone and the link graph
+  is a head chip. On the request page the fingerprint is a row under JA4H
+  and the Query string card is gone.
+- Shorter page text (MIK-494, MIK-501): the analyst pages (probe, intel,
+  campaign, links, uploads, canaries, decoys, search, lookup, analytics,
+  scans, export, dashboard, about) and the operator pages (credits, scans,
+  node, cluster, ownership, devices, settings) are cut to the essentials;
+  an operator page keeps one line under its heading and its rules in one
+  collapsed section. The
+  edge rules are on `/admin/links` only. The node page shows a member's
+  credit balance as the member itself counts it.
+- Dependency updates (MIK-518, #148): zstd, uuid, toml, hyper, serde_json
+  and the CI actions (#96–#99, #101–#104).
+
+### Fixed
+
+- IPv6 Tor exits are refused for counter-scans like IPv4 ones (#138). The
+  bulk exit list holds IPv4 addresses only; Onionoo exit addresses and the
+  ORPorts of exiting relays now count too. See `docs/detection.md` for what
+  the rule covers.
 
 ## [0.17.0] - 2026-10-18
 

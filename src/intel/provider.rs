@@ -133,6 +133,80 @@ impl Provider for TorExits {
     }
 }
 
+/// Relays per IP kept in one result (an IP rarely hosts more than a few;
+/// this keeps a result well under `MAX_PEER_DATA_BYTES`).
+const MAX_RELAYS_PER_IP: usize = 8;
+
+/// Tor relays from the Onionoo index (GH #138): whether an IP is a relay,
+/// in which roles, and which ones; and whether it is an exit by the bulk
+/// list or Onionoo. Ready only while a sane index is loaded.
+pub struct TorRelays(pub SharedTor);
+
+impl TorRelays {
+    /// What is known about `ip` from `list` (which holds an index).
+    pub fn data(list: &super::tor::TorExitList, ip: &str) -> serde_json::Value {
+        let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+            return serde_json::json!({});
+        };
+        let addr = crate::net::canonical(addr);
+        let at = list.relays().map(|r| r.at(&addr)).unwrap_or_default();
+        let sources = list.exit_sources(&addr);
+        let mut out = serde_json::json!({
+            "relay": !at.is_empty(),
+            "exit": !sources.is_empty(),
+        });
+        if !sources.is_empty() {
+            out["exit_sources"] = sources.into();
+            out["family"] = if addr.is_ipv6() { "IPv6" } else { "IPv4" }.into();
+        }
+        if !at.is_empty() {
+            out["relays"] = at
+                .iter()
+                .take(MAX_RELAYS_PER_IP)
+                .map(|r| {
+                    serde_json::json!({
+                        "nickname": r.nickname,
+                        "fingerprint": r.fingerprint,
+                        "roles": r.roles(),
+                        "or_ports": r.or_ports(&addr),
+                        "exit": r.exit,
+                        "family_size": r.family_size,
+                        "first_seen": r.first_seen,
+                        "version": r.version,
+                    })
+                })
+                .collect();
+        }
+        out
+    }
+}
+
+impl Provider for TorRelays {
+    fn name(&self) -> &'static str {
+        super::TOR_RELAYS
+    }
+
+    fn ready(&self) -> bool {
+        self.0.read_or_recover().relays().is_some()
+    }
+
+    fn lookup<'a>(&'a self, ips: &'a [String]) -> BoxFuture<'a, Vec<Finding>> {
+        Box::pin(async move {
+            let list = self.0.read_or_recover();
+            let Some(version) = list.relays().map(|r| r.published().to_string()) else {
+                return vec![];
+            };
+            ips.iter()
+                .map(|ip| Finding {
+                    ip: ip.clone(),
+                    source_version: Some(version.clone()),
+                    data: Self::data(&list, ip),
+                })
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +262,47 @@ mod tests {
             .await;
         let exits: Vec<_> = found.iter().map(|f| f.data["exit"].clone()).collect();
         assert_eq!(exits, [true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn tor_relays_names_the_relay_and_its_roles_once_an_index_is_loaded() {
+        let shared: SharedTor = Default::default();
+        let p = TorRelays(shared.clone());
+        assert_eq!(p.name(), crate::intel::TOR_RELAYS);
+        assert!(!p.ready());
+        assert!(p.lookup(&["144.76.159.218".into()]).await.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        crate::intel::relays::write_fixture(dir.path());
+        std::fs::write(dir.path().join("tor-exit.txt"), "198.51.100.20\n").unwrap();
+        *shared.write_or_recover() = crate::intel::tor::TorExitList::load(dir.path()).unwrap();
+        assert!(p.ready());
+        let found = p
+            .lookup(&[
+                "2a01:4f8:200:32e6::2".into(),
+                "198.51.100.20".into(),
+                "192.0.2.99".into(),
+            ])
+            .await;
+        assert!(found[0].source_version.is_some());
+        let beezar = &found[0].data;
+        assert_eq!(
+            (&beezar["relay"], &beezar["exit"]),
+            (&true.into(), &false.into())
+        );
+        let r = &beezar["relays"][0];
+        assert_eq!(r["nickname"], "BEEzar");
+        assert_eq!(r["roles"], serde_json::json!(["guard", "hsdir"]));
+        assert_eq!(r["or_ports"], serde_json::json!([8443]));
+        assert!(beezar.get("contact").is_none() && r.get("contact").is_none());
+        let exit = &found[1].data;
+        assert_eq!(
+            exit["exit_sources"],
+            serde_json::json!(["bulk list", "Onionoo"])
+        );
+        assert_eq!(exit["family"], "IPv4");
+        assert_eq!(
+            found[2].data,
+            serde_json::json!({"relay": false, "exit": false})
+        );
     }
 }

@@ -7,10 +7,12 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::{Chrome, link_href};
 use crate::store::browse::{CALENDAR_DAYS, CalendarDay, canonical_ip};
 use crate::store::campaigns::{
-    Campaign, CampaignFilter, CampaignListItem, CampaignShape, Edge, HARD_FANOUT_MAX, ORDER_AGREE,
-    Report,
+    Campaign, CampaignCommand, CampaignFilter, CampaignListItem, CampaignShape, Edge,
+    HARD_FANOUT_MAX, ORDER_AGREE, Report,
 };
+use crate::store::events::EventPage;
 use crate::store::links::LinkKind;
+use crate::store::uploads::UploadRow;
 use askama::Template;
 use axum::{
     Router,
@@ -29,6 +31,11 @@ pub fn routes() -> Router<Arc<AdminState>> {
 fn chrome() -> Chrome {
     Chrome::new(true, "admin")
 }
+
+/// Uploads and commands listed on a campaign's page.
+pub const CAMPAIGN_ARTIFACTS: i64 = 50;
+/// Events in a campaign's merged Timeline (no older pages).
+pub const CAMPAIGN_EVENTS: i64 = 100;
 
 /// Countries and ASNs shown in a list cell before "+N".
 pub const SPREAD_TOP: usize = 3;
@@ -116,6 +123,26 @@ struct CampaignPage {
     calendar_json: String,
     calendar_days: i64,
     shapes: Vec<CampaignShape>,
+    uploads: Vec<UploadRow>,
+    commands: Vec<CampaignCommand>,
+    /// The merged Timeline, as `_events.html` reads it.
+    t: CampaignTimeline,
+}
+
+/// The members' events for `_events.html`: an IP column, no older pages.
+pub struct CampaignTimeline {
+    pub events: EventPage,
+    pub labels: bool,
+}
+
+impl CampaignTimeline {
+    pub fn older_link(&self) -> Option<String> {
+        None
+    }
+
+    pub fn ip_column(&self) -> bool {
+        true
+    }
 }
 
 async fn campaign(
@@ -137,12 +164,24 @@ async fn campaign(
         .collect();
     let calendar = st.store.campaign_calendar(&key).await?;
     let shapes = st.store.campaign_shapes(&key).await?;
+    let uploads = st.store.campaign_uploads(&key, CAMPAIGN_ARTIFACTS).await?;
+    let commands = st.store.campaign_commands(&key, CAMPAIGN_ARTIFACTS).await?;
+    let events = st
+        .store
+        .campaign_events(&key, None, CAMPAIGN_EVENTS)
+        .await?;
     render(&CampaignPage {
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
         calendar,
         calendar_days: CALENDAR_DAYS,
         shapes,
+        uploads,
+        commands,
+        t: CampaignTimeline {
+            events,
+            labels: true,
+        },
         edges,
         c,
     })
@@ -151,7 +190,7 @@ async fn campaign(
 #[cfg(test)]
 mod tests {
     use crate::admin::devices::tests::{app, send};
-    use crate::store::campaigns::tests::{feed, fixture, tls_fixture};
+    use crate::store::campaigns::tests::{feed, fixture, seed_artifacts, tls_fixture};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
 
@@ -161,6 +200,7 @@ mod tests {
         feed(&state.store, fixture()).await;
         tls_fixture(&state.store).await;
         state.store.recompute_campaigns(true).await.unwrap();
+        seed_artifacts(&state.store).await;
         let get = |path: &str, authed: bool| {
             let r = Request::get(path).header("sec-fetch-site", "same-origin");
             if authed {
@@ -207,6 +247,10 @@ mod tests {
         ] {
             assert!(list.contains(want), "{want} missing:\n{list}");
         }
+        // Short strings (MIK-494): the edge rules live on /admin/links only.
+        assert!(list.contains("recomputed hourly. <a href=\"/admin/links\">What counts →</a>"));
+        assert!(list.contains("· no edge</span>"));
+        assert!(!list.contains("not one operator"), "{list}");
         let (_, _, few) = send(&app, get("/admin/campaigns?min=3", true), Body::empty()).await;
         assert!(few.contains("/admin/campaigns/192.0.2.3"));
         assert!(!few.contains("/admin/campaigns/198.51.100.10"));
@@ -224,9 +268,52 @@ mod tests {
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
+        for want in [
+            "<a href=\"/admin/campaigns\">← All campaigns</a>",
+            "soft · <a href=\"/admin/links\">what counts →</a>",
+            "<span class=\"muted\">per day, last 26 weeks, UTC</span>",
+        ] {
+            assert!(a.contains(want), "{want} missing:\n{a}");
+        }
+        for gone in [
+            "Computed from the stored rows",
+            "only ever support a path edge",
+        ] {
+            assert!(!a.contains(gone), "{gone} still there:\n{a}");
+        }
         let at = |s: &str| a.find(s).unwrap_or_else(|| panic!("{s} missing"));
         assert!(at("<h2>Members</h2>") < at("data-link-graph"));
         assert!(at("data-link-graph") < at("<h2>Evidence</h2>"));
+        // Artifacts (MIK-500): the members' uploads and commands, after
+        // Evidence; the outsider's are not listed.
+        assert!(at("<h2>Evidence</h2>") < at("data-section=\"artifacts\""));
+        assert!(at("data-section=\"artifacts\"") < at("data-section=\"timeline\""));
+        for want in [
+            "<td class=\"path\">/drop.php</td>",
+            "href=\"/admin/uploads?sha256=",
+            "<a href=\"/requests?cmd=ls%20-la\">ls -la</a></td><td class=\"num\">3</td><td class=\"num\">2</td>",
+            "<a href=\"/requests?cmd=id\">id</a>",
+        ] {
+            assert!(a.contains(want), "{want} missing:\n{a}");
+        }
+        for gone in ["/out.php", "uname", "203.0.113.9"] {
+            assert!(!a.contains(gone), "{gone} listed:\n{a}");
+        }
+        // The merged Timeline: the calendar and one events table with the
+        // member's address on every row, no older pages.
+        let tl = &a[at("data-section=\"timeline\"")..at("<h2>Shapes</h2>")];
+        for want in [
+            "data-calendar=",
+            "<table class=\"events\">",
+            "<th>IP</th>",
+            "<td class=\"ip\"><a href=\"/ip/192.0.2.2\">192.0.2.2</a></td>",
+            "data-kind=\"webshell\"",
+            "data-kind=\"upload\"",
+            "<td class=\"path\">/gamma</td>",
+        ] {
+            assert!(tl.contains(want), "{want} missing:\n{tl}");
+        }
+        assert!(!tl.contains("Older →"), "{tl}");
         let (_, _, b) = send(
             &app,
             get("/admin/campaigns/198.51.100.10", true),
@@ -234,7 +321,12 @@ mod tests {
         )
         .await;
         assert!(b.contains("131 shared shapes"), "{b}");
+        // A campaign without artifacts keeps the empty states.
+        assert!(b.contains("No file dropped by a member."), "{b}");
+        assert!(b.contains("No webshell command run by a member."), "{b}");
         assert!(b.contains("/.env"), "shapes listed:\n{b}");
+        assert!(b.contains("<th class=\"num\">IPs in dataset</th>"), "{b}");
+        assert!(!b.contains("normalized paths most members"), "{b}");
         let (_, _, d) = send(
             &app,
             get("/admin/campaigns/198.51.100.30", true),

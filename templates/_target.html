@@ -27,7 +27,7 @@
   {% endif %}
   {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
   {% for sc in adm.scans %}
-    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
+    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {% if let Some(os) = sc.s.os_guess %}<a href="{{ crate::admin::views::pivot_href("os", os.as_str()) }}">{{ os }}</a>{% else %}OS unknown{% endif %} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
       {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
     {% let ports = sc.ports %}{% include "_ports.html" %}
   {% endfor %}
@@ -39,35 +39,23 @@
   {% let keys = adm.host_keys %}{% include "_host_keys.html" %}
 </section>
 {% endif %}
-{% if adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}
-<section class="card" id="canaries" data-section="canaries">
-  <h2>Canaries</h2>
-  {% if adm.canary_links.0 > 0 %}<p>Credentials harvested here were used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}.</p>{% endif %}
-  {% if adm.canary_links.1 > 0 %}<p>Used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}.</p>{% endif %}
-  <p><a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">Show the reuses</a></p>
-</section>
-{% endif %}
-{% if adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}
-<section class="card" id="decoys" data-section="decoys">
-  <h2>Decoys</h2>
-  <p>MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }}</p>
-  <p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">Show the decoy requests</a></p>
-</section>
-{% endif %}
-{% if !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
+{% let canaries = adm.canary_links.0 > 0 || adm.canary_links.1 > 0 %}{% let decoys = adm.decoys.0 > 0 || adm.decoys.1 > 0 || adm.decoys.2 > 0 %}
+{% if canaries || decoys || !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
 <section class="card" id="drops" data-section="drops">
-  <div class="card-head"><h2>Uploads and webshell commands</h2></div>
+  <div class="card-head"><h2>Lures</h2></div>
+  {% if canaries %}<p><b>Canaries</b>{% if adm.canary_links.0 > 0 %} · credentials harvested here used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}{% endif %}{% if adm.canary_links.1 > 0 %} · used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}{% endif %} · <a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">the reuses →</a></p>{% endif %}
+  {% if decoys %}<p><b>Decoys</b> · MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }} · <a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">the decoy requests →</a></p>{% endif %}
   {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
   <h3>Uploads</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Kind</th><th>Type</th><th></th></tr></thead><tbody>
-  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono" title="{{ u.hash() }}">{{ u.hash()[..12] }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
+  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
   </tbody></table></div>
   {% if more_ups %}<p><a href="/admin/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
   {% endif %}
   {% let (cmds, more_cmds) = adm.webshell_shown() %}{% if !cmds.is_empty() %}
   <h3>Webshell commands</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>Verb</th><th></th></tr></thead><tbody>
-  {% for w in cmds %}<tr><td class="mono">{{ w.ts }}</td><td class="mono" title="{{ w.command }}">{{ w.verb() }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ w.request_id }}">inspect</a></td></tr>{% endfor %}
+  {% for w in cmds %}<tr><td class="mono">{{ w.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("cmd", w.command.trim()) }}" title="{{ w.command }}">{{ w.verb() }}</a></td><td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ w.request_id }}">inspect</a></td></tr>{% endfor %}
   </tbody></table></div>
   {% if more_cmds %}<p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=webshell">All its webshell requests →</a></p>{% endif %}
   {% endif %}
@@ -76,7 +64,7 @@
 {% endif %}
 
 <section class="card" data-section="activity">
-  <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span>{% if t.window_days > 0 %}<span class="muted">this node keeps {{ t.window_days }} days</span>{% endif %}</div>
+  <div class="card-head"><h2>Activity</h2><span class="muted">UTC</span>{% if t.window_days > 0 %}<span class="muted">this node keeps {{ t.window_days }} days</span>{% endif %}{% if chrome.authed %}<a href="/requests?ip={{ t.ov.ip.ip|urlencode }}">All requests →</a>{% endif %}</div>
   <div class="ip-activity">
     <div>
       <span class="label">Last 7 days</span>
@@ -89,6 +77,7 @@
     <div class="legend sev-legend" aria-hidden="true">{% for s in 0..5 %}<span><i class="swatch sev-fill-{{ s }}"></i>severity {{ s }}</span>{% endfor %}</div>
     <table class="visually-hidden"><caption>Days with requests</caption><tbody>{% for d in t.ov.calendar %}<tr><td>{{ d.day }}</td><td>{{ d.count }}</td><td>{{ d.max_severity }}</td></tr>{% endfor %}</tbody></table>
   </div>
+  {% include "_events.html" %}
 </section>
 
 {% if t.labels && !t.ov.families.is_empty() %}
@@ -122,49 +111,23 @@
       </ol>
       {% else %}<p class="muted small">None yet.</p>{% endif %}
     </div>
-    <div>
-      <h3>Same ASN{% if let Some(a) = t.ov.ip.asn %} · <a href="/ips?asn={{ a }}">AS{{ a }}</a>{% endif %}</h3>
-      <div class="big-stat">{{ crate::admin::views::thousands(t.ov.asn_count) }}</div>
-      {% if t.ov.ip.asn.is_none() %}<p class="muted small">ASN unknown.</p>{% endif %}
-    </div>
   </div>
 </section>
 
 {% if let Some(adm) = t.admin %}
+{% if !adm.fingerprints.is_empty() %}
 <section class="card" data-section="fingerprints">
-  <div class="card-head"><h2>Fingerprints</h2><a href="{{ crate::admin::views::link_href("ip", t.ov.ip.ip.as_str()) }}">Link graph</a></div>
-  {% if adm.fingerprints.is_empty() %}<p class="muted">No browser fingerprints collected.</p>{% endif %}
+  <div class="card-head"><h2>Fingerprints</h2></div>
   {% for f in adm.fingerprints %}
     <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
       {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>
   {% endfor %}
 </section>
-
+{% endif %}
+{% if !adm.claims.is_empty() %}
 <section class="card" data-section="claims">
   <div class="card-head"><h2>False-positive claims</h2></div>
-  {% if adm.claims.is_empty() %}<p class="muted">None.</p>{% endif %}
   {% for c in adm.claims %}<p><span class="mono">{{ c.ts }}</span> · {{ c.contact_email.as_deref().unwrap_or("no email") }} · <span class="muted">{{ c.user_agent }}</span></p>{% endfor %}
 </section>
 {% endif %}
-
-{% if chrome.authed %}
-<section class="card" data-section="requests">
-  <div class="card-head"><h2>Requests</h2></div>
-  <div class="table-wrap wide"><table>
-    <thead><tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Sev</th><th>Labels</th><th></th></tr></thead>
-    <tbody>
-    {% for r in t.page.items %}
-      <tr data-sev="{{ r.severity }}">
-        <td class="ts">{{ r.ts }}</td><td class="mono">{{ r.method }}</td>
-        <td class="path">{{ r.path }}{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
-        <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-        <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
-        <td class="nowrap">{% include "_canary_marks.html" %}<a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>
-      </tr>
-    {% endfor %}
-    {% if t.page.items.is_empty() %}<tr><td colspan="6" class="empty">No requests recorded.</td></tr>{% endif %}
-    </tbody>
-  </table></div>
-  {% if t.paged %}{% let page = t.page %}{% let qs = "" %}{% include "_pagination.html" %}{% else if t.page.has_next %}<p class="muted"><a href="/ip/{{ t.ov.ip.ip }}">All requests on its page →</a></p>{% endif %}
-</section>
 {% endif %}

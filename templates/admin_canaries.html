@@ -3,7 +3,7 @@
 {% block content %}
 {% let sub = "links" %}{% include "_admin_nav.html" %}
 {% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and the requests that used them again. The period is when they were served.</p></div>{% let base = "/admin/links/canaries" %}{% let keep = q.keep() %}{% include "_range.html" %}</div>
+<div class="page-head"><div><h1>Canaries</h1><p class="muted">Credentials served in decoys and their later uses; the period is when they were served.</p></div>{% let base = "/admin/links/canaries" %}{% let keep = q.keep() %}{% include "_range.html" %}</div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ crate::admin::views::thousands(sum.served) }}</div></div>

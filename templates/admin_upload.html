@@ -12,14 +12,14 @@
     <dt>File name</dt><dd class="mono">{% if let Some(f) = u.filename %}{{ f }}{% else %}<span class="muted">none sent</span>{% endif %}</dd>
     <dt>Type</dt><dd class="mono">{{ u.sniffed_type }} <span class="muted small">from its first bytes</span></dd>
     <dt>Size</dt><dd>{{ crate::admin::views::thousands(u.size) }} bytes{% if u.truncated %} <span class="muted small">· the first 1 MiB kept</span>{% endif %}</dd>
-    <dt>SHA-256</dt><dd class="mono">{{ u.hash() }}</dd>
+    <dt>SHA-256</dt><dd class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}">{{ u.hash() }}</a></dd>
     <dt>Answered at</dt><dd class="path">{{ u.answered_path }}{% if u.path_is_prefix %} <span class="muted small">and under it</span>{% endif %}</dd>
     <dt>Request</dt><dd>{% if let Some(id) = u.request_id %}<a href="/admin/requests/{{ id }}">inspect</a>{% else %}<span class="muted">not held here</span>{% endif %}</dd>
     <dt>Content</dt><dd>{% if u.held %}<a class="btn btn-sm" href="/admin/uploads/{{ u.uid|urlencode }}/content.zip">Download zip</a> <span class="muted small">password <span class="mono">infected</span></span>{% else %}<span class="muted">content not held</span> <span class="mono small">{{ u.content_state }}</span>{% endif %}</dd>
   </dl>
 </section>
 <section class="card">
-  <div class="card-head"><h2>Timeline</h2><span class="muted">later requests to where the file was told it landed</span></div>
+  <div class="card-head"><h2>Timeline</h2><span class="muted">requests to its reported location</span></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Request</th><th>Answer</th><th class="num">Status</th></tr></thead><tbody>
   {% for r in timeline %}<tr><td class="mono"><a href="/admin/requests/{{ r.id }}">{{ r.ts }}</a></td><td class="mono"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td><td class="path"><span class="mono muted">{{ r.method }}</span> {{ r.path }}{% if let Some(q) = r.query %}?{{ q }}{% endif %}</td><td class="mono">{% if let Some(a) = r.answer %}{{ a }}{% endif %}</td><td class="num">{% if let Some(s) = r.status %}{{ s }}{% endif %}</td></tr>{% endfor %}
   {% if timeline.is_empty() %}<tr><td colspan="5" class="empty">No request there since.</td></tr>{% endif %}

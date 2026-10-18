@@ -4,7 +4,7 @@
   {% if let Some(why) = s.refused %}
   <p class="text-warning small" data-guard>No scan: {{ why }}</p>
   {% else %}
-  <p class="muted small">Not in the dataset. Buying a scan adds the address, marked {% include "_unseen.html" %}: added by an operator for a counter-scan, no traffic recorded.</p>
+  <p class="muted small">Not in the dataset; buying a scan adds it, marked {% include "_unseen.html" %}.</p>
   <form class="action-block" method="post" action="/admin/lookup/scan">
     <input type="hidden" name="ip" value="{{ r.ip }}">
     <div class="level-grid">
@@ -12,7 +12,7 @@
       {% if o.price.is_empty() %}
       <button class="btn level-btn" type="button" disabled title="L{{ o.level }}: {{ o.about }}. No live scanner announces a price"><b>L{{ o.level }}</b><span>no scanner</span></button>
       {% else %}
-      <button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>
+      {% if s.standalone %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>{% else %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" data-quote="/admin/lookup/scan/quote" data-quote-title="Level {{ o.level }} counter-scan of {{ r.ip }}" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.about }}</span></button>{% endif %}
       {% endif %}
       {% endfor %}
     </div>

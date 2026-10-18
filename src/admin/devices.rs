@@ -202,6 +202,12 @@ secure_cookies = false
         let (st, _, html) = send(&app, get(), Body::empty()).await;
         assert_eq!(st, 200);
         assert!(html.contains("No devices paired yet"), "{html}");
+        // MIK-501 (P33, G21): one line each.
+        assert!(html.contains(
+            "<span class=\"mono\">read</span> is always granted; <span class=\"mono\">act</span> also starts probes and buys counter-scans (spends credits).</p>"
+        ));
+        assert!(html.contains("Also grant <span class=\"mono\">act</span></label>"));
+        assert!(!html.contains("machine API"));
         // Pair, with the act scope: the QR and its payload render inline.
         let (st, _, html) = send(
             &app,
@@ -214,6 +220,10 @@ secure_cookies = false
         .await;
         assert_eq!(st, 200);
         assert!(html.contains("<svg"), "{html}");
+        assert!(
+            html.contains("minutes; the code works once.</p>"),
+            "P33: {html}"
+        );
         let html = html.replace("&#34;", "\"");
         assert!(html.contains(r#""origin":"https://localhost""#), "{html}");
         let code = html

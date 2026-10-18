@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1 (master)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1 (master)
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -143,7 +143,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1 (master)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1 (master)
         with:
           toolchain: stable
 
@@ -168,7 +168,7 @@ jobs:
       - name: Package tarball
         run: tools/package.sh target/release/peephole "${{ matrix.target }}" "$BUILD" "$GITHUB_SHA" dist
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: peephole-${{ matrix.target }}
           path: dist/
@@ -184,7 +184,7 @@ jobs:
         with:
           persist-credentials: false
       # The binary the release would publish, not a rebuild.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: peephole-x86_64-unknown-linux-gnu
           path: dist
@@ -209,7 +209,7 @@ jobs:
       group: publish-latest
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: peephole-*
           merge-multiple: true
@@ -269,7 +269,7 @@ jobs:
       group: publish-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: peephole-*
           merge-multiple: true

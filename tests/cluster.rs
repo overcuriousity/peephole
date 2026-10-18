@@ -2442,6 +2442,74 @@ async fn only_the_tor_list_is_shared_as_a_file() {
     assert_eq!(share::manifests(&nb.store).await.unwrap().len(), 1);
 }
 
+/// The Onionoo fixture as a `tor-relays.json`, published now, padded with
+/// `pad` middle relays (a sane index needs `relays::MIN_RELAYS`).
+fn relay_index(pad: usize) -> Vec<u8> {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read("tests/fixtures/onionoo-details.json").unwrap())
+            .unwrap();
+    v["relays_published"] = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+        .into();
+    let relays = v["relays"].as_array_mut().unwrap();
+    for i in 0..pad {
+        relays.push(serde_json::json!({
+            "nickname": format!("pad{i}"),
+            "fingerprint": format!("{i:040X}"),
+            "or_addresses": [format!("10.{}.{}.1:9001", i / 256, i % 256)],
+            "exit_policy_summary": {"reject": ["1-65535"]},
+        }));
+    }
+    peephole::intel::relays::Relays::from_onionoo(&serde_json::to_vec(&v).unwrap(), None)
+        .unwrap()
+        .to_json()
+}
+
+/// GH #138: the relay index travels like the exit list. A member copies it
+/// without fetching Onionoo itself, and knows the IPv6 exits from it; a
+/// truncated index is not copied.
+#[tokio::test]
+async fn a_member_copies_the_tor_relay_index_without_its_own_fetch() {
+    use peephole::intel::relays;
+    let (ia, a) = new_node("a");
+    let (ib, b) = new_node("b");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(ib, &b, &[&a], DEFAULT).await;
+    std::fs::write(relays::file(na.dir.path()), relay_index(0)).unwrap();
+    share::publish(&na, na.dir.path(), &[share::RELAYS])
+        .await
+        .unwrap();
+    eventually("b knows the manifest", || async {
+        share::manifests(&nb.store).await.unwrap().len() == 1
+    })
+    .await;
+    assert!(
+        share::sync_files(&nb, nb.dir.path())
+            .await
+            .unwrap()
+            .is_empty(),
+        "too few relays: not copied"
+    );
+    assert!(!relays::file(nb.dir.path()).exists());
+    std::fs::write(relays::file(na.dir.path()), relay_index(relays::MIN_RELAYS)).unwrap();
+    share::publish(&na, na.dir.path(), &[share::RELAYS])
+        .await
+        .unwrap();
+    let sha = share::file_hash(&relays::file(na.dir.path())).unwrap().0;
+    eventually("b knows the new manifest", || async {
+        share::manifests(&nb.store).await.unwrap()[share::RELAYS].sha256 == sha
+    })
+    .await;
+    assert_eq!(
+        share::sync_files(&nb, nb.dir.path()).await.unwrap(),
+        [share::RELAYS]
+    );
+    let list = peephole::intel::tor::TorExitList::load(nb.dir.path()).unwrap();
+    assert!(list.contains(&"2001:db8:6::1".parse().unwrap()));
+    assert!(!list.contains(&"2a01:4f8:200:32e6::2".parse().unwrap()));
+}
+
 /// An exit list with `n` addresses.
 fn tor_list(n: u32) -> String {
     (0..n)
@@ -2838,6 +2906,18 @@ async fn admin_cluster_page_and_private_attribution() {
     assert!(
         scans.contains("id=\"scanners\"") && scans.contains(&b.id.short()),
         "scanner pace on the Scans page"
+    );
+    // MIK-501 (P31): the assignment rule is collapsed, verbatim.
+    let (_, rules) = scans
+        .split_once("<details class=\"muted\"><summary>How jobs are assigned</summary>")
+        .unwrap();
+    assert!(rules.contains("A job waits up to 30 min for a cheaper live scanner"));
+    // G18: short hints.
+    assert!(scans.contains("7-day mean") || scans.contains("assumed, nothing measured yet"));
+    assert!(!scans.contains("left the queue, last") && !scans.contains("backlog drains:"));
+    // P28: no paragraph under the h1 nor under the table.
+    assert!(
+        !members.contains("never appear on public pages") && !members.contains("open the node.")
     );
     // Remote pace from the UI.
     let r = admin
@@ -4221,6 +4301,24 @@ async fn admin_manages_a_sibling_from_its_page() {
         !html.contains("Remote configuration"),
         "the old line is gone"
     );
+    // MIK-501 (C11): one credits card, here and as b counts them.
+    let card = html
+        .split_once("<table class=\"node-credits\">")
+        .unwrap()
+        .1
+        .split_once("</table>")
+        .unwrap()
+        .0;
+    assert!(
+        card.contains("<th class=\"num\">Here</th>")
+            && card.contains("<th class=\"num\">As node-bravo counts them</th>")
+            && card.matches("<td class=\"num\">").count() == 2,
+        "{card}"
+    );
+    assert!(!html.contains("Credits there"), "{html}");
+    // C12, P32: the short lines.
+    assert!(html.contains("Web off removes its admin pages.</p>"));
+    assert!(!html.contains("reset roles.web") && !html.contains("Invites are created on the node"));
     // c is a member, not a sibling.
     let c_html = text(&admin, format!("{base}/admin/cluster/node/{}", c.id)).await;
     assert!(c_html.contains("Not one of your nodes"), "{c_html}");
@@ -4291,6 +4389,7 @@ async fn admin_manages_a_sibling_from_its_page() {
 
     // This node's own settings from its own page, as before.
     let page = text(&admin, format!("{base}/admin/system/settings")).await;
+    assert!(!page.contains("This node's runtime settings."), "P34");
     let shown = na.settings.snapshot().version;
     assert!(
         page.contains(&format!("name=\"base_version\" value=\"{shown}\"")),
@@ -4525,6 +4624,11 @@ async fn a_rotation_leaves_out_the_nodes_named() {
         html.contains(&format!("name=\"skip\" value=\"{}\"", c.id)),
         "the dialog offers to leave c out"
     );
+    // MIK-501 (P30, G20): the short lines.
+    assert!(html.contains("One key claims all your nodes; nodes that keep it manage the others."));
+    assert!(html.contains("<summary>Claim with another key</summary>"));
+    assert!(html.contains("from managing nodes · newest first · UTC"));
+    assert!(!html.contains("best for scanners and exposed nodes"));
     let r = admin
         .post(format!("{page}/rotate"))
         .form(&[("skip", c.id.to_string())])
@@ -6967,24 +7071,59 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     assert!(!cheap.contains("charged"), "nothing paid yet");
 
     let ip_page = text(&admin, format!("{base}/ip/198.51.100.77")).await;
-    let result = admin
-        .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.77"), ("ask", "abuseipdb")])
+    let ask = |quote_id: Option<&str>| {
+        let mut fields = vec![("ip", "198.51.100.77"), ("ask", "abuseipdb")];
+        fields.extend(quote_id.map(|q| ("quote_id", q)));
+        let req = admin.post(format!("{base}/admin/lookup")).form(&fields);
+        async move { req.send().await.unwrap().text().await.unwrap() }
+    };
+    // MIK-505: no paid provider is asked without a quote.
+    let refused = ask(None).await;
+    assert!(
+        refused.contains("Nothing asked: get its price first") && !refused.contains("Asked now"),
+        "{refused}"
+    );
+    // The "Ask" button's price dialog: one firm price, the one offered.
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.77&ask=abuseipdb"
+        ))
         .send()
         .await
         .unwrap()
-        .text()
+        .json()
         .await
         .unwrap();
+    assert_eq!(q["credits_mc"], cost as u64, "{q}");
+    assert!(
+        q["balance"].is_string() && q["expires_in"].is_number(),
+        "{q}"
+    );
+    let result = ask(q["quote_id"].as_str()).await;
+    assert_eq!(
+        count(
+            &na,
+            "SELECT COUNT(*) FROM device_actions WHERE action = 'lookup' AND device_id LIKE 'web:%'"
+        )
+        .await,
+        1,
+        "audited as the session's"
+    );
     let on_ip_page = sections(&ip_page);
     assert!(
-        on_ip_page.contains(&"scans".to_string()) && on_ip_page.contains(&"requests".to_string())
+        on_ip_page.contains(&"scans".to_string())
+            && on_ip_page.contains(&"activity".to_string())
+            && !on_ip_page.contains(&"requests".to_string())
+    );
+    // The Timeline replaced the Requests table on both (MIK-497).
+    assert!(
+        ip_page.contains("<table class=\"events\">") && result.contains("<table class=\"events\">")
     );
     assert_eq!(sections(&result), on_ip_page, "one source for both pages");
     assert!(result.contains("Asked now") && result.contains("node-bravo"));
     assert!(result.contains(&format!("charged {}", peephole::credits::show(cost as u64))));
     assert!(
-        result.contains("kept in the dataset"),
+        result.contains("Kept: the cluster records this address."),
         "the cluster recorded this address"
     );
 
@@ -7012,6 +7151,47 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         "{second}"
     );
     assert!(!second.contains("Asked now"));
+    // The page's script asks for the stored answers at once; the paid
+    // one is among them, and "Ask again" opens the price dialog.
+    let live = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[("ip", "198.51.100.77"), ("live", "1")])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        live.contains("From the dataset")
+            && live.contains(r#"data-quote="/admin/lookup/quote" data-quote-title="Ask "#),
+        "{live}"
+    );
+    // "Ask again" through its quote: asked now, although stored.
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.77&again=abuseipdb"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let again = admin
+        .post(format!("{base}/admin/lookup"))
+        .form(&[
+            ("ip", "198.51.100.77"),
+            ("again", "abuseipdb"),
+            ("quote_id", q["quote_id"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(again.contains("Asked now"), "{again}");
 
     // An address the dataset does not hold: said so, with what is near it,
     // by network and, since an answer names its ASN, by ASN.
@@ -7027,9 +7207,23 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     .execute(&na.store.pool)
     .await
     .unwrap();
+    let q: serde_json::Value = admin
+        .get(format!(
+            "{base}/admin/lookup/quote?ip=198.51.100.78&ask=abuseipdb"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let unknown = admin
         .post(format!("{base}/admin/lookup"))
-        .form(&[("ip", "198.51.100.78"), ("ask", "abuseipdb")])
+        .form(&[
+            ("ip", "198.51.100.78"),
+            ("ask", "abuseipdb"),
+            ("quote_id", q["quote_id"].as_str().unwrap()),
+        ])
         .send()
         .await
         .unwrap()
@@ -7041,18 +7235,15 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
         unknown.contains("198.51.100.0/24") && unknown.contains("198.51.100.77"),
         "{unknown}"
     );
-    assert!(unknown.contains("not kept"));
+    assert!(unknown.contains("Not kept: the cluster does not record it."));
     assert!(
-        unknown.contains("Same ASN") && unknown.contains("/ips?asn=64500"),
+        unknown.contains("Same ASN") && unknown.contains("/admin/asn/64500"),
         "{unknown}"
     );
     // Only the Counter-scan card, whose buy adds the address unseen
     // (MIK-329).
     assert_eq!(sections(&unknown), ["actions"], "{unknown}");
-    assert!(
-        unknown.contains("Buying a scan adds the address"),
-        "{unknown}"
-    );
+    assert!(unknown.contains("buying a scan adds it"), "{unknown}");
 }
 
 /// The Credits page: where credits come from, what this node holds, what
@@ -7105,6 +7296,28 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     assert!(html.contains("Resolving a name costs"));
     assert!(html.contains("Reverse names cost") && html.contains("Up today"));
     assert!(html.contains("also checks 5 % of other nodes' fresh scans unpaid"));
+    // MIK-501 (P29): one line under the h1, the rules verbatim in one
+    // collapsed <details> at the foot.
+    assert_eq!(
+        html.matches("<details class=\"muted\">").count(),
+        1,
+        "{html}"
+    );
+    let (top, rules) = html
+        .split_once("<summary>How credits work</summary>")
+        .unwrap();
+    assert!(top.contains("Every figure is this node's own count.</p>"));
+    for moved in [
+        "Every day 1000 credits are split evenly among the members anyone can reach",
+        "A credit can be used on the day it was earned and the 6 days after, whoever holds it by then.",
+    ] {
+        assert!(!top.contains(moved) && rules.contains(moved), "{moved}");
+    }
+    assert!(
+        !html.contains("as this node counts it"),
+        "G19: note removed"
+    );
+    assert!(html.contains("Money flow</h2><span class=\"muted\">7 days · UTC</span>"));
     // The market: the hourly refresh left a snapshot per good, with what b
     // announces for abuseipdb as the members' band (seen by now).
     price::refresh(&na.node).await.unwrap();
@@ -7286,7 +7499,12 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     let (admin, base) = admin_on(&na).await;
     let html = text(&admin, format!("{base}/admin")).await;
     // a, b, and the reporter `fund_listeners` made a member here.
-    assert!(html.contains("3 of 3 members earn here"), "{html}");
+    assert!(html.contains("3<span class=\"of\">/3</span>"), "{html}");
+    assert!(html.contains("<div class=\"hint\">lowest "), "G17: {html}");
+    assert!(
+        !html.contains("as this node counts it"),
+        "G17: note removed"
+    );
     let show = peephole::credits::show;
     let pool = peephole::credits::pool::POOL_PER_DAY;
     assert!(html.contains(&show(pool)), "credits in circulation");
@@ -8819,17 +9037,20 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     // Far above any budget a fresh node holds.
     const DEAR: u32 = 1_000_000_000;
     assert!((balance().await as u64) < DEAR as u64);
-    // The Actions card's buy button: where it lands and the error it
-    // flashes there (a cookie the page's script shows).
-    let form = |level: u8| {
+    // The Actions card's buy button, with the quote its price dialog got
+    // (MIK-505; `None`: no quote): where it lands and the error it flashes
+    // there (a cookie the page's script shows).
+    let post_form = |level: u8, quote_id: Option<String>| {
         let admin = admin.clone();
         let base = base.clone();
         let jar = jar.clone();
         async move {
             use reqwest::cookie::CookieStore;
+            let mut fields = vec![("ip", ip.to_string()), ("level", level.to_string())];
+            fields.extend(quote_id.map(|q| ("quote_id", q)));
             let r = admin
                 .post(format!("{base}/admin/lookup/scan"))
-                .form(&[("ip", ip.to_string()), ("level", level.to_string())])
+                .form(&fields)
                 .send()
                 .await
                 .unwrap();
@@ -8845,6 +9066,27 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
             let mut m: Vec<(String, String)> =
                 serde_urlencoded::from_str(&format!("m={flash}")).unwrap();
             m.pop().unwrap().1
+        }
+    };
+    // The price dialog's quote of a level: its id, or the refusal the
+    // dialog shows.
+    let web_quote = |level: u8| {
+        let admin = admin.clone();
+        let base = base.clone();
+        async move {
+            let r = admin
+                .get(format!(
+                    "{base}/admin/lookup/scan/quote?ip={ip}&level={level}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            let ok = r.status().is_success();
+            let v: serde_json::Value = r.json().await.unwrap();
+            match ok {
+                true => Ok(v["quote_id"].as_str().unwrap().to_string()),
+                false => Err(v["error"]["message"].as_str().unwrap().to_string()),
+            }
         }
     };
     let quote = |level: u8| {
@@ -8880,7 +9122,15 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
 
     // No live scanner announces a price.
     price(None);
-    assert_eq!(form(2).await, "No scan: no live scanner announces a price.");
+    assert_eq!(
+        web_quote(2).await,
+        Err("no live scanner announces a price".to_string())
+    );
+    // In a cluster the form buys nothing without a quote.
+    assert_eq!(
+        post_form(2, None).await,
+        "No scan: get its price first (the level button opens it)."
+    );
     price(None);
     let (st, v) = quote(2).await;
     assert_eq!(
@@ -8892,8 +9142,8 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     // A price, but the budget does not cover it.
     price(Some(DEAR));
     assert_eq!(
-        form(2).await,
-        "No scan: the scan budget does not cover this."
+        web_quote(2).await,
+        Err("the scan budget does not cover this".to_string())
     );
     price(Some(DEAR));
     let (st, v) = quote(2).await;
@@ -8904,7 +9154,22 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     );
 
     // A quote taken while the scan was free, bought after the scanners
-    // went away or the price rose past the budget: the buy checks again.
+    // went away or the price rose past the budget: the buy checks again,
+    // on the form as on the API.
+    price(Some(0));
+    let q = web_quote(2).await.unwrap();
+    price(None);
+    assert_eq!(
+        post_form(2, Some(q)).await,
+        "No scan: no live scanner announces a price. Nothing was charged."
+    );
+    price(Some(0));
+    let q = web_quote(2).await.unwrap();
+    price(Some(DEAR));
+    assert_eq!(
+        post_form(2, Some(q)).await,
+        "No scan: the scan budget does not cover this. Nothing was charged."
+    );
     price(Some(0));
     let (st, q) = quote(2).await;
     assert_eq!(st, reqwest::StatusCode::OK, "{q}");

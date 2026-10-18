@@ -2,20 +2,20 @@
 {% block title %}peephole — devices{% endblock %}
 {% block content %}
 {% let sub = "devices" %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Devices</h1><p class="muted">Phones and tools paired with this node's machine API (<span class="mono">/api/v1</span>).</p></div></div>
+<div class="page-head"><div><h1>Devices</h1><p class="muted">Phones and tools paired with <span class="mono">/api/v1</span>.</p></div></div>
 <div class="stack">
 <section class="card">
   <div class="card-head"><h2>Pair a device</h2></div>
   {% if let Some(p) = pair %}
-  <p>Scan with the app within {{ p.minutes }} minutes. The code works once; it is never stored, only its hash is.</p>
+  <p>Scan within {{ p.minutes }} minutes; the code works once.</p>
   <div>{{ p.qr|safe }}</div>
   <pre class="mono">{{ p.payload }}</pre>
   <p class="muted">Scopes: <span class="mono">{{ p.scopes }}</span></p>
   <form method="get" action="/admin/devices"><button class="btn" type="submit">Done</button></form>
   {% else %}
   <form method="post" action="/admin/devices/pair" class="stack">
-    <p class="muted">The <span class="mono">read</span> scope is always granted: every <span class="mono">GET</span> under <span class="mono">/api/v1</span> and <span class="mono">POST /api/v1/lookup</span>.</p>
-    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span>: start probes and buy counter-scans, which spend credits</label>
+    <p class="muted"><span class="mono">read</span> is always granted; <span class="mono">act</span> also starts probes and buys counter-scans (spends credits).</p>
+    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span></label>
     <div><button class="btn btn-primary" type="submit">Pair a device</button></div>
   </form>
   {% endif %}

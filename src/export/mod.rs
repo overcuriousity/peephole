@@ -115,6 +115,9 @@ pub struct ExportRow {
     pub asn: Option<i64>,
     pub asn_org: Option<String>,
     pub is_tor: Option<bool>,
+    /// A Tor relay of any role at the time (`tor-relays`, GH #138); exits
+    /// are `is_tor`.
+    pub is_tor_relay: Option<bool>,
     /// The campaign `key` of the address at export time; None when it is
     /// in none.
     pub campaign: Option<String>,
@@ -170,6 +173,7 @@ pub const COLUMNS: &[&str] = &[
     "asn",
     "asn_org",
     "is_tor",
+    "is_tor_relay",
     "campaign",
     "intel",
     "scans",
@@ -334,6 +338,7 @@ impl ExportRow {
             "asn": self.asn,
             "asn_org": self.asn_org,
             "is_tor": self.is_tor,
+            "is_tor_relay": self.is_tor_relay,
             "campaign": self.campaign,
             "message": self.message(),
             "datetime": rfc3339(self.ts_ms),
@@ -444,6 +449,7 @@ struct IpCols {
     /// GeoLite2 and Tor results with their times, oldest first.
     geo: Vec<(i64, Value)>,
     tor: Vec<(i64, bool)>,
+    relay: Vec<(i64, bool)>,
 }
 
 /// The newest entry at or before `ts_ms`, else the earliest.
@@ -495,6 +501,16 @@ fn ip_cols(ip: &str, ip_id: i64, ctx: &PageContext, opts: &ExportOptions) -> IpC
             )
         })
         .collect();
+    let relay = lookups
+        .iter()
+        .filter(|i| i.provider == crate::intel::TOR_RELAYS)
+        .map(|i| {
+            (
+                millis(&i.fetched_at),
+                data(i)["relay"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
     let scans = ctx
         .scans
         .get(&ip_id)
@@ -512,6 +528,7 @@ fn ip_cols(ip: &str, ip_id: i64, ctx: &PageContext, opts: &ExportOptions) -> IpC
             .into(),
         geo,
         tor,
+        relay,
     }
 }
 
@@ -615,6 +632,7 @@ fn fill_ip(
         row.asn_org = g["asn_org"].as_str().map(str::to_string);
     }
     row.is_tor = as_of(&cols.tor, row.ts_ms);
+    row.is_tor_relay = as_of(&cols.relay, row.ts_ms);
     row.campaign = ctx.campaigns.get(&ip_id).cloned();
 }
 
@@ -1172,6 +1190,14 @@ mod tests {
         )
         .await
         .unwrap();
+        rec.record_intel(
+            ip,
+            crate::intel::TOR_RELAYS,
+            Some("2026-09-01 10:00:00"),
+            serde_json::json!({"relay": true, "exit": false}),
+        )
+        .await
+        .unwrap();
         rec.record_lookup(
             ip,
             crate::intel::ABUSEIPDB,
@@ -1645,7 +1671,8 @@ mod tests {
         assert_eq!(r["country"], "Germany");
         assert_eq!(r["asn"], 3320);
         assert_eq!(r["is_tor"], false);
-        assert_eq!(r["intel"].as_array().unwrap().len(), 3);
+        assert_eq!(r["is_tor_relay"], true);
+        assert_eq!(r["intel"].as_array().unwrap().len(), 4);
         assert_eq!(r["scans"][0]["ports"][0]["port"], 22);
         assert!(r["scans"][0]["xml"].as_str().unwrap().contains("XML"));
         assert_eq!(r["fingerprints"][0]["fp_hash"], "fphash");
@@ -1658,7 +1685,7 @@ mod tests {
         assert_eq!(rows[1]["kind"], "skipped");
         assert_eq!(rows[1]["path"], "/s1");
         assert_eq!(rows[1]["timestamp_desc"], "HTTP request skipped");
-        assert_eq!(rows[1]["intel"].as_array().unwrap().len(), 3);
+        assert_eq!(rows[1]["intel"].as_array().unwrap().len(), 4);
         // The batch's drops weigh on its last light row.
         assert_eq!(rows[1]["weight"], 1);
         assert_eq!(rows[2]["weight"], 4);
@@ -2009,8 +2036,9 @@ mod tests {
             if format == Format::Jsonl {
                 let r: serde_json::Value =
                     serde_json::from_str(hay.lines().next().unwrap()).unwrap();
-                assert_eq!(r["intel"].as_array().unwrap().len(), 1, "tor only");
+                assert_eq!(r["intel"].as_array().unwrap().len(), 2, "tor only");
                 assert_eq!(r["is_tor"], false);
+                assert_eq!(r["is_tor_relay"], true, "Onionoo data is CC0");
             }
             if format == Format::Parquet {
                 // Compressed: read the values back rather than search bytes.

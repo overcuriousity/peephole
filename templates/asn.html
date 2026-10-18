@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block title %}peephole — AS{{ asn }}{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} {% endif %}{% endif %}<span class="mono">AS{{ asn }}</span></h1></div></div>
+{% if let Some(r) = r %}
+{% include "_rollup.html" %}
+{% else %}
+<p class="empty">No IP recorded in AS{{ asn }}.</p>
+{% endif %}
+{% endblock %}

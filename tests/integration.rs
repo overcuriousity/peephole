@@ -906,7 +906,7 @@ async fn admin_pages_and_deletes_with_session() {
         .text()
         .await
         .unwrap();
-    assert!(html.contains("22/tcp") && html.contains("ssh"));
+    assert!(html.contains(r#"href="/ips?port=22">22</a>/tcp"#) && html.contains("ssh"));
     assert!(
         html.contains("Host keys and certificates")
             && html.contains("SHA256:LvbxsAtrLqDESt7sCPrXK6n7L9j4J9myhtEO50ocsdM")
@@ -990,6 +990,40 @@ async fn admin_pages_and_deletes_with_session() {
         "method chip keeps path, drops page"
     );
     assert!(rows.contains("class=\"chip\" href=\"/requests?method=GET\""));
+    // A webshell command opens exactly the requests that sent it.
+    let mut shell = Vec::new();
+    for q in ["cmd=ls+-la", "cmd=id"] {
+        shell.push(
+            store
+                .insert_request(&peephole::store::requests::NewRequest {
+                    ip_id: ip78.id,
+                    method: "GET".into(),
+                    path: "/up/shell.php".into(),
+                    query: Some(q.into()),
+                    answer: Some("webshell".into()),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let rows = get("/requests?cmd=ls%20-la")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rows.contains(&format!("/admin/requests/{}\"", shell[0]))
+            && !rows.contains(&format!("/admin/requests/{}\"", shell[1])),
+        "the command filter finds only its requests"
+    );
+    assert!(
+        rows.contains("Webshell command: <span class=\"mono\">ls -la</span>"),
+        "command chip"
+    );
     let rows = get("/requests").await.unwrap().text().await.unwrap();
     assert!(!rows.contains("class=\"chip\""), "no filter, no chips");
     // Quick filters are always there and apply in one click.
@@ -1942,9 +1976,15 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
         .execute(&store.pool)
         .await
         .unwrap();
+    // Released requests are on the public Timeline, as on the public
+    // request list (owner, MIK-497); their query, node and inspect link
+    // are not.
+    let events = &html[html
+        .find("<table class=\"events\">")
+        .expect("public Timeline")..];
+    assert!(events.contains("/wp-login.php"), "{events}");
+    assert!(!events.contains("inspect"), "{events}");
     for marker in [
-        // Per-request rows (path included) are admin-only now.
-        "/wp-login.php",
         // Fingerprints are never public.
         ja4h,
         "/admin/links",
@@ -2516,8 +2556,8 @@ async fn query_strings_are_admin_only() {
     let base = spawn_admin_with(store.clone(), dir.path()).await;
     let get = |url: String| async move { reqwest::get(url).await.unwrap().text().await.unwrap() };
     // No public surface shows the query string. The wall's "Recent
-    // requests" list the path alone (not in the JSON); the IP pages show
-    // no request rows.
+    // requests" and the IP page's Timeline list the path alone (not in the
+    // JSON).
     for url in [
         format!("{base}/ip/203.0.113.200"),
         format!("{base}/ips"),
@@ -2528,12 +2568,16 @@ async fn query_strings_are_admin_only() {
         assert!(!body.contains("SECRET"), "{url} leaks the query string");
         assert!(!body.contains("api_key"), "{url} leaks the query string");
     }
-    for url in [format!("{base}/ip/203.0.113.200"), format!("{base}/ips")] {
-        assert!(
-            !get(url.clone()).await.contains("/api/v1/usres"),
-            "{url} leaks the request path"
-        );
-    }
+    assert!(
+        !get(format!("{base}/ips")).await.contains("/api/v1/usres"),
+        "/ips leaks the request path"
+    );
+    assert!(
+        get(format!("{base}/ip/203.0.113.200"))
+            .await
+            .contains("/api/v1/usres"),
+        "the public Timeline lists the path (MIK-497)"
+    );
     // The wall lists paths now, but its JSON keeps `recent` out.
     let stats = get(format!("{base}/api/stats?range=24h")).await;
     assert!(
@@ -3223,8 +3267,8 @@ async fn admin_search_sends_each_kind_of_input_to_its_page() {
         ("203.0.113.5", "/ip/203.0.113.5"),
         (" 198.51.100.99 ", "/admin/lookup?ip=198.51.100.99"),
         ("203.0.113.0/24", "/ips?q=203.0.113.0%2F24"),
-        ("AS64500", "/ips?asn=64500"),
-        ("as64500", "/ips?asn=64500"),
+        ("AS64500", "/admin/asn/64500"),
+        ("as64500", "/admin/asn/64500"),
         (&format!("#{rid}"), &format!("/admin/requests/{rid}")),
         ("/wp-login.php", "/requests?path=%2Fwp-login.php"),
         ("FPSEARCH", "/admin/links/fp/FPSEARCH"),

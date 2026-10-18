@@ -82,7 +82,11 @@ and looked up again when the address returns:
   looks up the addresses the other nodes recorded and shares the results,
   so one member with credentials is enough; without any, the dataset has no
   GeoIP data.
-- **The Tor exit list**: public, fetched by one node for all.
+- **Tor**: the bulk exit list (IPv4 exits measured by TorDNSEL) and the
+  Onionoo relay index (every running relay: its IPv4 and IPv6 addresses,
+  roles, nickname and fingerprint). Both are public and fetched by one node
+  for all. The IP page says whether an address is an exit or a guard or
+  middle relay, and an admin sees which relay it is.
 - **RDAP**: registration data from the registries (network, holder, abuse
   contact).
 - **Reverse DNS**: forward-confirmed PTR names.
@@ -134,6 +138,20 @@ HTTP ETags, so sources that share one show up as linked (Admin → Links).
   addresses of cluster members. `never_scan` applies on the node that sets
   it only: other members' scanners may still scan those addresses.
 - Per-network, per-ASN and queue budgets stop floods.
+
+**What "Tor exits are never scanned" covers.** An address counts as an exit
+when it is on the bulk exit list, is an exit address Onionoo observed, or is
+an ORPort address of a relay that has the `Exit` flag or an IPv4 or IPv6
+exit policy other than `reject *:*`. That last rule is how IPv6 exits are
+recognised. It is a heuristic: a relay can exit from another IPv6 address
+than its ORPort, which neither source lists, and the rule fails toward
+"exit" (every address of such a relay is refused, IPv4 and IPv6). Guard and
+middle relays are not refused: they never carry Tor users' traffic to the
+internet, so what comes from them comes from the host. Bridges are not
+public, so a bridge address is not known as Tor at all. A relay index that
+is too small, has no publish time, or is older than 72 hours is not used.
+The bulk list then decides alone, as before, and without either the Tor
+status is unknown (`scan.tor_unknown`).
 
 **On request**, an admin can also:
 

@@ -1,4 +1,4 @@
-{# The Actions card (admin::probes::ActionsView `a`, target `t`): admin only. Every button carries its cost or why it does nothing now; never hidden. #}
+{# The Actions card (admin::probes::ActionsView `a`, target `t`): admin only. Every button says what it does or why it does nothing now; never hidden. In a cluster a paid button (`data-quote`) opens the firm-price dialog first (admin::web_quote); standalone it acts at once, free. #}
 <section class="card actions-card"{% if first %} id="actions"{% endif %} data-section="actions">
   <div class="card-head"><h2>Actions</h2>{% if let Some(b) = a.balance %}<span class="muted">balance <span class="num">{{ b }}</span> credits</span>{% endif %}</div>
   <p class="{% if a.allowed %}muted{% else %}text-warning{% endif %} small" data-guard>{{ a.guard_line }}</p>
@@ -6,7 +6,7 @@
 
   <form class="action-block" method="post" action="/admin/lookup/probe" data-probe-form>
     <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    <h3 class="action-label">Probe <span class="muted">· read what the ports present{% if a.standalone %}, from this node{% endif %}</span></h3>
+    <h3 class="action-label" title="read what the ports present{% if a.standalone %}, from this node{% endif %}">Probe</h3>
     {% if !a.standalone %}
     <div class="vantage-chips">
       {% for v in a.vantages %}
@@ -16,11 +16,11 @@
     {% endif %}
     <div class="action-row">
       {% if let Some((done, asked)) = t.probe_progress() %}
-      <button class="btn action-btn busy" type="button" disabled><span class="spin" aria-hidden="true"></span>Probing · {{ done }} of {{ asked }} in</button>
+      <button class="btn action-btn busy" type="button" disabled><span class="spin" aria-hidden="true"></span>Probing {{ done }}/{{ asked }}</button>
       {% else if !a.allowed %}
       <button class="btn action-btn" type="button" disabled title="{{ a.why_not.as_deref().unwrap_or_default() }}">Probe</button>
       {% else %}
-      <button class="btn btn-primary action-btn" type="submit" data-busy="Asking…">Probe · {% if a.standalone %}free{% else %}<span class="num" data-probe-total>{{ a.default_total() }}</span> credits{% endif %}</button>
+      {% if a.standalone %}<button class="btn btn-primary action-btn" type="submit" data-busy="Asking…">Probe · free</button>{% else %}<button class="btn btn-primary action-btn" type="submit" data-busy="Asking…" data-quote="/admin/lookup/probe/quote" data-quote-kind="probe" data-quote-title="Probe {{ t.ov.ip.ip }}">Probe · <span class="num" data-probe-total>{{ a.default_total() }}</span> credits</button>{% endif %}
       {% endif %}
       {% if let Some(w) = a.why_not %}<span class="muted small">{{ w }}</span>{% endif %}
     </div>
@@ -28,7 +28,7 @@
 
   <form class="action-block" method="post" action="/admin/lookup/scan">
     <input type="hidden" name="ip" value="{{ t.ov.ip.ip }}">
-    <h3 class="action-label">Counter-scan <span class="muted">· {% if a.standalone %}from this node; {% endif %}a result of the same level less than a day old is shown instead</span></h3>
+    <h3 class="action-label"{% if a.standalone %} title="from this node"{% endif %}>Counter-scan</h3>
     <div class="level-grid">
       {% for o in a.scans %}
       {% if let Some(w) = o.waiting %}
@@ -38,7 +38,7 @@
       {% else if o.price.is_empty() %}
       <button class="btn level-btn" type="button" disabled title="L{{ o.level }}: {{ o.about }}. No live scanner announces a price"><b>L{{ o.level }}</b><span>no scanner</span></button>
       {% else %}
-      <button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>
+      {% if a.standalone %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.price }}</span></button>{% else %}<button class="btn level-btn" type="submit" name="level" value="{{ o.level }}" data-busy="Queuing…" data-quote="/admin/lookup/scan/quote" data-quote-title="Level {{ o.level }} counter-scan of {{ t.ov.ip.ip }}" title="L{{ o.level }}: {{ o.about }}"><b>L{{ o.level }}</b><span>{{ o.about }}</span></button>{% endif %}
       {% endif %}
       {% endfor %}
     </div>

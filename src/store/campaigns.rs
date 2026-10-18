@@ -248,6 +248,17 @@ pub struct CampaignShape {
     pub df: i64,
 }
 
+/// A webshell command the members ran.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct CampaignCommand {
+    /// Attacker-controlled (`requests.cmd`, capped).
+    pub cmd: String,
+    pub count: i64,
+    /// Members that ran it.
+    pub ips: i64,
+    pub last_ts: String,
+}
+
 /// Shapes listed on a campaign's page.
 pub const CAMPAIGN_SHAPES: i64 = 25;
 
@@ -420,6 +431,16 @@ impl Store {
         .await?)
     }
 
+    /// The key of campaign number `num` (the `#N` on the pages).
+    pub async fn campaign_by_num(&self, num: i64) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT key FROM campaigns WHERE num = ?")
+                .bind(num)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// A campaign by key, with its members and edges.
     pub async fn campaign(&self, key: &str) -> Result<Option<Campaign>> {
         let Some(row) = sqlx::query_as::<_, CampaignRow>(sqlx::AssertSqlSafe(format!(
@@ -554,6 +575,39 @@ impl Store {
         )
         .bind(key)
         .bind(CAMPAIGN_SHAPES)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// Up to `limit` of the members' uploads, newest first.
+    pub async fn campaign_uploads(
+        &self,
+        key: &str,
+        limit: i64,
+    ) -> Result<Vec<super::uploads::UploadRow>> {
+        Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {} JOIN campaign_members m ON m.ip_id = u.ip_id
+             WHERE m.campaign_key = ? ORDER BY u.id DESC LIMIT ?",
+            super::uploads::UPLOAD_COLS
+        )))
+        .bind(key)
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// Up to `limit` of the webshell commands the members ran, most run
+    /// first: the partial `idx_requests_cmd` holds only command rows.
+    pub async fn campaign_commands(&self, key: &str, limit: i64) -> Result<Vec<CampaignCommand>> {
+        Ok(sqlx::query_as(
+            "SELECT r.cmd, COUNT(*) AS count, COUNT(DISTINCT r.ip_id) AS ips, MAX(r.ts) AS last_ts
+             FROM requests r
+             WHERE r.cmd IS NOT NULL
+               AND r.ip_id IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?)
+             GROUP BY r.cmd ORDER BY count DESC, last_ts DESC, r.cmd LIMIT ?",
+        )
+        .bind(key)
+        .bind(limit)
         .fetch_all(&self.read)
         .await?)
     }
@@ -1737,6 +1791,49 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// A user agent is software, not an operator: one UA on every request,
+    /// across all the fixture's campaigns, changes nothing (MIK-504).
+    #[tokio::test]
+    async fn user_agents_are_not_campaign_evidence() {
+        let shared_ua = |ops: Vec<Op>| {
+            ops.into_iter().map(|op| match op {
+                Op::Rec(Record::Request(mut r)) => {
+                    r.headers_json = r#"[["User-Agent","Mozilla/5.0 (shared)"]]"#.into();
+                    Op::Rec(Record::Request(r))
+                }
+                op => op,
+            })
+        };
+        let mut runs = vec![];
+        for with_ua in [false, true] {
+            let (s, _dir) = store().await;
+            if with_ua {
+                feed(&s, shared_ua(fixture())).await;
+                let ips: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(DISTINCT ip_id) FROM requests
+                     WHERE user_agent = 'Mozilla/5.0 (shared)'",
+                )
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+                assert!(ips > 7, "the UA spans the campaigns: {ips}");
+                let mut conn = s.pool.acquire().await.unwrap();
+                let input = Input::read(&mut conn).await.unwrap();
+                assert!(input.sightings.iter().all(|x| x.0 != LinkKind::Ua));
+            } else {
+                feed(&s, fixture()).await;
+            }
+            tls_fixture(&s).await;
+            let mut r = s.recompute_campaigns(false).await.unwrap();
+            (r.seconds, r.at) = (0.0, None);
+            let d = dump(&s).await;
+            assert!(d.2.iter().all(|e| e.2 != "ua"), "{:?}", d.2);
+            runs.push((r, d));
+        }
+        assert_eq!(runs[0].0.campaigns, 3);
+        assert_eq!(runs[0], runs[1]);
+    }
+
     #[tokio::test]
     async fn the_fixture_makes_the_expected_campaigns() {
         let (s, _dir) = store().await;
@@ -1948,6 +2045,94 @@ pub(crate) mod tests {
             &span("2026-07-01 00:00:00", "2026-09-03 00:00:00")
         ));
         assert!(!apart(&x, &(None, None)));
+    }
+
+    /// Artifacts of the fixture's campaign 192.0.2.3 (members 192.0.2.1-3)
+    /// and of an outsider: one upload by 192.0.2.1, `ls -la` run twice by
+    /// 192.0.2.1 and once by 192.0.2.2, `id` once by 192.0.2.2; the
+    /// outsider 203.0.113.9 uploads and runs `uname`.
+    pub(crate) async fn seed_artifacts(s: &Store) {
+        let ws = |ip: &'static str, cmd: &'static str| async move {
+            let ip_id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id,
+                method: "GET".into(),
+                path: "/s.php".into(),
+                query: Some(format!("cmd={cmd}")),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                answer: Some("webshell".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        };
+        crate::store::uploads::seed_upload(s, "192.0.2.1", "/drop.php", b"<?php x").await;
+        crate::store::uploads::seed_upload(s, "203.0.113.9", "/out.php", b"<?php y").await;
+        ws("192.0.2.1", "ls+-la").await;
+        ws("192.0.2.1", "ls+-la").await;
+        ws("192.0.2.2", "ls+-la").await;
+        ws("192.0.2.2", "id").await;
+        ws("203.0.113.9", "uname").await;
+    }
+
+    #[tokio::test]
+    async fn a_campaign_lists_its_members_artifacts_and_events() {
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        s.recompute_campaigns(true).await.unwrap();
+        seed_artifacts(&s).await;
+
+        let ups = s.campaign_uploads("192.0.2.3", 50).await.unwrap();
+        assert_eq!(ups.len(), 1, "{ups:?}");
+        assert_eq!(
+            (ups[0].ip.as_str(), ups[0].answered_path.as_str()),
+            ("192.0.2.1", "/drop.php")
+        );
+        let cmds = s.campaign_commands("192.0.2.3", 50).await.unwrap();
+        let got: Vec<_> = cmds
+            .iter()
+            .map(|c| (c.cmd.as_str(), c.count, c.ips))
+            .collect();
+        assert_eq!(got, [("ls -la", 3, 2), ("id", 1, 1)]);
+        assert_eq!(s.campaign_commands("192.0.2.3", 1).await.unwrap().len(), 1);
+
+        let ev = s.campaign_events("192.0.2.3", None, 100).await.unwrap();
+        // 3 fixture requests and host-key probes, 1 upload request and
+        // its upload, 4 commands.
+        assert_eq!(ev.items.len(), 12, "{:?}", ev.items);
+        assert!(ev.next.is_none());
+        let ips: std::collections::BTreeSet<_> =
+            ev.items.iter().filter_map(|e| e.ip.as_deref()).collect();
+        assert_eq!(
+            ips.into_iter().collect::<Vec<_>>(),
+            ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
+        );
+        assert!(ev.items.iter().all(|e| e.ip.is_some()), "{:?}", ev.items);
+        assert!(ev.items.windows(2).all(|w| w[0].ts >= w[1].ts));
+        let kinds = |k| ev.items.iter().filter(|e| e.kind() == k).count();
+        use crate::store::events::EventKind;
+        assert_eq!(
+            (kinds(EventKind::Webshell), kinds(EventKind::Upload)),
+            (4, 1)
+        );
+        let page = s.campaign_events("192.0.2.3", None, 2).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        let rest = s
+            .campaign_events("192.0.2.3", page.next.as_ref(), 100)
+            .await
+            .unwrap();
+        assert_eq!(rest.items.len(), 10);
+
+        assert!(s.campaign_uploads("nope", 50).await.unwrap().is_empty());
+        assert!(s.campaign_commands("nope", 50).await.unwrap().is_empty());
+        assert!(
+            s.campaign_events("nope", None, 100)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[tokio::test]
