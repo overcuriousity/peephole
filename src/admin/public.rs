@@ -1646,6 +1646,123 @@ show_labels = {show_labels}
             .unwrap()
     }
 
+    /// The request page's path, user agent and command are pivots to the
+    /// requests with the same (MIK-498), and so is the list's path.
+    #[tokio::test]
+    async fn request_values_pivot_to_the_requests_with_the_same() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.50".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/wp-login.php".into(),
+                headers_json: r#"[["User-Agent","Mozilla/5.0 (X11)"]]"#.into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let shell = webshell_cmd(&st, "203.0.113.50", "id%20-a").await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+
+        let (status, html) = get_with(&app, &format!("/admin/requests/{id}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
+            "{html}"
+        );
+        let ua = "/requests?ua=Mozilla%2F5.0%20%28X11%29";
+        assert!(
+            html.contains(&format!(r#"href="{ua}">Mozilla/5.0 (X11)</a>"#)),
+            "{html}"
+        );
+        let (status, list) = get_with(&app, ua, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(list.contains(&format!("/admin/requests/{id}\"")), "{list}");
+        assert!(
+            !list.contains(&format!("/admin/requests/{shell}\"")),
+            "{list}"
+        );
+
+        let (status, html) =
+            get_with(&app, &format!("/admin/requests/{shell}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains(r#"href="/requests?cmd=id%20-a">id -a</a>"#),
+            "{html}"
+        );
+
+        let (status, list) = get_with(&app, "/requests", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
+            "{list}"
+        );
+        // The list has no public render: it asks for a session, so no
+        // pivot on it reaches a visitor.
+        let (status, public) = get_with(&app, "/requests", None).await;
+        assert_eq!(status, 303);
+        assert!(!public.contains("/admin/"), "{public}");
+    }
+
+    /// A link item's IP rows carry the campaign each address is a member
+    /// of (MIK-498), read in the rows' own query, and its AS badge.
+    #[tokio::test]
+    async fn link_item_rows_show_the_campaign_of_each_ip() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let ja4 = "t13d1516h2_8daaf6152771_02713d6af862";
+        let mut ids = vec![];
+        for ip in ["203.0.113.60", "203.0.113.61"] {
+            let ip = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: "/".into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ja4: Some(ja4.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            ids.push(ip.id);
+        }
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                hard_edges, soft_edges, v, computed_at)
+             VALUES ('203.0.113.60', 7, ?, 2, '2026-10-01 00:00:00', '2026-10-01 00:00:00',
+                1, 0, 2, '2026-10-01 00:00:00')",
+        )
+        .bind(ids[0])
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, '203.0.113.60')",
+        )
+        .bind(ids[0])
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, html) =
+            get_with(&app, &format!("/admin/links/ja4/{ja4}"), Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let badge = r#"href="/admin/campaigns/203.0.113.60">member of campaign #7</a>"#;
+        assert_eq!(html.matches(badge).count(), 1, "{html}");
+        assert_eq!(html.matches("member of campaign").count(), 1, "{html}");
+        assert!(html.contains("203.0.113.61"), "{html}");
+    }
+
     /// An admin's `AS{n}` badges lead to the network's page; the public
     /// ones keep the filtered list (the page needs a session).
     #[tokio::test]
@@ -1694,7 +1811,10 @@ show_labels = {show_labels}
         assert_eq!(status, 200);
         assert!(html.contains("Uploads and webshell commands"), "{html}");
         assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
-        assert!(html.contains(">whoami</td>"), "{html}");
+        assert!(
+            html.contains(r#"href="/requests?cmd=whoami" title="whoami">whoami</a></td>"#),
+            "{html}"
+        );
         // The kind is the stored string, whatever it is.
         assert!(html.contains("<td class=\"mono\">put</td>"), "{html}");
         assert!(!html.contains("All its uploads"), "{html}");
@@ -1727,7 +1847,7 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (_, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(html.matches("\">upload</a>").count(), IP_DROPS, "{html}");
-        assert_eq!(html.matches(">id</td>").count(), IP_DROPS, "{html}");
+        assert_eq!(html.matches(">id</a></td>").count(), IP_DROPS, "{html}");
         assert!(html.contains("/admin/uploads?ip=203.0.113.30\""), "{html}");
         assert!(
             html.contains("/requests?ip=203.0.113.30&amp;answer=webshell\""),
@@ -1788,7 +1908,12 @@ show_labels = {show_labels}
         assert!(up.contains("member of campaign #7"), "{up}");
         assert!(!up.contains("Webshell command"), "{up}");
         let (_, cmd) = get_with(&app, &format!("/admin/requests/{cmd_id}"), Some(&cookie)).await;
-        assert!(cmd.contains("<pre class=\"panel\">uname -a</pre>"), "{cmd}");
+        assert!(
+            cmd.contains(
+                r#"<pre class="panel"><a href="/requests?cmd=uname%20-a">uname -a</a></pre>"#
+            ),
+            "{cmd}"
+        );
         assert!(cmd.contains("member of campaign #7"), "{cmd}");
         assert!(!cmd.contains("/admin/uploads/"), "{cmd}");
         // Without a session the page is not served at all.
@@ -1858,6 +1983,30 @@ show_labels = {show_labels}
             ),
             "{html}"
         );
+    }
+
+    /// An open port and its product are pivots to the IPs with the same
+    /// (MIK-498), on the scan page and the IP page, and each lands on a list
+    /// that holds the scanned address.
+    #[tokio::test]
+    async fn ports_and_products_pivot_to_the_ips_with_the_same() {
+        let (st, _d, id) = scanned_state().await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let port = r#"href="/ips?port=22""#;
+        let product = r#"href="/ips?product=OpenSSH%209.6p1""#;
+        for page in [format!("/admin/scans/{id}"), "/ip/203.0.113.9".into()] {
+            let (status, html) = get_with(&app, &page, Some(&cookie)).await;
+            assert_eq!(status, 200, "{page}");
+            assert!(html.contains(port), "{page}: {html}");
+            assert!(html.contains(product), "{page}: {html}");
+            assert!(html.contains("Ubuntu Linux; protocol 2.0"), "{page}");
+        }
+        for list in ["/ips?port=22", "/ips?product=OpenSSH%209.6p1"] {
+            let (status, html) = get_with(&app, list, Some(&cookie)).await;
+            assert_eq!(status, 200, "{list}");
+            assert!(html.contains("203.0.113.9"), "{list}: {html}");
+        }
     }
 
     #[tokio::test]
@@ -2543,7 +2692,17 @@ show_labels = {show_labels}
         assert!(ev.contains("?secretq=1"), "{ev}");
         assert!(ev.contains("class=\"canary-mark\""), "{ev}");
         assert!(ev.contains(">inspect</a>"), "{ev}");
-        assert!(ev.contains(">whoami</span>"), "{ev}");
+        // The command is a pivot (MIK-498), here and in the drops card.
+        assert!(
+            ev.contains(r#"href="/requests?cmd=whoami">whoami</a>"#),
+            "{ev}"
+        );
+        let drops = &html[html.find("data-section=\"drops\"").unwrap()..];
+        let drops = &drops[..drops.find("</section>").unwrap()];
+        assert!(drops.contains(r#"href="/requests?cmd=whoami""#), "{drops}");
+        let (status, cmd) = get_with(&app, "/requests?cmd=whoami", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(cmd.contains("/s.php"), "{cmd}");
         assert!(ev.contains("/admin/uploads/"), "{ev}");
         assert!(ev.contains("/admin/scans/"), "{ev}");
         assert!(ev.contains("192.0.2.99"), "{ev}");

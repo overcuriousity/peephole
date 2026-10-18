@@ -906,7 +906,7 @@ async fn admin_pages_and_deletes_with_session() {
         .text()
         .await
         .unwrap();
-    assert!(html.contains("22/tcp") && html.contains("ssh"));
+    assert!(html.contains(r#"href="/ips?port=22">22</a>/tcp"#) && html.contains("ssh"));
     assert!(
         html.contains("Host keys and certificates")
             && html.contains("SHA256:LvbxsAtrLqDESt7sCPrXK6n7L9j4J9myhtEO50ocsdM")

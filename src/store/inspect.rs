@@ -69,6 +69,19 @@ impl PortRow {
             .join(" ")
     }
 
+    /// Product and version as the `/ips?product=` filter matches them, for
+    /// an open port with a product (the filter looks at open ports only).
+    pub fn product_key(&self) -> Option<String> {
+        if self.state != "open" {
+            return None;
+        }
+        let p = self.product.as_deref()?;
+        Some(match &self.version {
+            Some(v) => format!("{p} {v}"),
+            None => p.to_string(),
+        })
+    }
+
     /// OS type, device type and announced host name, the ones set, joined.
     pub fn system(&self) -> String {
         [&self.ostype, &self.devicetype, &self.hostname]

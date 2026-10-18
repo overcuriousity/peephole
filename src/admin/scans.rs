@@ -641,7 +641,7 @@ mod tests {
         };
         let html = page.render().unwrap();
         for s in [
-            "nginx 1.18.0 Ubuntu",
+            r#"href="/ips?product=nginx%201.18.0">nginx 1.18.0</a> Ubuntu"#,
             "Linux · host-7.example.net",
             "cpe:/a:nginx:nginx:1.18.0",
             "Title</strong> PentAGI &#60;b&#62;&#38;&#60;/b&#62; friends",

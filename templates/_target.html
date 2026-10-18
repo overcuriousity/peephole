@@ -27,7 +27,7 @@
   {% endif %}
   {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
   {% for sc in adm.scans %}
-    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {{ sc.s.os_guess.as_deref().unwrap_or("OS unknown") }} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
+    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {% if let Some(os) = sc.s.os_guess %}<a href="{{ crate::admin::views::pivot_href("os", os.as_str()) }}">{{ os }}</a>{% else %}OS unknown{% endif %} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
       {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
     {% let ports = sc.ports %}{% include "_ports.html" %}
   {% endfor %}
@@ -60,14 +60,14 @@
   {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
   <h3>Uploads</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Kind</th><th>Type</th><th></th></tr></thead><tbody>
-  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono" title="{{ u.hash() }}">{{ u.hash()[..12] }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
+  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
   </tbody></table></div>
   {% if more_ups %}<p><a href="/admin/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
   {% endif %}
   {% let (cmds, more_cmds) = adm.webshell_shown() %}{% if !cmds.is_empty() %}
   <h3>Webshell commands</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>Verb</th><th></th></tr></thead><tbody>
-  {% for w in cmds %}<tr><td class="mono">{{ w.ts }}</td><td class="mono" title="{{ w.command }}">{{ w.verb() }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ w.request_id }}">inspect</a></td></tr>{% endfor %}
+  {% for w in cmds %}<tr><td class="mono">{{ w.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("cmd", w.command.trim()) }}" title="{{ w.command }}">{{ w.verb() }}</a></td><td><a class="btn btn-sm btn-ghost" href="/admin/requests/{{ w.request_id }}">inspect</a></td></tr>{% endfor %}
   </tbody></table></div>
   {% if more_cmds %}<p><a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=webshell">All its webshell requests →</a></p>{% endif %}
   {% endif %}

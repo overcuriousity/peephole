@@ -37,6 +37,19 @@ pub struct ListQuery {
     /// Only this address's uploads (the IP page links here).
     #[serde(default)]
     ip: Option<String>,
+    /// Only this content's uploads, as 64 hex digits (the hash pivots
+    /// link here).
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+/// A `sha256` query value as its 32 bytes; anything else is a 400.
+fn sha256_param(h: &str) -> AppResult<Vec<u8>> {
+    data_encoding::HEXLOWER
+        .decode(h.trim().to_ascii_lowercase().as_bytes())
+        .ok()
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| AppError::BadRequest("sha256 must be 64 hex digits.".into()))
 }
 
 #[derive(Template)]
@@ -47,6 +60,8 @@ struct UploadsPage {
     /// Query string for the pager (ends in `&`).
     qs: String,
     ip: Option<String>,
+    /// The content shown, lowercase hex.
+    sha256: Option<String>,
 }
 
 async fn list(
@@ -55,18 +70,29 @@ async fn list(
     Query(q): Query<ListQuery>,
 ) -> AppResult<Html<String>> {
     let ip = q.ip.filter(|s| !s.trim().is_empty());
+    let hash = match q.sha256.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(h) => Some(sha256_param(h)?),
+        None => None,
+    };
+    let sha256 = hash.as_deref().map(|b| data_encoding::HEXLOWER.encode(b));
     let mut conn = st.store.read.acquire().await?;
+    let mut qs: Vec<(&str, &str)> = Vec::new();
+    if let Some(a) = &ip {
+        qs.push(("ip", a));
+    }
+    if let Some(h) = &sha256 {
+        qs.push(("sha256", h));
+    }
     render(&UploadsPage {
         chrome: Chrome::new(true, "admin"),
-        page: uploads::list(&mut conn, page_num(q.page), ip.as_deref()).await?,
-        qs: match &ip {
-            Some(a) => format!(
-                "{}&",
-                serde_urlencoded::to_string([("ip", a)]).unwrap_or_default()
-            ),
-            None => String::new(),
+        page: uploads::list(&mut conn, page_num(q.page), ip.as_deref(), hash.as_deref()).await?,
+        qs: if qs.is_empty() {
+            String::new()
+        } else {
+            format!("{}&", serde_urlencoded::to_string(qs).unwrap_or_default())
         },
         ip,
+        sha256,
     })
 }
 
@@ -252,6 +278,48 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, get("/admin/uploads/nope"), Body::empty()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The hash is a pivot (MIK-498): it links to the list filtered to
+    /// that content, which lists only it; a value that is no sha256 is a 400.
+    #[tokio::test]
+    async fn the_hash_pivots_to_the_uploads_of_that_content() {
+        let (st, cookie, app, _d) = app().await;
+        let a = upload(&st, "ua", "a.php", b"<?php echo 'a';", true).await;
+        upload(&st, "ub", "b.php", b"<?php echo 'b';", true).await;
+        let hash = data_encoding::HEXLOWER.encode(&a.sha256);
+        let get = |path: String| {
+            Request::get(path)
+                .header("cookie", cookie.clone())
+                .header("sec-fetch-site", "same-origin")
+        };
+        let href = format!("href=\"/admin/uploads?sha256={hash}\"");
+        let (status, _, body) = send(&app, get("/admin/uploads/ua".into()), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&href), "{body}");
+        let (_, _, body) = send(&app, get("/admin/uploads".into()), Body::empty()).await;
+        assert!(body.contains(&href), "{body}");
+
+        for q in [hash.clone(), hash.to_uppercase()] {
+            let (status, _, body) = send(
+                &app,
+                get(format!("/admin/uploads?sha256={q}")),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("/admin/uploads/ua\""), "{body}");
+            assert!(!body.contains("/admin/uploads/ub\""), "{body}");
+        }
+        for bad in ["zz", "abcd", &format!("{hash}00")] {
+            let (status, _, _) = send(
+                &app,
+                get(format!("/admin/uploads?sha256={bad}")),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]
