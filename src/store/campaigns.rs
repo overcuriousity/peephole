@@ -35,6 +35,20 @@ pub const MAX_SHAPES_PER_IP: usize = 2000;
 /// A hard value on more IPs than this is a shared image or default, not an
 /// operator: it forms no edge and is listed as excluded.
 pub const HARD_FANOUT_MAX: usize = 50;
+/// Soft edges two groups of two or more IPs need between them to merge.
+pub const K_SOFT_MERGE: usize = 2;
+/// Fewest shared shapes a pair needs for an order term.
+pub const ORDER_MIN_SHARED: usize = 8;
+/// Fewest untied pairs of shared shapes a pair needs for an order term (8
+/// distinct ranks).
+pub const ORDER_MIN_PAIRS: usize = 28;
+/// The rarest shared shapes the order term looks at.
+pub const ORDER_MAX: usize = 500;
+/// An order agreement at or above this supports a pair like a shared JA4
+/// and JA4H.
+pub const ORDER_AGREE: f64 = 0.5;
+/// An order agreement at or below this: the pair forms no edge.
+pub const ORDER_VETO: f64 = -0.3;
 /// How often maintenance recomputes (when the inputs changed).
 pub const RECOMPUTE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -43,6 +57,32 @@ const KEY_SIGNATURE: &str = "campaigns.signature";
 /// The last pass's [`Report`] as JSON (`settings`).
 const KEY_REPORT: &str = "campaigns.report";
 const PATHS: &str = "paths";
+
+/// The knobs of [`compute`]: whether the order of the shared shapes counts
+/// (`agree` and `veto` apply only then) and how many soft edges two groups
+/// need to merge (`None`: one, as in v1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Params {
+    pub order: bool,
+    pub agree: f64,
+    pub veto: Option<f64>,
+    pub guard: Option<usize>,
+}
+
+impl Params {
+    pub const V1: Params = Params {
+        order: false,
+        agree: ORDER_AGREE,
+        veto: Some(ORDER_VETO),
+        guard: None,
+    };
+    pub const V2: Params = Params {
+        order: true,
+        agree: ORDER_AGREE,
+        veto: Some(ORDER_VETO),
+        guard: Some(K_SOFT_MERGE),
+    };
+}
 
 /// What one pass did.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -60,6 +100,18 @@ pub struct Report {
     /// before it was recorded.
     #[serde(default)]
     pub at: Option<String>,
+    /// Soft edges between groups that did not merge (not stored).
+    #[serde(default)]
+    pub withheld: usize,
+    /// Candidate pairs whose shapes came in opposite orders.
+    #[serde(default)]
+    pub vetoed: usize,
+    /// Pairs whose shape sets scored high enough for the order term.
+    #[serde(default)]
+    pub candidates: usize,
+    /// Of those, the pairs with an order agreement.
+    #[serde(default)]
+    pub ordered: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -88,6 +140,11 @@ impl std::fmt::Display for Report {
             } else {
                 edges.join(", ")
             }
+        )?;
+        writeln!(
+            f,
+            "withheld soft edges {}, vetoed pairs {}, order known for {} of {} candidate pairs",
+            self.withheld, self.vetoed, self.ordered, self.candidates
         )?;
         write!(f, "excluded values (on more than {HARD_FANOUT_MAX} IPs): ")?;
         if self.excluded.is_empty() {
@@ -227,6 +284,11 @@ impl Store {
     /// then one write transaction). Unless `force`, does nothing when the
     /// inputs' signature is the last pass's.
     pub async fn recompute_campaigns(&self, force: bool) -> Result<Report> {
+        self.recompute_with(force, &Params::V1).await
+    }
+
+    /// [`Self::recompute_campaigns`] with the given parameters.
+    pub(crate) async fn recompute_with(&self, force: bool, p: &Params) -> Result<Report> {
         let started = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
         let sig = signature(&mut tx).await?;
@@ -246,7 +308,7 @@ impl Store {
         }
         let input = Input::read(&mut tx).await?;
         tx.rollback().await?;
-        let out = compute(&input);
+        let out = compute(&input, p);
         let now = super::data::now_ts();
 
         let mut report = Report {
@@ -257,6 +319,10 @@ impl Store {
             excluded: out.excluded.clone(),
             seconds: 0.0,
             at: Some(now.clone()),
+            withheld: out.withheld,
+            vetoed: out.vetoed,
+            candidates: out.candidates,
+            ordered: out.ordered,
         };
         for e in &out.edges {
             *report.edges.entry(e.kind.to_string()).or_default() += 1;
@@ -606,6 +672,9 @@ struct EdgeOut {
     score: Option<f64>,
     shared: Option<i64>,
     fp_support: bool,
+    /// Not stored yet (campaign v2, S3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    agreement: Option<f64>,
     first_ts: String,
     last_ts: String,
 }
@@ -616,6 +685,11 @@ struct Output {
     members: Vec<(i64, String)>,
     edges: Vec<EdgeOut>,
     excluded: Vec<Excluded>,
+    /// As in [`Report`].
+    withheld: usize,
+    vetoed: usize,
+    candidates: usize,
+    ordered: usize,
 }
 
 /// An edge between nodes `a < b` (indexes in IP-text order).
@@ -627,6 +701,7 @@ struct Link {
     score: Option<f64>,
     shared: Option<i64>,
     fp_support: bool,
+    agreement: Option<f64>,
     first: Option<String>,
     last: Option<String>,
 }
@@ -676,9 +751,45 @@ fn find(parent: &mut [usize], mut i: usize) -> usize {
     i
 }
 
+/// How far two IPs first asked for their shared shapes in the same order,
+/// from −1 (reversed) to 1, over `(shape, first time a, first time b)` and
+/// a shape's document frequency: concordant minus discordant over the pairs
+/// of shapes ordered on both sides (a tie on either side tells nothing).
+/// `None` with fewer than [`ORDER_MIN_SHARED`] shapes or
+/// [`ORDER_MIN_PAIRS`] untied pairs; only the [`ORDER_MAX`] rarest count.
+fn order_agreement(shared: &[(i64, &str, &str)], df: impl Fn(i64) -> usize) -> Option<f64> {
+    if shared.len() < ORDER_MIN_SHARED {
+        return None;
+    }
+    let mut v = shared.to_vec();
+    if v.len() > ORDER_MAX {
+        v.sort_by_key(|x| (df(x.0), x.0));
+        v.truncate(ORDER_MAX);
+    }
+    let (mut concordant, mut discordant) = (0usize, 0usize);
+    for (i, x) in v.iter().enumerate() {
+        for y in &v[i + 1..] {
+            let (a, b) = (x.1.cmp(y.1), x.2.cmp(y.2));
+            if a.is_eq() || b.is_eq() {
+                continue;
+            }
+            if a == b {
+                concordant += 1;
+            } else {
+                discordant += 1;
+            }
+        }
+    }
+    let effective = concordant + discordant;
+    if effective < ORDER_MIN_PAIRS {
+        return None;
+    }
+    Some((concordant as f64 - discordant as f64) / effective as f64)
+}
+
 /// The campaigns `input` makes; a pure function of the rows (ids are only
 /// carried through, never compared).
-fn compute(input: &Input) -> Output {
+fn compute(input: &Input, p: &Params) -> Output {
     // The universe in IP-text order: node i is `nodes[i]`.
     let mut ids: BTreeSet<i64> = input.sightings.iter().map(|s| s.2).collect();
     ids.extend(input.shapes.iter().map(|s| s.0));
@@ -730,6 +841,7 @@ fn compute(input: &Input) -> Output {
                     score: None,
                     shared: None,
                     fp_support: false,
+                    agreement: None,
                     first: span.0,
                     last: span.1,
                 });
@@ -786,6 +898,7 @@ fn compute(input: &Input) -> Output {
             tls[i].insert((ja4, ja4h));
         }
     }
+    let (mut vetoed, mut candidates, mut ordered) = (0, 0, 0);
     for (a, b) in pairs {
         if apart(&path_active[a], &path_active[b]) {
             continue;
@@ -795,6 +908,8 @@ fn compute(input: &Input) -> Output {
         let (mut shared_w, mut union_w) = (0.0, 0.0);
         let (mut shared, mut shared_rare) = (0i64, 0usize);
         let mut span: Span = (None, None);
+        // (shape, first asked by a, by b), for the order term.
+        let mut firsts: Vec<(i64, &str, &str)> = vec![];
         while x < sa.len() || y < sb.len() {
             let ord = match (sa.get(x), sb.get(y)) {
                 (Some(p), Some(q)) => p.0.cmp(&q.0),
@@ -811,13 +926,16 @@ fn compute(input: &Input) -> Output {
                     y += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    let (p, q) = (sa[x], sb[y]);
-                    let w = weight(p.0);
+                    let (q, r) = (sa[x], sb[y]);
+                    let w = weight(q.0);
                     shared_w += w;
                     union_w += w;
                     shared += 1;
-                    shared_rare += rare(p.0) as usize;
-                    widen(&mut span, Some(p.1.min(q.1)), Some(p.2.max(q.2)));
+                    shared_rare += rare(q.0) as usize;
+                    widen(&mut span, Some(q.1.min(r.1)), Some(q.2.max(r.2)));
+                    if p.order {
+                        firsts.push((q.0, q.1, r.1));
+                    }
                     x += 1;
                     y += 1;
                 }
@@ -830,14 +948,22 @@ fn compute(input: &Input) -> Output {
         if score < PATHS_T_SUPPORTED {
             continue;
         }
-        let fp_support = tls[a].iter().any(|p| tls[b].contains(p));
-        if score
-            < if fp_support {
-                PATHS_T_SUPPORTED
-            } else {
-                PATHS_T
-            }
+        candidates += 1;
+        let agreement = if p.order {
+            order_agreement(&firsts, |s| df[&s].len())
+        } else {
+            None
+        };
+        ordered += agreement.is_some() as usize;
+        if let (Some(veto), Some(agree)) = (p.veto, agreement)
+            && agree <= veto
         {
+            vetoed += 1;
+            continue;
+        }
+        let fp_support = tls[a].iter().any(|p| tls[b].contains(p));
+        let support = fp_support || agreement.is_some_and(|x| x >= p.agree);
+        if score < if support { PATHS_T_SUPPORTED } else { PATHS_T } {
             continue;
         }
         links.push(Link {
@@ -848,18 +974,56 @@ fn compute(input: &Input) -> Output {
             score: Some(score),
             shared: Some(shared),
             fp_support,
+            agreement,
             first: span.0,
             last: span.1,
         });
     }
 
-    // Components of two or more nodes.
+    // Components of two or more nodes: hard links first, then (with a
+    // guard) soft links only where they join a group strongly enough.
     let mut parent: Vec<usize> = (0..n).collect();
-    for l in &links {
+    let mut size: Vec<usize> = vec![1; n];
+    let union = |parent: &mut [usize], size: &mut [usize], ra: usize, rb: usize| {
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        parent[hi] = lo;
+        size[lo] += size[hi];
+    };
+    for l in links
+        .iter()
+        .filter(|l| p.guard.is_none() || l.kind != PATHS)
+    {
         let (ra, rb) = (find(&mut parent, l.a), find(&mut parent, l.b));
         if ra != rb {
-            parent[ra.max(rb)] = ra.min(rb);
+            union(&mut parent, &mut size, ra, rb);
         }
+    }
+    let mut withheld = 0;
+    if let Some(k) = p.guard {
+        // One merge per round: the pair of groups with the most soft links
+        // between them, ties by root IP text, among those with at least
+        // min(size, size, k); until none qualifies.
+        loop {
+            let mut support: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+            for l in links.iter().filter(|l| l.kind == PATHS) {
+                let (ra, rb) = (find(&mut parent, l.a), find(&mut parent, l.b));
+                if ra != rb {
+                    *support.entry((ra.min(rb), ra.max(rb))).or_default() += 1;
+                }
+            }
+            let best = support
+                .into_iter()
+                .filter(|&((ra, rb), count)| count >= size[ra].min(size[rb]).min(k))
+                .min_by_key(|&((ra, rb), count)| {
+                    (std::cmp::Reverse(count), nodes[ra].0, nodes[rb].0)
+                });
+            let Some(((ra, rb), _)) = best else { break };
+            union(&mut parent, &mut size, ra, rb);
+        }
+        // Soft links between groups that stayed apart are not edges.
+        let before = links.len();
+        links.retain(|l| l.kind != PATHS || find(&mut parent, l.a) == find(&mut parent, l.b));
+        withheld = before - links.len();
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..n {
@@ -934,6 +1098,7 @@ fn compute(input: &Input) -> Output {
             score: l.score,
             shared: l.shared,
             fp_support: l.fp_support,
+            agreement: l.agreement,
             first_ts: l.first.unwrap_or_default(),
             last_ts: l.last.unwrap_or_default(),
         })
@@ -943,6 +1108,10 @@ fn compute(input: &Input) -> Output {
         members,
         edges,
         excluded,
+        withheld,
+        vetoed,
+        candidates,
+        ordered,
     }
 }
 
@@ -1302,6 +1471,22 @@ pub(crate) mod tests {
         // And again, the same.
         s1.recompute_campaigns(true).await.unwrap();
         assert_eq!(d1, dump(&s1).await);
+
+        // The same under v2, with the v2 fixtures too.
+        let all = || fixture().into_iter().chain(v2_fixtures());
+        let (s3, _d3) = store().await;
+        let (s4, _d4) = store().await;
+        feed(&s3, all()).await;
+        feed(&s4, all().collect::<Vec<_>>().into_iter().rev()).await;
+        tls_fixture(&s3).await;
+        tls_fixture(&s4).await;
+        let r = s3.recompute_with(false, &Params::V2).await.unwrap();
+        assert!(r.vetoed > 0 && r.ordered > 0, "{r}");
+        s4.recompute_with(false, &Params::V2).await.unwrap();
+        let d3 = dump(&s3).await;
+        assert_eq!(d3, dump(&s4).await);
+        s3.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(d3, dump(&s3).await);
     }
 
     #[tokio::test]
@@ -1465,5 +1650,288 @@ pub(crate) mod tests {
         assert_eq!(cal.len(), 1);
         assert_eq!(cal[0].count, 3);
         assert!(s.campaign_shapes("nope").await.unwrap().is_empty());
+    }
+
+    /// What a pass under `p` would write, before storage.
+    async fn computed(s: &Store, p: &Params) -> Output {
+        let mut conn = s.pool.acquire().await.unwrap();
+        compute(&Input::read(&mut conn).await.unwrap(), p)
+    }
+
+    /// `n` paths `/{tag}/{word}`.
+    fn paths(tag: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("/{tag}/{}", word(i))).collect()
+    }
+
+    /// One request per second from `start`, in list order.
+    fn ordered(ip: &str, start: &str, paths: &[String]) -> Vec<Op> {
+        let t0 = chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%d %H:%M:%S").unwrap();
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ts = t0 + chrono::Duration::seconds(i as i64);
+                req(ip, &ts.format("%Y-%m-%d %H:%M:%S").to_string(), p)
+            })
+            .collect()
+    }
+
+    /// The same five paths from each IP, all in one second.
+    fn sweep(ips: &[&str], tag: &str) -> Vec<Op> {
+        let paths = paths(tag, 5);
+        ips.iter()
+            .flat_map(|ip| paths.iter().map(|p| req(ip, "2026-10-04 11:00:00", p)))
+            .collect()
+    }
+
+    /// Three IPs on one SSH host key.
+    fn group(ips: [&'static str; 3], key: &str) -> Vec<Op> {
+        ips.map(|ip| {
+            Op::Key(
+                ip,
+                "ssh-hostkey",
+                format!("SHA256:{key}"),
+                "2026-10-04 00:00:00",
+            )
+        })
+        .into()
+    }
+
+    /// Two pairs sharing 12 rare shapes over distinct seconds, each IP
+    /// with 3 own shapes (alone, a score of about 0.58): .60 and .61 in the
+    /// same order, .62 and .63 in reversed order.
+    fn order_fixture() -> Vec<Op> {
+        let mut ops = vec![];
+        for (tag, ips, reverse) in [
+            ("osame", ["192.0.2.60", "192.0.2.61"], false),
+            ("orev", ["192.0.2.62", "192.0.2.63"], true),
+        ] {
+            for (side, ip) in ips.iter().enumerate() {
+                let mut list = paths(tag, 12);
+                if reverse && side == 1 {
+                    list.reverse();
+                }
+                list.extend(paths(&format!("{tag}own{}", ["x", "y"][side]), 3));
+                ops.extend(ordered(ip, "2026-10-04 12:00:00", &list));
+            }
+        }
+        ops
+    }
+
+    /// Two IPs with the same 12 rare shapes, reversed, nothing else.
+    fn reversed_fixture() -> Vec<Op> {
+        let list = paths("rrev", 12);
+        let mut ops = ordered("192.0.2.70", "2026-10-04 12:00:00", &list);
+        let rev: Vec<String> = list.into_iter().rev().collect();
+        ops.extend(ordered("192.0.2.71", "2026-10-04 12:00:00", &rev));
+        ops
+    }
+
+    const H1: [&str; 3] = ["192.0.2.80", "192.0.2.81", "192.0.2.82"];
+    const H2: [&str; 3] = ["192.0.2.83", "192.0.2.84", "192.0.2.85"];
+
+    /// Hard groups H1 and H2 with a sweep between their first IPs, and
+    /// with `second`, another between their second ones.
+    fn chain_fixture(second: bool) -> Vec<Op> {
+        let mut ops = group(H1, "hone");
+        ops.extend(group(H2, "htwo"));
+        ops.extend(sweep(&[H1[0], H2[0]], "gone"));
+        if second {
+            ops.extend(sweep(&[H1[1], H2[1]], "gtwo"));
+        }
+        ops
+    }
+
+    /// Hard groups A, B, C with two soft edges A–B, two B–C, one A–C.
+    fn three_groups_fixture() -> Vec<Op> {
+        let a = ["203.0.113.1", "203.0.113.2", "203.0.113.3"];
+        let b = ["203.0.113.4", "203.0.113.5", "203.0.113.6"];
+        let c = ["203.0.113.7", "203.0.113.8", "203.0.113.9"];
+        let mut ops = group(a, "ga");
+        ops.extend(group(b, "gb"));
+        ops.extend(group(c, "gc"));
+        // a1–b1, b1–c1, a1–c1.
+        ops.extend(sweep(&[a[0], b[0], c[0]], "tabc"));
+        ops.extend(sweep(&[a[1], b[1]], "tab"));
+        ops.extend(sweep(&[b[2], c[1]], "tbc"));
+        ops
+    }
+
+    fn v2_fixtures() -> Vec<Op> {
+        let mut ops = order_fixture();
+        ops.extend(reversed_fixture());
+        ops.extend(chain_fixture(true));
+        ops.extend(three_groups_fixture());
+        ops
+    }
+
+    /// 2026-10-04 12:mm:ss, `i` seconds in.
+    fn at(i: usize) -> String {
+        format!("2026-10-04 12:{:02}:{:02}", i / 60, i % 60)
+    }
+
+    /// Order agreement of shapes 0.. ranked `(on a, on b)`.
+    fn agreement(ranks: &[(usize, usize)], df: impl Fn(i64) -> usize) -> Option<f64> {
+        let ts: Vec<(i64, String, String)> = ranks
+            .iter()
+            .enumerate()
+            .map(|(s, &(x, y))| (s as i64, at(x), at(y)))
+            .collect();
+        let v: Vec<(i64, &str, &str)> = ts.iter().map(|(s, x, y)| (*s, &**x, &**y)).collect();
+        order_agreement(&v, df)
+    }
+
+    #[test]
+    fn order_agreement_is_none_below_eight_shared() {
+        let ranks: Vec<_> = (0..7).map(|i| (i, i)).collect();
+        assert_eq!(agreement(&ranks, |_| 2), None);
+    }
+
+    #[test]
+    fn order_agreement_is_none_when_one_side_is_all_ties() {
+        let ranks: Vec<_> = (0..12).map(|i| (i, 0)).collect();
+        assert_eq!(agreement(&ranks, |_| 2), None);
+    }
+
+    #[test]
+    fn identical_order_is_one_and_reversed_is_minus_one() {
+        let same: Vec<_> = (0..12).map(|i| (i, i)).collect();
+        assert_eq!(agreement(&same, |_| 2), Some(1.0));
+        let reversed: Vec<_> = (0..12).map(|i| (i, 11 - i)).collect();
+        assert_eq!(agreement(&reversed, |_| 2), Some(-1.0));
+    }
+
+    #[test]
+    fn one_neighbour_swap_moves_agreement_by_two_over_pairs() {
+        let ranks: Vec<_> = (0..12)
+            .map(|i| match i {
+                5 => (5, 6),
+                6 => (6, 5),
+                _ => (i, i),
+            })
+            .collect();
+        let got = agreement(&ranks, |_| 2).unwrap();
+        assert!((got - (1.0 - 2.0 / 66.0)).abs() < 1e-12, "{got}");
+    }
+
+    #[test]
+    fn more_than_order_max_keeps_the_rarest() {
+        // Shapes 0..100 are the commonest and reversed; the 500 others agree.
+        let ranks: Vec<_> = (0..600)
+            .map(|i| (i, if i < 100 { 599 - i } else { i }))
+            .collect();
+        let df = |s: i64| if s < 100 { 1000 } else { 1 };
+        assert_eq!(agreement(&ranks, df), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn same_order_supports_a_pair_below_the_threshold() {
+        let (s, _d) = store().await;
+        feed(&s, order_fixture()).await;
+        let r = s.recompute_with(true, &Params::V1).await.unwrap();
+        assert_eq!(r.campaigns, 0, "below PATHS_T without support: {r}");
+
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!((r.campaigns, r.vetoed), (1, 1), "{r}");
+        assert_eq!((r.ordered, r.candidates), (2, 2), "{r}");
+        let c = s.campaign("192.0.2.60").await.unwrap().unwrap();
+        assert_eq!(c.row.size, 2);
+        assert_eq!(c.edges.len(), 1);
+        let e = &c.edges[0];
+        assert_eq!((e.kind.as_str(), e.b.as_str()), ("paths", "192.0.2.61"));
+        assert!(!e.fp_support);
+        let score = e.score.unwrap();
+        assert!((PATHS_T_SUPPORTED..PATHS_T).contains(&score), "{score}");
+        // The reversed twin forms no edge.
+        for ip in ["192.0.2.62", "192.0.2.63"] {
+            assert_eq!(s.campaign_of_ip(ip_id(&s, ip).await).await.unwrap(), None);
+        }
+        let out = computed(&s, &Params::V2).await;
+        assert_eq!(out.edges.len(), 1);
+        assert!(out.edges[0].agreement.unwrap() >= ORDER_AGREE);
+    }
+
+    #[tokio::test]
+    async fn ties_in_the_same_second_decide_by_score_alone() {
+        // Today's fixture puts each sweep in one second: v2 stores what v1
+        // does, and no edge has an order agreement.
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        tls_fixture(&s).await;
+        s.recompute_with(true, &Params::V1).await.unwrap();
+        let v1 = dump(&s).await;
+        assert_eq!(v1.0.len(), 3);
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(dump(&s).await, v1);
+        assert_eq!((r.withheld, r.vetoed, r.ordered), (0, 0, 0), "{r}");
+        assert!(r.candidates > 0, "{r}");
+        let out = computed(&s, &Params::V2).await;
+        assert!(!out.edges.is_empty());
+        assert!(out.edges.iter().all(|e| e.agreement.is_none()));
+    }
+
+    #[tokio::test]
+    async fn reversed_order_vetoes_an_identical_set() {
+        let (s, _d) = store().await;
+        feed(&s, reversed_fixture()).await;
+        let r = s.recompute_with(true, &Params::V1).await.unwrap();
+        assert_eq!(r.campaigns, 1, "{r}");
+        assert_eq!(r.edges, BTreeMap::from([("paths".to_string(), 1)]));
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!((r.campaigns, r.edges.len(), r.vetoed), (0, 0, 1), "{r}");
+    }
+
+    /// Campaign sizes and soft edge counts, by key.
+    fn shape_of(d: &Dump) -> Vec<(i64, i64)> {
+        d.0.iter().map(|c| (c.3, c.7)).collect()
+    }
+
+    #[tokio::test]
+    async fn one_soft_edge_does_not_chain_two_hard_groups() {
+        let (s, _d) = store().await;
+        feed(&s, chain_fixture(false)).await;
+        let r = s.recompute_with(true, &Params::V1).await.unwrap();
+        assert_eq!(shape_of(&dump(&s).await), [(6, 1)], "{r}");
+
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(r.withheld, 1, "{r}");
+        let d = dump(&s).await;
+        assert_eq!(shape_of(&d), [(3, 0), (3, 0)]);
+        assert!(d.2.iter().all(|e| e.2 != "paths"), "{:?}", d.2);
+    }
+
+    #[tokio::test]
+    async fn k_soft_edges_merge_two_hard_groups() {
+        let (s, _d) = store().await;
+        feed(&s, chain_fixture(true)).await;
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(r.withheld, 0, "{r}");
+        assert_eq!(shape_of(&dump(&s).await), [(6, 2)]);
+    }
+
+    #[tokio::test]
+    async fn a_singleton_joins_a_group_on_one_soft_edge() {
+        let (s, _d) = store().await;
+        let mut ops = group(H1, "hone");
+        ops.extend(sweep(&[H1[0], "192.0.2.86"], "gone"));
+        feed(&s, ops).await;
+        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(r.withheld, 0, "{r}");
+        assert_eq!(shape_of(&dump(&s).await), [(4, 1)]);
+    }
+
+    #[tokio::test]
+    async fn merges_go_by_support_then_ip_text() {
+        let (s1, _d1) = store().await;
+        let (s2, _d2) = store().await;
+        feed(&s1, three_groups_fixture()).await;
+        feed(&s2, three_groups_fixture().into_iter().rev()).await;
+        let r = s1.recompute_with(true, &Params::V2).await.unwrap();
+        assert_eq!(r.withheld, 0, "{r}");
+        s2.recompute_with(true, &Params::V2).await.unwrap();
+        let d = dump(&s1).await;
+        // A–B first (two edges each way, A's root first), then C on three.
+        assert_eq!(shape_of(&d), [(9, 5)]);
+        assert_eq!(d, dump(&s2).await);
     }
 }
