@@ -235,7 +235,8 @@ impl WebshellHit {
 
 impl Store {
     /// Up to `limit` of the commands an address sent dropped webshells,
-    /// newest first. A request without a readable command is left out.
+    /// newest first. A request without a readable command is left out after
+    /// the `LIMIT`, so fewer than `limit` can come back while more exist.
     pub async fn webshell_hits_for_ip(&self, ip_id: i64, limit: i64) -> Result<Vec<WebshellHit>> {
         type Row = (i64, String, Option<String>, Option<Vec<u8>>);
         let rows: Vec<Row> = sqlx::query_as(

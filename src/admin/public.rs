@@ -1656,6 +1656,8 @@ show_labels = {show_labels}
         assert!(html.contains("Uploads and webshell commands"), "{html}");
         assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
         assert!(html.contains(">whoami</td>"), "{html}");
+        // The kind is the stored string, whatever it is.
+        assert!(html.contains("<td class=\"mono\">put</td>"), "{html}");
         assert!(!html.contains("All its uploads"), "{html}");
         assert!(!html.contains("All its webshell requests"), "{html}");
         // The public page has none of it.
@@ -1740,6 +1742,10 @@ show_labels = {show_labels}
         let (status, up) = get_with(&app, &format!("/admin/requests/{up_id}"), Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(up.contains(&format!("/admin/uploads/{uid}\"")), "{up}");
+        assert!(
+            up.contains("bytes · <span class=\"mono\">put</span>"),
+            "{up}"
+        );
         assert!(up.contains("member of campaign #7"), "{up}");
         assert!(!up.contains("Webshell command"), "{up}");
         let (_, cmd) = get_with(&app, &format!("/admin/requests/{cmd_id}"), Some(&cookie)).await;

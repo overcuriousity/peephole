@@ -59,8 +59,8 @@
   <div class="card-head"><h2>Uploads and webshell commands</h2></div>
   {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
   <h3>Uploads</h3>
-  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Type</th><th></th></tr></thead><tbody>
-  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono" title="{{ u.hash() }}">{{ u.hash()[..12] }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
+  <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Kind</th><th>Type</th><th></th></tr></thead><tbody>
+  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono" title="{{ u.hash() }}">{{ u.hash()[..12] }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
   </tbody></table></div>
   {% if more_ups %}<p><a href="/admin/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
   {% endif %}
