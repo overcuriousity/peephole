@@ -34,6 +34,9 @@ pub fn routes() -> Router<Arc<AdminState>> {
 pub struct ListQuery {
     #[serde(default, deserialize_with = "lenient_i64")]
     page: Option<i64>,
+    /// Only this address's uploads (the IP page links here).
+    #[serde(default)]
+    ip: Option<String>,
 }
 
 #[derive(Template)]
@@ -41,8 +44,9 @@ pub struct ListQuery {
 struct UploadsPage {
     chrome: Chrome,
     page: Page<UploadRow>,
-    /// Query string for the pager (ends in `&`; none here).
+    /// Query string for the pager (ends in `&`).
     qs: String,
+    ip: Option<String>,
 }
 
 async fn list(
@@ -50,11 +54,19 @@ async fn list(
     State(st): State<Arc<AdminState>>,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Html<String>> {
+    let ip = q.ip.filter(|s| !s.trim().is_empty());
     let mut conn = st.store.read.acquire().await?;
     render(&UploadsPage {
         chrome: Chrome::new(true, "admin"),
-        page: uploads::list(&mut conn, page_num(q.page)).await?,
-        qs: String::new(),
+        page: uploads::list(&mut conn, page_num(q.page), ip.as_deref()).await?,
+        qs: match &ip {
+            Some(a) => format!(
+                "{}&",
+                serde_urlencoded::to_string([("ip", a)]).unwrap_or_default()
+            ),
+            None => String::new(),
+        },
+        ip,
     })
 }
 
