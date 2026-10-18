@@ -30,6 +30,15 @@ async fn spawn(extra: &str) -> (String, Store, tempfile::TempDir) {
 /// [`spawn`], with the trap's state; `settled` answers once the records
 /// are written, else as soon as the answer is ready.
 async fn serve(extra: &str, settled: bool) -> (String, Store, tempfile::TempDir, Arc<TrapState>) {
+    serve_with(extra, settled, false).await
+}
+
+/// [`serve`], with the tarpit `extra` sets up if `tarpit`, else none.
+async fn serve_with(
+    extra: &str,
+    settled: bool,
+    tarpit: bool,
+) -> (String, Store, tempfile::TempDir, Arc<TrapState>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg_text = format!(
         r#"
@@ -48,7 +57,12 @@ web = false
     std::fs::write(&cfg_path, cfg_text).unwrap();
     let cfg = Config::load(&cfg_path).unwrap();
     let store = Store::connect(&cfg.database_path).await.unwrap();
-    let state = Arc::new(TrapState::for_test(store.clone(), cfg));
+    let tarpit = tarpit.then(|| Arc::new(trap::tarpit::Tarpit::of(&cfg)));
+    let base = TrapState::for_test(store.clone(), cfg);
+    let state = Arc::new(match tarpit {
+        Some(tarpit) => TrapState { tarpit, ..base },
+        None => base,
+    });
     let app = if settled {
         settled_router(state.clone())
     } else {
@@ -631,4 +645,63 @@ async fn a_plugin_folder_answers_and_is_loaded_again() {
             .is_some()
     );
     assert!(loaded.lookup("/wp-content/plugins/other/x.php").is_none());
+}
+
+/// A tarpit holding one connection per source.
+const TARPIT: &str = "[trap]\nrecord_rate = 0\ntarpit_pool = 2\ntarpit_per_source = 1\n";
+
+#[tokio::test]
+async fn a_tarpitted_source_still_drops_its_file() {
+    let (base, store, _dir, state) = serve_with(TARPIT, true, true).await;
+    let ip = "8.8.8.8";
+    state.tarpit.mark(ip.parse().unwrap());
+    let (ct, b) = multipart("upfile", "x.php", b"<?php MARKt4 ?>");
+    let r = send(
+        &base,
+        "POST",
+        "/module/ueditor/php/action_upload.php",
+        ip,
+        Some(&ct),
+        b,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let rows = uploads(&store).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind.as_str(), rows[0].ip.as_str()), ("script", ip));
+    let answer: String = sqlx::query_scalar("SELECT answer FROM requests WHERE uid = ?")
+        .bind(&rows[0].request_uid)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(answer, "upload:script");
+    // The hold was not taken: the source's next request is tarpitted.
+    assert_eq!(state.tarpit.status().held, 0);
+    assert!(state.tarpit.take(ip.parse().unwrap()).is_some());
+}
+
+#[tokio::test]
+async fn a_tarpitted_source_gets_the_file_manager_unchanged_by_uploads() {
+    let (base, store, _dir, state) = serve_with(TARPIT, true, true).await;
+    let ip = "8.8.8.8";
+    state.tarpit.mark(ip.parse().unwrap());
+    let page = "/hellopress/wp_filemanager.php";
+    let r = send(&base, "GET", page, ip, None, vec![]).await;
+    assert_eq!(r.status(), 200);
+    let first = r.text().await.unwrap();
+    assert!(first.contains("enctype=\"multipart/form-data\""), "{first}");
+    let (ct, b) = multipart("upload[]", "fm.php", b"<?php MARKfm ?>");
+    let r = send(&base, "POST", "/filemanager/upload.php", ip, Some(&ct), b).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(uploads(&store).await.len(), 1);
+    let again = send(&base, "GET", page, ip, None, vec![]).await;
+    assert_eq!(again.text().await.unwrap(), first);
+    let answers: Vec<String> =
+        sqlx::query_scalar("SELECT answer FROM requests WHERE path = ? ORDER BY id")
+            .bind(page)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(answers, ["decoy:file-manager", "decoy:file-manager"]);
+    assert_eq!(state.tarpit.status().held, 0);
 }

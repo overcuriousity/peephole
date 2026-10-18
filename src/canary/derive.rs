@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 /// Version of the decoy templates this build serves (`requests.decoy_v`).
 /// A change to any template or to [`value`] bumps it.
-pub const DECOY_V: i64 = 3;
+pub const DECOY_V: i64 = 4;
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -197,7 +197,7 @@ pub fn served(
                 _ => vec![],
             }
         }
-        1..=3 => {
+        1..=4 => {
             let mut out = match decoy {
                 "dotenv" => v(&DOTENV),
                 "git-config" => v(&[Kind::GitToken]),
@@ -386,6 +386,11 @@ mod tests {
         );
         assert!(served(Some(1), TOK, "phpinfo", None).is_empty());
         assert!(served(Some(1), TOK, "wp-login-failed", None).is_empty());
+        assert!(served(Some(4), TOK, "file-manager", None).is_empty());
+        assert_eq!(
+            served(Some(4), TOK, "dotenv", None),
+            served(Some(3), TOK, "dotenv", None)
+        );
         assert!(
             served(Some(9), TOK, "dotenv", None).is_empty(),
             "unknown versions serve nothing known"

@@ -160,6 +160,12 @@ struct RequestPage {
     return_host: Option<String>,
     /// Reuses where this request is either side.
     reuses: Vec<crate::store::canaries::Reuse>,
+    /// The uploads it carried.
+    uploads: Vec<crate::store::uploads::UploadRow>,
+    /// The command it sent a dropped webshell, if it was answered as one.
+    webshell_cmd: Option<String>,
+    /// The campaign (key, number) its IP is a member of.
+    campaign: Option<(String, i64)>,
 }
 
 async fn request_page(
@@ -201,6 +207,13 @@ async fn request_page(
             ..Default::default()
         })
         .await?;
+    let uploads = st.store.uploads_of_request(id).await?;
+    let webshell_cmd = (d.row.answer.as_deref() == Some("webshell"))
+        .then(|| {
+            crate::model::webshell::extract_command(d.row.query.as_deref(), d.row.body.as_deref())
+        })
+        .flatten();
+    let campaign = st.store.campaign_of_ip(d.row.ip_id).await?;
     let request_target = match &d.row.query {
         Some(q) => format!("{}?{q}", d.row.path),
         None => d.row.path.clone(),
@@ -220,6 +233,9 @@ async fn request_page(
         served,
         return_host,
         reuses,
+        uploads,
+        webshell_cmd,
+        campaign,
     })
 }
 

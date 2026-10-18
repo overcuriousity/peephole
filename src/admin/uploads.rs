@@ -34,6 +34,9 @@ pub fn routes() -> Router<Arc<AdminState>> {
 pub struct ListQuery {
     #[serde(default, deserialize_with = "lenient_i64")]
     page: Option<i64>,
+    /// Only this address's uploads (the IP page links here).
+    #[serde(default)]
+    ip: Option<String>,
 }
 
 #[derive(Template)]
@@ -41,8 +44,9 @@ pub struct ListQuery {
 struct UploadsPage {
     chrome: Chrome,
     page: Page<UploadRow>,
-    /// Query string for the pager (ends in `&`; none here).
+    /// Query string for the pager (ends in `&`).
     qs: String,
+    ip: Option<String>,
 }
 
 async fn list(
@@ -50,11 +54,19 @@ async fn list(
     State(st): State<Arc<AdminState>>,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Html<String>> {
+    let ip = q.ip.filter(|s| !s.trim().is_empty());
     let mut conn = st.store.read.acquire().await?;
     render(&UploadsPage {
         chrome: Chrome::new(true, "admin"),
-        page: uploads::list(&mut conn, page_num(q.page)).await?,
-        qs: String::new(),
+        page: uploads::list(&mut conn, page_num(q.page), ip.as_deref()).await?,
+        qs: match &ip {
+            Some(a) => format!(
+                "{}&",
+                serde_urlencoded::to_string([("ip", a)]).unwrap_or_default()
+            ),
+            None => String::new(),
+        },
+        ip,
     })
 }
 
@@ -277,7 +289,7 @@ mod tests {
             "no entry opens without the password"
         );
         let mut f = a.by_index_decrypt(0, b"infected").unwrap();
-        assert_eq!(f.name(), format!("{hash}.bin"));
+        assert_eq!(f.name().unwrap(), format!("{hash}.bin"));
         let mut got = vec![];
         std::io::Read::read_to_end(&mut f, &mut got).unwrap();
         assert_eq!(sha2::Sha256::digest(&got).to_vec(), r.sha256);

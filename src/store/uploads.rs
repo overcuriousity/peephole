@@ -582,21 +582,47 @@ const UPLOAD_COLS: &str = "u.uid, u.ts, i.ip, u.kind, u.filename, u.sniffed_type
     (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
     FROM uploads u JOIN ips i ON i.id = u.ip_id";
 
-/// One page of uploads, newest first.
+/// One page of uploads, newest first; with `ip`, only that address's.
 pub async fn list(
     conn: &mut SqliteConnection,
     page: u32,
+    ip: Option<&str>,
 ) -> Result<super::browse::Page<UploadRow>> {
     use super::browse::{PAGE_SIZE, Page, offset};
     let page = page.max(1);
     let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {UPLOAD_COLS} ORDER BY u.id DESC LIMIT ? OFFSET ?"
+        "SELECT {UPLOAD_COLS} WHERE ?1 IS NULL OR i.ip = ?1 ORDER BY u.id DESC LIMIT ?2 OFFSET ?3"
     )))
+    .bind(ip)
     .bind(PAGE_SIZE + 1)
     .bind(offset(page))
     .fetch_all(&mut *conn)
     .await?;
     Ok(Page::from_rows(rows, page))
+}
+
+impl super::Store {
+    /// Up to `limit` of an address's uploads, newest first.
+    pub async fn uploads_for_ip(&self, ip_id: i64, limit: i64) -> Result<Vec<UploadRow>> {
+        Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {UPLOAD_COLS} WHERE u.ip_id = ? ORDER BY u.id DESC LIMIT ?"
+        )))
+        .bind(ip_id)
+        .bind(limit)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
+    /// The uploads a request carried (a form can send several).
+    pub async fn uploads_of_request(&self, request_id: i64) -> Result<Vec<UploadRow>> {
+        Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {UPLOAD_COLS}
+             WHERE u.request_uid = (SELECT uid FROM requests WHERE id = ?) ORDER BY u.id"
+        )))
+        .bind(request_id)
+        .fetch_all(&self.read)
+        .await?)
+    }
 }
 
 pub async fn get(conn: &mut SqliteConnection, uid: &str) -> Result<Option<UploadRow>> {
@@ -1285,7 +1311,7 @@ mod tests {
         assert_eq!((sha, bytes), (held.sha256.clone(), b"kept".to_vec()));
         assert!(content_for_export(&mut c, "g").await.unwrap().is_none());
         assert!(content_for_export(&mut c, "nope").await.unwrap().is_none());
-        let page = list(&mut c, 1).await.unwrap();
+        let page = list(&mut c, 1, None).await.unwrap();
         let got: Vec<_> = page
             .items
             .iter()
