@@ -1,4 +1,5 @@
 pub mod api_v1;
+pub mod asn;
 pub mod assets;
 pub mod auth;
 pub mod blocklist;
@@ -179,6 +180,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(asn::routes())
         .merge(decoys::routes())
         .merge(search::routes())
         .merge(system::routes())

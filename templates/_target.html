@@ -123,7 +123,7 @@
       {% else %}<p class="muted small">None yet.</p>{% endif %}
     </div>
     <div>
-      <h3>Same ASN{% if let Some(a) = t.ov.ip.asn %} · <a href="/ips?asn={{ a }}">AS{{ a }}</a>{% endif %}</h3>
+      <h3>Same ASN{% if let Some(a) = t.ov.ip.asn %} · <a href="{{ t.asn_href(a) }}">AS{{ a }}</a>{% endif %}</h3>
       <div class="big-stat">{{ crate::admin::views::thousands(t.ov.asn_count) }}</div>
       {% if t.ov.ip.asn.is_none() %}<p class="muted small">ASN unknown.</p>{% endif %}
     </div>
