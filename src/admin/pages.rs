@@ -552,7 +552,7 @@ mod short_strings_tests {
             (
                 "/admin/search",
                 &[
-                    "IP, network, <span class=\"mono\">AS123</span>, <span class=\"mono\">#request</span>, <span class=\"mono\">/path</span>, or any fingerprint, key or certificate.",
+                    "IP, network, <span class=\"mono\">AS123</span>, <span class=\"mono\">#request</span>, <span class=\"mono\">/path</span>, <span class=\"mono\">sha256</span>, <span class=\"mono\">#campaign</span>, label, or any fingerprint, key or certificate.",
                 ],
                 &["a path starting with"],
             ),

@@ -151,7 +151,7 @@ fn encrypted_zip(hash: &str, content: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::admin::devices::tests::{app, send};
     use crate::cluster::record::UploadRec;
     use crate::store::data::Ctx;
@@ -161,7 +161,7 @@ mod tests {
     use sha2::Digest;
 
     /// A standalone upload of `content`, held unless `held` is false.
-    async fn upload(
+    pub(crate) async fn upload(
         st: &crate::admin::AdminState,
         uid: &str,
         filename: &str,

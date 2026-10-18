@@ -1,10 +1,12 @@
 {% extends "layout.html" %}
 {% block title %}peephole — search{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>Search</h1><p class="muted">IP, network, <span class="mono">AS123</span>, <span class="mono">#request</span>, <span class="mono">/path</span>, or any fingerprint, key or certificate.</p></div></div>
+<div class="page-head"><div><h1>Search</h1><p class="muted">IP, network, <span class="mono">AS123</span>, <span class="mono">#request</span>, <span class="mono">/path</span>, <span class="mono">sha256</span>, <span class="mono">#campaign</span>, label, or any fingerprint, key or certificate.</p></div></div>
 <section class="card">
 {% if q.is_empty() %}
   <p class="muted">Type something into the search box.</p>
+{% else if let Some(n) = no_campaign %}
+  <p>No campaign #{{ n }}.</p>
 {% else if found.is_empty() %}
   <p>Nothing found for <span class="mono">{{ q }}</span>.</p>
 {% else %}
