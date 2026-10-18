@@ -496,3 +496,231 @@ mod delete_notice_tests {
         assert!(c.len() < 4096, "a long message is cut to fit a cookie");
     }
 }
+
+/// MIK-494: the analyst pages carry the short strings of the MIK-482 plan
+/// (sections 2b and 2c), and the long ones are gone.
+#[cfg(test)]
+mod short_strings_tests {
+    use crate::admin::devices::tests::{app, send};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    #[tokio::test]
+    async fn analyst_pages_carry_the_short_strings() {
+        let (_state, cookie, app, _d) = app().await;
+        let page = |path: &'static str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                let r = Request::get(path)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie);
+                let (st, _, body) = send(&app, r, Body::empty()).await;
+                assert_eq!(st, StatusCode::OK, "{path}");
+                body
+            }
+        };
+        let cases: [(&str, &[&str], &[&str]); 11] = [
+            (
+                "/admin/links",
+                &[
+                    "mean one operator; JA4, JA4H, HASSH and JA4X the same software; favicon, JARM, page and 404 hashes the same product.",
+                    "<option value=\"1\">shared</option>",
+                ],
+                &["point to one operator", "two or more IPs</option>"],
+            ),
+            (
+                "/admin/links/canaries",
+                &[
+                    "Credentials served in decoys and their later uses; the period is when they were served.",
+                ],
+                &["the requests that used them again"],
+            ),
+            (
+                "/admin/uploads",
+                &["Files dropped on the trap, kept by hash; download only as a zip (password"],
+                &["never served, run, shown or unpacked"],
+            ),
+            (
+                "/admin/decoys",
+                &[
+                    "What the fake MCP server and LLM gateway drew out.</p>",
+                    "<div class=\"hint\">distinct sessions</div>",
+                ],
+                &["Nothing they ask for", "as listed below"],
+            ),
+            (
+                "/admin/search",
+                &[
+                    "IP, network, <span class=\"mono\">AS123</span>, <span class=\"mono\">#request</span>, <span class=\"mono\">/path</span>, or any fingerprint, key or certificate.",
+                ],
+                &["a path starting with"],
+            ),
+            (
+                "/admin/search?q=zzzz",
+                &["Nothing found for <span class=\"mono\">zzzz</span>.</p>"],
+                &["not an address, network"],
+            ),
+            (
+                "/admin/lookup",
+                &[
+                    "What the cluster knows about an address and what providers say now.</p>",
+                    "placeholder=\"IP, host, URL or a list\"",
+                ],
+                &["every reachable provider", "placeholder=\"203.0.113.7"],
+            ),
+            (
+                "/admin/analytics",
+                &["<span class=\"muted\">direct HTTP/1 only</span>"],
+                &["not through an HTTP proxy"],
+            ),
+            (
+                "/admin/scans",
+                &["<h1>Scans</h1></div>"],
+                &["Pace, the live queue"],
+            ),
+            (
+                "/admin/system/export",
+                &[
+                    "Every request and what is known about it; claim e-mails excluded. Shell:",
+                    ">Uploads (Parquet)</option>",
+                    ">Redistributable (no GeoIP, no API)</option>",
+                ],
+                &["Claim e-mails are never exported"],
+            ),
+            ("/", &[], &[]),
+        ];
+        for (path, want, gone) in cases {
+            let html = page(path).await;
+            for w in want {
+                assert!(html.contains(w), "{path}: {w} missing:\n{html}");
+            }
+            for g in gone {
+                assert!(!html.contains(g), "{path}: {g} still there:\n{html}");
+            }
+            // One Severity chart per dashboard view, signed in or not.
+            if path == "/" {
+                assert_eq!(html.matches("id=\"chart-severity\"").count(), 1);
+            }
+        }
+        let (_, _, public) = send(&app, Request::get("/"), Body::empty()).await;
+        assert_eq!(public.matches("id=\"chart-severity\"").count(), 1);
+        // The about page no longer repeats the footer line that links to it.
+        let about = page("/about").await;
+        assert_eq!(about.matches("We claim the right to scan back.").count(), 1);
+    }
+
+    /// `_host_keys.html` alone.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_host_keys.html" %}"#, ext = "html")]
+    struct HostKeys {
+        keys: Vec<crate::store::hostkeys::HostKeyRow>,
+    }
+
+    /// `_names.html` alone.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_names.html" %}"#, ext = "html")]
+    struct Names {
+        names: Vec<crate::store::probes::NameRow>,
+    }
+
+    /// `_intel_card.html` alone.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_intel_card.html" %}"#, ext = "html")]
+    struct Intel {
+        c: crate::admin::public::IntelCard,
+        badge: &'static str,
+        verb: &'static str,
+        again: &'static str,
+        again_ip: &'static str,
+        again_price: String,
+    }
+
+    /// `_scan_unrecorded.html` alone; `r` stands in for the lookup result.
+    #[derive(askama::Template)]
+    #[template(source = r#"{% include "_scan_unrecorded.html" %}"#, ext = "html")]
+    struct Unrecorded {
+        s: crate::admin::lookup::UnrecordedScan,
+        r: R,
+        first: bool,
+    }
+    struct R {
+        ip: &'static str,
+    }
+
+    #[test]
+    fn partials_carry_the_short_strings() {
+        use askama::Template;
+        let html = HostKeys { keys: vec![] }.render().unwrap();
+        assert!(html.contains("None (needs level 2+)."), "{html}");
+        assert!(!html.contains("ssh2-enum-algos"), "{html}");
+
+        let name = |source: &str, agreed: bool| crate::store::probes::NameRow {
+            name: "host.example".into(),
+            source: source.into(),
+            first_seen: "2026-10-01 00:00:00".into(),
+            last_seen: "2026-10-02 00:00:00".into(),
+            agreed,
+            asked: 3,
+            answered: 3,
+            votes: 2,
+        };
+        let html = Names {
+            names: vec![name("ptr", false), name("rdns", true), name("rdns", false)],
+        }
+        .render()
+        .unwrap();
+        for want in [
+            "PTR · 2026-10-02 · unverified",
+            "rDNS · confirmed · agreed · 2026-10-02",
+            "rDNS · confirmed · disputed 2/3 · 2026-10-02",
+        ] {
+            assert!(html.contains(want), "{want} missing:\n{html}");
+        }
+        assert!(!html.contains("forward-confirmed"), "{html}");
+
+        let result = || crate::admin::public::IntelResult {
+            facts: vec![],
+            fetched_at: "2026-10-02 00:00:00".into(),
+            source_version: None,
+            node: None,
+        };
+        let html = Intel {
+            c: crate::admin::public::IntelCard {
+                label: "Registry",
+                name: "rdap".into(),
+                newest: None,
+                others: vec![],
+                disputed: vec![result(), result()],
+            },
+            badge: "",
+            verb: "checked",
+            again: "",
+            again_ip: "",
+            again_price: String::new(),
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains("title=\"the nodes' answers differ; none is shown as the answer\">Disputed</span></p>"),
+            "{html}"
+        );
+        assert!(!html.contains("registry answers differ"), "{html}");
+
+        let html = Unrecorded {
+            s: crate::admin::lookup::UnrecordedScan {
+                offers: vec![],
+                refused: None,
+            },
+            r: R { ip: "198.51.100.7" },
+            first: true,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains("Not in the dataset; buying a scan adds it, marked "),
+            "{html}"
+        );
+        assert!(html.contains(">unseen</span>.</p>"), "{html}");
+    }
+}
