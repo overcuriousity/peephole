@@ -700,6 +700,16 @@ impl Count {
 }
 
 impl Store {
+    /// Whether some IP carries `label` (admin count, as `/ips?label=`).
+    pub async fn label_exists(&self, label: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ip_labels WHERE label = ? AND count > 0)",
+        )
+        .bind(label)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Stored IPs among `addrs` or inside `nets`, by address, at most
     /// `limit` (admin bulk lookup).
     pub async fn ips_matching(

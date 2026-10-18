@@ -165,6 +165,16 @@ pub async fn has_blob(conn: &mut SqliteConnection, sha256: &[u8]) -> Result<bool
     )
 }
 
+/// Whether any upload hashed to `sha256`, held or not.
+pub async fn has_upload(conn: &mut SqliteConnection, sha256: &[u8]) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM uploads WHERE sha256 = ?)")
+            .bind(sha256)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
 /// Bytes of content held.
 pub async fn blob_bytes(conn: &mut SqliteConnection) -> Result<u64> {
     let n: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM upload_blobs")
