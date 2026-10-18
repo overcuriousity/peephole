@@ -420,6 +420,16 @@ impl Store {
         .await?)
     }
 
+    /// The key of campaign number `num` (the `#N` on the pages).
+    pub async fn campaign_by_num(&self, num: i64) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT key FROM campaigns WHERE num = ?")
+                .bind(num)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// A campaign by key, with its members and edges.
     pub async fn campaign(&self, key: &str) -> Result<Option<Campaign>> {
         let Some(row) = sqlx::query_as::<_, CampaignRow>(sqlx::AssertSqlSafe(format!(
