@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 /// Version of the algorithm and its constants; a change recomputes.
-pub const CAMPAIGN_V: i64 = 1;
+pub const CAMPAIGN_V: i64 = 2;
 /// Weighted-Jaccard score a `paths` edge needs.
 pub const PATHS_T: f64 = 0.60;
 /// The score it needs when the two IPs share a JA4 and JA4H pair (which
@@ -47,7 +47,8 @@ pub const ORDER_MAX: usize = 500;
 /// An order agreement at or above this supports a pair like a shared JA4
 /// and JA4H.
 pub const ORDER_AGREE: f64 = 0.5;
-/// An order agreement at or below this: the pair forms no edge.
+/// An order agreement at or below this: the pair forms no edge (a tuning
+/// value; [`Params::V2`] has no veto).
 pub const ORDER_VETO: f64 = -0.3;
 /// How often maintenance recomputes (when the inputs changed).
 pub const RECOMPUTE_EVERY: Duration = Duration::from_secs(3600);
@@ -79,7 +80,7 @@ impl Params {
     pub const V2: Params = Params {
         order: true,
         agree: ORDER_AGREE,
-        veto: Some(ORDER_VETO),
+        veto: None,
         guard: Some(K_SOFT_MERGE),
     };
 }
@@ -265,6 +266,8 @@ pub struct Edge {
     pub fp_support: bool,
     pub first_ts: String,
     pub last_ts: String,
+    /// A `paths` edge's order agreement, -1..1, when known.
+    pub agreement: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -284,7 +287,7 @@ impl Store {
     /// then one write transaction). Unless `force`, does nothing when the
     /// inputs' signature is the last pass's.
     pub async fn recompute_campaigns(&self, force: bool) -> Result<Report> {
-        self.recompute_with(force, &Params::V1).await
+        self.recompute_with(force, &Params::V2).await
     }
 
     /// [`Self::recompute_campaigns`] with the given parameters.
@@ -365,8 +368,8 @@ impl Store {
         for e in &out.edges {
             sqlx::query(
                 "INSERT INTO campaign_edges (a, b, kind, value, score, shared, fp_support,
-                                             first_ts, last_ts)
-                 VALUES (?,?,?,?,?,?,?,?,?)",
+                                             first_ts, last_ts, agreement)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(e.a)
             .bind(e.b)
@@ -377,6 +380,7 @@ impl Store {
             .bind(e.fp_support)
             .bind(&e.first_ts)
             .bind(&e.last_ts)
+            .bind(e.agreement)
             .execute(&mut *tx)
             .await?;
         }
@@ -438,7 +442,7 @@ impl Store {
         .await?;
         let edges = sqlx::query_as(
             "SELECT e.a AS a_id, ia.ip AS a, e.b AS b_id, ib.ip AS b, e.kind, e.value,
-                    e.score, e.shared, e.fp_support, e.first_ts, e.last_ts
+                    e.score, e.shared, e.fp_support, e.first_ts, e.last_ts, e.agreement
              FROM campaign_edges e
              JOIN campaign_members m ON m.ip_id = e.a
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
@@ -1165,7 +1169,7 @@ pub(crate) fn evaluate(input: &Input) -> String {
     block(&mut o, "guard only (order off, K = 2)", &g, g_s, &v1_keys);
     block(
         &mut o,
-        &format!("V2 default (K = {K_SOFT_MERGE}, agree {ORDER_AGREE}, veto {ORDER_VETO})"),
+        &format!("V2 default (K = {K_SOFT_MERGE}, agree {ORDER_AGREE}, veto none)"),
         &v2,
         v2_s,
         &v1_keys,
@@ -1692,6 +1696,7 @@ pub(crate) mod tests {
             bool,
             String,
             String,
+            Option<f64>,
         )>,
     );
 
@@ -1714,7 +1719,7 @@ pub(crate) mod tests {
         .unwrap();
         let edges = sqlx::query_as(
             "SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support,
-                    e.first_ts, e.last_ts
+                    e.first_ts, e.last_ts, e.agreement
              FROM campaign_edges e JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
              ORDER BY 1, 2, 3, 4",
         )
@@ -1754,6 +1759,9 @@ pub(crate) mod tests {
         }];
         assert_eq!(r.excluded, excluded);
         assert_eq!(s.campaign_report().await.unwrap().unwrap(), r);
+        // Each sweep in one second: no edge has an order agreement.
+        let d = dump(&s).await;
+        assert!(d.2.iter().all(|e| e.9.is_none()), "{:?}", d.2);
 
         // (a) one campaign of SSH edges, keyed by the member active first.
         let a = s.campaign("192.0.2.3").await.unwrap().unwrap();
@@ -1848,12 +1856,12 @@ pub(crate) mod tests {
         feed(&s4, all().collect::<Vec<_>>().into_iter().rev()).await;
         tls_fixture(&s3).await;
         tls_fixture(&s4).await;
-        let r = s3.recompute_with(false, &Params::V2).await.unwrap();
+        let r = s3.recompute_with(false, &V2_VETO).await.unwrap();
         assert!(r.vetoed > 0 && r.ordered > 0, "{r}");
-        s4.recompute_with(false, &Params::V2).await.unwrap();
+        s4.recompute_with(false, &V2_VETO).await.unwrap();
         let d3 = dump(&s3).await;
         assert_eq!(d3, dump(&s4).await);
-        s3.recompute_with(true, &Params::V2).await.unwrap();
+        s3.recompute_with(true, &V2_VETO).await.unwrap();
         assert_eq!(d3, dump(&s3).await);
     }
 
@@ -2018,7 +2026,57 @@ pub(crate) mod tests {
         assert_eq!(cal.len(), 1);
         assert_eq!(cal[0].count, 3);
         assert!(s.campaign_shapes("nope").await.unwrap().is_empty());
+
+        // The page says when the order agrees.
+        use crate::admin::campaigns::EdgeView;
+        let reason = |b: &Campaign| EdgeView::new(b.edges[0].clone()).reason;
+        assert!(!reason(&b).contains("order"), "{}", reason(&b));
+        sqlx::query("UPDATE campaign_edges SET agreement = ? WHERE kind = 'paths'")
+            .bind(ORDER_AGREE)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let b = s.campaign("198.51.100.10").await.unwrap().unwrap();
+        assert_eq!(b.edges[0].agreement, Some(ORDER_AGREE));
+        assert!(reason(&b).ends_with(", order agrees"), "{}", reason(&b));
     }
+
+    #[tokio::test]
+    async fn signature_changes_with_the_version() {
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        s.recompute_campaigns(false).await.unwrap();
+        assert!(s.recompute_campaigns(false).await.unwrap().unchanged);
+        let mut conn = s.pool.acquire().await.unwrap();
+        let sig = signature(&mut conn).await.unwrap();
+        drop(conn);
+        assert!(sig.starts_with(&format!("v{CAMPAIGN_V} ")), "{sig}");
+        // A pass stored by the previous version is redone.
+        sqlx::query("UPDATE settings SET value = ? WHERE key = ?")
+            .bind(sig.replacen(&format!("v{CAMPAIGN_V} "), "v1 ", 1))
+            .bind(KEY_SIGNATURE)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(!s.recompute_campaigns(false).await.unwrap().unchanged);
+    }
+
+    #[tokio::test]
+    async fn campaign_edges_have_an_agreement_column() {
+        let (s, _d) = store().await;
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('campaign_edges')")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(cols.iter().any(|c| c == "agreement"), "{cols:?}");
+    }
+
+    /// [`Params::V2`] with the veto the tuning grid tries.
+    const V2_VETO: Params = Params {
+        veto: Some(ORDER_VETO),
+        ..Params::V2
+    };
 
     /// What a pass under `p` would write, before storage.
     async fn computed(s: &Store, p: &Params) -> Output {
@@ -2199,15 +2257,19 @@ pub(crate) mod tests {
         let r = s.recompute_with(true, &Params::V1).await.unwrap();
         assert_eq!(r.campaigns, 0, "below PATHS_T without support: {r}");
 
-        let r = s.recompute_with(true, &Params::V2).await.unwrap();
-        assert_eq!((r.campaigns, r.vetoed), (1, 1), "{r}");
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert_eq!((r.campaigns, r.vetoed), (1, 0), "{r}");
         assert_eq!((r.ordered, r.candidates), (2, 2), "{r}");
+        let d = dump(&s).await;
+        assert_eq!(d.2.len(), 1);
+        assert!(d.2[0].9.is_some_and(|x| x >= ORDER_AGREE), "{:?}", d.2);
         let c = s.campaign("192.0.2.60").await.unwrap().unwrap();
         assert_eq!(c.row.size, 2);
         assert_eq!(c.edges.len(), 1);
         let e = &c.edges[0];
         assert_eq!((e.kind.as_str(), e.b.as_str()), ("paths", "192.0.2.61"));
         assert!(!e.fp_support);
+        assert!(e.agreement.is_some_and(|x| x >= ORDER_AGREE), "{e:?}");
         let score = e.score.unwrap();
         assert!((PATHS_T_SUPPORTED..PATHS_T).contains(&score), "{score}");
         // The reversed twin forms no edge.
@@ -2245,8 +2307,11 @@ pub(crate) mod tests {
         let r = s.recompute_with(true, &Params::V1).await.unwrap();
         assert_eq!(r.campaigns, 1, "{r}");
         assert_eq!(r.edges, BTreeMap::from([("paths".to_string(), 1)]));
-        let r = s.recompute_with(true, &Params::V2).await.unwrap();
+        let r = s.recompute_with(true, &V2_VETO).await.unwrap();
         assert_eq!((r.campaigns, r.edges.len(), r.vetoed), (0, 0, 1), "{r}");
+        // V2 has no veto: the reversed pair stays an edge.
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert_eq!((r.campaigns, r.vetoed), (1, 0), "{r}");
     }
 
     /// Campaign sizes and soft edge counts, by key.
@@ -2342,7 +2407,7 @@ pub(crate) mod tests {
             v2.contains(&"coverage: ordered 2 of 2 candidates (100.0 %)"),
             "{out}"
         );
-        assert!(v2.contains(&"withheld 0, vetoed 1"), "{out}");
+        assert!(v2.contains(&"withheld 0, vetoed 0"), "{out}");
         // The reversed pair is the one the veto drops, with its shapes.
         let vetoed = section(&out, "vetoed pairs");
         assert!(vetoed[0].starts_with("192.0.2.62 192.0.2.63 "), "{out}");
