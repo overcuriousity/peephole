@@ -293,13 +293,14 @@ pub fn link_href(kind: &str, value: &str) -> String {
 }
 
 /// The list a value pivots to, already filtered to it (MIK-482 table
-/// 5.3): `ua`, `path` and `cmd` to the requests; `port`, `product`, `os`
-/// and `label` to the IPs; `sha256` (lowercase hex) to the uploads;
+/// 5.3): `ua` to its Links page (MIK-504; no header, which links nothing,
+/// to the requests); `path` and `cmd` to the requests; `port`, `product`, `os` and `label` to the IPs; `sha256` (lowercase hex) to the uploads;
 /// `campaign` (its key) to its page. The value is urlencoded, so a
 /// template never builds such an `href` by concatenation.
 pub fn pivot_href(kind: &str, value: &str) -> String {
     let v = crate::admin::public::urlencode(value);
     match kind {
+        "ua" if value != crate::store::useragent::NONE => link_href("ua", value),
         "ua" | "path" | "cmd" => format!("/requests?{kind}={v}"),
         "port" | "product" | "os" | "label" => format!("/ips?{kind}={v}"),
         "sha256" => format!("/admin/uploads?sha256={v}"),
@@ -341,8 +342,9 @@ mod tests {
     fn pivot_href_encodes_the_value() {
         assert_eq!(
             pivot_href("ua", "Mozilla/5.0 (X11)"),
-            "/requests?ua=Mozilla%2F5.0%20%28X11%29"
+            "/admin/links/ua/Mozilla%2F5.0%20%28X11%29"
         );
+        assert_eq!(pivot_href("ua", "(none)"), "/requests?ua=%28none%29");
         assert_eq!(
             pivot_href("path", "/a.php?x=1&y"),
             "/requests?path=%2Fa.php%3Fx%3D1%26y"

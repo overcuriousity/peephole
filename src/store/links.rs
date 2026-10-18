@@ -26,17 +26,19 @@ pub enum LinkKind {
     HttpBody,
     Http404,
     HttpEtag,
+    Ua,
 }
 
 use LinkKind::*;
 
 impl LinkKind {
-    pub const ALL: [LinkKind; 13] = [
-        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
+    pub const ALL: [LinkKind; 14] = [
+        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
+        HttpEtag,
     ];
     /// The kinds the index lists (canaries have their own tab).
-    pub const LIST: [LinkKind; 12] = [
-        Fp, Ssh, Tls, Ja4, Ja4h, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
+    pub const LIST: [LinkKind; 13] = [
+        Fp, Ssh, Tls, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
     ];
     pub const IDENTITY: [LinkKind; 4] = [Fp, Ssh, Tls, Canary];
 
@@ -53,6 +55,7 @@ impl LinkKind {
             Canary => "canary",
             Ja4 => "ja4",
             Ja4h => "ja4h",
+            Ua => "ua",
             Hassh => "hassh",
             Ja4x => "ja4x",
             Favicon => "favicon",
@@ -71,6 +74,7 @@ impl LinkKind {
             Canary => "Canary",
             Ja4 => "JA4",
             Ja4h => "JA4H",
+            Ua => "User agent",
             Hassh => "HASSH",
             Ja4x => "JA4X",
             Favicon => "Favicon",
@@ -88,7 +92,7 @@ impl LinkKind {
 
     /// Recorded by a node (requests); host keys come from scans instead.
     pub fn by_node(self) -> bool {
-        matches!(self, Fp | Canary | Ja4 | Ja4h)
+        matches!(self, Fp | Canary | Ja4 | Ja4h | Ua)
     }
 
     /// Its `host_keys.kind`, for the kinds read from scans.
@@ -116,6 +120,7 @@ impl LinkKind {
             Fp => &FP_LEGS,
             Ja4 => &JA4_LEGS,
             Ja4h => &JA4H_LEGS,
+            Ua => &UA_LEGS,
             Ssh => &SSH_LEGS,
             Tls => &TLS_LEGS,
             Hassh => &HASSH_LEGS,
@@ -151,6 +156,13 @@ const JA4H_LEGS: [Leg; 1] = [Leg::row(
     "r.ts",
     "r.origin",
 )];
+// Attacker-chosen text: bound by equality, served escaped. Software, not an
+// operator, so not in `IDENTITY` (campaign evidence). A request without the
+// header stores `useragent::NONE`, which links nothing (checked by a test).
+const UA_LEGS: [Leg; 1] = [Leg {
+    cond: "r.user_agent != '(none)'",
+    ..Leg::row("requests r", "r.user_agent", "r.ip_id", "r.ts", "r.origin")
+}];
 // The literals are the `scan::hostkeys` kinds (checked by a test).
 const SSH_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'ssh-hostkey'")];
 const TLS_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'tls-cert'")];
@@ -1664,5 +1676,168 @@ mod tests {
     /// The IP of the `n`th node from the end of a graph.
     fn nth_last_ip(g: &LinkGraph, n: usize) -> String {
         g.nodes[g.nodes.len() - n].id["ip:".len()..].to_string()
+    }
+
+    const UA: &str = "Mozilla/5.0 (X11; <b>&\"x\")";
+
+    /// A request from `ip_id` with `ua` as its User-Agent (none: no header).
+    async fn ua_request(s: &Store, ip_id: i64, ua: Option<&str>) {
+        let headers = match ua {
+            Some(u) => serde_json::json!([["User-Agent", u]]).to_string(),
+            None => "[]".into(),
+        };
+        s.insert_request(&NewRequest {
+            ip_id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: headers,
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn a_user_agent_is_a_software_kind() {
+        assert_eq!(LinkKind::ALL.len(), 14);
+        assert_eq!(LinkKind::LIST.len(), 13);
+        assert_eq!(LinkKind::IDENTITY.len(), 4);
+        assert!(!LinkKind::IDENTITY.contains(&LinkKind::Ua));
+        assert!(!LinkKind::Ua.identity());
+        assert!(LinkKind::Ua.by_node());
+        assert_eq!(LinkKind::Ua.host_kind(), None);
+        assert_eq!(LinkKind::parse("ua"), Some(LinkKind::Ua));
+        let at = |k| LinkKind::LIST.iter().position(|x| *x == k).unwrap();
+        assert_eq!(at(LinkKind::Ua), at(LinkKind::Ja4h) + 1);
+        assert_eq!(
+            UA_LEGS[0].cond,
+            format!("r.user_agent != '{}'", crate::store::useragent::NONE)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_user_agent_links_its_ips() {
+        let (s, ids) = seeded().await;
+        ua_request(&s, ids[0], Some(UA)).await;
+        ua_request(&s, ids[1], Some(UA)).await;
+        ua_request(&s, ids[2], Some("curl/8.0")).await;
+        // No header: `(none)` on every IP without one, which links nothing.
+        let list = s.links_list(&filter("ua")).await.unwrap();
+        assert_eq!(values(&list), [UA]);
+        assert_eq!(list.items[0].ips, 2);
+        let all = LinkFilter {
+            shared: Some("0".into()),
+            ..filter("ua")
+        };
+        assert_eq!(values(&s.links_list(&all).await.unwrap()), [UA, "curl/8.0"]);
+        let item = s.link_item(LinkKind::Ua, UA).await.unwrap().unwrap();
+        assert_eq!(item.ips, 2);
+        let mut ips: Vec<&str> = item.ip_rows.iter().map(|r| r.ip.as_str()).collect();
+        ips.sort();
+        assert_eq!(ips, ["203.0.113.1", "203.0.113.2"]);
+        assert_eq!(s.find_value(UA).await.unwrap(), [LinkKind::Ua]);
+        assert!(s.find_value("(none)").await.unwrap().is_empty());
+        assert!(
+            s.link_item(LinkKind::Ua, "(none)")
+                .await
+                .unwrap()
+                .is_none_or(|i| i.ips == 0)
+        );
+        let vals = s.ip_values("203.0.113.1", &LinkKind::ALL).await.unwrap();
+        assert!(vals.contains(&(LinkKind::Ua, UA.to_string())), "{vals:?}");
+        assert!(!vals.iter().any(|(_, v)| v == "(none)"), "{vals:?}");
+    }
+
+    #[tokio::test]
+    async fn a_user_agent_is_graphed_only_on_request() {
+        let (s, ip) = seeded().await;
+        ua_request(&s, ip[0], Some(UA)).await;
+        ua_request(&s, ip[3], Some(UA)).await;
+        let item = format!("ua:{UA}");
+        let g = s
+            .link_graph(
+                &Focus::Item(LinkKind::Ua, UA.into()),
+                2,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        let nodes = ids(&g);
+        assert!(nodes.contains(&item.as_str()), "{nodes:?}");
+        assert!(nodes.contains(&"ip:203.0.113.1") && nodes.contains(&"ip:198.51.100.4"));
+        let g = s
+            .link_graph(
+                &Focus::Ip("203.0.113.1".into()),
+                2,
+                &LinkKind::IDENTITY,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!g.edges.iter().any(|e| e.kind == "ua"), "{:?}", g.edges);
+        assert!(!ids(&g).contains(&item.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_crowded_user_agent_collapses_into_a_group() {
+        let (s, _) = seeded().await;
+        for n in 0..(GROUP_AT + 1) {
+            let ip = s
+                .upsert_ip(format!("192.0.2.{}", n + 1).parse().unwrap())
+                .await
+                .unwrap();
+            ua_request(&s, ip.id, Some("zgrab/0.x")).await;
+        }
+        let f = Focus::Ip("192.0.2.1".into());
+        let g = s.link_graph(&f, 2, &[LinkKind::Ua], false).await.unwrap();
+        let grp = g.nodes.iter().find(|n| n.kind == "group").expect("a group");
+        assert_eq!(grp.id, "group:ua:zgrab/0.x");
+        assert_eq!(grp.ips, Some(GROUP_AT + 1));
+        // Expanding the group lists them all.
+        let all = s
+            .link_graph(&Focus::Item(LinkKind::Ua, "zgrab/0.x".into()), 1, &[], true)
+            .await
+            .unwrap();
+        assert_eq!(all.nodes.len() as i64, 1 + GROUP_AT + 1);
+        assert!(!all.nodes.iter().any(|n| n.kind == "group"));
+    }
+
+    /// Item page, search and index page read `idx_requests_ua`.
+    #[tokio::test]
+    async fn user_agent_reads_use_their_index() {
+        let (s, _) = seeded().await;
+        let (legs, _) = sightings(
+            LinkKind::Ua,
+            &Where {
+                value: Some(UA),
+                ..Default::default()
+            },
+        );
+        let (list, _) = sightings(LinkKind::Ua, &Where::default());
+        for sql in [
+            format!("SELECT v, ip_id FROM ({legs})"),
+            format!(
+                "SELECT v, COUNT(DISTINCT ip_id) FROM ({list}) GROUP BY v HAVING COUNT(DISTINCT ip_id) > 1"
+            ),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .bind(UA)
+                    .fetch_all(&s.pool)
+                    .await
+                    .unwrap();
+            assert!(
+                plan.iter().any(|p| p.3.contains("idx_requests_ua")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|p| p.3.starts_with("SCAN r") && !p.3.contains("INDEX")),
+                "{plan:?}"
+            );
+        }
     }
 }

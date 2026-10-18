@@ -1791,6 +1791,49 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// A user agent is software, not an operator: one UA on every request,
+    /// across all the fixture's campaigns, changes nothing (MIK-504).
+    #[tokio::test]
+    async fn user_agents_are_not_campaign_evidence() {
+        let shared_ua = |ops: Vec<Op>| {
+            ops.into_iter().map(|op| match op {
+                Op::Rec(Record::Request(mut r)) => {
+                    r.headers_json = r#"[["User-Agent","Mozilla/5.0 (shared)"]]"#.into();
+                    Op::Rec(Record::Request(r))
+                }
+                op => op,
+            })
+        };
+        let mut runs = vec![];
+        for with_ua in [false, true] {
+            let (s, _dir) = store().await;
+            if with_ua {
+                feed(&s, shared_ua(fixture())).await;
+                let ips: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(DISTINCT ip_id) FROM requests
+                     WHERE user_agent = 'Mozilla/5.0 (shared)'",
+                )
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+                assert!(ips > 7, "the UA spans the campaigns: {ips}");
+                let mut conn = s.pool.acquire().await.unwrap();
+                let input = Input::read(&mut conn).await.unwrap();
+                assert!(input.sightings.iter().all(|x| x.0 != LinkKind::Ua));
+            } else {
+                feed(&s, fixture()).await;
+            }
+            tls_fixture(&s).await;
+            let mut r = s.recompute_campaigns(false).await.unwrap();
+            (r.seconds, r.at) = (0.0, None);
+            let d = dump(&s).await;
+            assert!(d.2.iter().all(|e| e.2 != "ua"), "{:?}", d.2);
+            runs.push((r, d));
+        }
+        assert_eq!(runs[0].0.campaigns, 3);
+        assert_eq!(runs[0], runs[1]);
+    }
+
     #[tokio::test]
     async fn the_fixture_makes_the_expected_campaigns() {
         let (s, _dir) = store().await;

@@ -1676,8 +1676,9 @@ show_labels = {show_labels}
             .unwrap()
     }
 
-    /// The request page's path, user agent and command are pivots to the
-    /// requests with the same (MIK-498), and so is the list's path.
+    /// The request page's path and command are pivots to the requests with
+    /// the same (MIK-498), and so is the list's path; its user agent opens
+    /// the UA's Links page, which leads on to those requests (MIK-504).
     #[tokio::test]
     async fn request_values_pivot_to_the_requests_with_the_same() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
@@ -1708,11 +1709,41 @@ show_labels = {show_labels}
             html.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
             "{html}"
         );
-        let ua = "/requests?ua=Mozilla%2F5.0%20%28X11%29";
+        let item = "/admin/links/ua/Mozilla%2F5.0%20%28X11%29";
         assert!(
-            html.contains(&format!(r#"href="{ua}">Mozilla/5.0 (X11)</a>"#)),
+            html.contains(&format!(r#"href="{item}">Mozilla/5.0 (X11)</a>"#)),
             "{html}"
         );
+        let (status, page) = get_with(&app, item, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let ua = "/requests?ua=Mozilla%2F5.0%20%28X11%29";
+        assert!(
+            page.contains("User agent")
+                && page.contains(r#"href="/ip/203.0.113.50""#)
+                && page.contains(&format!(r#"href="{ua}""#)),
+            "{page}"
+        );
+        // One IP: listed only with `shared=0`, under its own tab.
+        let (_, index) = get_with(&app, "/admin/links?kind=ua", Some(&cookie)).await;
+        assert!(!index.contains(item), "{index}");
+        let (status, index) = get_with(&app, "/admin/links?kind=ua&shared=0", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(
+            index.contains(item) && index.contains(" aria-current=\"true\">User agent</a>"),
+            "{index}"
+        );
+        // Search resolves a pasted UA to its page.
+        let r = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/admin/search?q=Mozilla%2F5.0%20%28X11%29")
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.headers().get(axum::http::header::LOCATION).unwrap(), item);
         let (status, list) = get_with(&app, ua, Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(list.contains(&format!("/admin/requests/{id}\"")), "{list}");
