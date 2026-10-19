@@ -88,19 +88,8 @@ pub fn return_host(host: Option<&str>, site: &str) -> String {
     let Some(h) = host.filter(|h| !h.is_empty() && h.len() <= HOST_MAX) else {
         return site.to_string();
     };
-    let bare = if let Some(rest) = h.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((ip, port)) if port.is_empty() || is_port(port) => ip,
-            _ => return site.to_string(),
-        }
-    } else if h.matches(':').count() == 1 {
-        let (name, port) = h.split_once(':').expect("one colon");
-        if !is_port(&format!(":{port}")) {
-            return site.to_string();
-        }
-        name
-    } else {
-        h
+    let Some(bare) = bare_host(h) else {
+        return site.to_string();
     };
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return match ip {
@@ -117,13 +106,30 @@ pub fn return_host(host: Option<&str>, site: &str) -> String {
     }
 }
 
+/// A Host value without its brackets and port: `[2001:db8::1]:443` gives
+/// `2001:db8::1`, `a.example:80` gives `a.example`, an unbracketed IPv6
+/// literal is kept whole. None when the brackets or the port are malformed.
+pub fn bare_host(h: &str) -> Option<&str> {
+    if let Some(rest) = h.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, port)) if port.is_empty() || is_port(port) => Some(ip),
+            _ => None,
+        }
+    } else if h.matches(':').count() == 1 {
+        let (name, port) = h.split_once(':').expect("one colon");
+        is_port(&format!(":{port}")).then_some(name)
+    } else {
+        Some(h)
+    }
+}
+
 fn is_port(p: &str) -> bool {
     p.strip_prefix(':')
         .is_some_and(|d| !d.is_empty() && d.len() <= 5 && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A dotted DNS name with a letter TLD, not `localhost` or a local suffix.
-fn is_public_name(n: &str) -> bool {
+pub(crate) fn is_public_name(n: &str) -> bool {
     let lower = n.to_ascii_lowercase();
     let labels: Vec<&str> = lower.split('.').collect();
     labels.len() >= 2
