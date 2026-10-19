@@ -29,7 +29,7 @@ td.ts { white-space: nowrap; color: var(--color-fg-secondary); font-family: var(
 .badge-cat-interact { background: var(--cat-interact-dim); color: var(--cat-interact); border-color: var(--cat-interact); }
 .badge-cat-bot { background: var(--cat-bot-dim); color: var(--cat-bot); border-color: var(--cat-bot); }
 .badge-cat-postex { background: var(--color-fg-primary); color: var(--color-bg-base); border-color: var(--color-fg-primary); }
-.badge-owasp { background: transparent; color: var(--color-fg-muted); border-color: var(--color-border-strong); font-family: var(--font-mono); }
+.badge-owasp, .badge-reading { background: transparent; color: var(--color-fg-muted); border-color: var(--color-border-strong); font-family: var(--font-mono); }
 .badge-tor { background: var(--color-brand-dim); color: var(--color-brand); }
 .badge-agent { background: var(--color-accent-dim); color: var(--color-accent); border-color: var(--color-accent-muted); }
 .badge-unseen { color: var(--color-fg-muted); border: 1px dashed currentColor; }

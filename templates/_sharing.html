@@ -1,16 +1,18 @@
 {# The shared reading over an address's evidence rows (store::evidence::SharingView, `sh`), admin only (docs/shared-addresses.md, "Reading table"). Rule 1, one operator's address, never reaches here. A named state, never a number. #}
 <section class="card" id="sharing" data-section="sharing">
-  <div class="card-head"><h2>Shared reading</h2><a class="badge badge-status" data-status="queued" href="/ips?reading={{ sh.state.key() }}" title="Rule {{ sh.state.rule() }} of the reading table (docs/shared-addresses.md), evidence v{{ sh.v }}">{{ sh.label }}</a></div>
+  <div class="card-head"><h2>Address sharing</h2><span class="badge badge-reading" title="By the reading table in docs/shared-addresses.md, evidence v{{ sh.v }}">{{ sh.label }}</span></div>
+  <p class="small">Who else a block on this address would hit. Not a verdict on the address.</p>
+  <p>{{ sh.direction }}</p>
   <p>{{ sh.sentence }}</p>
-  <p class="small muted">{{ sh.direction }}</p>
   {% if !sh.lines.is_empty() %}<div class="table-wrap wide"><table>
-    <thead><tr><th>Evidence</th><th>Observed</th><th>Port</th><th>From</th><th>Seen</th></tr></thead>
+    <thead><tr><th>Kind</th><th>Observed</th><th>Port</th><th>From</th><th>Seen (UTC)</th></tr></thead>
     <tbody>{% for l in sh.lines %}<tr>
       <td class="mono">{{ l.kind }}</td>
       <td>{{ l.what }}</td>
       <td class="num">{% if let Some(p) = l.port %}{{ p }}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{% if let Some(h) = l.href %}<a href="{{ h }}">{{ l.source }}</a>{% else %}{{ l.source }}{% endif %}</td>
-      <td class="mono">{{ l.date }}</td>
+      <td class="mono">{{ l.first }}{% if l.first != l.date %} – {{ l.date }}{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table></div>{% endif %}
+  <p class="small"><a href="/ips?reading={{ sh.state.key() }}">Other addresses with this reading →</a></p>
 </section>

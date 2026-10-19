@@ -482,6 +482,19 @@ pub(crate) fn chips(path: &str, pairs: &[(&str, Option<String>)]) -> Vec<Chip> {
         .collect()
 }
 
+/// The reading chip shows the state's label, not its key.
+fn reading_chip(mut chips: Vec<Chip>) -> Vec<Chip> {
+    for c in chips
+        .iter_mut()
+        .filter(|c| c.label == filter_label("reading"))
+    {
+        if let Some(st) = crate::store::evidence::Sharing::from_key(c.value.trim()) {
+            c.value = st.label().to_string();
+        }
+    }
+    chips
+}
+
 /// A query parameter as people read it.
 fn filter_label(k: &str) -> &'static str {
     match k {
@@ -516,7 +529,7 @@ fn filter_label(k: &str) -> &'static str {
         "net" => "Network",
         "net_name" => "Network name",
         "evidence" => "Evidence",
-        "reading" => "Shared reading",
+        "reading" => "Address sharing",
         _ => "Filter",
     }
 }
@@ -568,7 +581,7 @@ async fn ips(
         count_max,
         qs: ip_qs(&f),
         hidden: hidden_fields(ip_pairs(&f)),
-        chips: chips("/ips", &ip_pairs(&f)),
+        chips: reading_chip(chips("/ips", &ip_pairs(&f))),
         f,
         page,
         bulk_total,
@@ -2325,7 +2338,7 @@ show_labels = {show_labels}
             page.contains(&format!(
                 "TP-LINK TR-069 remote access answered on 7547 in scan #{scan} (level 1, {day}) \
                  and the operator names this address dynamic-0-0-0-0.pool.telefonica.de \
-                 (PTR looked up {day})"
+                 (reverse DNS looked up {day})"
             )),
             "{page}"
         );
@@ -2351,6 +2364,30 @@ show_labels = {show_labels}
             sharing.contains(&format!("href=\"/admin/scans/{scan}\"")),
             "{sharing}"
         );
+        // MIK-652: the caveat leads, the badge is a neutral span with no rule
+        // number, the filter is its own link, both days in UTC, the real
+        // lookup word.
+        assert!(sharing.contains("<h2>Address sharing</h2>"), "{sharing}");
+        let (dir, sent) = (
+            sharing
+                .find("It is not a threat or suspicion score.")
+                .unwrap(),
+            sharing.find("not against reassignment.").unwrap(),
+        );
+        assert!(dir < sent, "{sharing}");
+        assert!(
+            sharing.contains("<span class=\"badge badge-reading\""),
+            "{sharing}"
+        );
+        assert!(!sharing.contains("data-status"), "{sharing}");
+        assert!(!sharing.contains("Rule "), "{sharing}");
+        assert!(
+            sharing.contains("href=\"/ips?reading=subscriber-pooled\">Other addresses"),
+            "{sharing}"
+        );
+        assert!(sharing.contains("<th>Kind</th>"), "{sharing}");
+        assert!(sharing.contains("<th>Seen (UTC)</th>"), "{sharing}");
+        assert!(sharing.contains(">rDNS</a>"), "{sharing}");
 
         // Rule 4: the operator's naming, not verified by behaviour.
         let (_, page) = get_with(&app, "/ip/203.0.113.48", Some(&cookie)).await;
@@ -2406,6 +2443,12 @@ show_labels = {show_labels}
                 "{state}: {list}"
             );
         }
+        // The chip names the state, not its key.
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", Some(&cookie)).await;
+        assert!(
+            list.contains("Address sharing: <span class=\"mono\">shared pool, by the operator&#39;s naming</span>"),
+            "{list}"
+        );
         let (_, list) = get_with(&app, "/ips?reading=shared-pool", None).await;
         assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
     }
