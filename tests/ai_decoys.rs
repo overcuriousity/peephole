@@ -152,7 +152,7 @@ async fn an_mcp_session_is_recorded_and_its_canary_links_back() {
         br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     )
     .await;
-    assert!(body.contains("run_command"));
+    assert!(body.contains("Run a shell command on the ops host"));
     let (_, _, body) = http(addr, "8.8.8.8", "POST", "/mcp", &session,
         br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/home/deploy/.aws/credentials"}}}"#).await;
     let key = body
@@ -204,7 +204,7 @@ async fn an_mcp_session_is_recorded_and_its_canary_links_back() {
 async fn the_llm_gateway_answers_each_api_style() {
     let (addr, store, _d) = spawn("", false).await;
     let (st, _, b) = http(addr, "8.8.8.8", "GET", "/api/tags", &[], b"").await;
-    assert!(st == 200 && b.contains("llama3.1:8b"));
+    assert!(st == 200 && b.contains(r#""family":"#), "{b}");
     let (st, hs, b) = http(
         addr,
         "8.8.8.8",
@@ -252,7 +252,10 @@ async fn compressed_bodies_are_read_and_our_own_key_does_not_open_the_admin_page
         &gz.finish().unwrap(),
     )
     .await;
-    assert!(st == 200 && b.contains("read_file"), "{b}");
+    assert!(
+        st == 200 && b.contains("Read a file on the ops host"),
+        "{b}"
+    );
     // Harvest an app-key canary from query_db, then present it as a Bearer key.
     let (_, _, b) = http(addr, "8.8.8.8", "POST", "/mcp", &[JSON_CT],
         br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_db","arguments":{"sql":"select * from users"}}}"#).await;
@@ -315,7 +318,7 @@ async fn a_tarpitted_source_still_gets_the_mcp_decoy() {
         br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     )
     .await;
-    assert!(st == 200 && b.contains("read_file"));
+    assert!(st == 200 && b.contains("Read a file on the ops host"));
     assert!(t0.elapsed() < Duration::from_secs(2));
 }
 
@@ -404,7 +407,7 @@ async fn legacy_sse_pushes_answers_down_the_stream() {
         assert!(n > 0, "stream ended early: {got}");
         got.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
-    assert!(got.contains("event: message") && got.contains("run_command"));
+    assert!(got.contains("event: message") && got.contains("Run a shell command on the ops host"));
     // Unknown session: 404, recorded as no-session.
     let (st, _, _) = http(
         addr,

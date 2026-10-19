@@ -53,6 +53,9 @@ pub struct DecoyIn {
     /// Anthropic count_tokens estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n: Option<i64>,
+    /// The serving node's AI identity (`model::ai_id`, decoy version 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i: Option<String>,
 }
 
 impl DecoyIn {
@@ -100,6 +103,7 @@ impl DecoyIn {
             api: d.api,
             ep: d.ep,
             via: d.via,
+            i: d.i,
             ..Default::default()
         };
         let s = serde_json::to_string(&min).unwrap_or_default();
@@ -178,10 +182,13 @@ pub fn candidate(path: &str) -> bool {
     PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
-/// The AI decoy for this request, if any: its name (`mcp:…`, `llm:…`) and
-/// what it is rendered from.
-pub fn choose(ask: &Ask) -> Option<(String, DecoyIn)> {
-    super::mcp::choose(ask).or_else(|| super::llm::choose(ask))
+/// The AI decoy for this request on the node with this `ident`
+/// ([`crate::model::ai_id::derive`]), if any: its name (`mcp:…`, `llm:…`)
+/// and what it is rendered from.
+pub fn choose(ask: &Ask, ident: &str) -> Option<(String, DecoyIn)> {
+    let (name, mut d) = super::mcp::choose(ask, Some(ident)).or_else(|| super::llm::choose(ask))?;
+    d.i = Some(ident.to_string());
+    Some((name, d))
 }
 
 #[cfg(test)]
@@ -223,6 +230,7 @@ mod tests {
             arg: Some(long),
             api: Some("openai".into()),
             via: Some("sse".into()),
+            i: Some(crate::model::ai_id::derive(None)),
             ..Default::default()
         };
         let s = d.to_json();
@@ -230,5 +238,6 @@ mod tests {
         let back = DecoyIn::parse(Some(&s));
         assert_eq!(back.api.as_deref(), Some("openai"));
         assert_eq!(back.via.as_deref(), Some("sse"));
+        assert_eq!(back.i, d.i);
     }
 }

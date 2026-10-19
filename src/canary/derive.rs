@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 /// Version of the decoy templates this build serves (`requests.decoy_v`).
 /// A change to any template or to [`value`] bumps it.
-pub const DECOY_V: i64 = 4;
+pub const DECOY_V: i64 = 5;
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -197,7 +197,7 @@ pub fn served(
                 _ => vec![],
             }
         }
-        1..=4 => {
+        1..=5 => {
             let mut out = match decoy {
                 "dotenv" => v(&DOTENV),
                 "git-config" => v(&[Kind::GitToken]),
