@@ -90,9 +90,9 @@ phone behind CGNAT, a small business, and a rented "ISP proxy" alike.
 Three ways, none bought: (a) a curated seed list of the clouds and scanner
 operators we see most (the top 20 ASNs cover 69% of sources and are all
 rented; a few hundred entries cover the bulk), (b) a published offline
-classification dataset bundled like the Tor list (candidates are for
-MIK-576 to verify for licence and freshness; PeeringDB's network-type
-field and the Stanford ASdb are the usual names), (c) self-labelling from
+classification dataset bundled like the Tor list (PeeringDB's
+network-type field and the Stanford ASdb; coverage and accuracy under
+Prior art, licence and freshness are MIK-582's question), (c) self-labelling from
 our own data (an AS whose sources carry consumer PTR names or CPE
 devices), which is circular and is not proposed. Cost of (a) or (b): one
 text file of well under 2 MiB, refreshed on the Tor list's cadence,
@@ -178,7 +178,10 @@ labels), for example a Viettel line with HikVision on 8001/8002 and
 MikroTik btest on 2000 under `dynamic-adsl.viettel.vn`, or a Telefonica
 Germany line with FRITZ!OS SIP and TR-069 under
 `dynamic-N.pool.telefonica.de`. The other 33 are thinner, typically
-MikroTik btest alone plus one `probe` request.
+MikroTik btest alone plus one `probe` request. Published work supports
+the signal: Yang et al. (CCS'22) found 3,232,698 China residential-proxy
+IPs with at least one TCP/UDP port open for relaying requests, seen by an
+outside scanner (see Prior art).
 
 Two limits are structural. `devicetype` is nearly empty, so classification
 has to come from `product`, `os_guess` and port sets, which means a
@@ -204,9 +207,12 @@ already scans every port) costs a few probes per scan and no retention. Scan bud
 storage: one derived row per matched (address, signature), thousands of
 rows at most.
 
-**Adversarial read.** A residential-proxy SDK inside an app on a phone or
-TV behind NAT opens nothing on the WAN address; the scan sees the ISP's
-CPE or nothing. A "clean" scan is therefore the default for the biggest
+**Adversarial read.** We assume that a residential-proxy SDK inside an app
+on a phone or TV behind NAT opens nothing on the WAN address, so the scan
+sees the ISP's CPE or nothing. That is our assumption and unquantified
+(the MIK-576 memo marks it as inference); Yang et al. (CCS'22) saw
+3,232,698 China residential-proxy IPs with a relay port open to an outside
+scanner, so at least part of the pool is visible. A "clean" scan is therefore the default for the biggest
 residential-proxy networks and costs the operator nothing. A botnet that
 owns a router can close its WAN listeners after infection, as Mirai
 variants do, also for free. In the rented direction the forgery is cheap
@@ -280,7 +286,8 @@ absent in practice (scanners do not run the trap's JavaScript).
 
 **Have / need.** Have the columns. A reference list of IoT/CPE ClientHello
 shapes would be new curation with no data to validate it against here;
-not proposed.
+not proposed. JA4 (TLS client) is BSD-3; JA4H, JA4X and the rest of
+JA4+ are under the FoxIO License 1.1, which MIK-581 settles.
 
 **Adversarial read.** A residential proxy forwards the operator's TCP
 stream, so the JA4 we see is the operator's client, the same from every
@@ -469,23 +476,37 @@ named split as follows. Exposed home routers and IoT boxes: partly
 visible (signal 3), and only at the scan level that reaches their ports.
 Infected desktops behind a router: the scan sees the router, so visible
 only if the router itself is exposed. Residential-proxy SDK exits on
-phones, TVs and PCs: invisible by construction (no WAN listener, operator-
-side JA4, rotating exits). The roadmap's "cannot be told apart" line
-remains correct for that last class.
+phones, TVs and PCs: mostly invisible, on our assumption that an SDK exit
+opens no WAN listener (unquantified; the MIK-576 memo marks it as
+inference), plus operator-side JA4 and rotating exits. Exits that do
+expose a relay port are visible to signal 3: Yang et al. (CCS'22) found
+3,232,698 such China residential-proxy IPs. The roadmap's "cannot be told
+apart" line remains correct for SDK exits without a listener.
 
 **CGNAT and shared addresses.** A mobile or CGNAT address is many
-households; 15 sources are "Mobile ISP" by the reference label and the
+households. CGN runs in 17-18% of eyeball ASes and over 90% of cellular
+ASes, with subscriber-to-IPv4 ratios up to 20:1 reported (Richter et al.,
+*A Multi-perspective Analysis of Carrier-Grade NAT Deployment*, IMC 2016,
+https://arxiv.org/abs/1605.05606). 15 sources are "Mobile ISP" by the reference label and the
 true number is unknown because CGNAT is not visible from outside. A
 per-address verdict there is a claim about a crowd. Mitigations in the
 scheme: the `mobile` caveat on every such verdict; a counter-scan of a
 CGNAT address scans the carrier's gateway, so `device.cpe` will rarely
-fire; and nothing here feeds the blocklist. A pre-existing hazard worth
+fire; and nothing here feeds the blocklist or leaves the node, because a shared
+verdict on a CGN address would be copied to every member as a claim about
+everyone behind it. A pre-existing hazard worth
 noting separately: the blocklist's `networks=1` option collapses busy /24s
 to a prefix, and an eyeball /24 collapsed that way blocks many
 households. An AS-type list would let `networks=1` skip eyeball /24s; that
 is a follow-up, not part of this slice.
 
-**Address churn.** Scans land within 1 hour for 88% of scanned sources and
+**Address churn: the dominant failure mode.** A per-address label goes
+stale faster than anything else in this scheme breaks. ISPs renumber IPv4
+every 1 day (DTAG) to 2 weeks (BT) (Padmanabhan et al., *DynamIPs*,
+CoNEXT 2020, https://www.caida.org/catalog/papers/2020_dynamips/dynamips.pdf),
+and 91% of China residential-proxy IPs lived under 10 days (Yang et al.,
+CCS'22). A "compromised" label therefore lands on an uninvolved subscriber
+within days. Scans land within 1 hour for 88% of scanned sources and
 within 24 hours for the rest; on a dynamic line the later ones can hit the
 next subscriber. The verdict text therefore names the scan time, and
 evidence older than the address's `last_seen` by more than 24 hours is
@@ -505,7 +526,13 @@ device" row is a statement about a third party's equipment, signed by a
 member and copied to every other member's dataset and exports, and the
 one strong signal behind it is forgeable by the party with the most to
 gain. A derived row can be withdrawn by changing a catalogue; a replicated
-row cannot.
+row cannot. A second reason is legal: a dynamic IP address can be personal
+data for a party with legal means to identify the subscriber (CJEU,
+*Breyer*, C-582/14, 19 October 2016,
+https://eur-lex.europa.eu/legal-content/EN/ALL/?uri=CELEX%3A62014CJ0582),
+so a "compromised device" label on it is plausibly processing personal
+data, and with churn and CGN often about the wrong person (the memo's
+inference).
 
 **Failure modes of the slice itself.** A catalogue regex that is too wide
 (for example matching "router" in any `os_guess`) mislabels load
@@ -515,30 +542,121 @@ list unmatched `devicetype`/`os_guess` values so the catalogue grows from
 data. The AS-type list goes stale; refresh it on the Tor list's cadence and
 show its date on the status page.
 
-## Prior art (pending MIK-576)
+## Prior art
 
-The Researcher's sibling ticket (MIK-576, passive identification of
-residential proxies, proxyware and botnet endpoints without commercial
-feeds) had not landed when this was written. This section is to be filled
-from it. The questions it should settle for this document:
+Source: the MIK-576 findings memo (passive identification of residential
+proxies, proxyware and botnet endpoints without commercial feeds).
+Citations are given as the memo gives them; figures it quotes second-hand
+are marked "via". Two paragraphs below are our decisions, not the memo's,
+and are labelled as such.
 
-- Offline AS-type sources: which published classifications (PeeringDB
-  network type, Stanford ASdb, X4BNet's ASN-derived `lists_vpn` already on
-  the roadmap) are redistributable under a licence we can bundle, how
-  fresh they are, and how they score the ASNs we see most (the top 20 in
-  MIK-577 are a ready test set).
-- Published CPE and IoT port/banner catalogues from the botnet literature
-  (Mirai and descendants, MikroTik campaigns), to seed `device.cpe`
-  instead of writing it from eight examples.
-- Confirmation that the major residential-proxy SDKs open no listener on
-  the host and rotate exits per session, which is the premise of the
-  "invisible by construction" claim above.
-- Any published false-positive rates for PTR-pattern or ASN-only
-  residential classification, to calibrate the "context only" rating of
-  signals 1 and 2.
+### Offline AS-type sources
 
-If MIK-576 contradicts a verdict above, the verdict changes; the scheme's
-shape (evidence rows, first-match, local only) does not depend on it.
+ASdb (Ziv, Izhikevich, Ruth, Izhikevich, Durumeric, *ASdb: A System for
+Classifying Owners of Autonomous Systems*, IMC 2021,
+https://dl.acm.org/doi/10.1145/3487552.3487853) covers 96% of ASes and is
+93% accurate on 17 categories (75% on 95 sub-categories), 2.5 to 6 times
+more accurate than IPinfo or PeeringDB on hosting providers. PeeringDB
+`info_type` covers only about 15% of ASes (95% recall where present, per
+ASdb). CAIDA's AS classification was discontinued for declining accuracy:
+72% coverage and 58%, 75% and 0% accuracy per class in the December 2020
+release, per ASdb's re-measurement. Whether ASdb or PeeringDB can be
+bundled, and how often it would need refreshing, is MIK-582's question,
+not this document's.
+
+The negative is the important part. AS type separates a hoster from an
+eyeball; it cannot separate a hijacked eyeball from an ordinary one.
+Residential-proxy exits sit on genuine residential addresses by
+construction: Mi et al. (*Resident Evil*, IEEE S&P 2019, via Chiapponi,
+*Detecting and Mitigating the New Generation of Scraping Bots*, PhD
+thesis, Sorbonne/EURECOM 2023,
+https://theses.hal.science/tel-04443915v1/file/CHIAPPONI_Elisa_these_2023.pdf)
+found 95.22% of 6M+ collected residential-proxy IPs genuinely residential.
+That is why `net.eyeball` is context, never evidence.
+
+### Botnet scanner fingerprints (Mirai)
+
+The memo cites no port or banner catalogue to seed `device.cpe`; what it
+found is a packet fingerprint. Mirai's scanner sets the TCP sequence
+number to the destination IP (`tcph->seq = iph->daddr;`, `scanner.c`
+lines 117-120 and 225,
+https://github.com/jgamblin/Mirai-Source-Code/blob/master/mirai/bot/scanner.c).
+Descendants diverge: Hajime and Mozi "have virtually no overlapping IP
+addresses", and the authors conclude "there is no longer one canonical
+IoT botnet" (*The End of the Canonical IoT Botnet*, arXiv 2309.01130,
+2023, https://arxiv.org/abs/2309.01130).
+
+**Our decision: peephole cannot see this fingerprint, and it is not a
+`devices.toml` entry.** Traps terminate TCP in userspace (tokio
+`TcpListener`) and nothing stores packet headers. The roadmap's JA4T item
+(`TCP_SAVE_SYN` / `TCP_SAVED_SYN`) would not help: the fingerprinted
+packet is the scanner's raw half-open SYN, which is answered by RST and
+never becomes an accepted socket, so `getsockopt(TCP_SAVED_SYN)` never
+runs on it. Mirai's follow-up brute-force connection uses an ordinary
+`connect()` (`setup_connection` in `scanner.c`) and gets a kernel-random
+ISN. Seeing the scanner SYN would take raw packet capture (pcap or
+AF_PACKET plus capabilities), which is outside peephole's design.
+
+### Proxy SDKs and listeners
+
+The memo finds no peer-reviewed receiving-end study of proxyware or
+bandwidth-sharing SDKs, only vendor blogs, which it does not draw on. That
+an SDK exit opens no listener is marked in the memo as inference, not
+measurement. What is measured points the other way for part of the pool:
+Yang, Yu, Mi, Tang, Guo, Li, Zheng, Duan (*An Extensive Study of
+Residential Proxies in China*, CCS 2022,
+https://dl.acm.org/doi/10.1145/3548606.3559377) found 3,232,698 China
+residential-proxy IPs that "opened at least one TCP/UDP port for accepting
+relaying requests". An open SOCKS port also fits a deliberately run proxy.
+
+**Our decision: this does not change the build.** It raises the value of
+signal 3, which the slice already builds on. "Invisible by construction"
+is restated in signal 3's adversarial read and in Confidence and failure
+modes as our unquantified assumption, with the CCS'22 figure beside it.
+
+### False-positive rates for residential classification
+
+None published, for any of the context signals. For PTR patterns the
+closest data point is UDmap's motivating case (Xie, Yu, Achan, Gillum,
+Goldszmidt, Wobber, *How Dynamic are IP Addresses?*, SIGCOMM 2007,
+http://ccr.sigcomm.org/online/files/fp179-xie.pdf): of 136 spam-sending
+addresses in one block, 93 had no rDNS at all, and 30 of the 33 with
+records "could not be classified due to the lack of any meaningful
+information". No accuracy figure exists for ASN-only residential
+classification as a proxy test, and none for "same JA4 from many eyeball
+ASNs means a pool". The "context only" rating of signals 1, 2 and 5
+stands; it rests on no published calibration.
+
+### Rejected techniques
+
+| Technique | Reported numbers | Why rejected | Source |
+|---|---|---|---|
+| CAIDA AS classification | 72% coverage; 58% / 75% / 0% accuracy per class (Dec 2020) | Discontinued by CAIDA for declining accuracy | ASdb, IMC 2021 (above) |
+| PeeringDB `info_type` alone | ~15% of ASes; 95% recall where present | Too little coverage to stand alone | ASdb, IMC 2021 (above) |
+| "Residential ASN means genuine user", or the reverse | 95.22% of 6M+ residential-proxy IPs genuinely residential (Mi et al., S&P 2019, via Chiapponi) | Defeated by design: residential-proxy providers sell exactly this property | Chiapponi thesis 2023 (above) |
+| JA3 | none | Broken by Chromium's 2023 extension-order randomisation and cipher stunting; use JA4 and expect yearly drift | FoxIO JA4 README, https://github.com/FoxIO-LLC/ja4 |
+| rDNS keywords alone | 93 of 136 addresses with no rDNS; 30 of the remaining 33 unclassifiable | Records often missing or meaningless | Xie et al., SIGCOMM 2007 (above) |
+| Long-lived per-IP "compromised" labels | IPv4 renumbering 1 day to 2 weeks; CGN in 17-18% of eyeball ASes | Churn plus CGNAT puts the label on the wrong subscriber | Padmanabhan et al., CoNEXT 2020; Richter et al., IMC 2016 (above) |
+| RTT gap: TCP-handshake RTT vs TLS/app-layer RTT | Lab (Δ = 50 ms): FPR 0.04%, FNR 1.93%, accuracy 99.01%. Production: daily FPR upper bound averaged 17.66% (sd 7.53%), 7.24-29.27% across airlines, driven by mobile clients | Decisive: the production FPR. A 7-29% false-positive rate concentrated on mobile clients lands on exactly the CGNAT population this document already flags. It also needs a session we terminate; peephole does terminate TLS and HTTP on its traps, so that is a scope limit (useless on bare SYNs and behind nginx), not a blocker | Chiapponi, Dacier, Thonnard, *Towards Detecting and Geolocalizing Web Scrapers with Round Trip Time Measurements*, TMA 2023, https://www.elisachiapponi.com/publication/tma_2023/; figures from the Chiapponi thesis ch. 4, Table 4.7 |
+| One fingerprint for "IoT botnet" | Hajime and Mozi with "virtually no overlapping IP addresses" | Mirai descendants diverge; a fingerprint covers a family | arXiv 2309.01130 (above) |
+
+### Gaps
+
+- No peer-reviewed receiving-end study of proxyware or bandwidth-sharing
+  SDKs.
+- No numbers on SSH host-key or certificate reuse across ASNs (pool vs
+  cloned image). Absent, not disproven.
+- No published false-positive rate for the same JA4 across eyeball ASNs.
+- Khan, Chiapponi, Verkleij, Sperotto et al., *A First Look at
+  User-Installed Residential Proxies From a Network Operator's
+  Perspective*, CNSM 2024 (UTwente): not read; the PDF sits behind a
+  Cloudflare challenge. Its perspective is in-path.
+- Mi et al. (IEEE S&P 2019) and Antonakakis et al. (*Understanding the
+  Mirai Botnet*, USENIX Security 2017) were not read in the primary;
+  figures from Mi are second-hand.
+
+The memo moved one verdict (signal 3, toward counter-scan, on the CCS'22
+figure) and did not change the evidence-row scheme or the recommendation.
 
 ## Recommendation
 
