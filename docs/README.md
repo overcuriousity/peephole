@@ -9,5 +9,6 @@ Start with the page for what you want to do.
 - **Understanding what gets flagged:** [Detection](detection.md). Classification, rules, enrichment, counter-scans, exempt scanners.
 - **What is next:** [Roadmap](roadmap.md).
 - **Proposals under assessment:** [Compromised sources](compromised-sources.md). Whether hijacked endpoints can be told from rented scanners with our own signals; not shipped behaviour.
+- **Proposals under assessment:** [Shared addresses](shared-addresses.md). Whether a source address can be read as shared, carrier-NATed, mobile or pooled from our own signals, and a transparent reading for that axis; not shipped behaviour.
 
 The [changelog](../CHANGELOG.md) lists what changed in each release.
