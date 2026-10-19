@@ -36,77 +36,13 @@ Measured on the real cluster, 30 days, before this roadmap (2026-10-04):
 
 Shipped in [0.19.0](../CHANGELOG.md#0190---2026-10-18).
 
-### 2. Personas per node or hostname (opt-in)
+### 2. Personas per node or hostname
 
-- **Cost:** M
-- **Benefit:** medium–high. A controlled comparison of targeted versus spray
-  traffic across the cluster.
-
-A node, or an SNI/Host name, consistently presents as one product
-(WordPress, a Fortinet appliance, a GPU box). Three conditions keep the
-dataset clean:
-
-1. The persona is recorded on every request, like `answer`.
-2. It stays stable over time.
-3. It is opt-in.
-
-Per-IP version roulette is ruled out: scanners that use many source IPs
-would see the banner change from visit to visit, and that gives away the
-honeypot.
-
-**The AI decoys vary per node, persona or not.** Today every node's MCP
-decoy answers with the same `serverInfo` (`internal-ops 0.3.1`), the same
-resources and the same tools, and the LLM decoy with the same model list.
-One fingerprint of those identifies every member of the cluster. The
-server name and version, the tool and resource set, and the model list
-are derived from the node's identity: stable per node, different between
-nodes, and recorded like any persona. With a persona set they follow it.
-
-**Shown:**
-
-- **Admin:** Analytics follow-up rate and family mix per persona.
-- **Public dashboard:** attack mix per persona.
-- **Dataset:** a `persona` column.
+Shipped in [0.20.0](../CHANGELOG.md#0200---2026-10-19).
 
 ### 3. AI agent detection
 
-- **Cost:** M
-- **Benefit:** high. It tells which traffic an LLM agent drives, a class of
-  attacker that grows fast and that the dataset cannot name today.
-
-`rules/ai.toml` labels what is probed (`ai-infra-probe`, `mcp-probe`,
-`mcp-abuse`, `llm-key-use`), not who probes. An agent leaves traces of the
-model in what it sends, and these are checked on every request: body,
-query string and headers, not only on traffic to the AI decoys.
-
-- **Model artifacts.** Chat-template tokens (`<|im_start|>`, `[INST]`),
-  role and tool tags (`<tool_use>`, `<function_call>`, `<thinking>`),
-  tool-call JSON, and an LLM's self-description or refusal text in a
-  parameter. Label `ai-agent-artifact`.
-- **Agent tooling.** SDK and framework headers and User-Agents (OpenAI and
-  Anthropic SDK `X-Stainless-*` headers, LangChain, LlamaIndex, browser-use
-  and the like), and the `clientInfo` an MCP client sends in `initialize`.
-  Label `ai-agent-tooling`.
-
-Both are ordinary built-in rules: deterministic, from the signed request
-alone, so every node derives the same labels and nothing rests on a
-peer's claim. No weighted score and no timing heuristics: regular timing
-does not tell an agent from a scanner.
-
-**Precision first.** Before release the rules run over the full 30-day
-dataset; every hit is reviewed and every false positive becomes a negative
-test. Pattern matches inside payloads that merely carry such strings (a
-prompt-injection probe aimed at someone else's LLM) are kept apart from
-an agent's own traces.
-
-**Shown:**
-
-- **Admin:** a filter on the live feed and `/requests`, a badge on the IP
-  page, and an "agent-driven" mark on a campaign any of whose requests
-  carries the label. Analytics gives the share of agent-driven sources and
-  campaigns over time.
-- **Public dashboard:** share of sources with agent traces this period.
-- **Dataset:** the labels, in the existing `labels` column.
+Shipped in [0.20.0](../CHANGELOG.md#0200---2026-10-19).
 
 ### 4. AI discovery lures
 

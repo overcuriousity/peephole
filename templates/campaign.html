@@ -5,6 +5,7 @@
 {% let sub = "campaigns" %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
 <div class="meta">
+  {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
   <span>{{ c.row.size }} IPs</span>
   <span>key <span class="mono">{{ c.row.key }}</span></span>
   <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>

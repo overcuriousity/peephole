@@ -57,6 +57,7 @@ struct AnalyticsMax {
     ja4x: i64,
     abuse: i64,
     levels: i64,
+    personas: i64,
 }
 
 fn max_of<T>(v: &[T], f: impl Fn(&T) -> i64) -> i64 {
@@ -82,6 +83,7 @@ async fn analytics(
         ja4x: max_of(&a.ja4x, |n| n.ips),
         abuse: max_of(&a.abuse, |n| n.count),
         levels: max_of(&a.scan_levels, |n| n.count),
+        personas: max_of(&a.personas, |p| p.requests),
     };
     let from = match range {
         Range::H24 => Some(chrono::Duration::hours(24)),

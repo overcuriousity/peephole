@@ -179,6 +179,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
                 build: String::new(),
             }),
@@ -206,6 +207,110 @@ mod tests {
         for bad in ["b1#0", "b1#-1", "b1#x", "b1#2"] {
             assert!(render_uid(&s, bad).await.unwrap().is_none(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_version_5_ai_decoy_renders_with_the_identity_it_served() {
+        use crate::trap::decoy::ai::{Ask, choose};
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let node = crate::cluster::identity::NodeId([5; 32]);
+        let ident = crate::model::ai_id::derive(Some(&node.0));
+        let word = crate::canary::site::word(Some(&node.0));
+        let cases = [
+            (
+                "r1",
+                "POST",
+                "/mcp",
+                &br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#[..],
+            ),
+            (
+                "r2",
+                "POST",
+                "/mcp",
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            ),
+            ("r3", "GET", "/api/tags", b""),
+            ("r4", "GET", "/v1/models", b""),
+        ];
+        let mut conn = s.pool.acquire().await.unwrap();
+        let mut want = vec![];
+        // Under a persona (`"p"`) and as a row written before personas.
+        let runs = cases
+            .iter()
+            .flat_map(|c| [(c, Some("gpu-box")), (c, None)])
+            .enumerate();
+        for (n, ((uid, method, path, body), persona)) in runs {
+            let uid = format!("{uid}-{}", persona.unwrap_or("none"));
+            let (name, mut d) = choose(
+                &Ask {
+                    method,
+                    path,
+                    query: None,
+                    headers: &[],
+                    body,
+                },
+                &ident,
+                "gpu-box",
+            )
+            .unwrap();
+            d.p = persona.map(str::to_string);
+            let din = d.to_json();
+            assert!(din.contains(&format!(r#""i":"{ident}""#)), "{din}");
+            assert_eq!(din.contains(r#""p":"gpu-box""#), persona.is_some(), "{din}");
+            // As the trap rendered it when it answered.
+            let served = crate::trap::decoy::render(
+                &crate::trap::decoy::Input {
+                    v: crate::canary::DECOY_V,
+                    page_token: "tok",
+                    host: None,
+                    word,
+                    ts: 1_791_108_000,
+                    method,
+                    path,
+                    decoy_in: Some(&din),
+                },
+                &name,
+            )
+            .unwrap();
+            apply(
+                &mut conn,
+                Ctx {
+                    origin: Some(&node),
+                    hlc: n as u64 + 1,
+                },
+                &Record::Request(Box::new(crate::cluster::record::RequestRec {
+                    uid: uid.clone(),
+                    ts: "2026-10-04 10:00:00".into(),
+                    ip: "198.51.100.4".into(),
+                    method: (*method).into(),
+                    path: (*path).into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    page_token: Some("tok".into()),
+                    answer: Some(format!("decoy:{name}")),
+                    decoy_v: Some(crate::canary::DECOY_V),
+                    decoy_site: Some(word.into()),
+                    decoy_in: Some(din.clone()),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+            want.push((uid, served));
+        }
+        drop(conn);
+        for (uid, served) in &want {
+            let (got, _) = render_uid(&s, uid).await.unwrap().unwrap();
+            assert_eq!(&got, served, "{uid}");
+        }
+        // The persona is what the row was served under: gpu-box lists more
+        // models than the node-neutral identity.
+        let body = |u: &str| &want.iter().find(|(w, _)| w == u).unwrap().1.body;
+        assert_ne!(body("r3-gpu-box"), body("r3-none"));
+        assert_ne!(body("r1-gpu-box"), body("r1-none"));
     }
 
     #[tokio::test]

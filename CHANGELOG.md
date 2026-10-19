@@ -3,6 +3,60 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.20.0] - 2026-10-19
+
+Personas and AI agent detection (roadmap #2 and #3). Each node presents
+as a product, its AI decoys answer with an identity of their own, and
+requests an LLM agent drove are labelled. One database migration (0046,
+additive), applied on start. No new setting, no protocol version bump.
+
+### Added
+- Personas: the trap presents as one of five products, `wordpress`,
+  `fortinet`, `gpu-box`, `gitlab` or `exchange-owa`. Nothing to configure:
+  the node key picks one for the bare IP and for every Host that is not a
+  public DNS name, and each public DNS name gets its own, fixed per key
+  and name. A persona changes the banner only: `GET /` answers with that
+  product's front or sign-in page (carrying the page token), every trap
+  response carries its `Server` header, and every decoy still answers
+  under every persona (MIK-562, MIK-563).
+- The persona is recorded on every request and light row, shown on the
+  request and the node in the admin, and exported as a `persona` column.
+  In replication it is an optional record field, left out when absent;
+  an older member stores the row without it (MIK-562).
+- Per-node AI decoy identity (decoy version 5): the MCP decoy's server
+  name and version, tool names, extra tools and resources, and the LLM
+  gateway's model lists and Ollama version are drawn from the node key,
+  so one fingerprint no longer names every member. A persona biases them
+  (an `exchange-owa` MCP server gets a mail-ops name, a `gpu-box` gateway
+  lists more and larger local models). Older rows render with the
+  identity they were served (MIK-561, MIK-563).
+- AI agent labels: `ai-agent-artifact` (chat-template tokens, tool-call
+  tags and JSON, refusal or self-description text in the target, body or
+  a header) and `ai-agent-tooling` (SDK and agent-framework User-Agents,
+  `X-Stainless-*` headers, an MCP `initialize` naming a known agent
+  client). Both are weak tells capped at a level-1 scan; rules gain an
+  `unless_target_regex` veto that keeps `ai-agent-artifact` off the LLM
+  decoy endpoints. Checked for precision over the live dataset before
+  release (MIK-564, MIK-565).
+- Admin: an agent filter on the live feed and `/requests`, an agent badge
+  on the IP page and an "agent-driven" mark on campaigns (MIK-566);
+  Analytics per persona (counts, follow-up rate, family mix) and the
+  share of agent-driven sources and campaigns over time (MIK-567).
+- Public dashboard: attack mix per persona (cluster-wide only, from three
+  distinct IPs up) and the share of sources with agent traces;
+  `/api/stats` gains `agent_ips` (MIK-567).
+
+### Compatibility
+- Labels are derived by each node from its own rules. Until every peer
+  runs 0.20.0, old and new builds disagree on agent rows: an older build
+  does not label `ai-agent-artifact` / `ai-agent-tooling`, so its counts,
+  levels and campaign marks for those requests differ from a 0.20.0
+  node's. Rows from older members carry no persona.
+
+### Database
+- Migration 0046: `requests` and `skipped_requests` gain a nullable
+  `persona` column with partial indexes (additive).
+
 ## [0.19.0] - 2026-10-18
 
 New paths and exploit waves (roadmap #1): early warning when a path no rule

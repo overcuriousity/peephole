@@ -7,7 +7,8 @@
 //! (`peephole decoy render`). Version 1 serves canaries derived from the
 //! page token ([`crate::canary`]); version 0 (rows with no `decoy_v`)
 //! served `canary-<ref>`. Version 3 adds an ETag canary to the web decoys
-//! that answer 200; version 4 the file-manager page.
+//! that answer 200; version 4 the file-manager page; version 5 the node's
+//! own AI decoy identity (`decoy_in` `"i"`, [`crate::model::ai_id`]).
 pub mod ai;
 pub mod llm;
 pub mod mcp;
@@ -156,11 +157,11 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 "git-head" => (200, ct(TEXT), "ref: refs/heads/main\n".into()),
                 "wp-login" => (200, ct(HTML), wp_login(false)),
                 "wp-login-failed" => (200, ct(HTML), wp_login(true)),
-                "phpinfo" => (200, ct(HTML), phpinfo("web01")),
+                "phpinfo" => (200, ct(HTML), phpinfo("web01", APACHE)),
                 _ => return None,
             }
         }
-        1..=4 => {
+        1..=5 => {
             let word = inp.word;
             let site_name = format!("{word}.internal");
             match name {
@@ -200,7 +201,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                     git_refs(&site_name),
                 ),
                 "git-pack" => (500, ct(TEXT), String::new()),
-                "phpinfo" => (200, ct(HTML), phpinfo(word)),
+                "phpinfo" => (200, ct(HTML), phpinfo(word, server_software(inp))),
                 "file-manager" if inp.v >= 4 => (200, ct(HTML), FILE_MANAGER.into()),
                 _ => return None,
             }
@@ -523,7 +524,35 @@ const FILE_MANAGER: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
-fn phpinfo(host: &str) -> String {
+/// `SERVER_SOFTWARE` before personas, and for a row without one.
+const APACHE: &str = "Apache/2.4.57 (Debian)";
+
+/// The phpinfo decoy's `SERVER_SOFTWARE`: the persona's (decoy version 5,
+/// `decoy_in` `"p"`), else [`APACHE`].
+fn server_software(inp: &Input) -> &'static str {
+    if inp.v < 5 {
+        return APACHE;
+    }
+    ai::DecoyIn::parse(inp.decoy_in)
+        .p
+        .as_deref()
+        .and_then(crate::trap::persona::by_name)
+        .map_or(APACHE, |p| p.server_software())
+}
+
+/// The `decoy_in` a decoy outside the AI decoys is rendered from under
+/// `persona` (None: it does not depend on the persona).
+pub fn persona_in(name: &str, persona: &str) -> Option<String> {
+    (name == "phpinfo").then(|| {
+        ai::DecoyIn {
+            p: Some(persona.to_string()),
+            ..Default::default()
+        }
+        .to_json()
+    })
+}
+
+fn phpinfo(host: &str, server_software: &str) -> String {
     let rows = [
         (
             "System",
@@ -544,7 +573,7 @@ fn phpinfo(host: &str) -> String {
         ("allow_url_fopen", "On".to_string()),
         ("disable_functions", "no value".to_string()),
         ("DOCUMENT_ROOT", "/var/www/html".to_string()),
-        ("SERVER_SOFTWARE", "Apache/2.4.57 (Debian)".to_string()),
+        ("SERVER_SOFTWARE", server_software.to_string()),
     ];
     let mut body = String::from(
         "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"DTD/xhtml1-transitional.dtd\">\n\
@@ -604,6 +633,11 @@ mod tests {
             assert_eq!(render(&one, name), render(&two, name), "{name}");
             let (three, four) = (inp(3, None, "GET", "/"), inp(4, None, "GET", "/"));
             assert_eq!(render(&three, name), render(&four, name), "{name}");
+            assert_eq!(
+                render(&four, name),
+                render(&inp(5, None, "GET", "/"), name),
+                "{name}"
+            );
         }
         assert_eq!(render(&inp(3, None, "GET", "/"), "file-manager"), None);
     }
@@ -863,7 +897,37 @@ mod tests {
             render(&inp(0, None, "GET", "/x"), "wp-admin").is_none(),
             "v0 had no wp-admin"
         );
-        assert!(render(&inp(5, None, "GET", "/.env"), "dotenv").is_none());
+        assert!(render(&inp(6, None, "GET", "/.env"), "dotenv").is_none());
+    }
+
+    #[test]
+    fn phpinfo_server_software_follows_the_persona_in_decoy_in() {
+        let soft = |v: i64, din: Option<&str>| {
+            let d = render(
+                &Input {
+                    decoy_in: din,
+                    ..inp(v, None, "GET", "/phpinfo.php")
+                },
+                "phpinfo",
+            )
+            .unwrap();
+            let at = d.body.find("SERVER_SOFTWARE").unwrap();
+            d.body[at..].split("class=\"v\">").nth(1).unwrap()[..24].to_string()
+        };
+        for p in &crate::trap::persona::ALL {
+            let din = persona_in("phpinfo", p.name).unwrap();
+            assert!(
+                soft(5, Some(&din)).starts_with(p.server_software()),
+                "{}",
+                p.name
+            );
+            // Version 4 knew no persona.
+            assert!(soft(4, Some(&din)).starts_with(APACHE));
+        }
+        // A version-5 row without "p" (written before personas rendered).
+        assert!(soft(5, None).starts_with(APACHE));
+        assert!(soft(5, Some(r#"{"p":"nope"}"#)).starts_with(APACHE));
+        assert_eq!(persona_in("dotenv", "gitlab"), None);
     }
 
     #[test]

@@ -76,6 +76,7 @@ fn schema() -> SchemaRef {
         ),
         i("status", true),
         i("held_ms", true),
+        s("persona", true),
         i("unrecorded", false),
         i("weight", false),
         Field::new(
@@ -216,6 +217,7 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
         Arc::new(used_from.finish()),
         ints(rows.iter().map(|r| r.status)),
         ints(rows.iter().map(|r| r.held_ms)),
+        strs(rows.iter().map(|r| r.persona.as_deref())),
         ints(rows.iter().map(|r| Some(r.unrecorded))),
         ints(rows.iter().map(|r| Some(r.weight))),
         Arc::new(labels.finish()),

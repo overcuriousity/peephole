@@ -187,6 +187,10 @@ pub struct RequestRec {
     /// What an MCP or LLM decoy was rendered from (compact JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_in: Option<String>,
+    /// The persona the node presented as (`crate::trap::persona`); absent
+    /// in records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// One request the flood gate answered without recording it in full.
@@ -214,6 +218,10 @@ pub struct SkipRow {
     /// What an MCP or LLM decoy was rendered from (compact JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoy_in: Option<String>,
+    /// The persona the node presented as (`crate::trap::persona`); absent
+    /// in records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// Skipped requests of one IP, sent together. `dropped`: requests past
@@ -1029,6 +1037,47 @@ mod tests {
         let back: Record = super::super::rpc::cbor::decode(&bytes).unwrap();
         assert_eq!(back, rec);
         assert_eq!(super::super::rpc::cbor::encode(&back).unwrap(), bytes);
+    }
+
+    /// A persona is left out when absent, so a record from before it
+    /// encodes and rebuilds as it was signed; one with it round-trips.
+    #[test]
+    fn a_persona_is_optional_on_requests_and_light_rows() {
+        let enc = |r: &Record| crate::cluster::rpc::cbor::encode(r).unwrap();
+        let has = |b: &[u8]| b.windows(7).any(|w| w == b"persona");
+        let skip = |persona: Option<&str>| {
+            Record::SkipBatch(SkipBatchRec {
+                uid: "u".into(),
+                ip: "203.0.113.1".into(),
+                dropped: 0,
+                rows: vec![SkipRow {
+                    persona: persona.map(Into::into),
+                    ..Default::default()
+                }],
+                build: String::new(),
+            })
+        };
+        let req = |persona: Option<&str>| {
+            Record::Request(Box::new(RequestRec {
+                persona: persona.map(Into::into),
+                ..Default::default()
+            }))
+        };
+        for r in [req(None), skip(None)] {
+            let bytes = enc(&r);
+            assert!(!has(&bytes));
+            let back: Record = crate::cluster::rpc::cbor::decode(&bytes).unwrap();
+            assert_eq!(back, r);
+            assert_eq!(enc(&back), bytes);
+        }
+        for r in [req(Some("gitlab")), skip(Some("gitlab"))] {
+            let bytes = enc(&r);
+            assert!(has(&bytes));
+            assert_eq!(
+                crate::cluster::rpc::cbor::decode::<Record>(&bytes).unwrap(),
+                r
+            );
+        }
     }
 
     /// A request without a ruleset fingerprint encodes as before; one with

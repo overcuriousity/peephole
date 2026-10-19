@@ -508,6 +508,12 @@ async fn every_answered_request_is_a_row_a_light_row_or_counted() {
     assert_eq!(full, 2);
     assert!(light >= 5, "light rows: {light}");
     assert_eq!(full + light + dropped, 51);
+    // Each carries the persona it was answered as: a standalone node's, as
+    // the Host is an IP literal.
+    let persona = trap::persona::resolve(None, None).name;
+    let q = |t: &str| format!("SELECT COUNT(*) FROM {t} WHERE persona = '{persona}'");
+    assert_eq!(count(&store, &q("requests")).await, full);
+    assert_eq!(count(&store, &q("skipped_requests")).await, light);
     let paths: Vec<String> =
         sqlx::query_scalar("SELECT path FROM skipped_requests ORDER BY ts_ms LIMIT 2")
             .fetch_all(&store.pool)
@@ -885,6 +891,7 @@ async fn light_rows_of_requests_in_flight_at_shutdown_are_kept() {
         "GET",
         "/late",
         trap::skiplog::SkipAnswer::Plain,
+        "wordpress",
         0,
         std::time::Instant::now(),
     );

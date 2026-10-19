@@ -56,6 +56,22 @@ pub struct ModelRow {
     pub api: String,
     pub requests: i64,
     pub ips: i64,
+    /// The serving nodes' AI identities, comma-separated, each
+    /// `ident/persona`; `-` for a part a row lacks.
+    pub idents: String,
+}
+
+impl ModelRow {
+    /// Whether a node it was asked of listed it.
+    pub fn listed(&self) -> bool {
+        fn part(p: &str) -> Option<&str> {
+            Some(p).filter(|p| *p != "-")
+        }
+        self.idents.split(',').any(|ip| {
+            let (i, p) = ip.split_once('/').unwrap_or((ip, "-"));
+            crate::model::llm::listed(part(i), part(p), &self.model)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,13 +214,13 @@ impl Store {
             q = q.bind(m);
         }
         let by_api = q.fetch_all(&self.read).await?;
-        // Counted in SQL per endpoint and model (few distinct pairs), not a
-        // row per request: the range may be the whole history.
-        let mut q = sqlx::query_as::<_, (String, Option<String>, i64)>(sqlx::AssertSqlSafe(
-            format!(
-                "SELECT r.answer, json_extract(r.decoy_in, '$.model'), COUNT(*) {base} GROUP BY 1, 2"
-            ),
-        ));
+        // Counted in SQL per endpoint, model and serving node's identity
+        // and persona (few distinct tuples), not a row per request: the range may be
+        // the whole history. A model is listed if that node listed it.
+        type Tally = (String, Option<String>, Option<String>, Option<String>, i64);
+        let mut q = sqlx::query_as::<_, Tally>(sqlx::AssertSqlSafe(format!(
+            "SELECT r.answer, json_extract(r.decoy_in, '$.model'), json_extract(r.decoy_in, '$.i'), json_extract(r.decoy_in, '$.p'), COUNT(*) {base} GROUP BY 1, 2, 3, 4"
+        )));
         if let Some(m) = since {
             q = q.bind(m);
         }
@@ -212,13 +228,15 @@ impl Store {
             by_api,
             ..Default::default()
         };
-        for (answer, model, n) in q.fetch_all(&self.read).await? {
+        for (answer, model, ident, persona, n) in q.fetch_all(&self.read).await? {
             match answer.trim_start_matches("decoy:llm:") {
                 "tags" | "models" if model.is_none() => s.listings += n,
                 "chat" | "generate" | "chat-completions" | "completions" | "responses"
                 | "messages" | "complete" => {
                     s.calls += n;
-                    if model.as_deref().is_some_and(crate::model::llm::listed) {
+                    if model.as_deref().is_some_and(|m| {
+                        crate::model::llm::listed(ident.as_deref(), persona.as_deref(), m)
+                    }) {
                         s.listed += n
                     } else {
                         s.unlisted += n
@@ -235,7 +253,8 @@ impl Store {
         let (w, since) = r.ts_clause("r.ts");
         let mut q = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe(format!(
             "SELECT json_extract(r.decoy_in, '$.model') AS model, COALESCE(json_extract(r.decoy_in, '$.api'), '') AS api,
-                    COUNT(*) AS requests, COUNT(DISTINCT r.ip_id) AS ips
+                    COUNT(*) AS requests, COUNT(DISTINCT r.ip_id) AS ips,
+                    group_concat(DISTINCT COALESCE(json_extract(r.decoy_in, '$.i'), '-') || '/' || COALESCE(json_extract(r.decoy_in, '$.p'), '-')) AS idents
              FROM requests r WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w}
              GROUP BY 1, 2 ORDER BY requests DESC LIMIT 100")));
         if let Some(m) = since {
@@ -812,6 +831,41 @@ mod tests {
             models
                 .iter()
                 .any(|m| m.model == "deepseek-r1:671b" && m.ips == 1)
+        );
+        // Version 5: listed means listed by the node that was asked.
+        let (with, without) = (0..64u8)
+            .map(|n| crate::model::ai_id::derive(Some(&[n; 32])))
+            .fold((None, None), |(w, wo), i| {
+                let has = crate::model::llm::listed(Some(&i), None, "phi3:mini");
+                (
+                    w.or(has.then(|| i.clone())),
+                    wo.or((!has).then(|| i.clone())),
+                )
+            });
+        for (ip, i) in [("8.8.8.8", without.unwrap()), ("9.9.9.9", with.unwrap())] {
+            req(
+                &s,
+                ip,
+                "/api/chat",
+                "decoy:llm:chat",
+                &format!(r#"{{"api":"ollama","ep":"chat","model":"phi3:mini","i":"{i}"}}"#),
+                &[],
+                None,
+                "",
+            )
+            .await;
+        }
+        let sum = s.llm_summary(Range::All).await.unwrap();
+        assert_eq!((sum.calls, sum.listed, sum.unlisted), (6, 4, 2));
+        let phi = s.llm_models(Range::All).await.unwrap();
+        let phi = phi.iter().find(|m| m.model == "phi3:mini").unwrap();
+        assert!(phi.listed(), "{}", phi.idents);
+        assert!(
+            !s.llm_models(Range::All)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.model == "deepseek-r1:671b" && m.listed())
         );
         let p = s.llm_prompts(Range::All, 1).await.unwrap();
         assert!(

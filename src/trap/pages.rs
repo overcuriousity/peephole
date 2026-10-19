@@ -6,6 +6,20 @@ pub fn trap_page(token: &str, prefix: &str) -> String {
         .replace("__PREFIX__", prefix)
 }
 
+/// A persona's landing `page` with its `__COLLECT__` placeholder replaced
+/// by the trap page's token link: the token and the collector script, so a
+/// landing is linked to its row as the trap page is. `prefix` as in
+/// [`trap_page`].
+pub fn with_collector(page: &str, token: &str, prefix: &str) -> String {
+    page.replace(
+        "__COLLECT__",
+        &format!(
+            "<script>window.PEEPHOLE_TOKEN = \"{token}\"; window.PEEPHOLE_BASE = \"{prefix}\";</script>\n\
+             <script src=\"{prefix}/collect.js\" defer></script>"
+        ),
+    )
+}
+
 pub fn claim_confirmation() -> String {
     r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

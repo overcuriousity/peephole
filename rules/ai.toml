@@ -4,6 +4,8 @@
 # Probing what a server runs is recon (weight 2, OAT-004); speaking MCP to
 # it is interaction (weight 3); driving its tools at files or internal
 # addresses is exploitation (weight 4, A01:2021).
+# The two ai-agent-* rules at the end say who sent a request (an LLM agent),
+# not what it was after: the classifier treats them as weak tells.
 
 [[rule]]
 label = "ai-infra-probe"
@@ -56,3 +58,28 @@ owasp = ["A01:2021"]
 # server — resources/read with a file:// URI, tool calls aimed at loopback
 # or the cloud metadata address.
 body_regex = '''"(resources/read|tools/call)"[^}]{0,4096}(file://|127\.0\.0\.1|localhost|169\.254\.)|"(uri|url|path|file|filename)"\s*:\s*"(file://|/etc/|/proc/|\.\./)'''
+
+[[rule]]
+label = "ai-agent-artifact"
+weight = 2
+owasp = ["OAT-014"]
+# An LLM's own output inside a request parameter: chat-template control
+# tokens, role/tool tags, tool-call JSON, refusal or self-description text.
+# Not on the LLM chat/completion endpoints (the endpoints of the first
+# ai-infra-probe rule): there such text is a prompt aimed at the decoy, not
+# an agent's trace. Kept on /mcp: an MCP client is an agent.
+target_regex = '''<\|(im_start|im_end|eot_id|start_header_id|end_header_id)\|>|\[/?INST\]|<</?SYS>>|</?(tool_call|tool_use|function_call|thinking)>|<invoke\s+name=|<antml:|"type"\s*:\s*"tool_use"|"tool_calls"\s*:\s*\[\s*\{|"function_call"\s*:\s*\{\s*"name"|\bas an ai language model\b|\bi['’]?m sorry,? but i can(['’]?t|not) (help|assist|comply|provide|do that)|\bi cannot assist with\b|\bi['’]?m an ai assistant\b'''
+body_regex = '''<\|(im_start|im_end|eot_id|start_header_id|end_header_id)\|>|\[/?INST\]|<</?SYS>>|</?(tool_call|tool_use|function_call|thinking)>|<invoke\s+name=|<antml:|"type"\s*:\s*"tool_use"|"tool_calls"\s*:\s*\[\s*\{|"function_call"\s*:\s*\{\s*"name"|\bas an ai language model\b|\bi['’]?m sorry,? but i can(['’]?t|not) (help|assist|comply|provide|do that)|\bi cannot assist with\b|\bi['’]?m an ai assistant\b'''
+header_regex = '''<\|(im_start|im_end|eot_id|start_header_id|end_header_id)\|>|\[/?INST\]|<</?SYS>>|</?(tool_call|tool_use|function_call|thinking)>|<invoke\s+name=|<antml:|"type"\s*:\s*"tool_use"|"tool_calls"\s*:\s*\[\s*\{|"function_call"\s*:\s*\{\s*"name"|\bas an ai language model\b|\bi['’]?m sorry,? but i can(['’]?t|not) (help|assist|comply|provide|do that)|\bi cannot assist with\b|\bi['’]?m an ai assistant\b'''
+unless_target_regex = '''^/v1/(chat/completions|completions|messages|responses)(/|\?|$)|^/api/(chat|generate)(/|\?|$)|^/api/v1/chat/completions(/|\?|$)|^/v1/complete(\?|$)|^/(anthropic|api/anthropic|litellm|openai|ollama)/'''
+
+[[rule]]
+label = "ai-agent-tooling"
+weight = 1
+owasp = ["OAT-011"]
+# LLM SDKs and agent frameworks: their User-Agents, the headers the OpenAI
+# and Anthropic SDKs add, and an MCP initialize whose clientInfo names a
+# known agent client (every initialize carries clientInfo, scanners too).
+ua_regex = '''^(openai|anthropic)/|^(openai|anthropic)-(python|node|typescript|java|go)\b|\b(langchain|llama-?index|browser-use|crewai|autogen|smolagents|aider|claude-code|claude-cli|codex[-_]cli|mcp-(remote|inspector|client))\b'''
+header_regex = '''(?m)^(x-stainless-(lang|package-version|os|arch|runtime|runtime-version|retry-count)|anthropic-version|openai-(beta|organization|project)):'''
+body_regex = '''"clientInfo"\s*:\s*\{[^}]{0,256}"name"\s*:\s*"[^"]{0,48}\b(claude|cursor|windsurf|cline|roo|copilot|vscode|visual studio code|zed|continue|goose|langchain|openai|codex|gemini|fast-agent|aider|n8n|dify)\b'''

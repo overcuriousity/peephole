@@ -74,6 +74,7 @@ struct WallPage {
     family_max: i64,
     verb_max: i64,
     campaign_family_max: i64,
+    persona_family_max: i64,
     /// "Recent requests": the newest `[public] recent_rows` of `stats.recent`.
     recent: Vec<crate::store::stats::RecentRequest>,
     /// Shortest and longest publication delay, in minutes.
@@ -166,6 +167,10 @@ async fn wall(
             .campaigns
             .iter()
             .flat_map(|c| c.families.iter().map(|n| n.count))),
+        persona_family_max: max(&mut stats
+            .personas
+            .iter()
+            .flat_map(|p| p.families.iter().map(|n| n.count))),
         recent,
         delay_min: state.cfg.public.delay_minutes,
         delay_max: state.cfg.public.delay_minutes + state.cfg.public.jitter_minutes,
@@ -198,6 +203,8 @@ async fn stats_json(
     hidden.top_labels.clear();
     hidden.families.clear();
     hidden.owasp.clear();
+    hidden.agent_ips = 0;
+    hidden.personas.clear();
     if let Some(c) = hidden.campaigns.as_mut() {
         c.families.clear();
     }
@@ -582,7 +589,7 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             .format("%Y-%m-%dT%H:%M")
             .to_string()
     };
-    let presets: [(&str, &str, &str, String); 12] = [
+    let presets: [(&str, &str, &str, String); 14] = [
         ("Last hour", "Received in the last hour", "from", since(1)),
         (
             "Last 24 h",
@@ -620,6 +627,18 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             "Logins with default credentials (admin:admin, Mirai pairs)",
             "label",
             "credential-attack".into(),
+        ),
+        (
+            "Agent artifact",
+            "Agent traces: an LLM agent's own output in the request",
+            "label",
+            "ai-agent-artifact".into(),
+        ),
+        (
+            "Agent tooling",
+            "Agent traces: an agent SDK or framework's headers",
+            "label",
+            "ai-agent-tooling".into(),
         ),
         ("POST", "Requests with method POST", "method", "POST".into()),
         (
@@ -1354,6 +1373,14 @@ mod tests {
         let none = RequestFilter::default();
         assert_eq!(get(&none, "MCP decoy").href, "/requests?answer=decoy%3Amcp");
         assert_eq!(get(&none, "LLM decoy").href, "/requests?answer=decoy%3Allm");
+        assert_eq!(
+            get(&none, "Agent artifact").href,
+            "/requests?label=ai-agent-artifact"
+        );
+        assert_eq!(
+            get(&none, "Agent tooling").href,
+            "/requests?label=ai-agent-tooling"
+        );
         let s = request_qs(&RequestFilter {
             session: Some("ab-cd".into()),
             ..Default::default()
@@ -1850,6 +1877,69 @@ show_labels = {show_labels}
         let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["campaigns"]["families"], serde_json::json!([]), "{json}");
+    }
+
+    /// Three agent-labelled IPs as wordpress, one as gpu-box.
+    async fn seed_personas(st: &AdminState) {
+        for (i, persona) in ["wordpress", "wordpress", "wordpress", "gpu-box"]
+            .into_iter()
+            .enumerate()
+        {
+            let ip = st
+                .store
+                .upsert_ip(format!("198.51.100.{}", i + 1).parse().unwrap())
+                .await
+                .unwrap();
+            st.store
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: "/personapath".into(),
+                    headers_json: "[]".into(),
+                    labels_json: r#"["sqli","ai-agent-tooling"]"#.into(),
+                    persona: Some(persona.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_shows_persona_mix_and_agent_share_as_aggregates() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_personas(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        let card = between(&html, "What each persona drew", "</section>");
+        assert!(
+            card.contains(">wordpress<") && card.contains("fam-inject"),
+            "{card}"
+        );
+        assert!(
+            !card.contains("gpu-box"),
+            "one IP is below the threshold: {card}"
+        );
+        let tile = between(&html, "Sources with agent traces", "</div></div>");
+        // The fixture's own IP has no agent label: 4 of 5.
+        assert!(tile.contains("80 %") && tile.contains("4 IPs"), "{tile}");
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["agent_ips"], 4);
+        for x in ["persona", "wordpress", "gpu-box", "personapath"] {
+            assert!(!json.contains(x), "{x:?} in /api/stats");
+        }
+
+        // Labels hidden: neither the mix nor the share.
+        let (st, _d) = state_with(false, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_personas(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, html) = get_with(&app, "/?range=7d", None).await;
+        assert!(!html.contains("What each persona drew"));
+        assert!(!html.contains("Sources with agent traces"));
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["agent_ips"], 0, "{json}");
     }
 
     #[tokio::test]

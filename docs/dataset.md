@@ -39,7 +39,7 @@ duckdb.sql("SELECT country, COUNT(*) FROM 'peephole.parquet' GROUP BY 1 ORDER BY
 | `kind` | One row per | Columns filled |
 |---|---|---|
 | `request` | request recorded in full | all |
-| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, the per-IP columns; for a decoy or tarpit answer also `answer` (and `decoy_v`, `host`, or `held_ms`) |
+| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, `persona`, the per-IP columns; for a decoy or tarpit answer also `answer` (and `decoy_v`, `host`, or `held_ms`) |
 
 A trap records every request from an address up to a rate; above it, the
 request is still answered and classified but kept as a light row, and
@@ -89,12 +89,13 @@ Column order is as listed.
 | `tls_client_hello` | binary? | The raw TLS ClientHello (HTTPS only) |
 | `ja4` | string? | JA4 fingerprint of that ClientHello |
 | `ja4h` | string? | JA4H fingerprint of `raw_head` (HTTP/1 only; null for plain HTTP from a trusted proxy, whose head is the proxy's request, not the client's): method, version, cookie and referer flags, header count, first `Accept-Language`, then hashes of the header names in order and of the sorted cookie names and pairs. An unknown method gives its first two letters |
-| `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `webshell` (a request to a path an upload on this node was told it landed at: a canned reply to a few commands, else an empty `200`), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
+| `answer` | string? | What the trap sent: `not-found` (a 404), `landing` (a `GET` or `HEAD` of `/`: the persona's front or sign-in page, a 200, carrying the page token as the 404 page does), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `webshell` (a request to a path an upload on this node was told it landed at: a canned reply to a few commands, else an empty `200`), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
 | `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
-| `decoy_in` | string? | What an MCP or LLM decoy was rendered from (JSON); empty otherwise |
+| `decoy_in` | string? | What an MCP or LLM decoy was rendered from (JSON), and for `decoy:phpinfo` from decoy version 5 `{"p": …}`; empty otherwise. From decoy version 5 it carries the serving node's AI identity as `"i"` and the persona it answered under as `"p"` (see Canaries); `"tool"` is the canonical tool name |
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
 | `status` | int? | HTTP status sent |
 | `held_ms` | int? | How long a `tarpit` answer held the client, in milliseconds: up to the last chunk the connection took, so a client that gave up counts until then; the configured hold (`trap.tarpit_hold_secs`, default 600 s) when it waited to the end. Null for other answers |
+| `persona` | string? | What the trap presented as when it answered: `wordpress`, `fortinet`, `gpu-box`, `gitlab` or `exchange-owa`. Fixed per node key for its bare IP and every Host that is not a public DNS name, and per (node key, name) for each public DNS name it was reached by. Null for rows from before v0.20.0 or from an older member |
 | `unrecorded` | int | Requests from this address answered since the previous row but not recorded (light rows: the drops of the batch, on its last row) |
 | `weight` | int | Answered requests this row stands for (see Rows) |
 
@@ -110,10 +111,10 @@ Treat them as weak labels, or re-label from `method`, `path`, `query`,
 
 | Column | Type | Meaning |
 |---|---|---|
-| `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [detection.md](detection.md#classification) |
+| `labels` | list of string | Labels that matched: rule labels (`sqli`, `rce`, `path-traversal`, `ssrf`, `webshell`, `scanner-ua`, `ai-infra-probe`, `ai-agent-artifact`, `ai-agent-tooling`, … one family per file in `rules/`) and behavioural labels from code (`probe`, `path-scanner`, `form-interaction`, …); see the taxonomy in [detection.md](detection.md#classification) |
 | `owasp` | list of string | OWASP tags of the matching rules: a Top 10 2021 class (`A03:2021`) for payload families, an Automated Threat (`OAT-014`) for scanning behaviour. Behavioural labels carry none |
 | `severity` | int? | 0 (noise) to 4 (exploit attempt); the highest of the matching rules. Null on light rows |
-| `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4); weak tells alone (`probe`, `path-scanner`, `php-probe`) cap it at 1 whatever the severity |
+| `scan_level` | int? | Counter-scan level this request earned (0: none, 1 to 4); weak tells alone (`probe`, `path-scanner`, `php-probe`, `ai-agent-artifact`, `ai-agent-tooling`) cap it at 1 whatever the severity |
 | `rules` | string? | Fingerprint of the rules that classified it, those built into the recording binary: SHA-256 (hex) over the `rules/*.toml` files, sorted by name, each as its name's and text's 8-byte big-endian length followed by the bytes. Rows with the same value were classified by the same rules, whatever the build; to see the rules, check out a commit whose `rules/` has that fingerprint (`peephole check-config` prints the start of a binary's). Null for claims, light rows and rows recorded before the column existed. It is what the recording node says it used, not a proof |
 | `fp_claim` | bool | The address filed a false-positive claim at some point (claim texts and e-mail addresses are never exported) |
 
@@ -315,6 +316,33 @@ docs, api, account, checkout, catalog, newsletter, jobs, status. Links a
 scanner can follow back (`ADMIN_URL`, the git remote) use the request's
 `Host` header (HTTP/2: `:authority`; never a proxy-form target) when it
 is a public IP or DNS name, an IPv6 literal in brackets, else the site.
+
+**Version 5** adds the node's own AI decoy identity. The node's `ident`
+is the first 4 bytes of `SHA-256("peephole-ai-id-v1\0" || node_id)` as 8
+lowercase hex characters (a standalone node hashes nothing, as for the
+site word), stored in `decoy_in` as `"i"`, so the row renders with the
+identity it was served even after the node's key changes. From its bytes
+`r[0..4]` and `sel = SHA-256("peephole-ai-sel-v1\0" || r)`: the MCP
+server name is `SERVERS[r[0] mod 24]`, its version `r[1] mod 3`.`r[2] mod
+16`.`r[3] mod 32`; tool `t` is listed under its name number `sel[t] mod 3`;
+`sel[5] mod 3` extra tools from `sel[6]` on; tools in an order drawn from
+`sel[8..14]`, resources 2 of 4 drawn from `sel[15..18]`; the gateway lists
+`3 + sel[18] mod 2` local models drawn from `sel[20..29]`, Ollama version
+`VERSIONS[sel[29] mod 6]`, and drops the OpenAI (Anthropic) model
+`sel[30] mod 4` (`sel[31] mod 4`) unless that is 3. The pools are in
+`src/trap/decoy/mcp.rs` and `src/model/llm.rs`. A row without `"i"`
+(versions 2-4) renders the identity every node served before:
+`internal-ops 0.3.1`, the five canonical tools, the first two resources,
+the first four local models, all six upstream models, Ollama 0.6.5. Under a persona, `decoy_in` also carries `"p"`: the MCP
+server name is then drawn from that persona's own pool of eight
+(`mcp_servers` in `src/trap/persona/<name>.rs`) instead of `SERVERS`, the
+`gpu-box` gateway lists two more local models (`5 + sel[18] mod 2`) and
+`2 + (sel[18] >> 4) mod 2` large ones (`LARGE` in `src/model/llm.rs`,
+consecutive from `(sel[18] >> 1) mod 6`), and the phpinfo decoy's
+`SERVER_SOFTWARE` is the persona's `Server` header (`Apache` for
+`fortinet`, which sends none). A version-5 row without `"p"` renders the
+node-neutral identity above, and phpinfo's `Apache/2.4.57 (Debian)`. The
+web decoys render as in version 4.
 
 **Version 0** (empty `decoy_v` on a decoy row) served `canary-<ref>`,
 `AKIACANARY<REF>` (first 10 characters upper-cased) and

@@ -50,7 +50,7 @@
 <section class="card">
   <h2>Models requested</h2>
   <div class="table-wrap"><table class="table"><thead><tr><th>Model</th><th>API</th><th class="num">Requests</th><th class="num">IPs</th><th>Listed</th></tr></thead><tbody>
-  {% for m in models %}<tr><td class="mono">{{ m.model }}</td><td>{{ m.api }}</td><td class="num">{{ m.requests }}</td><td class="num">{{ m.ips }}</td><td>{% if crate::trap::decoy::llm::listed(m.model.as_str()) %}yes{% else %}no{% endif %}</td></tr>{% endfor %}
+  {% for m in models %}<tr><td class="mono">{{ m.model }}</td><td>{{ m.api }}</td><td class="num">{{ m.requests }}</td><td class="num">{{ m.ips }}</td><td>{% if m.listed() %}yes{% else %}no{% endif %}</td></tr>{% endfor %}
   {% if models.is_empty() %}<tr><td colspan="5" class="empty">No model asked for in this range.</td></tr>{% endif %}
   </tbody></table></div>
 </section>
