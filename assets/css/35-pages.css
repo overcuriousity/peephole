@@ -79,6 +79,7 @@ a.tile:hover .label { color: var(--color-accent); }
 .lookup-notes { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.75rem; font-size: var(--text-sm); }
 .lookup-result > details { margin-top: 0.5rem; }
 .names { margin: 0.75rem 0 0; }
+.names a { scroll-margin-top: 6.5rem; }
 .names a:target { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
 /* ---- In-page section nav (IP page, lookup result) ------------------- */
