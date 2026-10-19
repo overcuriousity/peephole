@@ -216,6 +216,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::config::Secret;
+    use crate::lock::MutexExt;
     use axum::http::{HeaderMap, StatusCode, header::LOCATION};
     use std::sync::{Arc, Mutex};
 
@@ -232,7 +233,7 @@ mod tests {
             axum::routing::post(move |h: HeaderMap, body: String| {
                 let g = g.clone();
                 async move {
-                    g.lock().unwrap().push((h, body));
+                    g.lock_or_recover().push((h, body));
                     (status, [(LOCATION, "http://127.0.0.1:9/elsewhere")])
                 }
             }),
@@ -298,7 +299,7 @@ mod tests {
         let (url, got) = sink("hook", StatusCode::OK).await;
         let p = pusher(NotifyKind::Webhook, &url, Some("tk_1"));
         p.push_pending(&s, 60, now()).await;
-        let got = got.lock().unwrap().clone();
+        let got = got.lock_or_recover().clone();
         assert_eq!(got.len(), 1);
         let (h, body) = &got[0];
         assert_eq!(h[AUTHORIZATION], "Bearer tk_1");
@@ -336,7 +337,7 @@ mod tests {
         pusher(NotifyKind::Ntfy, &url, None)
             .push_pending(&s, 60, now())
             .await;
-        let got = got.lock().unwrap().clone();
+        let got = got.lock_or_recover().clone();
         assert_eq!(got.len(), 1, "one push for both waves");
         let (h, body) = &got[0];
         assert_eq!(h["title"], "exploit wave on node-a");
@@ -371,7 +372,7 @@ mod tests {
         );
         p.push_pending(&s, 60, now()).await;
         assert_eq!(
-            got.lock().unwrap().len(),
+            got.lock_or_recover().len(),
             3,
             "no fourth try, redirect not followed"
         );
