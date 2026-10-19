@@ -403,6 +403,18 @@ cluster.
   operators should not be identifiable from the file.
 - **Claim e-mails are never exported**, only `fp_claim`.
 - **Counts need `weight`.** See Rows.
-- **JA4H is FoxIO's method under the FoxIO License 1.1** (JA4 is BSD
-  3-Clause). Check its terms before building a commercial product on the
-  `ja4h` column.
+- **Fingerprint methods have their own licences.** Two are FoxIO
+  License 1.1, which allows non-commercial use only (§2). Check before
+  building a commercial product on them. Below: (a) implementing it in a
+  binary we distribute, (b) publishing its values in exports, (c) selling
+  peephole or a service built on it. This is a reading of the terms, not
+  legal advice.
+
+  | Column / kind | Method, owner | Licence | (a) binary | (b) values | (c) selling |
+  |---|---|---|---|---|---|
+  | `ja4` | JA4, FoxIO | BSD 3-Clause (`LICENSE-JA4`) | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
+  | `ja4h` | JA4H, FoxIO (patent pending) | FoxIO License 1.1 | Non-commercial only, with the licence terms or URL attached (§2) | Licence is silent; FoxIO's FAQ counts indirect monetisation without exposing the values as commercial | Not allowed without a FoxIO OEM licence (§2, FAQ) |
+  | `host_keys` `ja4x` | JA4X, FoxIO (patent pending) | FoxIO License 1.1 | As `ja4h` | As `ja4h` | As `ja4h` |
+  | `host_keys` `hassh` | HASSH-server, Salesforce (not FoxIO's JA4SSH) | BSD 3-Clause | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
+  | `jarm` (probes; not exported) | JARM, Salesforce | BSD 3-Clause | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
+  | `host_keys` `ssh-hostkey`, `tls-cert`, `http-etag`; `favicon`, `http-body`, `http-404` (probes; not exported); `fingerprints` | SHA-256 or MD5 of standard data; Shodan's favicon convention over MurmurHash3 (public domain); in-tree browser collector | None beyond the crates' MIT / Apache-2.0 | No restriction found | No restriction found | No restriction found |
