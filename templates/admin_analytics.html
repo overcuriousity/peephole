@@ -53,6 +53,27 @@
     </section>
   </div>
 
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-head"><h2>Personas</h2><span class="muted">all nodes · follow-up = another request from the IP within 24 h of its first</span></div>
+      <div class="table-wrap"><table class="an-table">
+        <thead><tr><th>Persona</th><th class="num">Requests</th><th class="num">IPs</th><th class="num">Follow-up</th></tr></thead>
+        <tbody>{% for p in a.personas %}<tr><td class="name"><span class="mono">{{ p.name }}</span>{% let v = p.requests %}{% let max = max.personas %}{% include "_bar.html" %}<div class="muted">{% for f in p.families %}{{ crate::admin::views::family_name(f.name) }} {{ crate::admin::views::pct(f.count, p.requests) }} %{% if !loop.last %} · {% endif %}{% endfor %}</div></td><td class="num">{{ crate::admin::views::thousands(p.requests) }}</td><td class="num">{{ p.ips }}</td><td class="num">{{ crate::admin::views::pct(p.followed, p.ips) }} %</td></tr>{% endfor %}
+        {% if a.personas.is_empty() %}<tr><td colspan="4" class="empty">None (rows from before personas carry none).</td></tr>{% endif %}</tbody>
+      </table></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>AI agent traces</h2><a href="/requests?label=ai-agent-artifact">requests →</a></div>
+      {% let t = a.agent.total %}
+      <p>{{ t.agent_ips }} of {{ t.ips }} IPs ({{ crate::admin::views::pct(t.agent_ips, t.ips) }} %) · {{ t.agent_campaigns }} of {{ t.campaigns }} active campaigns agent-driven</p>
+      <div class="table-wrap"><table class="an-table">
+        <thead><tr><th>{% if range.hourly() %}Hour{% else %}Day{% endif %} (UTC)</th><th class="num">Agent IPs</th><th class="num">Share</th><th class="num">Agent campaigns</th></tr></thead>
+        <tbody>{% for b in a.agent.series.iter().rev() %}{% if b.agent_ips > 0 || b.agent_campaigns > 0 %}<tr><td class="mono">{{ b.ts }}</td><td class="num">{{ b.agent_ips }} / {{ b.ips }}</td><td class="num">{{ crate::admin::views::pct(b.agent_ips, b.ips) }} %</td><td class="num">{{ b.agent_campaigns }} / {{ b.campaigns }}</td></tr>{% endif %}{% endfor %}
+        {% if t.agent_ips == 0 %}<tr><td colspan="4" class="empty">None.</td></tr>{% endif %}</tbody>
+      </table></div>
+    </section>
+  </div>
+
   <section class="card">
     <div class="card-head"><h2>TLS fingerprints (JA4)</h2></div>
     <div class="table-wrap"><table class="an-table">

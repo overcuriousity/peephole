@@ -153,8 +153,16 @@ calendar, rank and neighbours (same /24 and ASN).
   spread as counts and their requests per attack family. It appears only
   from three active campaigns up; which address belongs to which campaign,
   and what tied them, is admin-only.
-- **Rule labels**, and the families and OWASP tags derived from them, can
-  be hidden too.
+- **Personas only cluster-wide**: "What each persona drew" shows, per
+  persona a node presented as (WordPress, FortiGate and so on, never a
+  hostname or a node), the requests per attack family over all nodes, and
+  only for personas hit by at least three distinct IPs in the range.
+- **AI agents only as a share**: "Sources with agent traces" shows which
+  share of the range's IPs sent requests with an AI-agent label, only from
+  three such IPs up; `/api/stats` carries the count (`agent_ips`) and
+  nothing else about them.
+- **Rule labels**, and the families, OWASP tags, persona mix and agent
+  share derived from them, can be hidden too.
 
 **The blocklist feed**, `GET /api/blocklist`, lists the addresses that sent
 requests of severity 3 or more in the last 24 hours, after the same delay,
