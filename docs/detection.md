@@ -144,14 +144,81 @@ intrusive and only ever bought:
 
 | Level | Scans |
 |---|---|
-| 1 | the top 100 TCP ports, with light service detection (`-sV --version-light`) |
-| 2 | the top 1000 TCP ports, service and OS detection (`-O`), and the source's own identifiers: SSH host keys and algorithm lists, TLS certificates, HTTP headers with their ETag |
+| 1 | the top 100 TCP ports and the device and proxy ports below, with light service detection (`-sV --version-light`) |
+| 2 | the top 1000 TCP ports and the device and proxy ports below, service and OS detection (`-O`), and the source's own identifiers: SSH host keys and algorithm lists, TLS certificates, HTTP headers with their ETag |
 | 3 | as level 2, plus traceroute and nmap's safe discovery scripts (never those that are intrusive, broadcast, ask third parties or flood) |
 | 4 | as level 3 on every TCP port (with `scan.level4_udp`, also the top 50 UDP ports) |
 | 5 | the top 1000 ports with nmap's `vuln` scripts, minus those that ask third parties; only bought, never queued automatically |
 
 From level 2 the scan reads the source's SSH host keys, TLS certificates and
 HTTP ETags, so sources that share one show up as linked (Admin → Links).
+
+The top lists are nmap 7.95's (`--top-ports 100` and `1000`), written out
+as port lists, because nmap's `-p` can only narrow a top list. Levels 1 to
+3 add the ports where proxies and consumer devices answer and nmap's lists
+do not reach: 1080 (SOCKS), 4145 (SOCKS4), 8118 (Privoxy) and 9050 (Tor
+SOCKS); 7547 (TR-069), 8291 (MikroTik WinBox), 8089 (FRITZ!Box TR-069),
+5555 (Android ADB) and 37777 (Dahua). Level 1 gains nine ports, levels 2
+and 3 four. The level lists of 0.20.0 and earlier still earn.
+
+### Device evidence
+
+For an admin, the IP page says what a counter-scan saw answering on the
+address, if anything. The page never gives a score, and it never says
+whose box answered. The page draws on typed evidence rows. Each row points
+at the row that produced it:
+
+| Row | When |
+|---|---|
+| `device.proxy` | an open port with 3Proxy or SOCKS software, or nmap's service `socks4`, `socks5` or `http-proxy`, or a `socks.method` scan fact |
+| `device.cpe` | an open port, or the scan's OS guess, matching a consumer-device signature: TR-069, MikroTik, FRITZ!Box, HikVision, Dahua, OpenWrt/LuCI, Android ADB |
+| `fleet.key` | an SSH host key, TLS certificate or HTTP ETag shared with 2 to 50 other addresses |
+| `fleet.canary` | a canary served to another address came back from this one in a header or the request body (never the path or query, which a link can plant on anyone) |
+| `fleet.dense` | 16 or more sources in the address's /24 (IPv4) or /48 (IPv6) |
+| `name.consumer`, `name.scanner` | the reverse or PTR name matches a consumer-line or a scanner pattern |
+| `net.hosting`, `net.eyeball` | the ASN is in a bundled AS-type list; none is bundled yet |
+
+The signatures and name patterns are built into the binary
+(`rules/evidence/`). Each has a sample it must match. No consumer-device
+signature or consumer-name pattern may match the banners or names of the
+20 largest rented fleets seen on a node. Two nmap OS guesses are left out
+for that reason: "Android TV OS 11" and "3Com OfficeConnect wireless
+broadband router" turn up on rented hosting addresses.
+
+A scan or name more than 24 hours older than the address's last request is
+not used: on a dynamic line the address may have passed to the next
+subscriber.
+
+The verdict is the first rule that matches:
+
+| # | When | Shown |
+|---|---|---|
+| 1 | a Tor exit | nothing new (the existing badge) |
+| 2 | `fleet.key` or `fleet.canary`; or `fleet.dense` or `name.scanner` with `net.hosting` | rented fleet: "one of N addresses sharing SSH host key …" |
+| 3 | `net.hosting` | rented: "hosting AS" |
+| 4 | `device.cpe` with `net.eyeball`, no scanner name | consumer device answered: "… answered on 7547 in scan #…; the line is in a consumer ISP AS" |
+| 5 | `device.proxy` with `net.eyeball` | proxy software on a consumer line |
+| 6 | `device.cpe` or `device.proxy`, and no `net.*` row | device evidence only: "TP-LINK TR-069 remote access answered on 7547 in scan #12 (level 4, 2026-10-18); AS type not classified" |
+| 7 | anything else | nothing |
+
+Rule 7 shows nothing. An address without evidence is not cleared of
+anything; the scan just saw nothing to name. A device verdict
+also carries the caveat that what answered is the box on the address at
+scan time, not necessarily the sender. Until an AS-type list is bundled
+(a file `rules/evidence/as-types.toml`), rules 3 to 5 and the hosting
+branches of rule 2 cannot fire. The list turns them on without a code
+change. Each row on the page carries the device or proxy, the port, the
+scan with a link to it, and the date. `/ips?evidence=device.cpe` (or any
+other row kind) lists the addresses with such a row.
+
+The rows are derived on each node with the hourly campaign pass. They are
+never replicated, never exported and never in the blocklist: a dynamic
+address can be personal data, and a device banner is cheap to fake for
+whoever wants an address to look like a victim. A forged banner earns at
+most a sentence on the admin page of the node it was shown to.
+`peephole store recompute-campaigns` recomputes them too. It prints the
+rows by kind, the verdicts by rule, and the device types and OS guesses
+no signature matched, so the catalogue can grow from data.
 
 **Bystanders are spared.**
 

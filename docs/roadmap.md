@@ -91,10 +91,13 @@ Rules that hold:
   scanned, flagged like `is_tor_exit`, and kept off the blocklist. Shown
   on the IP page, as an IP directory filter, and as a public "via VPN"
   share beside the Tor share.
-- **Proxy signals from our own data.** S, medium. A `Via`, `Forwarded` or
-  `X-Forwarded-For` header in the probe itself means a forwarding proxy
-  (a rule label); a counter-scan finding `socks5`, `http-proxy` or OpenVPN
-  means the source likely is one. Both are admin-only flags on the IP page.
+- **`header-spoof` label.** S, low. A `Via`, `Forwarded` or
+  `X-Forwarded-For` header the source sends itself (not the one the
+  trusted reverse proxy adds) carries values like `0.0.0.0` or `localhost`:
+  an access-control bypass attempt, not a proxy chain. Label it
+  `header-spoof` (weight 2), a reconnaissance label, not evidence about
+  the source. Proxy software found by a counter-scan is already shown as
+  device evidence (see [Detection](detection.md#device-evidence)).
 - **JA4T on directly listening traps.** S–M, medium. `TCP_SAVE_SYN` and
   `TCP_SAVED_SYN` give the client's SYN without pcap. This works only where
   the trap listens on 80/443 itself; behind nginx the SYN goes to nginx.

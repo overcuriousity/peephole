@@ -1,0 +1,234 @@
+# Open-port banners and OS guesses of the top-20 source ASNs on the hermes node
+# (MIK-577, read 2026-10-19 on a copy of its database): kind, port, service,
+# product, os_guess, tab-separated. No addresses.
+port	21	ftp	Pure-FTPd	
+port	22	ms-wbt-server	Microsoft Terminal Services	
+port	22	ssh		
+port	22	ssh	OpenSSH	
+port	22	tcpwrapped		
+port	53	domain		
+port	53	tcpwrapped		
+port	80	daap	mt-daapd DAAP	
+port	80	http		
+port	80	http	Apache httpd	
+port	80	http	BaseHTTPServer	
+port	80	http	Caddy httpd	
+port	80	http	Golang net/http server	
+port	80	http	LiteSpeed	
+port	80	http	Microsoft IIS httpd	
+port	80	http	Python http.server	
+port	80	http	lighttpd	
+port	80	http	nginx	
+port	80	http	optout/1.0 Python/3.11.3	
+port	80	http-proxy	3Proxy http proxy	
+port	80	tcpwrapped		
+port	88	http	nginx	
+port	89	http	nginx	
+port	99	http	nginx	
+port	111	rpcbind		
+port	135	msrpc	Microsoft Windows RPC	
+port	139	netbios-ssn	Microsoft Windows netbios-ssn	
+port	179	bgp		
+port	179	tcpwrapped		
+port	443	http	AkamaiGHost	
+port	443	http	Apache httpd	
+port	443	http	Golang net/http server	
+port	443	http	nginx	
+port	443	http-proxy	Apache Traffic Server	
+port	443	https		
+port	443	https	LiteSpeed	
+port	443	https	nginx	
+port	443	tcpwrapped		
+port	445	microsoft-ds		
+port	445	microsoft-ds	Microsoft Windows Server 2008 R2 - 2012 microsoft-ds	
+port	445	tcpwrapped		
+port	500	isakmp		
+port	631	ipp	CUPS	
+port	880	http	nginx	
+port	888	http	nginx	
+port	1080	socks5		
+port	1081	pvuniwien		
+port	1338	http-proxy		
+port	1339	kjtsiteserver		
+port	1443	ies-lm		
+port	2096	http	Golang net/http server	
+port	2179	vmrdp		
+port	3000	http	Golang net/http server	
+port	3000	ppp		
+port	3001	nessus		
+port	3128	http-proxy		
+port	3306	mysql	MySQL	
+port	3306	tcpwrapped		
+port	3389	http-proxy		
+port	3389	ms-wbt-server		
+port	3389	ms-wbt-server	Microsoft Terminal Service	
+port	3389	ms-wbt-server	Microsoft Terminal Services	
+port	4000	http	Golang net/http server	
+port	4330	dey-sapi		
+port	4369	epmd	Erlang Port Mapper Daemon	
+port	4444	socks-proxy	Socks4A	
+port	5060	sip		
+port	5060	tcpwrapped		
+port	5061	sip-tls		
+port	5357	http	Microsoft HTTPAPI httpd	
+port	5432	postgresql	PostgreSQL DB	
+port	5555	http	Tornado httpd	
+port	5678	rrac		
+port	5985	http	Microsoft HTTPAPI httpd	
+port	6000	ssh	OpenSSH	
+port	6969	acmsoda		
+port	6969	ms-wbt-server	Microsoft Terminal Services	
+port	7000	afs3-fileserver		
+port	7080	empowerid	LiteSpeed	
+port	7443	oracleas-https		
+port	7777	http-proxy	3Proxy http proxy	
+port	8001	http	BaseHTTPServer	
+port	8001	http	Golang net/http server	
+port	8012	http	Golang net/http server	
+port	8080	daap	mt-daapd DAAP	
+port	8080	http	aiohttp	
+port	8080	http-proxy		
+port	8080	http-proxy	uvicorn	
+port	8080	rtsp		
+port	8080	tcpwrapped		
+port	8081	http	Golang net/http server	
+port	8081	tcpwrapped		
+port	8082	http	Golang net/http server	
+port	8082	tcpwrapped		
+port	8085	http	Uvicorn	
+port	8085	unknown		
+port	8088	http-proxy		
+port	8090	http	Golang net/http server	
+port	8090	opsmessaging		
+port	8181	http	Uvicorn	
+port	8229	ssh	OpenSSH	
+port	8443	http	Golang net/http server	
+port	8443	https-alt		
+port	8888	http	BaseHTTPServer	
+port	8888	http	Tornado httpd	
+port	9000	cslistener		
+port	9002	http	PHP cli server	
+port	9090	http	Golang net/http server	
+port	9100	jetdirect		
+port	9876	http	Golang net/http server	
+port	9999	http	Golang net/http server	
+port	9999	http-proxy		
+port	9999	ms-wbt-server	Microsoft Terminal Services	
+port	10000	snet-sensor-mgmt		
+port	10003	http	Golang net/http server	
+port	12345	http-proxy	3Proxy http proxy	
+port	15483			
+port	20000	http	Golang net/http server	
+port	20001	http	Golang net/http server	
+port	20532	http	Golang net/http server	
+port	26737			
+port	30000	grpc		
+port	30002	grpc		
+port	31400	tcpwrapped		
+port	31401	unknown		
+port	31402	unknown		
+port	31405			
+port	31407			
+port	31408	tcpwrapped		
+port	31409	tcpwrapped		
+port	33060	mysqlx	MySQL X protocol listener	
+port	33283			
+port	35129			
+port	36373			
+port	38108	http	Ajenti http control panel	
+port	41502			
+port	43949			
+port	44321	pmcd		
+port	44322	pmcdproxy		
+port	44323	pmwebapi		
+port	45003			
+port	46673			
+port	47001	http	Microsoft HTTPAPI httpd	
+port	49152			
+port	49152	unknown		
+port	49153			
+port	49153	unknown		
+port	49154			
+port	49154	unknown		
+port	49155			
+port	49155	unknown		
+port	49156			
+port	49156	unknown		
+port	49157			
+port	49157	unknown		
+port	49664	msrpc	Microsoft Windows RPC	
+port	49665	msrpc	Microsoft Windows RPC	
+port	49666	msrpc	Microsoft Windows RPC	
+port	49667	msrpc	Microsoft Windows RPC	
+port	49669	msrpc	Microsoft Windows RPC	
+port	49670	msrpc	Microsoft Windows RPC	
+port	49671	msrpc	Microsoft Windows RPC	
+port	49681	msrpc	Microsoft Windows RPC	
+port	49683	msrpc	Microsoft Windows RPC	
+port	49684	msrpc	Microsoft Windows RPC	
+port	49685	msrpc	Microsoft Windows RPC	
+port	49687	msrpc	Microsoft Windows RPC	
+port	55555	http-proxy	3Proxy http proxy	
+port	55620			
+port	65530	http	Golang net/http server	
+os				3Com OfficeConnect 3CRWER100-75 wireless broadband router
+os				3Com WX1200 Wireless LAN Switch
+os				Aerohive HiveOS 6.8
+os				Android TV OS 11 (Linux 4.19)
+os				Avocent/Cyclades ACS 6000
+os				Cisco IP Phone 7912-series
+os				Cisco Unified Communications Manager VoIP adapter
+os				Crestron XPanel control system
+os				Cyberoam UTM firewall
+os				Fortinet FortiGate 100D firewall
+os				FreeBSD 6.2-RELEASE
+os				HP P2000 G3 NAS device
+os				IPCop 2.0 (Linux 2.6.32)
+os				IPFire 2.25 firewall (Linux 4.14)
+os				IPFire 2.27 (Linux 5.15 - 6.1)
+os				Linux 2.6.11
+os				Linux 2.6.18
+os				Linux 2.6.31
+os				Linux 2.6.32
+os				Linux 2.6.32 - 3.13
+os				Linux 3.1
+os				Linux 3.10
+os				Linux 3.10 - 3.12
+os				Linux 3.10 - 3.16
+os				Linux 3.10 - 4.11
+os				Linux 3.11 - 4.9
+os				Linux 3.2 - 4.14
+os				Linux 3.2 - 4.9
+os				Linux 3.2.0
+os				Linux 3.2.1
+os				Linux 3.8
+os				Linux 4.0 - 4.4
+os				Linux 4.10
+os				Linux 4.15
+os				Linux 4.15 - 5.19
+os				Linux 4.15 - 5.6
+os				Linux 4.19
+os				Linux 4.19 - 5.15
+os				Linux 5.0 - 5.14
+os				Linux 5.0 - 5.3
+os				Linux 5.0 - 5.4
+os				Linux 5.18
+os				Linux 5.4
+os				Microsoft Windows 10 - 11
+os				Microsoft Windows 10 1703
+os				Microsoft Windows 10 1709 - 1803
+os				Microsoft Windows 10 1709 - 1909
+os				Microsoft Windows 10 1803
+os				Microsoft Windows 10 1903 - 21H1
+os				Microsoft Windows 10 1909 - 2004
+os				Microsoft Windows Server 2012
+os				Microsoft Windows Server 2012 R2
+os				Microsoft Windows Server 2016
+os				Microsoft Windows Server 2016 build 10586 - 14393
+os				Microsoft Windows Server 2022
+os				OpenBSD 4.0
+os				Oracle VM Server 3.4.2 (Linux 4.1)
+os				QNAP QTS 5.0 (Linux 5.10)
+os				Tomato 1.28 (Linux 2.4.20)
+os				Ubiquiti AirMax NanoStation WAP (Linux 2.6.32)
+os				Ubiquiti Dream Machine Pro gateway (Linux 4.19)

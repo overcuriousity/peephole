@@ -40,6 +40,9 @@ pub struct Target {
     pub campaign: Option<(String, i64)>,
     /// The address carries an agent label (admin only).
     pub agent: bool,
+    /// The verdict over its evidence rows, where it says anything (admin
+    /// only; node-local, never public).
+    pub evidence: Option<crate::store::evidence::View>,
 }
 
 impl Target {
@@ -220,17 +223,19 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
-    let (campaign, agent) = if authed {
+    let (campaign, agent, evidence) = if authed {
         (
             state.store.campaign_of_ip(ip.id).await?,
             state.store.ip_has_agent_label(ip.id).await?,
+            state.store.evidence_view(ip.id, ov.ip.is_tor_exit).await?,
         )
     } else {
-        (None, false)
+        (None, false, None)
     };
     Ok(Some(Target {
         campaign,
         agent,
+        evidence,
         actions,
         probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),

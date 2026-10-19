@@ -841,7 +841,7 @@ fn widen(span: &mut Span, first: Option<&str>, last: Option<&str>) {
 }
 
 /// Seconds since the epoch of a time as the rows hold it.
-fn epoch(ts: &str) -> Option<i64> {
+pub(crate) fn epoch(ts: &str) -> Option<i64> {
     let t = ts.get(..19)?.replacen('T', " ", 1);
     chrono::NaiveDateTime::parse_from_str(&t, "%Y-%m-%d %H:%M:%S")
         .ok()

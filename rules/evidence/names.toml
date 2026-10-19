@@ -1,0 +1,58 @@
+# Name patterns for evidence rows (docs/detection.md, "Device evidence"),
+# read on the forward-confirmed reverse name of an address and the PTR
+# name nmap reported (`ip_names.source IN ('rdns','ptr')`), lower-cased.
+# Built into the binary like `rules/`; a change here bumps `EVIDENCE_V`.
+#
+# `consumer` → `name.consumer` (context only: a renter can set any PTR,
+# so a name never decides a verdict on its own). `scanner` →
+# `name.scanner` (counts only next to a hosting AS). Every `sample` must
+# match its own entry; no `consumer` entry may match a name of the top-20
+# rented fleets (tests/fixtures/rented-fleet-names.txt, digits as 0).
+#
+# Words count at label or dash boundaries, so "dyn" matches
+# `dyn-0.example.net` and `dynamic-adsl.example.vn`, not `dynatrace.com`.
+
+[[consumer]]
+id = "dynamic"
+pattern = '(^|[.-])dyn(amic)?([.-]|[0-9]|$)'
+sample = ["dynamic-adsl.viettel.vn", "dynamic-0.pool.telefonica.de", "dyn-0-0.example.net"]
+
+[[consumer]]
+id = "pool"
+pattern = '(^|[.-])(ip)?pool([.-]|[0-9]|$)'
+sample = ["0.pool.example-isp.de", "ippool0.example.net"]
+
+[[consumer]]
+id = "dsl"
+pattern = '(^|[.-])[avx]?dsl([.-]|[0-9]|$)'
+sample = ["0-0-0-0.adsl.example.net", "dsl-0.example.at", "vdsl0.example.it"]
+
+[[consumer]]
+id = "cable"
+pattern = '(^|[.-])cable([.-]|[0-9]|$)'
+sample = ["0-0-0-0.cable.example.com"]
+
+[[consumer]]
+id = "dhcp"
+pattern = '(^|[.-])dhcp([.-]|[0-9]|$)'
+sample = ["dhcp-0-0.example.edu"]
+
+[[consumer]]
+id = "customer"
+pattern = '(^|[.-])(customer|cust|subscriber)([.-]|[0-9]|$)'
+sample = ["0.0.0.0.customer.example.net", "cust-0.example.ru"]
+
+[[consumer]]
+id = "broadband"
+pattern = '(^|[.-])broadband([.-]|[0-9]|$)'
+sample = ["0-0-0-0.broadband.example.co.uk"]
+
+[[consumer]]
+id = "fibre"
+pattern = '(^|[.-])(fttx|ftth|fttb|fibra|fiber)([.-]|[0-9]|$)'
+sample = ["0.ftth.example.ro", "0-0.fttx.example.pl", "0.fibra.example.es"]
+
+[[scanner]]
+id = "scanner"
+pattern = 'scan|crawl|research|measurement|probe|stretchoid|internetdata'
+sample = ["scan-0-0.shadowserver.io", "a0c0e.scan.leakix.org", "azpdcggsepij.stretchoid.com", "albert.probe.onyphe.net"]

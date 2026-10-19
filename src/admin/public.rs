@@ -385,6 +385,7 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         name: None,
         net: None,
         net_name: None,
+        evidence: None,
     }
 }
 
@@ -408,6 +409,7 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("name", f.name.clone()),
         ("net", f.net.clone()),
         ("net_name", f.net_name.clone()),
+        ("evidence", f.evidence.clone()),
     ]
 }
 
@@ -511,6 +513,7 @@ fn filter_label(k: &str) -> &'static str {
         "name" => "Name",
         "net" => "Network",
         "net_name" => "Network name",
+        "evidence" => "Evidence",
         _ => "Filter",
     }
 }
@@ -2213,6 +2216,50 @@ show_labels = {show_labels}
             assert!(list.contains("href=\"/ip/198.51.100.1\""), "{q}: {list}");
             assert!(!list.contains("Network: "), "{q}: {list}");
         }
+    }
+
+    /// The IP page shows the verdict over the evidence rows and the IP list
+    /// filters on them, for admins only, and
+    /// nothing on either page claims more than was observed (MIK-586).
+    #[tokio::test]
+    async fn device_evidence_shows_and_filters_for_admins_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let (_, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        st.store.recompute_evidence().await.unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (status, admin) = get_with(&app, "/ip/203.0.113.47", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(admin.contains("device evidence only"), "{admin}");
+        assert!(
+            admin.contains(&format!(
+                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan}"
+            )),
+            "{admin}"
+        );
+        assert!(admin.contains("AS type not classified"), "{admin}");
+        assert!(
+            admin.contains(&format!("href=\"/admin/scans/{scan}\"")),
+            "{admin}"
+        );
+        let (status, public) = get_with(&app, "/ip/203.0.113.47", None).await;
+        assert_eq!(status, 200);
+        assert!(!public.contains("device evidence"), "{public}");
+        assert!(!public.contains("id=\"evidence\""), "{public}");
+        for page in [&admin, &public] {
+            assert!(!page.to_lowercase().contains("compromis"), "{page}");
+        }
+
+        let (status, list) = get_with(&app, "/ips?evidence=device.cpe", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
+        let (status, list) = get_with(&app, "/ips?evidence=device.proxy", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(!list.contains("href=\"/ip/203.0.113.47\""), "{list}");
+        // The public list ignores the filter.
+        let (status, list) = get_with(&app, "/ips?evidence=device.proxy", None).await;
+        assert_eq!(status, 200);
+        assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
     }
 
     #[tokio::test]
