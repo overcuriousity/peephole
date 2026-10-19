@@ -1639,6 +1639,7 @@ pub(crate) mod tests {
                     decoy_site: None,
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 })
                 .collect(),
             build: String::new(),

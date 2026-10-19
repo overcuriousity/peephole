@@ -28,6 +28,7 @@
 <section class="card"><h2>Details</h2>
   <dl class="kv">
     <dt>Key</dt><dd class="mono break">{{ m.key }}{% let value = m.key.as_str() %}{% let what = "node key" %}{% let subtle = false %}{% include "_copy.html" %}</dd>
+    <dt>Persona</dt><dd>{{ m.persona }} <span class="muted small">on its IP; each DNS name it is reached by can present another</span></dd>
     <dt>Roles</dt><dd>{{ m.roles }}{% if !m.providers.is_empty() %} <span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</dd>
     <dt>Address</dt><dd class="mono">{{ m.address }}</dd>
     <dt>Version</dt><dd class="mono">{{ m.version }}</dd>

@@ -816,6 +816,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
                 build: String::new(),
             }),
@@ -993,6 +994,7 @@ mod tests {
             decoy_site: None,
             held_ms: None,
             decoy_in: None,
+            persona: None,
         };
         apply(
             &mut conn,
@@ -1555,6 +1557,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
                 build: String::new(),
             }),
@@ -1594,6 +1597,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
                 build: String::new(),
             }),

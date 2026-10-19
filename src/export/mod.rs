@@ -94,6 +94,9 @@ pub struct ExportRow {
     pub status: Option<i64>,
     /// How long a `tarpit` answer held the client, in milliseconds.
     pub held_ms: Option<i64>,
+    /// What the node presented as (`crate::trap::persona`); None for rows
+    /// from before personas.
+    pub persona: Option<String>,
     /// Requests from the IP answered but not recorded since the previous
     /// recorded one (for a light row: drops of its batch, on its last row).
     pub unrecorded: i64,
@@ -161,6 +164,7 @@ pub const COLUMNS: &[&str] = &[
     "canary_used_from",
     "status",
     "held_ms",
+    "persona",
     "unrecorded",
     "weight",
     "labels",
@@ -326,6 +330,7 @@ impl ExportRow {
             "canary_used_from": self.canary_used_from,
             "status": self.status,
             "held_ms": self.held_ms,
+            "persona": self.persona,
             "unrecorded": self.unrecorded,
             "weight": self.weight,
             "labels": self.labels,
@@ -699,6 +704,7 @@ fn request_row(
         canary_used_from,
         status: r.status,
         held_ms: r.held_ms,
+        persona: r.persona,
         unrecorded,
         weight,
         labels: serde_json::from_str(&r.labels_json).unwrap_or_default(),
@@ -729,6 +735,7 @@ fn skipped_row(s: SkipOut, ctx: &PageContext, cols: &IpCols, opts: &ExportOption
         decoy_v: s.decoy_v,
         decoy_in: s.decoy_in,
         held_ms: s.held_ms,
+        persona: s.persona,
         path: s.path,
         unrecorded,
         weight: unrecorded + 1,
@@ -1341,6 +1348,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
             )
             .await
@@ -1370,6 +1378,7 @@ mod tests {
             answer: Some("tarpit".into()),
             status: Some(200),
             held_ms: Some(600_000),
+            persona: Some("gitlab".into()),
             ts: Some("2026-01-01 00:00:00".into()),
             ..Default::default()
         })
@@ -1385,6 +1394,7 @@ mod tests {
                     path: "/b".into(),
                     answer: Some("tarpit".into()),
                     held_ms: Some(12_000),
+                    persona: Some("fortinet".into()),
                     ..Default::default()
                 }],
             )
@@ -1400,6 +1410,9 @@ mod tests {
         assert_eq!(rows[1]["kind"], "skipped");
         assert_eq!(rows[1]["answer"], "tarpit");
         assert_eq!(rows[1]["held_ms"], 12_000);
+        assert_eq!(rows[0]["persona"], "gitlab");
+        assert_eq!(rows[1]["persona"], "fortinet");
+        assert!(COLUMNS.contains(&"persona"));
         assert!(COLUMNS.contains(&"held_ms"));
         let csv = text(&collect(&s, ExportFilter::default(), Format::Csv).await);
         assert!(csv.lines().next().unwrap().contains("held_ms"));

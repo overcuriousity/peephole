@@ -4,6 +4,7 @@ mod flood;
 pub use crate::model::ja4h;
 pub mod listen;
 mod pages;
+pub mod persona;
 pub mod proxy_proto;
 pub mod raw_head;
 pub mod skiplog;
@@ -587,6 +588,8 @@ struct Capture<'a> {
     answer: String,
     /// How long the tarpit held the client, in milliseconds.
     held_ms: Option<i64>,
+    /// What the node presented as ([`persona::resolve`]).
+    persona: &'static str,
     status: u16,
     /// Requests from this IP answered but not recorded since its last
     /// recorded one.
@@ -756,6 +759,7 @@ async fn record(state: &TrapState, c: Capture<'_>) -> Result<Recorded> {
                 decoy_site: c.decoy_site,
                 held_ms: c.held_ms,
                 decoy_in: c.decoy_in,
+                persona: Some(c.persona.to_string()),
             },
         )
         .await?;
@@ -1343,6 +1347,8 @@ async fn record_trap(
         received,
         hold: _hold,
     } = body;
+    let node_id = state.recorder.node_id();
+    let persona = persona::resolve(node_id.as_ref().map(|n| &n.0[..]), served.host.as_deref()).name;
     match admission {
         flood::Admission::Skip => {
             let answer = match (served.decoy_v, served.held_ms) {
@@ -1368,6 +1374,7 @@ async fn record_trap(
                 method,
                 path,
                 answer,
+                persona,
                 state.cfg.trap.skip_log_rate,
                 Instant::now(),
             );
@@ -1418,6 +1425,7 @@ async fn record_trap(
                 decoy_in: served.decoy_in,
                 answer: served.answer,
                 held_ms: served.held_ms,
+                persona,
                 status: served.status,
                 unrecorded,
                 conn: parts
@@ -1570,6 +1578,11 @@ async fn claim_handler(
             decoy_in: None,
             answer: "claim".into(),
             held_ms: None,
+            persona: persona::resolve(
+                state.recorder.node_id().as_ref().map(|n| &n.0[..]),
+                crate::canary::site::request_host(&raw),
+            )
+            .name,
             status: 200,
             unrecorded: 0,
             conn,

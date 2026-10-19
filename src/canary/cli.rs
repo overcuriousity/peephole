@@ -179,6 +179,7 @@ mod tests {
                     decoy_site: Some("shop".into()),
                     held_ms: None,
                     decoy_in: None,
+                    persona: None,
                 }],
                 build: String::new(),
             }),

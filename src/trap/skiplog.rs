@@ -100,6 +100,7 @@ impl SkipLog {
         method: &str,
         path: &str,
         answer: SkipAnswer,
+        persona: &str,
         rate: u32,
         now: Instant,
     ) -> Option<Batch> {
@@ -138,6 +139,7 @@ impl SkipLog {
             ts_ms,
             method: cut(method, 64).to_string(),
             path: cut(path, SKIP_PATH_MAX).to_string(),
+            persona: Some(persona.to_string()),
             ..Default::default()
         };
         match answer {
@@ -217,6 +219,7 @@ mod tests {
                     "GET",
                     "/x",
                     SkipAnswer::Plain,
+                    "wordpress",
                     100,
                     now
                 )
@@ -225,15 +228,33 @@ mod tests {
         }
         // The next second has room again.
         assert!(
-            s.note(ip(), 1_001_000, "GET", "/y", SkipAnswer::Plain, 100, now)
-                .is_none()
+            s.note(
+                ip(),
+                1_001_000,
+                "GET",
+                "/y",
+                SkipAnswer::Plain,
+                "wordpress",
+                100,
+                now
+            )
+            .is_none()
         );
         let b = s.take(ip()).unwrap();
         assert_eq!((b.rows.len(), b.dropped), (101, 50));
         assert!(s.take(ip()).is_none());
         // Past the rate with nothing pending (just taken): a row, never a
         // count without one.
-        s.note(ip(), 1_001_500, "GET", "/z", SkipAnswer::Plain, 1, now);
+        s.note(
+            ip(),
+            1_001_500,
+            "GET",
+            "/z",
+            SkipAnswer::Plain,
+            "wordpress",
+            1,
+            now,
+        );
         let b = s.take(ip()).unwrap();
         assert_eq!((b.rows.len(), b.dropped), (1, 0));
     }
@@ -251,6 +272,7 @@ mod tests {
                     "GET",
                     "/x",
                     SkipAnswer::Plain,
+                    "wordpress",
                     100,
                     now
                 )
@@ -271,6 +293,7 @@ mod tests {
                 "GET",
                 "/x",
                 SkipAnswer::Plain,
+                "wordpress",
                 100,
                 now,
             );
@@ -279,7 +302,16 @@ mod tests {
         assert_eq!((last.rows.len(), last.dropped), (1, 50));
         // Another /64 has its own rate.
         let other: IpAddr = "2001:db8:0:2::1".parse().unwrap();
-        s.note(other, 1_000_000, "GET", "/y", SkipAnswer::Plain, 100, now);
+        s.note(
+            other,
+            1_000_000,
+            "GET",
+            "/y",
+            SkipAnswer::Plain,
+            "wordpress",
+            100,
+            now,
+        );
         assert_eq!(s.take(other).unwrap().rows.len(), 1);
     }
 
@@ -290,7 +322,16 @@ mod tests {
         let mut got = None;
         for i in 0..1000 {
             assert!(got.is_none());
-            got = s.note(ip(), i * 1000, "GET", "/x", SkipAnswer::Plain, 0, now);
+            got = s.note(
+                ip(),
+                i * 1000,
+                "GET",
+                "/x",
+                SkipAnswer::Plain,
+                "wordpress",
+                0,
+                now,
+            );
         }
         assert_eq!(got.unwrap().rows.len(), 1000);
         assert!(s.take(ip()).is_none());
@@ -305,6 +346,7 @@ mod tests {
             "GET",
             &"é".repeat(600),
             SkipAnswer::Plain,
+            "wordpress",
             0,
             Instant::now(),
         );
@@ -317,7 +359,7 @@ mod tests {
     fn old_batches_are_taken_and_young_ones_stay() {
         let s = SkipLog::default();
         let t0 = Instant::now();
-        s.note(ip(), 0, "GET", "/a", SkipAnswer::Plain, 0, t0);
+        s.note(ip(), 0, "GET", "/a", SkipAnswer::Plain, "wordpress", 0, t0);
         let other: IpAddr = "192.0.2.2".parse().unwrap();
         s.note(
             other,
@@ -325,6 +367,7 @@ mod tests {
             "GET",
             "/b",
             SkipAnswer::Plain,
+            "wordpress",
             0,
             t0 + Duration::from_secs(8),
         );
@@ -352,6 +395,7 @@ mod tests {
             "GET",
             "/.git/config",
             SkipAnswer::Decoy(d),
+            "wordpress",
             0,
             Instant::now(),
         );
@@ -367,10 +411,20 @@ mod tests {
         let log = SkipLog::default();
         let ip: IpAddr = "198.51.100.5".parse().unwrap();
         let t = SkipAnswer::Tarpit { held_ms: 31_000 };
-        log.note(ip, 1_000, "GET", "/cgi-bin/x", t, 0, Instant::now());
+        log.note(
+            ip,
+            1_000,
+            "GET",
+            "/cgi-bin/x",
+            t,
+            "wordpress",
+            0,
+            Instant::now(),
+        );
         let b = log.take(ip).unwrap();
         assert_eq!(b.rows[0].answer.as_deref(), Some("tarpit"));
         assert_eq!(b.rows[0].held_ms, Some(31_000));
         assert_eq!(b.rows[0].page_token, None);
+        assert_eq!(b.rows[0].persona.as_deref(), Some("wordpress"));
     }
 }
