@@ -309,7 +309,7 @@ impl Catalogue {
     /// guess, and per fact port and kind the first matching entry.
     pub fn hits(
         &self,
-        ports: &[(i64, Option<&str>, Option<&str>)],
+        ports: &[PortSeen],
         os_guess: Option<&str>,
         facts: &[(Option<i64>, &str)],
     ) -> Vec<Hit> {
@@ -435,6 +435,14 @@ pub struct EvidenceRow {
     pub last_ts: String,
 }
 
+/// An open port as a scan stored it: scan id, port, service, product,
+/// device type.
+type PortRow = (i64, i64, Option<String>, Option<String>, Option<String>);
+/// An open port as a signature reads it: port, service, product.
+type PortSeen<'a> = (i64, Option<&'a str>, Option<&'a str>);
+/// An evidence row's key: ip id, kind, value, ref kind, ref id.
+type RowKey = (i64, String, String, String, i64);
+
 /// The rows a pass reads.
 #[derive(Default)]
 pub(crate) struct Input {
@@ -444,7 +452,7 @@ pub(crate) struct Input {
     scans: Vec<(i64, i64, String, Option<String>)>,
     /// Open ports of finished scans: scan id, port, service, product,
     /// device type.
-    ports: Vec<(i64, i64, Option<String>, Option<String>, Option<String>)>,
+    ports: Vec<PortRow>,
     /// Facts of the kinds the catalogue reads: scan id, port, kind.
     facts: Vec<(i64, Option<i64>, String)>,
     /// Reverse and PTR names: id, ip id, name, first and last seen.
@@ -549,7 +557,7 @@ fn prefix(ip: &str) -> Option<String> {
 }
 
 pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
-    let mut rows: BTreeMap<(i64, String, String, String, i64), (String, String)> = BTreeMap::new();
+    let mut rows: BTreeMap<RowKey, (String, String)> = BTreeMap::new();
     let mut add =
         |ip: i64, kind: &str, value: &str, rk: &str, rid: i64, first: &str, last: &str| {
             let e = rows
@@ -569,7 +577,7 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
         .collect();
 
     // device.*: per finished scan, its open ports, OS guess and facts.
-    let mut ports: HashMap<i64, Vec<(i64, Option<&str>, Option<&str>)>> = HashMap::new();
+    let mut ports: HashMap<i64, Vec<PortSeen>> = HashMap::new();
     for (scan, port, service, product, _) in &input.ports {
         ports
             .entry(*scan)
@@ -636,7 +644,9 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
     }
 
     // fleet.key: an instance key on this address and 2 to 50 others.
-    let mut by_key: HashMap<(&str, &str), BTreeMap<i64, (i64, &str)>> = HashMap::new();
+    // (kind, fingerprint) → ip → (lowest host_keys id, when seen).
+    type Holders<'a> = BTreeMap<i64, (i64, &'a str)>;
+    let mut by_key: HashMap<(&str, &str), Holders> = HashMap::new();
     for (id, ip, kind, fp, ts) in &input.keys {
         let e = by_key
             .entry((kind.as_str(), fp.as_str()))
@@ -1129,7 +1139,7 @@ impl Store {
                         .bind(r.ref_id)
                         .fetch_all(&self.read)
                         .await?;
-                let ports: Vec<(i64, Option<&str>, Option<&str>)> = ports
+                let ports: Vec<PortSeen> = ports
                     .iter()
                     .map(|(p, s, d)| (*p, s.as_deref(), d.as_deref()))
                     .collect();

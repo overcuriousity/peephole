@@ -2219,8 +2219,8 @@ show_labels = {show_labels}
     }
 
     /// The IP page shows the verdict over the evidence rows and the IP list
-    /// filters on them, for admins only; nothing user-facing calls a box
-    /// compromised (MIK-586).
+    /// filters on them, for admins only, and
+    /// nothing on either page claims more than was observed (MIK-586).
     #[tokio::test]
     async fn device_evidence_shows_and_filters_for_admins_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
