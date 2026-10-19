@@ -56,6 +56,10 @@ pub struct DecoyIn {
     /// The serving node's AI identity (`model::ai_id`, decoy version 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i: Option<String>,
+    /// The persona the request was answered under
+    /// ([`crate::trap::persona`]); absent: the node-neutral identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p: Option<String>,
 }
 
 impl DecoyIn {
@@ -104,6 +108,7 @@ impl DecoyIn {
             ep: d.ep,
             via: d.via,
             i: d.i,
+            p: d.p,
             ..Default::default()
         };
         let s = serde_json::to_string(&min).unwrap_or_default();
@@ -184,10 +189,11 @@ pub fn candidate(path: &str) -> bool {
 
 /// The AI decoy for this request on the node with this `ident`
 /// ([`crate::model::ai_id::derive`]), if any: its name (`mcp:…`, `llm:…`)
-/// and what it is rendered from.
-pub fn choose(ask: &Ask, ident: &str) -> Option<(String, DecoyIn)> {
+/// under `persona`, and what it is rendered from.
+pub fn choose(ask: &Ask, ident: &str, persona: &str) -> Option<(String, DecoyIn)> {
     let (name, mut d) = super::mcp::choose(ask, Some(ident)).or_else(|| super::llm::choose(ask))?;
     d.i = Some(ident.to_string());
+    d.p = Some(persona.to_string());
     Some((name, d))
 }
 
@@ -231,6 +237,7 @@ mod tests {
             api: Some("openai".into()),
             via: Some("sse".into()),
             i: Some(crate::model::ai_id::derive(None)),
+            p: Some("exchange-owa".into()),
             ..Default::default()
         };
         let s = d.to_json();
@@ -239,5 +246,6 @@ mod tests {
         assert_eq!(back.api.as_deref(), Some("openai"));
         assert_eq!(back.via.as_deref(), Some("sse"));
         assert_eq!(back.i, d.i);
+        assert_eq!(back.p, d.p);
     }
 }

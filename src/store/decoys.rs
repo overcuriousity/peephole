@@ -56,17 +56,21 @@ pub struct ModelRow {
     pub api: String,
     pub requests: i64,
     pub ips: i64,
-    /// The serving nodes' AI identities, comma-separated; `-` for rows
-    /// without one.
+    /// The serving nodes' AI identities, comma-separated, each
+    /// `ident/persona`; `-` for a part a row lacks.
     pub idents: String,
 }
 
 impl ModelRow {
     /// Whether a node it was asked of listed it.
     pub fn listed(&self) -> bool {
-        self.idents
-            .split(',')
-            .any(|i| crate::model::llm::listed(Some(i).filter(|i| *i != "-"), &self.model))
+        fn part(p: &str) -> Option<&str> {
+            Some(p).filter(|p| *p != "-")
+        }
+        self.idents.split(',').any(|ip| {
+            let (i, p) = ip.split_once('/').unwrap_or((ip, "-"));
+            crate::model::llm::listed(part(i), part(p), &self.model)
+        })
     }
 }
 
@@ -211,13 +215,12 @@ impl Store {
         }
         let by_api = q.fetch_all(&self.read).await?;
         // Counted in SQL per endpoint, model and serving node's identity
-        // (few distinct triples), not a row per request: the range may be
+        // and persona (few distinct tuples), not a row per request: the range may be
         // the whole history. A model is listed if that node listed it.
-        let mut q = sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
-            sqlx::AssertSqlSafe(format!(
-                "SELECT r.answer, json_extract(r.decoy_in, '$.model'), json_extract(r.decoy_in, '$.i'), COUNT(*) {base} GROUP BY 1, 2, 3"
-            )),
-        );
+        type Tally = (String, Option<String>, Option<String>, Option<String>, i64);
+        let mut q = sqlx::query_as::<_, Tally>(sqlx::AssertSqlSafe(format!(
+            "SELECT r.answer, json_extract(r.decoy_in, '$.model'), json_extract(r.decoy_in, '$.i'), json_extract(r.decoy_in, '$.p'), COUNT(*) {base} GROUP BY 1, 2, 3, 4"
+        )));
         if let Some(m) = since {
             q = q.bind(m);
         }
@@ -225,16 +228,15 @@ impl Store {
             by_api,
             ..Default::default()
         };
-        for (answer, model, ident, n) in q.fetch_all(&self.read).await? {
+        for (answer, model, ident, persona, n) in q.fetch_all(&self.read).await? {
             match answer.trim_start_matches("decoy:llm:") {
                 "tags" | "models" if model.is_none() => s.listings += n,
                 "chat" | "generate" | "chat-completions" | "completions" | "responses"
                 | "messages" | "complete" => {
                     s.calls += n;
-                    if model
-                        .as_deref()
-                        .is_some_and(|m| crate::model::llm::listed(ident.as_deref(), m))
-                    {
+                    if model.as_deref().is_some_and(|m| {
+                        crate::model::llm::listed(ident.as_deref(), persona.as_deref(), m)
+                    }) {
                         s.listed += n
                     } else {
                         s.unlisted += n
@@ -252,7 +254,7 @@ impl Store {
         let mut q = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe(format!(
             "SELECT json_extract(r.decoy_in, '$.model') AS model, COALESCE(json_extract(r.decoy_in, '$.api'), '') AS api,
                     COUNT(*) AS requests, COUNT(DISTINCT r.ip_id) AS ips,
-                    group_concat(DISTINCT COALESCE(json_extract(r.decoy_in, '$.i'), '-')) AS idents
+                    group_concat(DISTINCT COALESCE(json_extract(r.decoy_in, '$.i'), '-') || '/' || COALESCE(json_extract(r.decoy_in, '$.p'), '-')) AS idents
              FROM requests r WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:llm:%' AND json_extract(r.decoy_in, '$.model') IS NOT NULL{w}
              GROUP BY 1, 2 ORDER BY requests DESC LIMIT 100")));
         if let Some(m) = since {
@@ -834,7 +836,7 @@ mod tests {
         let (with, without) = (0..64u8)
             .map(|n| crate::model::ai_id::derive(Some(&[n; 32])))
             .fold((None, None), |(w, wo), i| {
-                let has = crate::model::llm::listed(Some(&i), "phi3:mini");
+                let has = crate::model::llm::listed(Some(&i), None, "phi3:mini");
                 (
                     w.or(has.then(|| i.clone())),
                     wo.or((!has).then(|| i.clone())),

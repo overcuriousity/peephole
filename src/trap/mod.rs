@@ -411,7 +411,33 @@ pub fn router(state: Arc<TrapState>) -> Router {
         // A wrong method on a helper path is the trap too: axum's own 405
         // would go unrecorded and give the helpers away.
         .method_not_allowed_fallback(trap_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            persona_banner,
+        ))
         .with_state(state)
+}
+
+/// Every trap response carries the banner of the persona the request is
+/// recorded under: the same node key and host
+/// ([`crate::canary::site::served_host`] over the same header values), so
+/// the same persona.
+async fn persona_banner(
+    State(state): State<Arc<TrapState>>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
+        .filter(|h| h.len() <= crate::canary::site::HOST_MAX);
+    let node_id = state.recorder.node_id();
+    let p = persona::resolve(node_id.as_ref().map(|n| &n.0[..]), host.as_deref());
+    let mut resp = next.run(req).await;
+    p.stamp(resp.headers_mut());
+    resp
 }
 
 /// One `X-Forwarded-For` entry: an address, optionally with a port
@@ -581,10 +607,10 @@ struct Capture<'a> {
     ts: String,
     decoy_v: Option<i64>,
     decoy_site: Option<String>,
-    /// What an MCP or LLM decoy was rendered from.
+    /// What an MCP or LLM decoy (or the phpinfo one) was rendered from.
     decoy_in: Option<String>,
-    /// How the request is answered: `not-found`, `decoy:<name>`, `claim`,
-    /// `tarpit`.
+    /// How the request is answered: `not-found`, `landing`, `decoy:<name>`,
+    /// `claim`, `tarpit`.
     answer: String,
     /// How long the tarpit held the client, in milliseconds.
     held_ms: Option<i64>,
@@ -893,9 +919,10 @@ async fn trap(
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
+    let node_id = state.recorder.node_id();
+    let persona = persona::resolve(node_id.as_ref().map(|n| &n.0[..]), host.as_deref());
     let mut ai = if decoy::ai::candidate(path) {
         let decoded = crate::classify::decoded_body(&headers, &body.bytes);
-        let node_id = state.recorder.node_id();
         decoy::ai::choose(
             &decoy::ai::Ask {
                 method,
@@ -905,6 +932,7 @@ async fn trap(
                 body: &decoded,
             },
             &crate::model::ai_id::derive(node_id.as_ref().map(|n| &n.0[..])),
+            persona.name,
         )
     } else {
         None
@@ -927,7 +955,6 @@ async fn trap(
             state, in_flight, ip, parts, body, hold, page_token, now, host,
         );
     }
-    let node_id = state.recorder.node_id();
     let word = crate::canary::site::word(node_id.as_ref().map(|n| &n.0[..]));
     if let Some(u) = upload {
         // A file dropped: told it landed, whatever else the request is.
@@ -1059,22 +1086,34 @@ async fn trap(
         None => None,
     };
     // An AI decoy that renders nothing falls back to the version-1 pick
-    // (and its row carries no `decoy_in`).
-    let (decoy, ai) = match (decoy, ai) {
-        (None, _) => (
-            decoy::choose(method, path, parts.uri.query(), presented, word)
-                .and_then(|name| decoy::render(&input, name)),
-            None,
-        ),
-        (d, a) => (d, a),
+    // (and its row carries no `decoy_in`, but for one that depends on the
+    // persona: [`decoy::persona_in`]).
+    let (decoy, decoy_in) = match (decoy, ai) {
+        (None, _) => match decoy::choose(method, path, parts.uri.query(), presented, word) {
+            Some(name) => {
+                let pin = decoy::persona_in(name, persona.name);
+                let d = decoy::render(
+                    &decoy::Input {
+                        decoy_in: pin.as_deref(),
+                        ..input
+                    },
+                    name,
+                );
+                (d, pin)
+            }
+            None => (None, None),
+        },
+        (d, Some(_)) => {
+            let din = d.as_ref().and(decoy_in);
+            (d, din)
+        }
+        (d, None) => (d, None),
     };
-    let decoy_in = if ai.is_some() {
-        decoy.as_ref().and(decoy_in)
-    } else {
-        None
-    };
+    // What else there is: the persona's page at `/`, the trap page.
+    let landing = decoy.is_none() && matches!(method, "GET" | "HEAD") && path == "/";
     let (answer, status) = match &decoy {
         Some(d) => (format!("decoy:{}", d.name), d.status),
+        None if landing => ("landing".to_string(), 200),
         None => ("not-found".to_string(), 404),
     };
     // Recorded apart from the answer: hyper drops this future when the
@@ -1102,6 +1141,13 @@ async fn trap(
     ));
     if let Some(d) = decoy {
         return decoy_response(d);
+    }
+    if landing {
+        return Html((persona.landing)(
+            &page_token,
+            &state.cfg.trap.helper_prefix,
+        ))
+        .into_response();
     }
     (
         StatusCode::NOT_FOUND,
