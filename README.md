@@ -117,5 +117,6 @@ security key with the one-time token the installer prints. Details:
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT License](LICENSE-MIT), at your option.
 
-Third-party data shipped with peephole (the X4BNet datacenter ASN list,
-MIT) is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Third-party fingerprint methods carry their own notices, and JA4H and JA4X
+are under the FoxIO License 1.1 (non-commercial only); the bundled X4BNet
+datacenter ASN list is under MIT: see [NOTICE](NOTICE).
