@@ -203,6 +203,24 @@ any address to any node, the admin names the request that harvested it and
 the time in between. How the values are derived is in
 [Canaries](dataset.md#canaries).
 
+### AI decoys: one identity per node
+
+The MCP server (`/mcp`, `/messages`, `/sse`) and the LLM gateway (Ollama,
+OpenAI, Anthropic and Azure paths) answer with an identity of their own on
+each node, so one fingerprint does not name every cluster member. It is
+drawn from the node key, stays the same for as long as the key does, and
+never varies per source address. Per node, the MCP server has its own
+name and version, lists the five tools (read a file, list a directory,
+run a command, query the database, fetch a URL) under its own names, adds
+0-2 canned extra tools, and lists 2 of 4 file resources; the gateway
+lists 3-4 of 10 local models, its own Ollama version, and 4-6 of the 6
+upstream models. A model the node does not list answers "not found" and
+counts as unlisted in the admin's LLM tallies. A tool call is classed and
+stored under the tool's canonical name (`read_file`, `list_directory`,
+`run_command`, `query_db`, `fetch_url`), whichever name it was sent with;
+the canonical names are answered on every node. The derivation is in
+[Canaries](dataset.md#canaries) (version 5).
+
 ## Scanners we do not counter-scan
 
 peephole answers reconnaissance with a counter-scan of the source — except

@@ -891,13 +891,17 @@ async fn trap(
     let presented = presented(&state, &headers, method, path, &body.bytes).await;
     let mut ai = if decoy::ai::candidate(path) {
         let decoded = crate::classify::decoded_body(&headers, &body.bytes);
-        decoy::ai::choose(&decoy::ai::Ask {
-            method,
-            path,
-            query: parts.uri.query(),
-            headers: &headers,
-            body: &decoded,
-        })
+        let node_id = state.recorder.node_id();
+        decoy::ai::choose(
+            &decoy::ai::Ask {
+                method,
+                path,
+                query: parts.uri.query(),
+                headers: &headers,
+                body: &decoded,
+            },
+            &crate::model::ai_id::derive(node_id.as_ref().map(|n| &n.0[..])),
+        )
     } else {
         None
     };

@@ -7,7 +7,8 @@
 //! (`peephole decoy render`). Version 1 serves canaries derived from the
 //! page token ([`crate::canary`]); version 0 (rows with no `decoy_v`)
 //! served `canary-<ref>`. Version 3 adds an ETag canary to the web decoys
-//! that answer 200; version 4 the file-manager page.
+//! that answer 200; version 4 the file-manager page; version 5 the node's
+//! own AI decoy identity (`decoy_in` `"i"`, [`crate::model::ai_id`]).
 pub mod ai;
 pub mod llm;
 pub mod mcp;
@@ -160,7 +161,7 @@ pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
                 _ => return None,
             }
         }
-        1..=4 => {
+        1..=5 => {
             let word = inp.word;
             let site_name = format!("{word}.internal");
             match name {
@@ -604,6 +605,11 @@ mod tests {
             assert_eq!(render(&one, name), render(&two, name), "{name}");
             let (three, four) = (inp(3, None, "GET", "/"), inp(4, None, "GET", "/"));
             assert_eq!(render(&three, name), render(&four, name), "{name}");
+            assert_eq!(
+                render(&four, name),
+                render(&inp(5, None, "GET", "/"), name),
+                "{name}"
+            );
         }
         assert_eq!(render(&inp(3, None, "GET", "/"), "file-manager"), None);
     }
@@ -863,7 +869,7 @@ mod tests {
             render(&inp(0, None, "GET", "/x"), "wp-admin").is_none(),
             "v0 had no wp-admin"
         );
-        assert!(render(&inp(5, None, "GET", "/.env"), "dotenv").is_none());
+        assert!(render(&inp(6, None, "GET", "/.env"), "dotenv").is_none());
     }
 
     #[test]

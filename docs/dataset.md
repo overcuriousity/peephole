@@ -91,7 +91,7 @@ Column order is as listed.
 | `ja4h` | string? | JA4H fingerprint of `raw_head` (HTTP/1 only; null for plain HTTP from a trusted proxy, whose head is the proxy's request, not the client's): method, version, cookie and referer flags, header count, first `Accept-Language`, then hashes of the header names in order and of the sorted cookie names and pairs. An unknown method gives its first two letters |
 | `answer` | string? | What the trap sent: `not-found` (a 404), `decoy:<name>` (a believable fake: `decoy:dotenv`, `decoy:git-config`, `decoy:git-head`, `decoy:wp-login`, `decoy:wp-login-failed`, `decoy:phpinfo`; answers to a harvested canary: `decoy:wp-login-ok`, `decoy:wp-admin`, `decoy:admin`, `decoy:git-auth`, `decoy:git-refs`, `decoy:git-pack`), `claim` (the false-positive claim page), `webshell` (a request to a path an upload on this node was told it landed at: a canned reply to a few commands, else an empty `200`), `tarpit` (a slow `200` that drips a few bytes at a time, for sources whose requests reached severity 4 in the hour before; see `held_ms`) |
 | `decoy_v` | int? | Template version of a decoy answer (see Canaries); empty for other answers, and empty on a decoy row means version 0 |
-| `decoy_in` | string? | What an MCP or LLM decoy was rendered from (JSON); empty otherwise |
+| `decoy_in` | string? | What an MCP or LLM decoy was rendered from (JSON); empty otherwise. From decoy version 5 it carries the serving node's AI identity as `"i"` (see Canaries); `"tool"` is the canonical tool name |
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
 | `status` | int? | HTTP status sent |
 | `held_ms` | int? | How long a `tarpit` answer held the client, in milliseconds: up to the last chunk the connection took, so a client that gave up counts until then; the configured hold (`trap.tarpit_hold_secs`, default 600 s) when it waited to the end. Null for other answers |
@@ -315,6 +315,25 @@ docs, api, account, checkout, catalog, newsletter, jobs, status. Links a
 scanner can follow back (`ADMIN_URL`, the git remote) use the request's
 `Host` header (HTTP/2: `:authority`; never a proxy-form target) when it
 is a public IP or DNS name, an IPv6 literal in brackets, else the site.
+
+**Version 5** adds the node's own AI decoy identity. The node's `ident`
+is the first 4 bytes of `SHA-256("peephole-ai-id-v1\0" || node_id)` as 8
+lowercase hex characters (a standalone node hashes nothing, as for the
+site word), stored in `decoy_in` as `"i"`, so the row renders with the
+identity it was served even after the node's key changes. From its bytes
+`r[0..4]` and `sel = SHA-256("peephole-ai-sel-v1\0" || r)`: the MCP
+server name is `SERVERS[r[0] mod 24]`, its version `r[1] mod 3`.`r[2] mod
+16`.`r[3] mod 32`; tool `t` is listed under its name number `sel[t] mod 3`;
+`sel[5] mod 3` extra tools from `sel[6]` on; tools in an order drawn from
+`sel[8..14]`, resources 2 of 4 drawn from `sel[15..18]`; the gateway lists
+`3 + sel[18] mod 2` local models drawn from `sel[20..29]`, Ollama version
+`VERSIONS[sel[29] mod 6]`, and drops the OpenAI (Anthropic) model
+`sel[30] mod 4` (`sel[31] mod 4`) unless that is 3. The pools are in
+`src/trap/decoy/mcp.rs` and `src/model/llm.rs`. A row without `"i"`
+(versions 2-4) renders the identity every node served before:
+`internal-ops 0.3.1`, the five canonical tools, the first two resources,
+the first four local models, all six upstream models, Ollama 0.6.5. The
+web decoys render as in version 4.
 
 **Version 0** (empty `decoy_v` on a decoy row) served `canary-<ref>`,
 `AKIACANARY<REF>` (first 10 characters upper-cased) and
