@@ -126,7 +126,7 @@ mod tests {
             data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(BUILTIN)),
             "49c95d9219a060b8f29525e0b648bd40a5a39c124c09d6831b20f3768ccf3dd2",
             "rules/evidence/x4bnet/ASN.txt changed: refetch it from {X4B_URL} and \
-             update SNAPSHOT_DATE, SNAPSHOT_COMMIT and THIRD_PARTY_NOTICES.md"
+             update SNAPSHOT_DATE, SNAPSHOT_COMMIT and NOTICE"
         );
     }
 

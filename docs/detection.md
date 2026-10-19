@@ -214,7 +214,7 @@ with such a row.
 
 `net.hosting` comes from the datacenter ASN list of X4BNet `lists_vpn`
 (`input/datacenter/ASN.txt`, MIT licence, notice in
-`rules/evidence/x4bnet/LICENSE` and [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).
+`rules/evidence/x4bnet/LICENSE` and [NOTICE](../NOTICE)).
 A snapshot is built into the binary unmodified. Each node fetches the list
 from GitHub at startup and then daily, with the Tor exit list's cadence
 and backoff, into `<data_dir>/x4b-datacenter-asn.txt`. A fetched copy
