@@ -91,6 +91,9 @@ pub struct IpFilter {
     /// Admin only: in an RDAP network with this name, exactly (names are
     /// not unique: one can cover several handles).
     pub net_name: Option<String>,
+    /// Admin only: has an evidence row of this kind (`device.cpe`,
+    /// `device.proxy`, … of `store::evidence::KINDS`).
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -515,6 +518,12 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
         }
         if let Some(v) = nonempty(&f.net_name) {
             wheres.push("i.rdap_name = ?".into());
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.evidence) {
+            wheres.push(
+                "EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id AND e.kind = ?)".into(),
+            );
             binds.push(v);
         }
     }

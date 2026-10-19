@@ -15,6 +15,8 @@
 {% if let Some(a) = t.actions %}{% include "_actions.html" %}{% endif %}
 {% if t.admin.is_some() && !t.probes.is_empty() %}{% include "_probes.html" %}{% endif %}
 
+{% if let Some(ev) = t.evidence %}{% include "_evidence.html" %}{% endif %}
+
 {% if let Some(adm) = t.admin %}
 <section class="card ip-scans" id="scans" data-section="scans"{% if t.scans_waiting() %} data-scans-src="/admin/api/scan-jobs?ip={{ t.ov.ip.ip|urlencode }}" data-scans-states="{{ t.scan_states() }}"{% endif %}>
   <div class="card-head"><h2>Counter-scans</h2></div>

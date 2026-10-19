@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- A level-4 scan of a TP-LINK TR-069 router as nmap 7.95 recorded it on the hermes node (2026-10-18), trimmed to the open port and redacted: target 203.0.113.47, no traceroute (MIK-586). -->
+<!-- Nmap 7.95 scan initiated Sun Oct 18 01:42:51 2026 as: nmap -Pn -sS -p- -sV -O -T3 -&#45;max-retries 1 -&#45;traceroute -&#45;script &quot;(discovery or safe) and not (intrusive or broadcast or external or dos or http-comments-displayer)&quot; -&#45;host-timeout 6840s -&#45;script-timeout 600s -&#45;min-rate 300 -oX - 203.0.113.47 -->
+<nmaprun scanner="nmap" args="nmap -Pn -sS -p- -sV -O -T3 -&#45;max-retries 1 -&#45;traceroute -&#45;script &quot;(discovery or safe) and not (intrusive or broadcast or external or dos or http-comments-displayer)&quot; -&#45;host-timeout 6840s -&#45;script-timeout 600s -&#45;min-rate 300 -oX - 203.0.113.47" start="1792287771" startstr="Sun Oct 18 01:42:51 2026" version="7.95" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="65535" services="1-65535"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1792287773" endtime="1792288146"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="203.0.113.47" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="filtered" count="65531">
+<extrareasons reason="no-response" count="65531" proto="tcp" ports="1-7546,7548-20000,20002-45064,45066-51819,51821-65535"/>
+</extraports>
+<port protocol="tcp" portid="7547"><state state="open" reason="syn-ack" reason_ttl="57"/><service name="http" product="TP-LINK TR-069 remote access" devicetype="broadband router" method="probed" conf="10"/><script id="http-server-header" output="tr069 http server"><elem>tr069 http server</elem>
+</script></port>
+<port protocol="tcp" portid="20001"><state state="closed" reason="reset" reason_ttl="57"/><service name="microsan" method="table" conf="3"/></port>
+</ports>
+<os><portused state="open" proto="tcp" portid="7547"/>
+<osmatch name="FreeBSD 6.2-RELEASE" accuracy="86" line="29729">
+<osclass type="general purpose" vendor="FreeBSD" osfamily="FreeBSD" osgen="6.X" accuracy="86"><cpe>cpe:/o:freebsd:freebsd:6.2</cpe></osclass>
+</osmatch>
+</os>
+<times srtt="177768" rttvar="5105" to="198188"/>
+</host>
+<runstats><finished time="1792288146" timestr="Sun Oct 18 01:49:06 2026" summary="Nmap done at Sun Oct 18 01:49:06 2026; 1 IP address (1 host up) scanned in 374.65 seconds" elapsed="374.65" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

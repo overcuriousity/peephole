@@ -934,8 +934,298 @@ pub fn verdict(rows: &[EvidenceRow], declared: bool) -> Verdict {
     }
 }
 
+// ---- The IP page ----------------------------------------------------------
+
+/// One evidence row as the IP page shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Line {
+    pub kind: String,
+    /// What was observed: the device or proxy, the key, the name.
+    pub what: String,
+    pub port: Option<i64>,
+    /// Where it came from, and the page that shows it.
+    pub source: String,
+    pub href: Option<String>,
+    pub date: String,
+}
+
+/// The verdict as the IP page shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct View {
+    pub rule: Rule,
+    pub label: &'static str,
+    /// What was observed, in one sentence; never a claim about whose box
+    /// it is.
+    pub sentence: String,
+    pub caveat: Option<&'static str>,
+    pub lines: Vec<Line>,
+}
+
+/// The caveat on a device verdict.
+pub const DEVICE_CAVEAT: &str = "What answered is the box on this address at scan time, \
+     not necessarily the sender; who runs it is not observable from here.";
+/// The caveat on a mobile ISP address.
+pub const MOBILE_CAVEAT: &str = "mobile ISP address: usually many subscribers (CGNAT)";
+
+fn day(ts: &str) -> String {
+    ts.get(..10).unwrap_or(ts).to_string()
+}
+
+fn short(fp: &str) -> String {
+    if fp.chars().count() > 20 {
+        format!("{}…", fp.chars().take(20).collect::<String>())
+    } else {
+        fp.to_string()
+    }
+}
+
+fn key_name(kind: &str) -> &str {
+    match kind {
+        "ssh-hostkey" => "SSH host key",
+        "tls-cert" => "TLS certificate",
+        "http-etag" => "HTTP ETag",
+        other => other,
+    }
+}
+
+impl Store {
+    /// The verdict on an address with its evidence, as the IP page shows
+    /// it; None where it shows nothing new (rules 1 and 7).
+    pub async fn evidence_view(&self, ip_id: i64, tor_exit: bool) -> Result<Option<View>> {
+        let rows = self.evidence_rows(ip_id).await?;
+        let v = verdict(&rows, tor_exit);
+        let Some(label) = v.rule.label() else {
+            return Ok(None);
+        };
+        let cat = Catalogue::builtin();
+        let mut lines = vec![];
+        for r in &v.rows {
+            lines.extend(self.lines_of(cat, r).await?);
+        }
+        // Devices newest first, then the rest in row order.
+        let device = |l: &Line| l.kind.starts_with("device.");
+        lines.sort_by(|a, b| {
+            device(b)
+                .cmp(&device(a))
+                .then_with(|| (a.kind == "device.proxy").cmp(&(b.kind == "device.proxy")))
+                .then_with(|| b.date.cmp(&a.date))
+        });
+        let mobile = rows
+            .iter()
+            .any(|r| r.kind == "net.eyeball" && r.value == "mobile");
+        let first = |kinds: &[&str]| lines.iter().find(|l| kinds.contains(&l.kind.as_str()));
+        let observed = |l: &Line| match l.port {
+            Some(p) => format!("{} answered on {p} in {}", l.what, l.source),
+            None => format!("{} in {}", l.what, l.source),
+        };
+        let sentence = match v.rule {
+            Rule::RentedFleet => {
+                first(&["fleet.key", "fleet.canary", "fleet.dense", "name.scanner"])
+                    .map(|l| l.what.clone())
+                    .unwrap_or_default()
+            }
+            Rule::Rented => "hosting AS".into(),
+            Rule::ConsumerDevice => first(&["device.cpe"])
+                .map(|l| format!("{}; the line is in a consumer ISP AS", observed(l)))
+                .unwrap_or_default(),
+            Rule::ProxyOnConsumer => first(&["device.proxy"])
+                .map(|l| format!("{}; the line is in a consumer ISP AS", observed(l)))
+                .unwrap_or_default(),
+            Rule::DeviceOnly => first(&["device.cpe", "device.proxy"])
+                .map(|l| format!("{}; AS type not classified", observed(l)))
+                .unwrap_or_default(),
+            Rule::Declared | Rule::Unknown => unreachable!("no label"),
+        };
+        let caveat = match v.rule {
+            Rule::ConsumerDevice | Rule::ProxyOnConsumer if mobile => Some(MOBILE_CAVEAT),
+            Rule::ConsumerDevice | Rule::ProxyOnConsumer | Rule::DeviceOnly => Some(DEVICE_CAVEAT),
+            _ => None,
+        };
+        Ok(Some(View {
+            rule: v.rule,
+            label,
+            sentence,
+            caveat,
+            lines,
+        }))
+    }
+
+    /// The lines one evidence row stands for (a device row: every port of
+    /// its scan the entry matched).
+    async fn lines_of(&self, cat: &Catalogue, r: &EvidenceRow) -> Result<Vec<Line>> {
+        let line = |what: String, port, source: String, href, date: &str| Line {
+            kind: r.kind.clone(),
+            what,
+            port,
+            source,
+            href,
+            date: day(date),
+        };
+        Ok(match r.kind.as_str() {
+            "device.cpe" | "device.proxy" => {
+                let Some((level, at, os)) = sqlx::query_as::<_, (i64, String, Option<String>)>(
+                    "SELECT level, finished_at, os_guess FROM scans
+                     WHERE id = ? AND finished_at IS NOT NULL",
+                )
+                .bind(r.ref_id)
+                .fetch_optional(&self.read)
+                .await?
+                else {
+                    return Ok(vec![]);
+                };
+                let ports: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT port, service, product FROM ports
+                     WHERE scan_id = ? AND state = 'open' ORDER BY port",
+                )
+                .bind(r.ref_id)
+                .fetch_all(&self.read)
+                .await?;
+                let facts: Vec<(Option<i64>, String)> =
+                    sqlx::query_as("SELECT port, kind FROM scan_facts WHERE scan_id = ?")
+                        .bind(r.ref_id)
+                        .fetch_all(&self.read)
+                        .await?;
+                let ports: Vec<(i64, Option<&str>, Option<&str>)> = ports
+                    .iter()
+                    .map(|(p, s, d)| (*p, s.as_deref(), d.as_deref()))
+                    .collect();
+                let facts: Vec<(Option<i64>, &str)> =
+                    facts.iter().map(|(p, k)| (*p, k.as_str())).collect();
+                let source = format!("scan #{} (level {level}, {})", r.ref_id, day(&at));
+                let href = Some(format!("/admin/scans/{}", r.ref_id));
+                cat.hits(&ports, os.as_deref(), &facts)
+                    .into_iter()
+                    .filter(|h| h.kind.row_kind() == r.kind && h.id == r.value)
+                    .map(|h| match h.seen {
+                        Seen::Port(p, product) => line(
+                            product.unwrap_or(h.label),
+                            Some(p),
+                            source.clone(),
+                            href.clone(),
+                            &at,
+                        ),
+                        Seen::Os(os) => line(
+                            format!("nmap's OS guess {os}"),
+                            None,
+                            source.clone(),
+                            href.clone(),
+                            &at,
+                        ),
+                        Seen::Fact(p, kind) => line(
+                            format!("{} ({kind})", h.label),
+                            p,
+                            source.clone(),
+                            href.clone(),
+                            &at,
+                        ),
+                    })
+                    .collect()
+            }
+            "fleet.key" => {
+                let Some((kind, port, scan)) = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+                    "SELECT kind, port, scan_id FROM host_keys WHERE id = ?",
+                )
+                .bind(r.ref_id)
+                .fetch_optional(&self.read)
+                .await?
+                else {
+                    return Ok(vec![]);
+                };
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(DISTINCT ip_id) FROM host_keys WHERE kind = ? AND fingerprint = ?",
+                )
+                .bind(&kind)
+                .bind(&r.value)
+                .fetch_one(&self.read)
+                .await?;
+                let what = format!(
+                    "one of {n} addresses sharing {} {}",
+                    key_name(&kind),
+                    short(&r.value)
+                );
+                let link = crate::store::links::LinkKind::of_host_kind(&kind)
+                    .map(|k| crate::admin::views::link_href(k.key(), &r.value));
+                match scan {
+                    Some(s) => vec![line(
+                        what,
+                        Some(port),
+                        format!("scan #{s}"),
+                        Some(format!("/admin/scans/{s}")),
+                        &r.last_ts,
+                    )],
+                    None => vec![line(what, Some(port), "a probe".into(), link, &r.last_ts)],
+                }
+            }
+            "fleet.canary" => {
+                let served: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT DISTINCT ci.ip, t.place FROM request_tokens t
+                     JOIN canaries c ON c.value_hash = t.value_hash
+                     JOIN ips ci ON ci.id = c.ip_id
+                     WHERE t.request_id = ?1 AND c.value_hash = ?2 AND c.ip_id != ?3
+                       AND (t.place = 'body' OR t.place LIKE 'header:%')
+                     ORDER BY ci.ip",
+                )
+                .bind(r.ref_id)
+                .bind(r.value.parse::<i64>().unwrap_or_default())
+                .bind(r.ip_id)
+                .fetch_all(&self.read)
+                .await?;
+                served
+                    .into_iter()
+                    .map(|(ip, place)| {
+                        line(
+                            format!("canary served to {ip} came back from here ({place})"),
+                            None,
+                            format!("request #{}", r.ref_id),
+                            Some(format!("/admin/requests/{}", r.ref_id)),
+                            &r.last_ts,
+                        )
+                    })
+                    .collect()
+            }
+            "name.consumer" | "name.scanner" => {
+                let name: Option<String> =
+                    sqlx::query_scalar("SELECT name FROM ip_names WHERE id = ?")
+                        .bind(r.ref_id)
+                        .fetch_optional(&self.read)
+                        .await?;
+                let pattern = if r.kind == "name.consumer" {
+                    "consumer-line"
+                } else {
+                    "scanner"
+                };
+                name.map(|n| {
+                    line(
+                        format!("named {n} ({pattern} pattern {})", r.value),
+                        None,
+                        "reverse DNS".into(),
+                        None,
+                        &r.last_ts,
+                    )
+                })
+                .into_iter()
+                .collect()
+            }
+            "fleet.dense" => vec![line(
+                format!("one of {DENSE_MIN} or more sources in {}", r.value),
+                None,
+                "recorded addresses".into(),
+                None,
+                &r.last_ts,
+            )],
+            _ => vec![line(
+                format!("AS type {}", r.value),
+                None,
+                "AS-type list".into(),
+                None,
+                &r.last_ts,
+            )],
+        })
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn builtin() -> &'static Catalogue {
@@ -1305,5 +1595,145 @@ mod tests {
         assert_eq!(kinds, ["device.cpe", "name.consumer"]);
         assert_eq!(Rule::Unknown.label(), None, "rule 7 shows nothing");
         assert_eq!(Rule::Declared.label(), None);
+    }
+
+    /// The address a recorded nmap XML of a TR-069 router scanned, and the
+    /// scan, stored through the scan ingest.
+    pub(crate) async fn seed_tr069(s: &Store) -> (i64, i64) {
+        let row = s.upsert_ip("203.0.113.47".parse().unwrap()).await.unwrap();
+        s.insert_request(&crate::store::requests::NewRequest {
+            ip_id: row.id,
+            method: "GET".into(),
+            path: "/".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.enqueue_scan(row.id, 1, 0).await.unwrap();
+        let job = s.next_queued_job().await.unwrap().unwrap();
+        let res = crate::scan::nmap_xml::parse_nmap_xml(include_bytes!(
+            "../../tests/fixtures/nmap-tr069.xml"
+        ))
+        .unwrap();
+        s.finish_job(job.id, Some(&res), None).await.unwrap();
+        let scan: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE ip_id = ?")
+            .bind(row.id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        (row.id, scan)
+    }
+
+    /// A recorded scan of a box answering TR-069 on 7547, fed through the
+    /// ingest, gives a `device.cpe` row and a rule-6 sentence naming the
+    /// device, the port, the scan and its date (the lab check of the
+    /// design, without nmap on the host).
+    #[tokio::test]
+    async fn a_recorded_tr069_scan_gives_a_device_row_and_a_rule_6_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let (ip, scan) = seed_tr069(&s).await;
+        let r = s.recompute_evidence().await.unwrap();
+        assert_eq!(r.ips.get("device.cpe"), Some(&1), "{r}");
+        assert!(
+            r.to_string().contains("device.cpe: 1 rows on 1 addresses"),
+            "{r}"
+        );
+        let rows = s.evidence_rows(ip).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (
+                rows[0].kind.as_str(),
+                rows[0].value.as_str(),
+                rows[0].ref_id
+            ),
+            ("device.cpe", "tr069", scan)
+        );
+        let v = s.evidence_view(ip, false).await.unwrap().unwrap();
+        assert_eq!(v.rule, Rule::DeviceOnly);
+        let today = &crate::store::data::now_ts()[..10];
+        assert_eq!(
+            v.sentence,
+            format!(
+                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan} \
+                 (level 1, {today}); AS type not classified"
+            )
+        );
+        assert_eq!(
+            v.lines[0].href.as_deref(),
+            Some(&*format!("/admin/scans/{scan}"))
+        );
+        assert_eq!(v.caveat, Some(DEVICE_CAVEAT));
+        // A Tor exit is rule 1: nothing new on the page.
+        assert_eq!(s.evidence_view(ip, true).await.unwrap(), None);
+        // The rows go with the address.
+        assert!(s.delete_ip(ip).await.unwrap());
+        assert!(s.evidence_rows(ip).await.unwrap().is_empty());
+    }
+
+    /// `ip_evidence` stays on the node: no replication, export, dataset,
+    /// API or blocklist code reads it, and an export of an address with
+    /// evidence carries none of it.
+    #[tokio::test]
+    async fn evidence_is_in_no_export_dataset_replication_or_blocklist_path() {
+        fn sources(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if path.is_dir() {
+                for e in std::fs::read_dir(path).unwrap() {
+                    sources(&e.unwrap().path(), out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path.to_path_buf());
+            }
+        }
+        let mut files = vec![];
+        for p in [
+            "src/export",
+            "src/cluster",
+            "src/store/export.rs",
+            "src/store/publish.rs",
+            "src/store/blocklist.rs",
+            "src/store/recorder.rs",
+            "src/admin/blocklist.rs",
+            "src/admin/api_v1.rs",
+        ] {
+            sources(std::path::Path::new(p), &mut files);
+        }
+        assert!(files.len() > 20, "{files:?}");
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            for needle in [
+                "ip_evidence",
+                "evidence::",
+                "recompute_evidence",
+                "evidence_view",
+            ] {
+                assert!(!text.contains(needle), "{} reads {needle}", f.display());
+            }
+        }
+
+        use futures::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        seed_tr069(&s).await;
+        s.recompute_evidence().await.unwrap();
+        let parts: Vec<axum::body::Bytes> = crate::export::stream_requests(
+            s.clone(),
+            crate::export::ExportFilter::default(),
+            crate::export::Format::Jsonl,
+            Default::default(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let out: String = parts.iter().map(|b| String::from_utf8_lossy(b)).collect();
+        assert!(
+            out.contains("TP-LINK TR-069"),
+            "the scan itself is exported"
+        );
+        for needle in ["device.cpe", "\"tr069\"", "evidence"] {
+            assert!(!out.contains(needle), "{needle} in the export");
+        }
     }
 }
