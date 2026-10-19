@@ -191,6 +191,14 @@ pub struct Stats {
     /// Campaigns with released activity in the range, as counts and family
     /// labels only; only from [`CAMPAIGN_TILE_MIN`] campaigns up.
     pub campaigns: Option<CampaignTile>,
+    /// Distinct IPs whose requests in the range carry an AI-agent label: a
+    /// count only. The wall shows the share from [`PORT_MIN_IPS`] up.
+    pub agent_ips: i64,
+    /// The family mix per persona, cluster-wide (never per node), only of
+    /// personas hit by at least [`PORT_MIN_IPS`] distinct IPs in the range.
+    /// For the wall; not serialized to `/api/stats`.
+    #[serde(skip_serializing)]
+    pub personas: Vec<super::analytics::PersonaStat>,
 }
 
 /// Most rows "Recent requests" can show (`[public] recent_rows` is at most
@@ -631,6 +639,9 @@ impl Store {
             reused: sum.harvests_reused,
         });
         let campaigns = self.campaign_tile_as(r, a).await?;
+        let agent_ips = self.agent_ips_as(r, a).await?;
+        let mut personas = self.personas_as(r, a, false).await?;
+        personas.retain(|p| p.ips >= PORT_MIN_IPS);
         Ok(Stats {
             range: r.key(),
             generated_at: chrono::Utc::now().to_rfc3339(),
@@ -662,7 +673,31 @@ impl Store {
             webshells_dropped,
             verbs,
             campaigns,
+            agent_ips,
+            personas,
         })
+    }
+
+    /// Distinct IPs with an AI-agent label in the range this audience may
+    /// see; over all time from the `ip_labels` read model.
+    async fn agent_ips_as(&self, r: Range, a: Audience) -> Result<i64> {
+        let (w, since) = r.ts_clause("r.ts");
+        let sql = match r {
+            Range::All => format!(
+                "SELECT COUNT(DISTINCT ip_id) FROM ip_labels
+                 WHERE label IN ({}) AND {} > 0",
+                crate::classify::AGENT_LABELS
+                    .map(|l| format!("'{l}'"))
+                    .join(","),
+                a.label_count()
+            ),
+            _ => format!(
+                "SELECT COUNT(DISTINCT r.ip_id) FROM requests r WHERE {}{w}{}",
+                super::analytics::AGENT_LIKE,
+                a.released("r")
+            ),
+        };
+        self.count_where(&sql, since).await
     }
 
     /// The campaign tile, counted over the member requests in the range

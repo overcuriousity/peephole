@@ -2,8 +2,10 @@
 //! for and what the counter-scans found, per time range. Admin-only — the
 //! paths, user agents and JA4/JA4H fingerprints describe request contents.
 use super::Store;
+use super::browse::Audience;
 use super::stats::{Named, PortStat, Range, RecentRequest, RecentTuple, recent_from};
 use anyhow::Result;
+use std::collections::HashMap;
 
 /// A value, how many requests carried it and from how many IPs.
 #[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
@@ -39,6 +41,104 @@ pub struct Analytics {
     pub scan_levels: Vec<Named>,
     /// Jobs queued in the range per status.
     pub job_status: Vec<Named>,
+    /// Requests per persona the nodes presented as (MIK-560 D8), most
+    /// requested first; rows without a persona (older builds) left out.
+    pub personas: Vec<PersonaStat>,
+    /// Sources and campaigns with AI-agent traces (MIK-560 D12).
+    pub agent: AgentShare,
+}
+
+/// One persona's requests in a range, cluster-wide.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PersonaStat {
+    pub name: String,
+    pub requests: i64,
+    /// Distinct source IPs, which is also the number of (IP, persona)
+    /// first contacts the follow-up rate is taken over.
+    pub ips: i64,
+    /// First contacts followed by another request from the same IP, on
+    /// any node and as any persona, within 24 hours (0 when not counted).
+    pub followed: i64,
+    /// Requests per label family (`classify::FAMILIES` order, non-zero
+    /// only).
+    pub families: Vec<Named>,
+}
+
+/// One bucket of the agent share: distinct IPs and active campaigns, and
+/// how many of them carried an AI-agent label in the bucket.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AgentBucket {
+    pub ts: String,
+    pub ips: i64,
+    pub agent_ips: i64,
+    pub campaigns: i64,
+    pub agent_campaigns: i64,
+}
+
+/// The agent share over the whole range (`total`, no bucket key) and per
+/// hour or day (`series`, oldest first).
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AgentShare {
+    pub total: AgentBucket,
+    pub series: Vec<AgentBucket>,
+}
+
+/// A request carries an AI-agent label (`classify::AGENT_LABELS`): both
+/// start with this, and a stored label list quotes every label.
+pub(crate) const AGENT_LIKE: &str = "r.labels_json LIKE '%\"ai-agent-%'";
+
+/// The rows of a known persona (`trap::persona::ALL`): one seek per
+/// persona on `idx_requests_persona`, and a member's replicated free text
+/// in the column never reaches a page.
+fn persona_in() -> String {
+    let names: Vec<String> = crate::trap::persona::ALL
+        .iter()
+        .map(|p| format!("'{}'", p.name))
+        .collect();
+    format!("r.persona IN ({})", names.join(","))
+}
+
+/// The per-persona counts. With `followed`, one grouped query over the
+/// (IP, persona) first contacts of the range: each first request's IP is
+/// looked up again in the 24 hours after it (`idx_requests_ip_ts`).
+fn persona_sql(w: &str, followed: bool) -> String {
+    let f = if followed {
+        "SUM(EXISTS (SELECT 1 FROM requests q WHERE q.ip_id = f.ip_id
+                     AND q.ts > f.t0 AND q.ts <= datetime(f.t0, '+24 hours')))"
+    } else {
+        "0"
+    };
+    let known = persona_in();
+    format!(
+        "SELECT f.persona, SUM(f.n), COUNT(*), {f}
+         FROM (SELECT r.persona, r.ip_id, MIN(r.ts) AS t0, COUNT(*) AS n
+               FROM requests r INDEXED BY idx_requests_persona
+               WHERE {known}{w} GROUP BY r.persona, r.ip_id) f
+         GROUP BY f.persona ORDER BY 2 DESC, f.persona"
+    )
+}
+
+/// Per bucket of the range: distinct IPs and those with an agent label,
+/// and the same for campaigns (a campaign is active through any member's
+/// request, agent-driven through any member's request with the label).
+/// Without a bucket key, one row for the whole range.
+fn agent_sql(bucket: Option<&str>, w: &str) -> [String; 2] {
+    let (b, g) = match bucket {
+        Some(fmt) => (format!("strftime('{fmt}', r.ts)"), " GROUP BY 1 ORDER BY 1"),
+        None => ("''".to_string(), ""),
+    };
+    [
+        format!(
+            "SELECT {b}, COUNT(DISTINCT r.ip_id),
+                    COUNT(DISTINCT CASE WHEN {AGENT_LIKE} THEN r.ip_id END)
+             FROM requests r WHERE 1=1{w}{g}"
+        ),
+        format!(
+            "SELECT {b}, COUNT(DISTINCT m.campaign_key),
+                    COUNT(DISTINCT CASE WHEN {AGENT_LIKE} THEN m.campaign_key END)
+             FROM requests r JOIN campaign_members m ON m.ip_id = r.ip_id WHERE 1=1{w}{g}"
+        ),
+    ]
 }
 
 /// Rows per ranked list.
@@ -237,6 +337,121 @@ impl Store {
             abuse,
             scan_levels,
             job_status,
+            personas: self.personas_as(r, Audience::Admin, true).await?,
+            agent: self.agent_share(r).await?,
+        })
+    }
+
+    /// Requests, IPs and family mix per persona over the range this
+    /// audience may see; the follow-up count only with `followed`.
+    pub(crate) async fn personas_as(
+        &self,
+        r: Range,
+        a: Audience,
+        followed: bool,
+    ) -> Result<Vec<PersonaStat>> {
+        let (w, since) = r.ts_clause("r.ts");
+        let w = w + &a.released("r");
+        let mut q = sqlx::query_as::<_, (String, i64, i64, i64)>(sqlx::AssertSqlSafe(persona_sql(
+            &w, followed,
+        )));
+        if let Some(m) = since {
+            q = q.bind(m);
+        }
+        let counts = q.fetch_all(&self.read).await?;
+        let mut q = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(format!(
+            "SELECT r.persona, r.labels_json, COUNT(*) FROM requests r
+             WHERE {}{w} GROUP BY r.persona, r.labels_json",
+            persona_in()
+        )));
+        if let Some(m) = since {
+            q = q.bind(m);
+        }
+        let mut fam: HashMap<String, HashMap<&'static str, i64>> = HashMap::new();
+        for (persona, labels, n) in q.fetch_all(&self.read).await? {
+            let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            let per = fam.entry(persona).or_default();
+            for f in crate::classify::request_families(&labels) {
+                *per.entry(f).or_default() += n;
+            }
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(name, requests, ips, followed)| {
+                let per = fam.remove(&name).unwrap_or_default();
+                PersonaStat {
+                    families: crate::classify::FAMILIES
+                        .iter()
+                        .filter_map(|f| {
+                            per.get(f).map(|&count| Named {
+                                name: (*f).to_string(),
+                                count,
+                            })
+                        })
+                        .collect(),
+                    name,
+                    requests,
+                    ips,
+                    followed,
+                }
+            })
+            .collect())
+    }
+
+    async fn agent_rows(
+        &self,
+        sql: String,
+        since: Option<&'static str>,
+    ) -> Result<Vec<(Option<String>, i64, i64)>> {
+        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+        if let Some(m) = since {
+            q = q.bind(m);
+        }
+        Ok(q.fetch_all(&self.read).await?)
+    }
+
+    /// The agent share of the range, per hour (24 h, 7 d) or day.
+    async fn agent_share(&self, r: Range) -> Result<AgentShare> {
+        let (w, since) = r.ts_clause("r.ts");
+        let fmt = if r.hourly() {
+            "%Y-%m-%dT%H:00"
+        } else {
+            "%Y-%m-%d"
+        };
+        let [ips, campaigns] = agent_sql(Some(fmt), &w);
+        let mut series: Vec<AgentBucket> = self
+            .agent_rows(ips, since)
+            .await?
+            .into_iter()
+            .map(|(ts, ips, agent_ips)| AgentBucket {
+                ts: ts.unwrap_or_default(),
+                ips,
+                agent_ips,
+                ..Default::default()
+            })
+            .collect();
+        for (ts, n, a) in self.agent_rows(campaigns, since).await? {
+            // Every campaign request is a request: its bucket exists.
+            if let Some(b) = series.iter_mut().find(|b| Some(&b.ts) == ts.as_ref()) {
+                (b.campaigns, b.agent_campaigns) = (n, a);
+            }
+        }
+        let [ips, campaigns] = agent_sql(None, &w);
+        let (_, ips, agent_ips) = self.agent_rows(ips, since).await?.pop().unwrap_or_default();
+        let (_, campaigns, agent_campaigns) = self
+            .agent_rows(campaigns, since)
+            .await?
+            .pop()
+            .unwrap_or_default();
+        Ok(AgentShare {
+            total: AgentBucket {
+                ts: String::new(),
+                ips,
+                agent_ips,
+                campaigns,
+                agent_campaigns,
+            },
+            series,
         })
     }
 
@@ -441,5 +656,161 @@ mod tests {
         let (rows, ips) = s.related_by_ja4("t13d_a", 1).await.unwrap();
         assert_eq!((rows.len(), ips), (1, 1));
         assert_eq!(rows[0].ip, "198.51.100.2");
+    }
+
+    /// Rows `hours` ago from the IP, as the persona (None: a row of an
+    /// older build), with these labels.
+    async fn personas_seeded() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        std::mem::forget(dir);
+        let s = Store::connect(&path).await.unwrap();
+        let mut ip = Vec::new();
+        for a in ["203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"] {
+            ip.push(s.upsert_ip(a.parse().unwrap()).await.unwrap().id);
+        }
+        let rows: [(usize, i64, Option<&str>, &str); 7] = [
+            // A: followed one hour later, as another persona.
+            (0, 50, Some("wordpress"), r#"["sqli"]"#),
+            (0, 49, Some("gpu-box"), r#"["probe","ai-agent-tooling"]"#),
+            // B: back only after 30 hours, not a follow-up.
+            (1, 40, Some("wordpress"), r#"["sensitive-path"]"#),
+            (1, 10, Some("wordpress"), r#"["sensitive-path"]"#),
+            // C: followed by a legacy row, which counts as "another request".
+            (2, 5, Some("wordpress"), r#"["sensitive-path"]"#),
+            (2, 4, None, "[]"),
+            // D: legacy only, left out of every persona.
+            (3, 3, None, r#"["sqli"]"#),
+        ];
+        for (who, hours, persona, labels) in rows {
+            let ts = (chrono::Utc::now() - chrono::Duration::hours(hours))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            s.insert_request(&NewRequest {
+                ip_id: ip[who],
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: labels.into(),
+                ts: Some(ts),
+                persona: persona.map(String::from),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        // A and B form a campaign; A's request carries the agent label.
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                                    hard_edges, soft_edges, v, computed_at)
+             VALUES ('k', 1, ?, 2, '', '', 1, 0, 1, '')",
+        )
+        .bind(ip[0])
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        for who in [0, 1] {
+            sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, 'k')")
+                .bind(ip[who])
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn personas_count_requests_ips_families_and_follow_ups() {
+        let s = personas_seeded().await;
+        let a = s.analytics(Range::D7).await.unwrap();
+        let got: Vec<_> = a
+            .personas
+            .iter()
+            .map(|p| (p.name.as_str(), p.requests, p.ips, p.followed))
+            .collect();
+        assert_eq!(got, [("wordpress", 4, 3, 2), ("gpu-box", 1, 1, 0)]);
+        let fam: Vec<_> = a.personas[0]
+            .families
+            .iter()
+            .map(|n| (n.name.as_str(), n.count))
+            .collect();
+        assert_eq!(fam, [("exposure", 3), ("inject", 1)]);
+        // In the last 24 hours B (back at 10 h) is first seen there, and
+        // not followed.
+        let a = s.analytics(Range::H24).await.unwrap();
+        let got: Vec<_> = a
+            .personas
+            .iter()
+            .map(|p| (p.name.as_str(), p.requests, p.ips, p.followed))
+            .collect();
+        assert_eq!(got, [("wordpress", 2, 2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn agent_share_per_bucket_and_over_the_range() {
+        let s = personas_seeded().await;
+        let a = s.analytics(Range::D7).await.unwrap();
+        let t = &a.agent.total;
+        assert_eq!(
+            (t.ips, t.agent_ips, t.campaigns, t.agent_campaigns),
+            (4, 1, 1, 1)
+        );
+        let agent: Vec<_> = a.agent.series.iter().filter(|b| b.agent_ips > 0).collect();
+        assert_eq!(agent.len(), 1, "{:?}", a.agent.series);
+        assert_eq!(
+            (agent[0].ips, agent[0].campaigns, agent[0].agent_campaigns),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            a.agent.series.iter().map(|b| b.ips).sum::<i64>(),
+            7,
+            "one IP per hour"
+        );
+        let a = s.analytics(Range::H24).await.unwrap();
+        let t = &a.agent.total;
+        assert_eq!(
+            (t.ips, t.agent_ips, t.campaigns, t.agent_campaigns),
+            (3, 0, 1, 0)
+        );
+    }
+
+    /// The wall: a persona only from three IPs up, an agent count only.
+    #[tokio::test]
+    async fn public_personas_need_three_ips() {
+        let s = personas_seeded().await;
+        for r in [Range::D7, Range::All] {
+            let st = s.stats_as(r, Audience::Public).await.unwrap();
+            let names: Vec<_> = st.personas.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["wordpress"], "{r:?}: gpu-box has one IP");
+            assert_eq!(st.agent_ips, 1, "{r:?}");
+            let json = serde_json::to_value(&st).unwrap();
+            assert!(json.get("personas").is_none(), "{json}");
+            assert_eq!(json["agent_ips"], 1);
+        }
+        let st = s.stats_as(Range::H24, Audience::Public).await.unwrap();
+        assert!(st.personas.is_empty(), "two IPs in the last 24 hours");
+        assert_eq!(st.agent_ips, 0);
+    }
+
+    /// Per-persona counts read the (persona, ts) index, the follow-up
+    /// lookup the (ip_id, ts) one.
+    #[tokio::test]
+    async fn persona_counts_read_the_persona_index() {
+        let s = personas_seeded().await;
+        let sql = persona_sql(" AND r.ts >= datetime('now', ?)", true);
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .bind("-24 hours")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(
+            plan.iter().any(|p| p.3.contains("idx_requests_persona")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|p| p.3.contains("idx_requests_ip_ts")),
+            "{plan:?}"
+        );
     }
 }
