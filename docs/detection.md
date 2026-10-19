@@ -303,7 +303,9 @@ replicated:
   change.
 
 Each value names who makes the claim: the operator's naming, plus a scan
-for rule 2. None says "detected": a carrier-NAT name is the carrier's own
+for rule 2. A value is set only on an agreed name the export lists, so a
+rule-5 reading from a mobile `net.eyeball` row alone stays on the IP page
+and goes out with neither. None says "detected": a carrier-NAT name is the carrier's own
 statement about its address plan, and nothing a honeypot receives can
 verify it. The reading is a cost warning about blocking, not a verdict:
 an address in a mobile pool usually holds a subscriber for a day or less,

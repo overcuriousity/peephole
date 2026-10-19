@@ -1437,8 +1437,24 @@ pub fn reading_sql() -> String {
 
 // ---- The shared reading at the boundaries --------------------------------
 
-/// Kinds one of which every rule-2, 4, 5 or 6 reading needs.
-const SHARED_KINDS: [&str; 4] = ["name.pool", "name.cgn", "name.mobile", "net.eyeball"];
+/// Kinds one of which every shared field needs: the field rests on an
+/// operator's name only, so a mobile `net.eyeball` row alone sets none.
+const SHARED_KINDS: [&str; 3] = ["name.pool", "name.cgn", "name.mobile"];
+
+/// One `ip_evidence` row with its address and Tor flag, as
+/// [`Store::shared_readings`] reads it.
+type SharedRow = (
+    String,
+    bool,
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+);
 
 impl Sharing {
     /// The readings the export and the blocklist feed carry: those that
@@ -1475,12 +1491,12 @@ pub struct Shared {
     pub state: &'static str,
     pub rule: u8,
     pub v: i64,
-    /// Who makes the claim: `operator naming`, `operator naming and scan`
-    /// (rule 2), or the list that classes the network (rule 5, inert).
+    /// Who makes the claim: `operator naming`, or `operator naming and
+    /// scan` (rule 2).
     pub source: &'static str,
     /// The operator's name the claim rests on, as the export's `names`
-    /// column lists it; None when a list makes the claim.
-    pub name: Option<String>,
+    /// column lists it.
+    pub name: String,
 }
 
 impl Shared {
@@ -1492,19 +1508,15 @@ impl Shared {
         if !r.state.is_shared() {
             return None;
         }
-        let named = r
-            .state
-            .name_kind()
-            .and_then(|k| r.rows.iter().find(|x| x.kind == k && x.ref_kind == "name"))
-            .and_then(|x| names.get(&x.ref_id).cloned());
-        let (source, name) = match (r.state, named) {
-            (Sharing::SubscriberPooled, Some(n)) => ("operator naming and scan", Some(n)),
-            (_, Some(n)) => ("operator naming", Some(n)),
-            (Sharing::MobilePool, None) => {
-                let row = r.rows.iter().find(|x| holds(x, EYEBALL_MOBILE))?;
-                (as_source(&row.ref_kind), None)
-            }
-            _ => return None,
+        let kind = r.state.name_kind()?;
+        let row = r
+            .rows
+            .iter()
+            .find(|x| x.kind == kind && x.ref_kind == "name")?;
+        let name = names.get(&row.ref_id)?.clone();
+        let source = match r.state {
+            Sharing::SubscriberPooled => "operator naming and scan",
+            _ => "operator naming",
         };
         Some(Shared {
             state: r.state.key(),
@@ -1517,10 +1529,7 @@ impl Shared {
 
     /// What the reading says, with who says it, in one line; never "detected".
     pub fn text(&self) -> String {
-        let by = match self.source {
-            "operator naming" | "operator naming and scan" => "the operator's naming".to_string(),
-            list => format!("the {list}"),
-        };
+        let by = "the operator's naming";
         let pooled = "the line is reassigned, the next holder is someone else";
         match self.rule {
             2 => {
@@ -1554,21 +1563,7 @@ impl Store {
         &self,
         ip_ids: Option<&[i64]>,
     ) -> Result<Vec<(i64, String, Shared)>> {
-        let rows: Vec<(String, bool, EvidenceRow)> = sqlx::query_as::<
-            _,
-            (
-                String,
-                bool,
-                i64,
-                String,
-                String,
-                String,
-                i64,
-                String,
-                String,
-                i64,
-            ),
-        >(
+        let rows: Vec<(String, bool, EvidenceRow)> = sqlx::query_as::<_, SharedRow>(
             "SELECT i.ip, i.is_tor_exit, e.ip_id, e.kind, e.value, e.ref_kind, e.ref_id,
                     e.first_ts, e.last_ts, e.v
              FROM ip_evidence e JOIN ips i ON i.id = e.ip_id
@@ -2567,6 +2562,9 @@ pub(crate) mod tests {
         let r = reading(&[kv_row("net.eyeball", "mobile")], false);
         assert_eq!(r.state, Sharing::MobilePool);
         assert_eq!(r.rows.len(), 1);
+        // The page reads it, but the export and the feed carry a field
+        // only on an operator's name the export lists.
+        assert_eq!(Shared::of(&r, &HashMap::new()), None);
         assert_eq!(
             reading(&[kv_row("net.eyeball", "fixed")], false).state,
             Sharing::Insufficient
@@ -2934,7 +2932,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
         // (address, name, agreed, Tor exit, expected rule)
-        let cases: &[(&str, Option<&str>, bool, bool, Option<u8>)] = &[
+        type Case<'a> = (&'a str, Option<&'a str>, bool, bool, Option<u8>);
+        let cases: &[Case] = &[
             (
                 "192.0.2.1",
                 Some("0-0-0-1.cgn-wdsl.example.it"),
