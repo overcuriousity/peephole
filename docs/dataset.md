@@ -412,9 +412,25 @@ cluster.
 
   | Column / kind | Method, owner | Licence | (a) binary | (b) values | (c) selling |
   |---|---|---|---|---|---|
-  | `ja4` | JA4, FoxIO | BSD 3-Clause (`LICENSE-JA4`) | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
+  | `ja4` | JA4, FoxIO | BSD 3-Clause (`LICENSE-JA4`) | Allowed; notice in [`NOTICE`](../NOTICE) | Licence is silent | Allowed |
   | `ja4h` | JA4H, FoxIO (patent pending) | FoxIO License 1.1 | Non-commercial only, with the licence terms or URL attached (§2) | Licence is silent; FoxIO's FAQ counts indirect monetisation without exposing the values as commercial | Not allowed without a FoxIO OEM licence (§2, FAQ) |
   | `host_keys` `ja4x` | JA4X, FoxIO (patent pending) | FoxIO License 1.1 | As `ja4h` | As `ja4h` | As `ja4h` |
-  | `host_keys` `hassh` | HASSH-server, Salesforce (not FoxIO's JA4SSH) | BSD 3-Clause | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
-  | `jarm` (probes; not exported) | JARM, Salesforce | BSD 3-Clause | Allowed; the notice goes in the binary's docs | Licence is silent | Allowed |
-  | `host_keys` `ssh-hostkey`, `tls-cert`, `http-etag`; `favicon`, `http-body`, `http-404` (probes; not exported); `fingerprints` | SHA-256 or MD5 of standard data; Shodan's favicon convention over MurmurHash3 (public domain); in-tree browser collector | None beyond the crates' MIT / Apache-2.0 | No restriction found | No restriction found | No restriction found |
+  | `host_keys` `hassh` | HASSH-server, Salesforce (not FoxIO's JA4SSH) | BSD 3-Clause | Allowed; notice in [`NOTICE`](../NOTICE) | Licence is silent | Allowed |
+  | `jarm` (probes; not exported) | JARM, Salesforce | BSD 3-Clause | Allowed; notice in [`NOTICE`](../NOTICE) | Licence is silent | Allowed |
+  | `host_keys` `ssh-hostkey`, `tls-cert`, `http-etag`; `favicon`, `http-body`, `http-404` (probes; not exported); `fingerprints` | SHA-256 of standard data; Shodan's favicon convention over MurmurHash3 (public domain); in-tree browser collector | None beyond the crates' MIT / Apache-2.0 | No restriction found | No restriction found | No restriction found |
+
+  **Commercial gate.** We sell nothing today: credits are earned by work
+  for other members and buy nothing outside the cluster
+  ([Credits](overview.md#credits)). Before any of the following ships, the
+  FoxIO columns (`ja4h` and `ja4x`, together) must be resolved, by dropping
+  both or by obtaining a FoxIO OEM licence, and counsel reviews this
+  reading of the licences:
+
+  1. selling credits, scans or capacity for money;
+  2. hosted or managed scanning we charge for;
+  3. any paid product that distributes the binary or the fingerprint
+     values.
+
+  Teaching or writing about peephole, without distributing the binary or
+  its outputs, is outside the gate. If you read the terms differently,
+  open an issue.

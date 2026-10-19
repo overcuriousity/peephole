@@ -1,0 +1,98 @@
+peephole
+Copyright the peephole contributors.
+
+peephole is licensed under either of the Apache License, Version 2.0
+(LICENSE-APACHE) or the MIT License (LICENSE-MIT), at your option, except
+for the parts named under "FoxIO License 1.1" below.
+
+peephole implements fingerprint methods designed by third parties. Their
+notices follow, each copied verbatim from the source named above it.
+
+
+========================================================================
+JARM (Salesforce)
+========================================================================
+
+Implemented in: src/scan/probe/jarm.rs (a port of jarm.py)
+Source: https://github.com/salesforce/jarm/blob/e00ad79b02166568048266054a38470f4814c868/LICENSE.txt
+
+Copyright (c) 2020, Salesforce.com, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+* Neither the name of Salesforce.com nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+========================================================================
+HASSH (Salesforce)
+========================================================================
+
+Implemented in: hassh() in src/scan/probe/ssh.rs and in
+src/model/hostkeys.rs (HASSH-server)
+Source: https://github.com/salesforce/hassh/blob/56fa496af4495ce890ea790a0152215520fc3b7a/LICENSE.txt
+
+Copyright (c) 2018, Salesforce.com, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+* Neither the name of Salesforce.com nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+========================================================================
+JA4 (FoxIO)
+========================================================================
+
+Implemented in: ja4() in src/trap/tls_hello.rs (TLS client fingerprint
+only; the rest of JA4+ is not covered by this licence)
+Source: https://github.com/FoxIO-LLC/ja4/blob/c6469a7b0dbf8fe963810162429fbfd9d1acc4d5/LICENSE-JA4
+
+THIS LICENSE IS FOR JA4 ONLY (TLS CLIENT FINGERPRINTING) AND NOT FOR THE REST OF JA4+ (JA4PLUS). THE JA4+ LICENSE IS HERE: https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE
+THE JA4+ LICENSE FAQ IS HERE: https://github.com/FoxIO-LLC/ja4/blob/main/License%20FAQ.md
+
+Copyright (c) 2026 FoxIO
+All rights reserved.
+Software: JA4 (TLS client fingerprinting)
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+* Neither the name of FoxIO nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+========================================================================
+FoxIO License 1.1: JA4H and JA4X
+========================================================================
+
+The following are licensed under the FoxIO License 1.1, not under
+peephole's MIT / Apache-2.0 offer:
+
+- JA4H: src/model/ja4h.rs
+- JA4X: ja4x() in src/model/hostkeys.rs
+
+The FoxIO License 1.1 permits non-commercial use only. Its terms:
+https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE
+(as read for peephole: https://github.com/FoxIO-LLC/ja4/blob/c6469a7b0dbf8fe963810162429fbfd9d1acc4d5/LICENSE)
+
+FoxIO's licence FAQ:
+https://github.com/FoxIO-LLC/ja4/blob/c6469a7b0dbf8fe963810162429fbfd9d1acc4d5/License%20FAQ.md
+
+Commercial use of JA4H or JA4X requires an OEM licence from FoxIO, LLC.
