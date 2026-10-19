@@ -9,9 +9,10 @@
   <div class="table-wrap"><table class="table"><thead><tr><th>Parameter</th><th>Values</th><th>Default</th></tr></thead><tbody>
     <tr><td class="mono">hours</td><td>1–{{ crate::admin::blocklist::MAX_HOURS }}: the window</td><td>{{ crate::admin::blocklist::DEFAULT_HOURS }}</td></tr>
     <tr><td class="mono">min_severity</td><td>1–4: the least severity a request needs</td><td>{{ crate::admin::blocklist::DEFAULT_MIN_SEVERITY }}</td></tr>
-    <tr><td class="mono">networks=1</td><td>collapse a /24 (IPv6: /64) with {{ crate::admin::blocklist::NET_MIN_IPS }} or more entries into one prefix</td><td>off</td></tr>
+    <tr><td class="mono">networks=1</td><td>collapse a /24 (IPv6: /64) with {{ crate::admin::blocklist::NET_MIN_IPS }} or more entries into one prefix, unless it holds a shared address (below)</td><td>off</td></tr>
   </tbody></table></div>
   <p>An unusable value means its default, so a typo never makes a firewall script fail open. Never listed: Tor exits, verified crawlers, the addresses of this project's own nodes, and the operator's own and excluded networks. In a cluster, the list is drawn from every member's trap.</p>
+  <p><strong>Shared addresses.</strong> Where the operator's own naming calls an address a carrier-NAT or mobile pool, or a line that is reassigned (rules 2, 4, 5 and 6 of the <a href="https://github.com/overcuriousity/peephole/blob/master/docs/detection.md#shared-addresses">shared reading</a>), a comment line comes just before its entry, for example <span class="mono"># shared 192.0.2.1 rule=4 v=3: shared pool, by the operator's naming; not verified by behaviour</span>. <span class="mono">rule</span> is the reading's rule, <span class="mono">v</span> the evidence version. It is a cost warning, not a verdict: a block on such an address hits other people, and the address changes hands fast (75&nbsp;% of mobile associations are gone within a day). Entries and membership are the same with or without it, and <span class="mono">networks=1</span> never collapses a /24 or /64 that holds such an address, so its addresses are listed one by one.</p>
   <pre>curl -fsS 'https://&lt;this host&gt;/api/blocklist?hours=48&amp;min_severity=3&amp;networks=1'
 
 # nginx
