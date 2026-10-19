@@ -38,6 +38,7 @@ pub struct ReqRow {
     pub decoy_v: Option<i64>,
     pub held_ms: Option<i64>,
     pub decoy_in: Option<String>,
+    pub persona: Option<String>,
 }
 
 /// A light row with its batch.
@@ -63,6 +64,8 @@ pub struct SkipOut {
     pub held_ms: Option<i64>,
     /// What an MCP or LLM decoy was rendered from (compact JSON).
     pub decoy_in: Option<String>,
+    /// What the node presented as.
+    pub persona: Option<String>,
     /// The batch's last light row (it carries the batch's drops).
     pub last_in_batch: bool,
 }
@@ -239,7 +242,8 @@ impl Store {
             "SELECT r.id, r.uid, r.origin, r.ts, r.ip_id, i.ip, r.method, r.path, r.query,
                     r.headers_json, r.body, r.labels_json, r.owasp_json, r.severity, r.scan_level, r.answer,
                     r.status, r.unrecorded, r.transport, r.via_proxy, r.raw_head,
-                    r.tls_client_hello, r.ja4, r.ja4h, r.build, r.rules, r.decoy_v, r.held_ms, r.decoy_in
+                    r.tls_client_hello, r.ja4, r.ja4h, r.build, r.rules, r.decoy_v, r.held_ms, r.decoy_in,
+                    r.persona
              FROM requests r JOIN ips i ON r.ip_id = i.id WHERE 1=1",
         );
         if after.is_some() {
@@ -291,7 +295,7 @@ impl Store {
                     (SELECT COUNT(*) FROM skipped_requests x
                      WHERE x.batch_id = s.batch_id AND x.rowid <= s.rowid) AS row,
                     s.ts_ms, s.method, s.path, b.ip_id, i.ip, b.uid, b.origin,
-                    b.build, b.dropped, s.decoy_v, s.answer, s.host, s.held_ms, s.decoy_in,
+                    b.build, b.dropped, s.decoy_v, s.answer, s.host, s.held_ms, s.decoy_in, s.persona,
                     s.rowid = (SELECT MAX(x.rowid) FROM skipped_requests x
                                WHERE x.batch_id = s.batch_id) AS last_in_batch
              FROM skipped_requests s JOIN skipped_batches b ON b.id = s.batch_id

@@ -40,6 +40,8 @@ pub struct NewRequest {
     pub held_ms: Option<i64>,
     /// What an MCP or LLM decoy was rendered from (compact JSON).
     pub decoy_in: Option<String>,
+    /// The persona the node presented as (`crate::trap::persona`).
+    pub persona: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -92,6 +94,8 @@ pub struct RequestRow {
     pub held_ms: Option<i64>,
     /// What an MCP or LLM decoy was rendered from (compact JSON).
     pub decoy_in: Option<String>,
+    /// What the node presented as (`crate::trap::persona`).
+    pub persona: Option<String>,
 }
 
 /// Distinct refresh intervals; later lookups reuse the last one (over
