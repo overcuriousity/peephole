@@ -31,6 +31,10 @@ pub struct Rule {
     /// other matchers the rule only fires for these methods; on its own it
     /// fires on the method alone.
     pub methods: Option<Vec<String>>,
+    /// Veto, not a matcher: when it matches the target (raw or decoded) the
+    /// rule does not fire, whatever else matched. A rule with only this
+    /// field still has no matcher.
+    pub unless_target_regex: Option<String>,
     /// OWASP references for the family: Top-10 2021 classes (`A03:2021`)
     /// and/or Automated Threats (`OAT-014`). Optional; all shipped rules
     /// carry it (a meta-test enforces that).
@@ -187,6 +191,12 @@ mod tests {
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=0\ntarget_regex=\"a\"\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=5\ntarget_regex=\"a\"\n").is_err());
         assert!(one("[[rule]]\nlabel=\"x\"\nweight=3\ntarget_regex=\"a\"\n").is_ok());
+        // A veto is not a matcher.
+        assert!(one("[[rule]]\nlabel=\"x\"\nweight=2\nunless_target_regex=\"a\"\n").is_err());
+        assert!(
+            one("[[rule]]\nlabel=\"x\"\nweight=2\nbody_regex=\"b\"\nunless_target_regex=\"a\"\n")
+                .is_ok()
+        );
     }
 
     #[test]
