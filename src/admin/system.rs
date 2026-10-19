@@ -47,6 +47,8 @@ fn chrome() -> Chrome {
 /// The intel feeds as this node sees them.
 pub struct IntelStatus {
     pub tor_fetch: String,
+    /// The X4BNet datacenter ASN list: last fetch, else the snapshot.
+    pub hosting_fetch: String,
     pub maxmind_fetch: String,
     /// Tor or GeoIP data missing or older than 48 h.
     pub stale: bool,
@@ -76,6 +78,15 @@ pub(crate) async fn intel_status(st: &AdminState) -> AppResult<IntelStatus> {
     Ok(IntelStatus {
         stale: intel_stale(&intel),
         tor_fetch: fetched("tor_last_fetch"),
+        hosting_fetch: intel
+            .get(crate::intel::hosting::FETCHED_KEY)
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "never (built-in snapshot of {})",
+                    crate::intel::hosting::SNAPSHOT_DATE
+                )
+            }),
         maxmind_fetch: match (
             intel.get("maxmind_last_fetch"),
             intel.get(crate::intel::MAXMIND_CLUSTER_SEEN),

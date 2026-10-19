@@ -612,7 +612,8 @@ impl Store {
         // serialized into the public /api/stats response.
         let intel = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM intel_meta
-             WHERE key IN ('tor_last_fetch','maxmind_last_fetch','maxmind_cluster_seen')",
+             WHERE key IN ('tor_last_fetch','asn_hosting_last_fetch',
+                           'maxmind_last_fetch','maxmind_cluster_seen')",
         )
         .fetch_all(&self.read)
         .await?

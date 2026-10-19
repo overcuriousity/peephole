@@ -9,13 +9,14 @@
 //! a dynamic address can be personal data, and a device banner is
 //! forgeable by the party with the most to gain from it.
 use super::Store;
+use crate::lock::RwLockExt;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 
 /// Version of the derivation and the catalogues; recorded on every row.
-pub const EVIDENCE_V: i64 = 1;
+pub const EVIDENCE_V: i64 = 2;
 /// Evidence older than the address's `last_seen` by more than this is not
 /// used: on a dynamic line the next subscriber may hold the address.
 pub const STALE_SECS: i64 = 24 * 3600;
@@ -27,10 +28,17 @@ pub const FLEET_KEY_MIN_OTHERS: usize = 2;
 pub const FLEET_KEY_MAX_OTHERS: usize = super::campaigns::HARD_FANOUT_MAX;
 /// `fleet.dense`: sources in the address's /24 (IPv4) or /48 (IPv6).
 pub const DENSE_MIN: usize = 16;
-/// The AS-type list's file name among the catalogues. Absent: no `net.*`
-/// row exists, so rules 3 to 5 and the `fleet.dense` and `name.scanner`
-/// branches of rule 2 cannot fire.
+/// The AS-type list's file name among the catalogues; not bundled. The
+/// `net.hosting` rows come from the X4BNet list (`intel::hosting`) and
+/// [`SUPPLEMENT`]; nothing bundled gives `net.eyeball`, so rules 4 and 5
+/// cannot fire.
 pub const AS_TYPES: &str = "as-types.toml";
+/// Our own AS classifications next to the X4BNet list: hosting types only,
+/// each with its reason and the day it was added.
+pub const SUPPLEMENT: &str = "as-supplement.toml";
+/// Supplement entries past this many are a hand-kept AS-type feed, a
+/// decision of its own (MIK-587); a test holds the bundled file to it.
+pub const SUPPLEMENT_MAX: usize = 20;
 /// Unmatched OS guesses and device types the report lists.
 const REPORT_UNMATCHED: usize = 25;
 
@@ -40,6 +48,17 @@ pub const BUILTIN: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/builtin
 
 static CATALOGUE: LazyLock<Catalogue> =
     LazyLock::new(|| Catalogue::parse(BUILTIN).expect("built-in evidence catalogues"));
+
+/// The built-in catalogues with the X4BNet list loaded: the snapshot until
+/// [`Catalogue::install_hosting`] swaps in a fetched copy.
+static CURRENT: LazyLock<RwLock<Arc<Catalogue>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(current_with(&crate::intel::hosting::builtin()))));
+
+fn current_with(asns: &BTreeSet<i64>) -> Catalogue {
+    Catalogue::parse(BUILTIN)
+        .expect("built-in evidence catalogues")
+        .with_hosting(asns)
+}
 
 /// The kinds of evidence row.
 pub const KINDS: &[&str] = &[
@@ -160,6 +179,53 @@ struct AsTypesFile {
     entries: Vec<AsEntry>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupplementEntry {
+    asn: i64,
+    #[serde(rename = "type")]
+    kind: AsType,
+    reason: String,
+    added: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupplementFile {
+    #[serde(rename = "as")]
+    entries: Vec<SupplementEntry>,
+}
+
+/// Where an AS type comes from; the `ref_kind` of its `net.*` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsSource {
+    /// [`AS_TYPES`].
+    List,
+    /// The X4BNet datacenter list (`intel::hosting`).
+    X4b,
+    /// [`SUPPLEMENT`]: our own classification.
+    Supplement,
+}
+
+impl AsSource {
+    fn ref_kind(self) -> &'static str {
+        match self {
+            AsSource::List => "as-types",
+            AsSource::X4b => "x4bnet",
+            AsSource::Supplement => "supplement",
+        }
+    }
+}
+
+/// One ASN's type and where it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsClass {
+    pub kind: AsType,
+    pub source: AsSource,
+    /// The supplement's reason.
+    pub reason: Option<String>,
+}
+
 /// One device or proxy signature, compiled.
 pub struct Device {
     pub id: String,
@@ -253,8 +319,9 @@ pub struct Catalogue {
     pub devices: Vec<Device>,
     pub consumer: Vec<NamePattern>,
     pub scanner: Vec<NamePattern>,
-    /// The AS-type list; empty while none is bundled.
-    pub as_types: HashMap<i64, AsType>,
+    /// AS types by ASN: [`AS_TYPES`], [`SUPPLEMENT`] and, once
+    /// [`Catalogue::with_hosting`] adds it, the X4BNet list.
+    pub as_types: HashMap<i64, AsClass>,
 }
 
 impl Catalogue {
@@ -263,9 +330,54 @@ impl Catalogue {
         &CATALOGUE
     }
 
+    /// The built-in catalogues with the X4BNet list as last installed.
+    pub fn current() -> Arc<Catalogue> {
+        CURRENT.read_or_recover().clone()
+    }
+
+    /// Swap a (fetched) X4BNet list into [`Catalogue::current`].
+    pub fn install_hosting(asns: &BTreeSet<i64>) {
+        let c = Arc::new(current_with(asns));
+        *CURRENT.write_or_recover() = c;
+    }
+
+    /// The same with every ASN in `asns` (the X4BNet list) as hosting.
+    /// Supplement entries the list covers are dropped and logged: the
+    /// list has caught up, so the entry can go.
+    pub fn with_hosting(mut self, asns: &BTreeSet<i64>) -> Catalogue {
+        for asn in asns {
+            match self.as_types.get(asn).map(|c| c.source) {
+                Some(AsSource::List) => continue,
+                Some(AsSource::Supplement) => tracing::info!(
+                    asn,
+                    "{SUPPLEMENT}: AS{asn} is in the X4BNet list now; supplement entry dropped"
+                ),
+                _ => {}
+            }
+            self.as_types.insert(
+                *asn,
+                AsClass {
+                    kind: AsType::Hosting,
+                    source: AsSource::X4b,
+                    reason: None,
+                },
+            );
+        }
+        self
+    }
+
+    /// ASNs by source.
+    pub fn as_count(&self, source: AsSource) -> usize {
+        self.as_types
+            .values()
+            .filter(|c| c.source == source)
+            .count()
+    }
+
     /// Parse and validate the catalogue files by name: `devices.toml`,
-    /// `names.toml` and, when present, [`AS_TYPES`]. Other names are an
-    /// error, so a misnamed file cannot be silently ignored.
+    /// `names.toml` and, when present, [`AS_TYPES`] and [`SUPPLEMENT`].
+    /// Other names are an error, so a misnamed file cannot be silently
+    /// ignored.
     pub fn parse(files: &[(&str, &str)]) -> Result<Catalogue> {
         let mut c = Catalogue {
             devices: vec![],
@@ -293,7 +405,38 @@ impl Catalogue {
                     let f: AsTypesFile =
                         toml::from_str(text).with_context(|| format!("parsing {name}"))?;
                     for e in f.entries {
-                        if c.as_types.insert(e.asn, e.kind).is_some() {
+                        let class = AsClass {
+                            kind: e.kind,
+                            source: AsSource::List,
+                            reason: None,
+                        };
+                        if c.as_types.insert(e.asn, class).is_some() {
+                            bail!("{name}: AS{} listed twice", e.asn);
+                        }
+                    }
+                }
+                SUPPLEMENT => {
+                    let f: SupplementFile =
+                        toml::from_str(text).with_context(|| format!("parsing {name}"))?;
+                    for e in f.entries {
+                        if matches!(e.kind, AsType::Fixed | AsType::Mobile) {
+                            bail!(
+                                "{name}: AS{}: the supplement classifies hosting only",
+                                e.asn
+                            );
+                        }
+                        if e.reason.trim().is_empty() {
+                            bail!("{name}: AS{}: no reason", e.asn);
+                        }
+                        chrono::NaiveDate::parse_from_str(&e.added, "%Y-%m-%d").with_context(
+                            || format!("{name}: AS{}: added is not YYYY-MM-DD", e.asn),
+                        )?;
+                        let class = AsClass {
+                            kind: e.kind,
+                            source: AsSource::Supplement,
+                            reason: Some(e.reason),
+                        };
+                        if c.as_types.insert(e.asn, class).is_some() {
                             bail!("{name}: AS{} listed twice", e.asn);
                         }
                     }
@@ -686,9 +829,9 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
         if *seen && let Some(p) = prefix(ip) {
             per_prefix.entry(p).or_default().push((*id, last.as_str()));
         }
-        if let Some(t) = asn.and_then(|a| cat.as_types.get(&a)) {
-            let (kind, value) = t.row();
-            add(*id, kind, value, "ip", *id, last, last);
+        if let Some(c) = asn.and_then(|a| cat.as_types.get(&a)) {
+            let (kind, value) = c.kind.row();
+            add(*id, kind, value, c.source.ref_kind(), *id, last, last);
         }
     }
     for (p, members) in &per_prefix {
@@ -733,8 +876,11 @@ pub struct Report {
     pub ips: BTreeMap<String, usize>,
     /// Device rows left out as stale.
     pub stale: usize,
-    /// Entries in the AS-type list (0: none bundled).
+    /// ASNs with an AS type (0: none loaded), of them from the X4BNet
+    /// list and from our supplement.
     pub as_types: usize,
+    pub as_x4b: usize,
+    pub as_supplement: usize,
     pub unmatched_devicetype: Vec<(String, usize)>,
     pub unmatched_os: Vec<(String, usize)>,
     /// Addresses per verdict rule (1 to 6; 7 is everything else), and per
@@ -762,9 +908,13 @@ impl std::fmt::Display for Report {
             self.stale
         )?;
         if self.as_types == 0 {
-            writeln!(f, "AS-type list: none bundled (no net.* rows)")?;
+            writeln!(f, "AS-type list: none loaded (no net.* rows)")?;
         } else {
-            writeln!(f, "AS-type list: {} ASNs", self.as_types)?;
+            writeln!(
+                f,
+                "AS types: {} ASNs (X4BNet datacenter list {}, our supplement {}); hosting only",
+                self.as_types, self.as_x4b, self.as_supplement
+            )?;
         }
         write!(f, "verdicts (addresses with evidence):")?;
         for n in 1..=7u8 {
@@ -807,10 +957,10 @@ impl std::fmt::Display for Report {
 }
 
 impl Store {
-    /// Recompute every evidence row with the built-in catalogues (one read
-    /// snapshot, then one write transaction).
+    /// Recompute every evidence row with the built-in catalogues and the
+    /// loaded X4BNet list (one read snapshot, then one write transaction).
     pub async fn recompute_evidence(&self) -> Result<Report> {
-        self.recompute_evidence_with(Catalogue::builtin()).await
+        self.recompute_evidence_with(&Catalogue::current()).await
     }
 
     pub(crate) async fn recompute_evidence_with(&self, cat: &Catalogue) -> Result<Report> {
@@ -823,6 +973,8 @@ impl Store {
         let mut report = Report {
             stale: out.stale,
             as_types: cat.as_types.len(),
+            as_x4b: cat.as_count(AsSource::X4b),
+            as_supplement: cat.as_count(AsSource::Supplement),
             unmatched_devicetype: out.unmatched_devicetype,
             unmatched_os: out.unmatched_os,
             ..Report::default()
@@ -1021,6 +1173,15 @@ pub const DEVICE_CAVEAT: &str = "What answered is the box on this address at sca
 /// The caveat on a mobile ISP address.
 pub const MOBILE_CAVEAT: &str = "mobile ISP address: usually many subscribers (CGNAT)";
 
+/// Who a `net.*` row's AS type is from, by its `ref_kind`.
+fn as_source(ref_kind: &str) -> &'static str {
+    match ref_kind {
+        "x4bnet" => "X4BNet datacenter ASN list",
+        "supplement" => "our own classification",
+        _ => "AS-type list",
+    }
+}
+
 fn day(ts: &str) -> String {
     ts.get(..10).unwrap_or(ts).to_string()
 }
@@ -1051,10 +1212,10 @@ impl Store {
         let Some(label) = v.rule.label() else {
             return Ok(None);
         };
-        let cat = Catalogue::builtin();
+        let cat = Catalogue::current();
         let mut lines = vec![];
         for r in &v.rows {
-            lines.extend(self.lines_of(cat, r).await?);
+            lines.extend(self.lines_of(&cat, r).await?);
         }
         // Devices newest first, then the rest in row order.
         let device = |l: &Line| l.kind.starts_with("device.");
@@ -1270,7 +1431,7 @@ impl Store {
             _ => vec![line(
                 format!("AS type {}", r.value),
                 None,
-                "AS-type list".into(),
+                as_source(&r.ref_kind).into(),
                 None,
                 &r.last_ts,
             )],
@@ -1725,6 +1886,113 @@ pub(crate) mod tests {
         // The rows go with the address.
         assert!(s.delete_ip(ip).await.unwrap());
         assert!(s.evidence_rows(ip).await.unwrap().is_empty());
+    }
+
+    /// The supplement holds exactly the three scanner ASNs MIK-587
+    /// approved, each with a reason and a date, and stays within
+    /// [`SUPPLEMENT_MAX`]; a malformed entry does not load.
+    #[test]
+    fn the_supplement_is_small_dated_and_reasoned() {
+        let sup: Vec<(i64, &AsClass)> = builtin()
+            .as_types
+            .iter()
+            .filter(|(_, c)| c.source == AsSource::Supplement)
+            .map(|(a, c)| (*a, c))
+            .collect();
+        assert!(sup.len() <= SUPPLEMENT_MAX, "{} entries", sup.len());
+        let mut asns: Vec<i64> = sup.iter().map(|(a, _)| *a).collect();
+        asns.sort();
+        assert_eq!(asns, [200373, 211298, 398324]);
+        assert!(sup.iter().all(|(_, c)| c.kind == AsType::Scanner
+            && c.reason.as_deref().is_some_and(|r| r.contains("DB copy"))));
+        for bad in [
+            "[[as]]\nasn = 1\ntype = \"scanner\"\nadded = \"2026-10-19\"\n",
+            "[[as]]\nasn = 1\ntype = \"scanner\"\nreason = \"x\"\n",
+            "[[as]]\nasn = 1\ntype = \"scanner\"\nreason = \"x\"\nadded = \"19.10.2026\"\n",
+            "[[as]]\nasn = 1\ntype = \"scanner\"\nreason = \" \"\nadded = \"2026-10-19\"\n",
+            "[[as]]\nasn = 1\ntype = \"fixed\"\nreason = \"x\"\nadded = \"2026-10-19\"\n",
+            "[[as]]\nasn = 1\ntype = \"mobile\"\nreason = \"x\"\nadded = \"2026-10-19\"\n",
+        ] {
+            assert!(Catalogue::parse(&[(SUPPLEMENT, bad)]).is_err(), "{bad}");
+        }
+    }
+
+    /// The shipped files classify hosting only: every X4BNet ASN is
+    /// `net.hosting`, no entry is fixed or mobile, and a supplement entry
+    /// the list covers is dropped for the list's.
+    #[test]
+    fn the_shipped_as_types_are_hosting_only() {
+        let cur = Catalogue::current();
+        let x4b = crate::intel::hosting::builtin();
+        assert_eq!(cur.as_count(AsSource::X4b), x4b.len());
+        assert_eq!(cur.as_count(AsSource::Supplement), 3);
+        assert!(
+            cur.as_types
+                .values()
+                .all(|c| !matches!(c.kind, AsType::Fixed | AsType::Mobile)),
+            "an eyeball type in a shipped file"
+        );
+        assert!(x4b.iter().all(|a| cur.as_types[a].kind == AsType::Hosting));
+        let covered: BTreeSet<i64> = x4b.iter().copied().chain([200373]).collect();
+        let c = Catalogue::parse(BUILTIN).unwrap().with_hosting(&covered);
+        assert_eq!(c.as_types[&200373].source, AsSource::X4b);
+        assert_eq!(c.as_types[&200373].kind, AsType::Hosting);
+        assert_eq!(c.as_count(AsSource::Supplement), 2);
+    }
+
+    /// With the real list and supplement, a recompute gives `net.hosting`
+    /// rows attributed to their source, a device in an unlisted AS stays
+    /// rule 6, and no address gets `net.eyeball`.
+    #[tokio::test]
+    async fn the_bundled_list_gives_hosting_rows_and_never_eyeball() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let (device, _) = seed_tr069(&s).await;
+        // Hetzner (X4BNet), 3xK (supplement), Deutsche Telekom (neither).
+        let mut ids = vec![];
+        for (ip, asn) in [
+            ("198.51.100.7", 24940),
+            ("198.51.100.8", 200373),
+            ("198.51.100.9", 3320),
+        ] {
+            let row = s.upsert_ip(ip.parse().unwrap()).await.unwrap();
+            ids.push(row.id);
+            sqlx::query("UPDATE ips SET asn = ? WHERE id = ?")
+                .bind(asn)
+                .bind(row.id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE ips SET asn = 3320 WHERE id = ?")
+            .bind(device)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let r = s.recompute_evidence().await.unwrap();
+        assert_eq!(r.ips.get("net.hosting"), Some(&2), "{r}");
+        assert_eq!(r.ips.get("net.eyeball"), None, "{r}");
+        let eyeball: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ip_evidence WHERE kind = 'net.eyeball'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(eyeball, 0);
+        let source = |v: &View| v.lines.iter().map(|l| l.source.clone()).collect::<Vec<_>>();
+        let v = s.evidence_view(ids[0], false).await.unwrap().unwrap();
+        assert_eq!(v.rule, Rule::Rented);
+        assert_eq!(source(&v), ["X4BNet datacenter ASN list"]);
+        let v = s.evidence_view(ids[1], false).await.unwrap().unwrap();
+        assert_eq!(v.rule, Rule::Rented);
+        assert_eq!(source(&v), ["our own classification"]);
+        assert_eq!(s.evidence_view(ids[2], false).await.unwrap(), None);
+        let v = s.evidence_view(device, false).await.unwrap().unwrap();
+        assert_eq!(v.rule, Rule::DeviceOnly);
+        assert!(
+            v.sentence.ends_with("AS type not classified"),
+            "{}",
+            v.sentence
+        );
     }
 
     /// `ip_evidence` stays on the node: no replication, export, dataset,
