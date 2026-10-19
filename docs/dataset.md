@@ -39,7 +39,7 @@ duckdb.sql("SELECT country, COUNT(*) FROM 'peephole.parquet' GROUP BY 1 ORDER BY
 | `kind` | One row per | Columns filled |
 |---|---|---|
 | `request` | request recorded in full | all |
-| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, the per-IP columns; for a decoy or tarpit answer also `answer` (and `decoy_v`, `host`, or `held_ms`) |
+| `skipped` | request the flood gate answered but recorded only lightly (time, method, path) | `uid`, `node*`, `build`, `ts`, `ip`, `method`, `path`, `unrecorded`, `weight`, `persona`, the per-IP columns; for a decoy or tarpit answer also `answer` (and `decoy_v`, `host`, or `held_ms`) |
 
 A trap records every request from an address up to a rate; above it, the
 request is still answered and classified but kept as a light row, and
@@ -95,6 +95,7 @@ Column order is as listed.
 | `canary_used_from` | list of string | The `uid`s of the rows whose served canaries this row carried (light rows as `<batch uid>#<n>`, `n` the row's position in its batch from 1); empty when none |
 | `status` | int? | HTTP status sent |
 | `held_ms` | int? | How long a `tarpit` answer held the client, in milliseconds: up to the last chunk the connection took, so a client that gave up counts until then; the configured hold (`trap.tarpit_hold_secs`, default 600 s) when it waited to the end. Null for other answers |
+| `persona` | string? | What the trap presented as when it answered: `wordpress`, `fortinet`, `gpu-box`, `gitlab` or `exchange-owa`. Fixed per node key for its bare IP and every Host that is not a public DNS name, and per (node key, name) for each public DNS name it was reached by. Null for rows from before v0.20.0 or from an older member |
 | `unrecorded` | int | Requests from this address answered since the previous row but not recorded (light rows: the drops of the batch, on its last row) |
 | `weight` | int | Answered requests this row stands for (see Rows) |
 

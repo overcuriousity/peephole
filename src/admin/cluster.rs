@@ -36,6 +36,8 @@ pub fn routes() -> Router<Arc<AdminState>> {
 #[derive(Default, Clone)]
 pub struct MemberView {
     pub key: String,
+    /// What it presents as on its bare IP ([`crate::trap::persona`]).
+    pub persona: &'static str,
     pub short: String,
     pub name: String,
     pub roles: String,
@@ -318,6 +320,7 @@ pub(crate) async fn views(
             rules: agreement.map(Agreement::summary).unwrap_or_default(),
             rules_differ: agreement.is_some_and(|a| a.differing > 0),
             key: m.id.to_string(),
+            persona: crate::trap::persona::resolve(Some(&m.id.0[..]), None).name,
             short: m.id.short(),
             name: m.name.clone(),
             roles: m.roles.join(", "),
@@ -387,6 +390,7 @@ pub(crate) async fn views(
         ruleset,
         ruleset_same,
         key: me.to_string(),
+        persona: crate::trap::persona::resolve(Some(&me.0[..]), None).name,
         short: me.short(),
         name: node.cfg.node_name.clone(),
         roles: node.roles().names().join(", "),

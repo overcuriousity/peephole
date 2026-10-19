@@ -474,6 +474,18 @@ Both hold a connection open and take a place from a pool, in `[trap]`:
 A full pool answers with the trap 404. The AI decoy routes (MCP, LLM
 gateway) skip the tarpit.
 
+### What your node presents as
+
+The trap presents as one of five products: `wordpress`, `fortinet`,
+`gpu-box`, `gitlab`, `exchange-owa`. Nothing to configure: the node key
+picks one for the bare IP and every Host that is not a public DNS name,
+and each public DNS name the node is reached by gets its own, fixed for
+that key and name. Admin → Cluster → a node shows its IP persona; each
+request shows the one it was answered as. A standalone node has no key
+and presents as the same persona as every other standalone node. A new
+node key (rejoining as a new node) changes the personas; rows keep the
+one they were answered as.
+
 ## Cluster administration
 
 The installer writes a `[cluster]` section on every node (see

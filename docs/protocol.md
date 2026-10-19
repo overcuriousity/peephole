@@ -117,6 +117,10 @@ node that wrote it.
   daily budget per origin (counted on the receiver's day), a ceiling on
   all upload content, and a free-disk floor. The entry applies and is
   relayed either way. The bytes never enter the log.
+- A request or light row may carry a `persona` (what the trap presented
+  as, since v0.20.0). It is optional and left out when absent, so no
+  protocol version bump: an older member stores the row without it and
+  relays the entry as signed.
 - A standalone node that joins brings its history with it.
 - Every member sees everything the cluster records, including raw requests
   and false-positive claims with their optional contact address. Every
