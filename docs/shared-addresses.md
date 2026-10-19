@@ -370,8 +370,9 @@ gear.
 
 **Evasion.** Faking a banner is self-defeating; the adversarial move is
 suppression, which is free and the default state. Presence is solid
-evidence against (b); absence is zero weight. A panel may lower a pooled
-reading, never raise one.
+evidence against (b); absence is zero weight. A panel may lower a
+carrier-pool reading, never raise one, and it says nothing against a
+reassigned line.
 
 **Literature.** Richter (IMC 2016): CGN-negative ASes have the NAT one hop
 from the client in 92 % of cases, so a reachable CPE on the public address
@@ -561,8 +562,8 @@ recompute pass, node-local, replaced in one transaction, versioned by
 | `name.mobile` | a `[[mobile]]` pattern matches: `umts`, `lte`, `gprs`, `3g`, `4g`, `5g`, `mobil`, `mob`, `wap` as tokens | pattern id | `name` | (c) | raise to *shared pool* |
 | `name.pool` | the existing `name.consumer` entries `dynamic`, `pool` plus a new `ppp` entry, split out so the reading can tell "pooled" from "consumer" | pattern id | `name` | (d) | raise to *pooled line* |
 | `net.eyeball` = `mobile` | exists in `KINDS`, never set; fires when a licensable list or our own prefix labels land | `mobile` | `ip` | (c) | raise to *shared pool* |
-| `device.cpe` | exists | catalogue id | `scan` | (a), against (b) | lower to *one subscriber's network* |
-| `scan.multistack` (optional, not in the slice) | two open `syn-ack` ports of one finished scan answer in different initial-TTL classes, neither port `tcpwrapped` | `64+128` | `scan` | (a) | lower to *one subscriber's network* |
+| `device.cpe` | exists | catalogue id | `scan` | (a), against (b) and (c); says nothing about (d) | lower a *shared pool* reading to *one subscriber's network*; with `name.pool`, to *one subscriber's network, on a pooled line* |
+| `scan.multistack` (optional, not in the slice) | two open `syn-ack` ports of one finished scan answer in different initial-TTL classes, neither port `tcpwrapped` | `64+128` | `scan` | (a), against (b) and (c); says nothing about (d) | as `device.cpe` |
 
 Every `cgn`, `mobile` and `pool` entry carries a `sample` it must match and
 is tested against the top-20 rented-fleet names
@@ -572,7 +573,8 @@ existing token-boundary rule. Name rows are not subject to the 24-hour
 device staleness (`STALE_SECS`): a pool or CGN name is a property of the
 operator's address plan and holds for weeks to months; the reading quotes
 the lookup time and the row is re-derived with every recompute, and a
-name older than 30 days than the address's `last_seen` is not used, which
+name looked up more than 30 days before the address's `last_seen` is not
+used, which
 is the monthly re-derivation the literature supports.
 
 ### Reading table
@@ -585,29 +587,38 @@ who observed it.
 | # | rule | reading | shown as |
 |---|---|---|---|
 | 1 | `net.hosting`, `name.scanner`, `fleet.key` or `fleet.canary`, or a Tor exit | *not read: one operator's address* | nothing on this axis; the compromised-family verdict already describes the address |
-| 2 | `device.cpe` (or `scan.multistack`) | *one subscriber's network* | "A FRITZ!Box answered on 8089 in scan #… (level 3, 2026-10-14): a consumer router fronts this address, so one subscriber holds it and several of their devices may share it. This argues against a carrier pool." |
-| 3 | `name.cgn` | *shared pool, by the operator's naming* | "The operator names this address `…cgn-wdsl…` (PTR looked up 2026-10-15): a carrier-NAT pool by its own naming, shared by unrelated subscribers. Not verified by behaviour; nothing we hold can verify it." |
-| 4 | `name.mobile`, or `net.eyeball` = `mobile` | *shared pool, mobile* | "The operator names this address `…umts…` (PTR looked up …): a mobile pool, where an address usually holds a subscriber for a day or less. By naming only." |
-| 5 | `name.pool` | *pooled line* | "The operator names this address `…dynamic…` (PTR looked up …): a line that is reassigned, on such networks daily to fortnightly. The next holder is someone else." |
-| 6 | `name.consumer` (any other entry) | *consumer line, sharing not read* | "The name says a consumer line (`…dsl…`); whether it is shared is not observed." |
-| 7 | otherwise | *insufficient evidence* | "No evidence either way. An address without a name or a scan result is not thereby single-user, and not thereby shared." |
+| 2 | `device.cpe` (or `scan.multistack`) and `name.pool` | *one subscriber's network, on a pooled line* | "A FRITZ!Box answered on 8089 in scan #… (level 3, 2026-10-14) and the operator names this address `…dynamic…` (PTR looked up …): a consumer router fronts this address, so one subscriber holds it at a time, and the line is reassigned, on such networks daily to fortnightly. The next holder is someone else. This argues against a carrier pool, not against reassignment." |
+| 3 | `device.cpe` (or `scan.multistack`) | *one subscriber's network* | "A FRITZ!Box answered on 8089 in scan #… (level 3, 2026-10-14): a consumer router fronts this address, so one subscriber holds it and several of their devices may share it. This argues against a carrier pool." |
+| 4 | `name.cgn` | *shared pool, by the operator's naming* | "The operator names this address `…cgn-wdsl…` (PTR looked up 2026-10-15): a carrier-NAT pool by its own naming, shared by unrelated subscribers. Not verified by behaviour; nothing we hold can verify it." |
+| 5 | `name.mobile`, or `net.eyeball` = `mobile` | *shared pool, mobile* | "The operator names this address `…umts…` (PTR looked up …): a mobile pool, where an address usually holds a subscriber for a day or less. By naming only." |
+| 6 | `name.pool` | *pooled line* | "The operator names this address `…dynamic…` (PTR looked up …): a line that is reassigned, on such networks daily to fortnightly. The next holder is someone else." |
+| 7 | `name.consumer` (any other entry) | *consumer line, sharing not read* | "The name says a consumer line (`…dsl…`); whether it is shared is not observed." |
+| 8 | otherwise | *insufficient evidence* | "No evidence either way. An address without a name or a scan result is not thereby single-user, and not thereby shared." |
 
 Rule order is the forgery argument. Rule 1 removes every address a renter
 controls the PTR of, so a planted `cgn` name on rented space reads nothing
-(the data pass found none, and the hosting list is the gate). Rule 2 sits
-before the name rules because a CPE answering is the one observation that
-contradicts a carrier pool, cannot be planted to the operator's benefit,
-and is the only behavioural evidence on this axis; it overrides a stale or
-wrong pool name. Rules 3 to 5 are the operator speaking, in the order of
-the strength of what the name claims. Nothing combines: an address with a
-`cgn` name *and* a `pool` name reads rule 3 with both rows shown, not a
-higher level. Rule 7 is the default, and absence of any row never moves an
-address off it.
+(the data pass found none, and the hosting list is the gate). Rules 2 and
+3 sit before the carrier-pool rules because a CPE answering is the one
+observation that contradicts a carrier pool, cannot be planted to the
+operator's benefit, and is the only behavioural evidence on this axis; it
+overrides a stale or wrong `cgn` or `mobile` name. It contradicts nothing
+about reassignment: a FRITZ!Box on a `dynamic-….pool.telefonica.de` line
+is one subscriber's network *and* a reassigned line, both at once, and a
+block on it still hits the next holder. That is why rule 2 exists: when a
+CPE answers and the operator names the line pooled, the reading keeps the
+pooled claim instead of dropping it. Rules 4 to 6 are the operator
+speaking, in the order of the strength of what the name claims. Nothing
+adds up: an address with a `cgn` name *and* a `pool` name reads rule 4
+with both rows shown, not a higher level, and rule 2 reads two rows
+because both are true at once, not because two rows are worth more than
+one. Rule 8 is the default, and absence of any row never moves an address
+off it.
 
 What each signal may do is the whole weight table, and it is bounded by
 the evasion read: signals 1, 2, 3, 6, 8, 9, 10 appear in no rule; 7 and 11
-only reach rule 1 or 2, which are the two lowest readings on the sharing
-axis; 4 reaches rules 3 to 6 only past the rule-1 gate; 5 reaches rule 4
+only reach rules 1 to 3, the readings that lower a carrier-pool claim, and
+neither can remove a pooled-line claim; 4 reaches rules 4 to 7 only past
+the rule-1 gate, and rule 2 only alongside a CPE row; 5 reaches rule 5
 only through `net.eyeball`, which stays inert. Changing a weight means
 reordering or adding a rule in this table and bumping `EVIDENCE_V`, which
 recomputes every node's rows and readings.
@@ -622,12 +633,12 @@ recomputes every node's rows and readings.
 - **Rules and weights published and versioned.** This table, the
   `names.toml` entries and `EVIDENCE_V`. The reading carries `v`. There is
   no tuning outside the catalogue and no learned component.
-- **Never a bare number.** The reading is one of seven named states with
+- **Never a bare number.** The reading is one of eight named states with
   its sentences. The API (`/api/v1`, if it ever exposes it) returns the
   state name, the rule number as `rule`, and the rows, never an integer
   score; the states carry no numerals in their names so that none is read
   as one.
-- **An explicit "insufficient evidence".** Rule 7, the default. Absence of
+- **An explicit "insufficient evidence".** Rule 8, the default. Absence of
   a name, of a scan result or of a `net.*` row is not evidence, and the
   text says so where it is shown.
 - **Recomputable and withdrawable.** Rows are derived state the recompute
@@ -640,7 +651,7 @@ recomputes every node's rows and readings.
   threat or suspicion score. A shared pool means a block on this address
   hits other people; it does not change what the address sent." The
   blocklist and severity are untouched (next section).
-- **Rules needing the mobile list ship inert.** Rule 4's `net.eyeball`
+- **Rules needing the mobile list ship inert.** Rule 5's `net.eyeball`
   branch is in the table and in the code and fires on no address until a
   source sets `net.eyeball`, as MIK-585 and MIK-587 shipped rules 3 to 5 of
   the device verdict.
@@ -662,8 +673,8 @@ the *cost* of blocking, not the evidence of abuse, so the reading is shown
 as a cost caveat wherever a block or a blocklist entry is shown, and the
 one place it may act is additive-safe: the blocklist's `networks=1` option,
 which collapses a busy /24 into a prefix and thereby lists addresses that
-sent nothing. A /24 holding a rule-3, 4 or 5 reading should not be
-collapsed. That removes no observed address from the list and stops the
+sent nothing. A /24 holding a rule-2, 4, 5 or 6 reading, the four readings
+that say the address is, or sits on, a pool, should not be collapsed. That removes no observed address from the list and stops the
 hazard the compromised assessment flagged (an eyeball /24 collapsed into a
 prefix blocks many households). It is a follow-up with its own check, not
 part of the slice below.
@@ -699,8 +710,11 @@ boundaries where the collateral is paid, computed by the publishing node
 at publish time, never replicated as a claim:
 
 1. **Export:** one derived column, `shared` (the reading's state name,
-   rule number and `v`), null below rule 2. Recomputable by the consumer
-   from the `names` column, so it adds no authority, only convenience.
+   rule number and `v`), set by rules 2, 4, 5 and 6 only, the four readings
+   that say the address is, or sits on, a pool; null for rules 1, 3, 7 and
+   8, which say nothing about sharing or argue against it. Recomputable by
+   the consumer from the `names` column, so it adds no authority, only
+   convenience.
 2. **Blocklist feed:** one additive per-entry field with the same content,
    and the `networks=1` skip above. Membership never changes.
 
@@ -730,7 +744,7 @@ only, the build recommendation below changes.
   pool rotation seen directly), and they have shown it zero times in 11
   days. **So (b) cannot be validated here beyond the face plausibility of
   the carrier's own naming**, and that limits how loudly the reading may
-  speak: rule 3 says "by the operator's naming" and "not verified by
+  speak: rule 4 says "by the operator's naming" and "not verified by
   behaviour" in its own sentence, and the reading never says "detected".
   Face plausibility is at least consistent: all three named candidates
   answered nothing on the counter-scan, as a carrier gateway would.
@@ -740,7 +754,7 @@ only, the build recommendation below changes.
   names the source of the claim (the PTR, or later the list) in its own
   sentence and claims nothing more.
 - **(d)** Our own history is the ground truth, and it needs months, not
-  days: watch addresses with a rule-5 reading for a change of identity
+  days: watch addresses with a rule-2 or rule-6 reading for a change of identity
   class across days (a canary or JA4-plus-UA hop within one /24 or one
   ISP, or an address whose scan results change vendor between weeks). That
   is a measurement to run on the cluster before anyone claims the
@@ -770,20 +784,27 @@ The slice, in order, each step with its check:
    `name.mobile` on 2 of the hermes data, and `expresspools.us` on none.
    Half a day.
 2. **Reading.** A function over an address's rows implementing rules 1 to
-   7, with the sentences above and the fixed direction text; shown on the
+   8, with the sentences above and the fixed direction text; shown on the
    admin IP page under the device verdict, with each row linked to its
    name or scan; `/ips?reading=<state>` as a list filter. Check: the three
-   `cgn` candidates read rule 3, the Vodacom address reads rule 3 and
+   `cgn` candidates read rule 4, the Vodacom address reads rule 4 and
    shows both its `cgn`-class and `mobile` rows, the FRITZ!Box address
-   (`dynamic-….pool.telefonica.de`, a CPE answering) reads rule 2 and not
-   rule 5, every `net.hosting` address reads rule 1, and an address with no
-   rows reads rule 7 with the insufficient-evidence sentence. One day.
+   (`dynamic-….pool.telefonica.de`, a CPE answering) reads rule 2, *one
+   subscriber's network, on a pooled line*, showing both its scan row and
+   its `name.pool` row, every `net.hosting` address reads rule 1, and an
+   address with no rows reads rule 8 with the insufficient-evidence
+   sentence. One day.
 3. **Boundaries (if Head says yes).** The export column and the blocklist
    field, computed at publish time from the publishing node's rows; the
-   `networks=1` skip for /24s holding a rule-3 to 5 reading. Check: an
-   export of the hermes data has `shared` null on every hosting row and
-   set on the 23 named rows; the blocklist feed with `networks=1` lists the
-   Telkom SA `dsl` /24s as single addresses, not prefixes. Half a day to
+   `networks=1` skip for /24s holding a rule-2, 4, 5 or 6 reading. Check:
+   an export of the hermes data has `shared` null on every hosting row and
+   on every rule-3, 7 and 8 row, and set on the 22 to 24 rows that carry a
+   `cgn`, `mobile` or `pool` name (3 + 18–20 + 2, less the one Vodacom
+   address that has both a `cgn` and a `mobile` name, less any address the
+   step-1 recompute shows named both `cgn` and `pool`; the step-1 count is
+   the exact figure, and the FRITZ!Box address counts once, under rule 2);
+   the blocklist feed with `networks=1` lists the Telkom SA `dsl` /24s as
+   single addresses, not prefixes. Half a day to
    one day; `docs/dataset.md` and the feed documentation gain the field.
 4. **Docs.** The shipped part moves into `detection.md`; this file keeps
    the reasoning.
@@ -808,7 +829,7 @@ Not in the slice, each with its reason:
   cost.
 - IP-ID and TCP-timestamp counting (signal 9): closed above.
 - A mobile list or our own prefix labels (signal 5): nothing qualifies
-  today (MIK-599). What would have to change for rule 4's inert branch to
+  today (MIK-599). What would have to change for rule 5's inert branch to
   fire: a licensable list the operator supplies per node under `data_dir`
   on their own licence (never bundled, loaded like the X4BNet fetch), or
   our own prefix labels derived from the cluster's replicated names, "N or
