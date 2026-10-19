@@ -221,6 +221,13 @@ stored under the tool's canonical name (`read_file`, `list_directory`,
 the canonical names are answered on every node. The derivation is in
 [Canaries](dataset.md#canaries) (version 5).
 
+The persona a request is answered under (see Operations, "What your node
+presents as") biases that identity and nothing else of the decoys: the
+MCP server takes its name from a pool that fits the product (`ml-ops`,
+`gpu-tools` for `gpu-box`; `mail-ops`, `exch-admin` for `exchange-owa`),
+and a `gpu-box` gateway lists 7-9 local models, 2-3 of them 27B-70B ones.
+Tool names, extra tools, resources and upstream models stay the node's.
+
 ## Scanners we do not counter-scan
 
 peephole answers reconnaissance with a counter-scan of the source — except
