@@ -174,6 +174,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     ));
     let rdap: intel::SharedRdap =
         Arc::new(RwLock::new(intel::rdap::Bootstrap::load(&cfg.data_dir)));
+    intel::hosting::install(&cfg.data_dir);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

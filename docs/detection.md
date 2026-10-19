@@ -176,7 +176,8 @@ at the row that produced it:
 | `fleet.canary` | a canary served to another address came back from this one in a header or the request body (never the path or query, which a link can plant on anyone) |
 | `fleet.dense` | 16 or more sources in the address's /24 (IPv4) or /48 (IPv6) |
 | `name.consumer`, `name.scanner` | the reverse or PTR name matches a consumer-line or a scanner pattern |
-| `net.hosting`, `net.eyeball` | the ASN is in a bundled AS-type list; none is bundled yet |
+| `net.hosting` | the ASN is in the X4BNet datacenter ASN list or in our supplement (see [AS type](#as-type)) |
+| `net.eyeball` | never set: no bundled source classifies consumer ISPs |
 
 The signatures and name patterns are built into the binary
 (`rules/evidence/`). Each has a sample it must match. No consumer-device
@@ -204,12 +205,39 @@ The verdict is the first rule that matches:
 Rule 7 shows nothing. An address without evidence is not cleared of
 anything; the scan just saw nothing to name. A device verdict
 also carries the caveat that what answered is the box on the address at
-scan time, not necessarily the sender. Until an AS-type list is bundled
-(a file `rules/evidence/as-types.toml`), rules 3 to 5 and the hosting
-branches of rule 2 cannot fire. The list turns them on without a code
-change. Each row on the page carries the device or proxy, the port, the
-scan with a link to it, and the date. `/ips?evidence=device.cpe` (or any
-other row kind) lists the addresses with such a row.
+scan time, not necessarily the sender. Each row on the page carries the
+device or proxy, the port, the scan with a link to it, and the date.
+`/ips?evidence=device.cpe` (or any other row kind) lists the addresses
+with such a row.
+
+#### AS type
+
+`net.hosting` comes from the datacenter ASN list of X4BNet `lists_vpn`
+(`input/datacenter/ASN.txt`, MIT licence, notice in
+`rules/evidence/x4bnet/LICENSE` and [NOTICE](../NOTICE)).
+A snapshot is built into the binary unmodified. Each node fetches the list
+from GitHub at startup and then daily, with the Tor exit list's cadence
+and backoff, into `<data_dir>/x4b-datacenter-asn.txt`. A fetched copy
+replaces the snapshot. A failed fetch, or a fetched file that does not
+parse or has fewer than 300 ASNs, keeps the list already loaded. The
+system page shows the last fetch next to the Tor exit list's, or the
+snapshot's date when there was none.
+
+A small supplement, `rules/evidence/as-supplement.toml`, holds scanner
+ASNs the list misses and our own data shows (3xK, Censys, Driftnet). Each
+entry must carry the evidence for it (`reason`) and the day it was added
+(`added`), and may only say hosting, cloud or scanner. A test fails past
+20 entries: beyond that we would be keeping an AS-type feed by hand. An
+entry the loaded list covers is dropped on load and logged, so the
+supplement shrinks as the list catches up. On the IP page a row from the
+supplement is attributed to "our own classification", a row from the list
+to the X4BNet list.
+
+Nothing sets `net.eyeball`: no redistributable source classifies consumer
+ISPs, and an ASN missing from the hosting list is not thereby one. So
+rules 4 and 5 do not fire, and a device in an unlisted AS stays rule 6,
+"AS type not classified". `peephole store recompute-campaigns` reports the
+ASNs loaded per source.
 
 The rows are derived on each node with the hourly campaign pass. They are
 never replicated, never exported and never in the blocklist: a dynamic

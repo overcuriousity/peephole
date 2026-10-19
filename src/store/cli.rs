@@ -33,6 +33,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             let cfg = Config::load(Path::new(config))?;
             let store = Store::connect(&cfg.database_path).await?;
             println!("{}", store.recompute_campaigns(true).await?);
+            crate::intel::hosting::install(&cfg.data_dir);
             print!("{}", store.recompute_evidence().await?);
             Ok(())
         }

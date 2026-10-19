@@ -118,4 +118,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT License](LICENSE-MIT), at your option.
 
 Third-party fingerprint methods carry their own notices, and JA4H and JA4X
-are under the FoxIO License 1.1 (non-commercial only): see [NOTICE](NOTICE).
+are under the FoxIO License 1.1 (non-commercial only); the bundled X4BNet
+datacenter ASN list is under MIT: see [NOTICE](NOTICE).

@@ -10,6 +10,7 @@
   <div class="card-head"><h2>Intel feeds</h2></div>
   <dl class="kv">
     <dt>Tor exit list</dt><dd>{{ intel.tor_fetch }}</dd>
+    <dt>Datacenter ASN list (X4BNet)</dt><dd>{{ intel.hosting_fetch }}</dd>
     <dt>MaxMind GeoLite2</dt><dd>{{ intel.maxmind_fetch }}</dd>
     {% for (label, state) in intel.api %}<dt>{{ label }}</dt><dd>{{ state }}</dd>{% endfor %}
   </dl>

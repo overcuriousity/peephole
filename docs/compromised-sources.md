@@ -435,8 +435,8 @@ was observed.
 (rule 2), never a consumer one, and it does not block rules 4 to 6, because
 a /24 of infected routers in one ISP is dense too. Rule 6 is where every
 `device.*` row lands when the address has no `net.*` row, which is every
-address until the AS-type list exists, and any address in an AS the list
-does not classify afterwards. Rule 3 catches `net.hosting` before rule 6,
+address outside a listed hosting AS: the bundled list classifies hosting
+only (MIK-587), so no address has `net.eyeball`. Rule 3 catches `net.hosting` before rule 6,
 so rule 6 never describes a hosting address.
 
 Rules 4 to 6 never say "compromised", "hijacked" or "botnet". The data
@@ -579,11 +579,13 @@ The slice, in order, each step with its check:
 5. **Docs.** The shipped part moves into `detection.md`; the roadmap's
    forwarding-header line is reworded as a `header-spoof` label.
 
-Not in the slice: the AS-type list (`net.hosting` / `net.eyeball`). Until
-MIK-576 names a source we can bundle, no `net.*` row exists, so rules 3, 4
-and 5 and the `fleet.dense` and `name.scanner` branches of rule 2 cannot
-fire; `fleet.dense` is computed but inert. What the slice ships is rules
-1, 2 (through `fleet.key` and `fleet.canary` only), 6 and 7. Rule 6 is
+Not in the slice: the AS-type list (`net.hosting` / `net.eyeball`). It
+has since landed for hosting only (MIK-587): the X4BNet datacenter ASN
+list plus a small supplement give `net.hosting`, which switches on rule 3
+and the `fleet.dense` and `name.scanner` branches of rule 2. No source we
+can bundle classifies eyeball networks, so `net.eyeball` is never set and
+rules 4 and 5 cannot fire. What the slice shipped was rules 1, 2 (through
+`fleet.key` and `fleet.canary` only), 6 and 7. Rule 6 is
 still useful on the IP page and never leaves the node. When a list lands,
 it is one more bundled file, the `net.*` rows appear on the next recompute,
 and rules 3 to 5 and the rest of rule 2 switch on without a code change.

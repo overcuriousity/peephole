@@ -2,6 +2,7 @@ pub mod abuseipdb;
 pub mod api;
 pub mod dns;
 pub mod geo;
+pub mod hosting;
 pub mod lookup;
 pub mod provider;
 pub mod rdap;
@@ -925,6 +926,7 @@ pub async fn run_scheduler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let store = rec.store().clone();
+    tokio::spawn(hosting_loop(store.clone(), cfg.clone(), shutdown.clone()));
     tokio::spawn(relays_loop(
         rec.clone(),
         cfg.clone(),
@@ -994,6 +996,44 @@ pub async fn run_scheduler(
         }
         tokio::select! {
             _ = tokio::time::sleep_until(tor_next.min(mm_next).min(rdap_next)) => {}
+            _ = shutdown.changed() => { break; }
+        }
+    }
+}
+
+/// The X4BNet datacenter ASN list (`hosting`): fetched at startup, then
+/// daily with the Tor exit list's jitter and backoff, on every node (35 KB
+/// from GitHub). A fetched copy replaces the evidence catalogue's list; a
+/// failed fetch keeps the one loaded.
+async fn hosting_loop(store: Store, cfg: Config, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let mut backoff = TOR_BACKOFF;
+    loop {
+        let wait = match hosting::refresh(&cfg.data_dir).await {
+            Ok(n) => {
+                info!(n, "datacenter ASN list refreshed");
+                let dir = cfg.data_dir.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || hosting::install(&dir)).await {
+                    warn!(?e, "loading the datacenter ASN list failed");
+                }
+                if let Err(e) = store
+                    .intel_set(hosting::FETCHED_KEY, &chrono::Utc::now().to_rfc3339())
+                    .await
+                {
+                    warn!(?e, "recording the datacenter ASN list fetch time failed");
+                }
+                backoff.reset();
+                Duration::from_secs(
+                    24 * 3600 + (chrono::Utc::now().timestamp_subsec_nanos() as u64) % 3600,
+                )
+            }
+            Err(e) => {
+                let wait = backoff.fail();
+                warn!(error = %format!("{e:#}"), retry_in_secs = wait.as_secs(), "datacenter ASN list refresh failed; keeping previous");
+                wait
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
             _ = shutdown.changed() => { break; }
         }
     }

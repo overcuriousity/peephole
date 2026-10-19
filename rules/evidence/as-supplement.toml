@@ -1,0 +1,28 @@
+# Our own AS classifications, next to the bundled X4BNet datacenter list
+# (`x4bnet/ASN.txt`, never edited here; docs/detection.md, "AS type").
+# Only ASNs the list misses and our own data shows; each entry gives the
+# evidence (`reason`) and the day it was added (`added`), both required.
+# The IP page attributes a row from here to "our own classification".
+#
+# An entry the bundled or a fetched list already covers is dropped on load
+# (and logged): remove it here then. More than 20 entries means we are
+# maintaining an AS-type feed by hand; stop and decide that deliberately
+# (MIK-587). Types: hosting, cloud, scanner; never fixed or mobile.
+
+[[as]]
+asn = 200373
+type = "scanner"
+reason = "3xK Tech GmbH: 396 addresses, 847 requests on the hermes node, 2026-10-08 to 2026-10-19 (MIK-595 DB copy)"
+added = "2026-10-19"
+
+[[as]]
+asn = 398324
+type = "scanner"
+reason = "Censys, Inc.: 148 addresses, 351 requests on the hermes node, 2026-10-08 to 2026-10-19 (MIK-595 DB copy)"
+added = "2026-10-19"
+
+[[as]]
+asn = 211298
+type = "scanner"
+reason = "Driftnet Ltd: 74 addresses, 59 requests on the hermes node, 2026-10-08 to 2026-10-19 (MIK-595 DB copy)"
+added = "2026-10-19"
