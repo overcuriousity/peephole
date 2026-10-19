@@ -5,7 +5,8 @@
 -- because a dynamic address can be personal data. A recompute replaces
 -- the table in one transaction.
 --
--- kind: 'device.cpe' | 'device.proxy' | 'name.consumer' | 'name.scanner' |
+-- kind: 'device.cpe' | 'device.proxy' | 'name.consumer' | 'name.pool' |
+-- 'name.cgn' | 'name.mobile' | 'name.scanner' |
 -- 'fleet.key' | 'fleet.canary' | 'fleet.dense' | 'net.hosting' |
 -- 'net.eyeball'. value: the catalogue id, fingerprint, canary hash, prefix
 -- or AS type. ref_kind / ref_id: the row that produced it ('scan' →

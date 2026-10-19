@@ -16,10 +16,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, RwLock};
 
 /// Version of the derivation and the catalogues; recorded on every row.
-pub const EVIDENCE_V: i64 = 2;
+pub const EVIDENCE_V: i64 = 3;
 /// Evidence older than the address's `last_seen` by more than this is not
 /// used: on a dynamic line the next subscriber may hold the address.
 pub const STALE_SECS: i64 = 24 * 3600;
+/// A name looked up more than this before the address's `last_seen` is
+/// not used. Names are exempt from [`STALE_SECS`]: a pool or carrier-NAT
+/// name is a property of the operator's address plan and holds for weeks
+/// to months (docs/shared-addresses.md, "Evidence rows").
+pub const NAME_STALE_SECS: i64 = 30 * 24 * 3600;
 /// `fleet.key`: an instance key on this address and on at least this many
 /// others …
 pub const FLEET_KEY_MIN_OTHERS: usize = 2;
@@ -65,6 +70,9 @@ pub const KINDS: &[&str] = &[
     "device.cpe",
     "device.proxy",
     "name.consumer",
+    "name.pool",
+    "name.cgn",
+    "name.mobile",
     "name.scanner",
     "fleet.key",
     "fleet.canary",
@@ -136,6 +144,12 @@ struct NameEntry {
 struct NamesFile {
     #[serde(default)]
     consumer: Vec<NameEntry>,
+    #[serde(default)]
+    pool: Vec<NameEntry>,
+    #[serde(default)]
+    cgn: Vec<NameEntry>,
+    #[serde(default)]
+    mobile: Vec<NameEntry>,
     #[serde(default)]
     scanner: Vec<NameEntry>,
 }
@@ -318,6 +332,9 @@ pub struct NamePattern {
 pub struct Catalogue {
     pub devices: Vec<Device>,
     pub consumer: Vec<NamePattern>,
+    pub pool: Vec<NamePattern>,
+    pub cgn: Vec<NamePattern>,
+    pub mobile: Vec<NamePattern>,
     pub scanner: Vec<NamePattern>,
     /// AS types by ASN: [`AS_TYPES`], [`SUPPLEMENT`] and, once
     /// [`Catalogue::with_hosting`] adds it, the X4BNet list.
@@ -382,6 +399,9 @@ impl Catalogue {
         let mut c = Catalogue {
             devices: vec![],
             consumer: vec![],
+            pool: vec![],
+            cgn: vec![],
+            mobile: vec![],
             scanner: vec![],
             as_types: HashMap::new(),
         };
@@ -399,6 +419,9 @@ impl Catalogue {
                     let f: NamesFile =
                         toml::from_str(text).with_context(|| format!("parsing {name}"))?;
                     c.consumer = compile_names(f.consumer).with_context(|| format!("in {name}"))?;
+                    c.pool = compile_names(f.pool).with_context(|| format!("in {name}"))?;
+                    c.cgn = compile_names(f.cgn).with_context(|| format!("in {name}"))?;
+                    c.mobile = compile_names(f.mobile).with_context(|| format!("in {name}"))?;
                     c.scanner = compile_names(f.scanner).with_context(|| format!("in {name}"))?;
                 }
                 AS_TYPES => {
@@ -576,6 +599,8 @@ pub struct EvidenceRow {
     pub ref_id: i64,
     pub first_ts: String,
     pub last_ts: String,
+    /// [`EVIDENCE_V`] of the pass that derived it.
+    pub v: i64,
 }
 
 /// An open port as a scan stored it: scan id, port, service, product,
@@ -686,10 +711,10 @@ pub(crate) struct Output {
 }
 
 /// Whether evidence seen at `ts` is too old for an address last seen at
-/// `last`.
-fn stale(ts: &str, last: &str) -> bool {
+/// `last`, by more than `secs`.
+fn stale(ts: &str, last: &str, secs: i64) -> bool {
     use super::campaigns::epoch;
-    matches!((epoch(ts), epoch(last)), (Some(t), Some(l)) if l - t > STALE_SECS)
+    matches!((epoch(ts), epoch(last)), (Some(t), Some(l)) if l - t > secs)
 }
 
 /// The /24 (IPv4) or /48 (IPv6) of an address, as text.
@@ -749,7 +774,7 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
         if hits.is_empty() {
             continue;
         }
-        if last_seen.get(ip).is_some_and(|l| stale(at, l)) {
+        if last_seen.get(ip).is_some_and(|l| stale(at, l, STALE_SECS)) {
             stale_rows += hits.len();
             continue;
         }
@@ -771,13 +796,20 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
         }
     }
 
-    // name.*: the first matching pattern of each list.
+    // name.*: the first matching pattern of each list; a name is stale
+    // after NAME_STALE_SECS, not STALE_SECS.
     for (id, ip, name, first, last) in &input.names {
-        if last_seen.get(ip).is_some_and(|l| stale(last, l)) {
+        if last_seen
+            .get(ip)
+            .is_some_and(|l| stale(last, l, NAME_STALE_SECS))
+        {
             continue;
         }
         for (kind, list) in [
             ("name.consumer", &cat.consumer),
+            ("name.pool", &cat.pool),
+            ("name.cgn", &cat.cgn),
+            ("name.mobile", &cat.mobile),
             ("name.scanner", &cat.scanner),
         ] {
             if let Some(p) = list.iter().find(|p| p.re.is_match(name)) {
@@ -859,6 +891,7 @@ pub(crate) fn compute(input: &Input, cat: &Catalogue) -> Output {
                     ref_id,
                     first_ts,
                     last_ts,
+                    v: EVIDENCE_V,
                 },
             )
             .collect(),
@@ -887,6 +920,8 @@ pub struct Report {
     /// row kind a rule-2 verdict rests on.
     pub rules: BTreeMap<u8, usize>,
     pub fleet_by: BTreeMap<String, usize>,
+    /// Addresses per shared-reading rule (1 to 8, every address).
+    pub readings: BTreeMap<u8, usize>,
     pub seconds: f64,
 }
 
@@ -926,6 +961,11 @@ impl std::fmt::Display for Report {
             .iter()
             .map(|(k, n)| format!("{k} {n}"))
             .collect();
+        write!(f, "shared readings (addresses):")?;
+        for n in 1..=8u8 {
+            write!(f, " rule {n} {}", self.readings.get(&n).unwrap_or(&0))?;
+        }
+        writeln!(f)?;
         writeln!(
             f,
             "rule 2 rests on: {}",
@@ -1000,6 +1040,12 @@ impl Store {
             }
         }
 
+        for (id, ..) in &input.ips {
+            let rows = per_ip.get(id).map_or(&[][..], Vec::as_slice);
+            let r = reading(rows, input.tor.contains(id));
+            *report.readings.entry(r.state.rule()).or_default() += 1;
+        }
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM ip_evidence")
             .execute(&mut *tx)
@@ -1028,7 +1074,7 @@ impl Store {
     /// An address's evidence rows.
     pub async fn evidence_rows(&self, ip_id: i64) -> Result<Vec<EvidenceRow>> {
         Ok(sqlx::query_as(
-            "SELECT ip_id, kind, value, ref_kind, ref_id, first_ts, last_ts
+            "SELECT ip_id, kind, value, ref_kind, ref_id, first_ts, last_ts, v
              FROM ip_evidence WHERE ip_id = ? ORDER BY kind, last_ts DESC, ref_id",
         )
         .bind(ip_id)
@@ -1108,7 +1154,7 @@ pub fn verdict(rows: &[EvidenceRow], declared: bool) -> Verdict {
     let eyeball = has("net.eyeball");
     let fleet = has("fleet.key") || has("fleet.canary");
     let (cpe, proxy) = (has("device.cpe"), has("device.proxy"));
-    let devices = ["device.cpe", "device.proxy", "name.consumer"];
+    let devices = ["device.cpe", "device.proxy", "name.consumer", "name.pool"];
     let (rule, kinds): (Rule, &[&str]) = if declared {
         (Rule::Declared, &[])
     } else if fleet {
@@ -1122,12 +1168,18 @@ pub fn verdict(rows: &[EvidenceRow], declared: bool) -> Verdict {
     } else if cpe && eyeball && !has("name.scanner") {
         (
             Rule::ConsumerDevice,
-            &["device.cpe", "device.proxy", "net.eyeball", "name.consumer"],
+            &[
+                "device.cpe",
+                "device.proxy",
+                "net.eyeball",
+                "name.consumer",
+                "name.pool",
+            ],
         )
     } else if proxy && eyeball {
         (
             Rule::ProxyOnConsumer,
-            &["device.proxy", "net.eyeball", "name.consumer"],
+            &["device.proxy", "net.eyeball", "name.consumer", "name.pool"],
         )
     } else if (cpe || proxy) && !eyeball {
         (Rule::DeviceOnly, &devices)
@@ -1138,6 +1190,246 @@ pub fn verdict(rows: &[EvidenceRow], declared: bool) -> Verdict {
         rule,
         rows: of(kinds),
     }
+}
+
+// ---- The shared reading ---------------------------------------------------
+
+/// The shared reading's states (docs/shared-addresses.md, "Reading table"):
+/// how many parties may share an address, by named observations only.
+/// Never a number and never a sum; the states carry no numerals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sharing {
+    /// 1: a hosting AS, a scanner name, a fleet row or a Tor exit: one
+    /// operator's address, not read on this axis.
+    Operator,
+    /// 2: a consumer router answered and the operator names the line
+    /// pooled.
+    SubscriberPooled,
+    /// 3: a consumer router answered.
+    Subscriber,
+    /// 4: a carrier-NAT name.
+    CarrierPool,
+    /// 5: a mobile name, or a mobile `net.eyeball` row (none sets it yet).
+    MobilePool,
+    /// 6: a pooled-line name.
+    PooledLine,
+    /// 7: another consumer-line name.
+    ConsumerLine,
+    /// 8: the default.
+    Insufficient,
+}
+
+/// An evidence row a rule asks for: its kind and, where it matters, value.
+type Cond = (&'static str, Option<&'static str>);
+
+/// One rule of the reading table: it matches when any clause has every
+/// one of its rows; the reading then carries the rows of `shows`.
+struct SharingRule {
+    state: Sharing,
+    tor: bool,
+    any: &'static [&'static [Cond]],
+    shows: &'static [Cond],
+}
+
+const HOSTING: Cond = ("net.hosting", None);
+const SCANNER: Cond = ("name.scanner", None);
+const FLEET_KEY: Cond = ("fleet.key", None);
+const FLEET_CANARY: Cond = ("fleet.canary", None);
+const CPE: Cond = ("device.cpe", None);
+const POOL: Cond = ("name.pool", None);
+const CGN: Cond = ("name.cgn", None);
+const MOBILE: Cond = ("name.mobile", None);
+const EYEBALL_MOBILE: Cond = ("net.eyeball", Some("mobile"));
+const CONSUMER: Cond = ("name.consumer", None);
+
+/// Rules 1 to 8, first match wins, in the doc's order. Changing a rule
+/// bumps [`EVIDENCE_V`].
+const SHARING_RULES: &[SharingRule] = &[
+    SharingRule {
+        state: Sharing::Operator,
+        tor: true,
+        any: &[&[HOSTING], &[SCANNER], &[FLEET_KEY], &[FLEET_CANARY]],
+        shows: &[HOSTING, SCANNER, FLEET_KEY, FLEET_CANARY],
+    },
+    SharingRule {
+        state: Sharing::SubscriberPooled,
+        tor: false,
+        any: &[&[CPE, POOL]],
+        shows: &[CPE, POOL],
+    },
+    SharingRule {
+        state: Sharing::Subscriber,
+        tor: false,
+        any: &[&[CPE]],
+        shows: &[CPE],
+    },
+    SharingRule {
+        state: Sharing::CarrierPool,
+        tor: false,
+        any: &[&[CGN]],
+        shows: &[CGN, MOBILE, EYEBALL_MOBILE, POOL],
+    },
+    SharingRule {
+        state: Sharing::MobilePool,
+        tor: false,
+        any: &[&[MOBILE], &[EYEBALL_MOBILE]],
+        shows: &[MOBILE, EYEBALL_MOBILE, POOL],
+    },
+    SharingRule {
+        state: Sharing::PooledLine,
+        tor: false,
+        any: &[&[POOL]],
+        shows: &[POOL],
+    },
+    SharingRule {
+        state: Sharing::ConsumerLine,
+        tor: false,
+        any: &[&[CONSUMER]],
+        shows: &[CONSUMER],
+    },
+    SharingRule {
+        state: Sharing::Insufficient,
+        tor: false,
+        any: &[&[]],
+        shows: &[],
+    },
+];
+
+/// The direction text beside every reading above rule 1.
+pub const SHARING_DIRECTION: &str = "This reading says how many parties may share this \
+     address. It is not a threat or suspicion score. A shared pool means a block on this \
+     address hits other people; it does not change what the address sent.";
+
+impl Sharing {
+    pub const ALL: [Sharing; 8] = [
+        Sharing::Operator,
+        Sharing::SubscriberPooled,
+        Sharing::Subscriber,
+        Sharing::CarrierPool,
+        Sharing::MobilePool,
+        Sharing::PooledLine,
+        Sharing::ConsumerLine,
+        Sharing::Insufficient,
+    ];
+
+    /// Its rule in the reading table.
+    pub fn rule(self) -> u8 {
+        match self {
+            Sharing::Operator => 1,
+            Sharing::SubscriberPooled => 2,
+            Sharing::Subscriber => 3,
+            Sharing::CarrierPool => 4,
+            Sharing::MobilePool => 5,
+            Sharing::PooledLine => 6,
+            Sharing::ConsumerLine => 7,
+            Sharing::Insufficient => 8,
+        }
+    }
+
+    /// The state's name, as `/ips?reading=` takes it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Sharing::Operator => "operator",
+            Sharing::SubscriberPooled => "subscriber-pooled",
+            Sharing::Subscriber => "subscriber",
+            Sharing::CarrierPool => "shared-pool",
+            Sharing::MobilePool => "shared-mobile",
+            Sharing::PooledLine => "pooled-line",
+            Sharing::ConsumerLine => "consumer-line",
+            Sharing::Insufficient => "insufficient",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Sharing> {
+        Sharing::ALL.into_iter().find(|s| s.key() == key)
+    }
+
+    /// The reading as the IP page names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Sharing::Operator => "not read: one operator's address",
+            Sharing::SubscriberPooled => "one subscriber's network, on a pooled line",
+            Sharing::Subscriber => "one subscriber's network",
+            Sharing::CarrierPool => "shared pool, by the operator's naming",
+            Sharing::MobilePool => "shared pool, mobile",
+            Sharing::PooledLine => "pooled line",
+            Sharing::ConsumerLine => "consumer line, sharing not read",
+            Sharing::Insufficient => "insufficient evidence",
+        }
+    }
+}
+
+/// The shared reading of an address: its state, the version of the rows it
+/// rests on, and every row that matched. Computed at render time, never
+/// stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub state: Sharing,
+    pub v: i64,
+    pub rows: Vec<EvidenceRow>,
+}
+
+fn holds(r: &EvidenceRow, (kind, value): Cond) -> bool {
+    r.kind == kind && value.is_none_or(|v| r.value == v)
+}
+
+/// Rules 1 to 8 over an address's evidence rows, first match wins.
+/// `tor_exit`: the address is a Tor exit (rule 1).
+pub fn reading(rows: &[EvidenceRow], tor_exit: bool) -> Reading {
+    let has = |c: Cond| rows.iter().any(|r| holds(r, c));
+    let rule = SHARING_RULES
+        .iter()
+        .find(|t| (t.tor && tor_exit) || t.any.iter().any(|all| all.iter().all(|c| has(*c))))
+        .expect("rule 8 always matches");
+    Reading {
+        state: rule.state,
+        v: rows.iter().map(|r| r.v).max().unwrap_or(EVIDENCE_V),
+        rows: rows
+            .iter()
+            .filter(|r| rule.shows.iter().any(|c| holds(r, *c)))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The reading of `i` (an `ips` row) as one SQL expression, built from the
+/// same table as [`reading`] so the list filter cannot drift from it.
+pub fn reading_sql() -> String {
+    let exists = |(kind, value): &Cond| match value {
+        Some(v) => format!(
+            "EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id \
+             AND e.kind = '{kind}' AND e.value = '{v}')"
+        ),
+        None => {
+            format!(
+                "EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id AND e.kind = '{kind}')"
+            )
+        }
+    };
+    let mut sql = String::from("CASE");
+    for t in SHARING_RULES {
+        let mut any: Vec<String> = t
+            .any
+            .iter()
+            .map(|all| {
+                if all.is_empty() {
+                    "1".to_string()
+                } else {
+                    all.iter().map(exists).collect::<Vec<_>>().join(" AND ")
+                }
+            })
+            .collect();
+        if t.tor {
+            any.insert(0, "i.is_tor_exit = 1".into());
+        }
+        sql.push_str(&format!(
+            " WHEN ({}) THEN '{}'",
+            any.join(") OR ("),
+            t.state.key()
+        ));
+    }
+    sql.push_str(" END");
+    sql
 }
 
 // ---- The IP page ----------------------------------------------------------
@@ -1172,6 +1464,19 @@ pub const DEVICE_CAVEAT: &str = "What answered is the box on this address at sca
      not necessarily the sender; who runs it is not observable from here.";
 /// The caveat on a mobile ISP address.
 pub const MOBILE_CAVEAT: &str = "mobile ISP address: usually many subscribers (CGNAT)";
+
+/// The shared reading as the IP page shows it (rules 2 to 8; rule 1 shows
+/// nothing on this axis).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharingView {
+    pub state: Sharing,
+    pub label: &'static str,
+    pub v: i64,
+    /// What was observed and who observed it, in the doc's words.
+    pub sentence: String,
+    pub direction: &'static str,
+    pub lines: Vec<Line>,
+}
 
 /// Who a `net.*` row's AS type is from, by its `ref_kind`.
 fn as_source(ref_kind: &str) -> &'static str {
@@ -1261,6 +1566,118 @@ impl Store {
             label,
             sentence,
             caveat,
+            lines,
+        }))
+    }
+
+    /// The shared reading of an address with its rows, as the IP page
+    /// shows it; None for rule 1 (one operator's address).
+    pub async fn sharing_view(&self, ip_id: i64, tor_exit: bool) -> Result<Option<SharingView>> {
+        let rows = self.evidence_rows(ip_id).await?;
+        let r = reading(&rows, tor_exit);
+        if r.state == Sharing::Operator {
+            return Ok(None);
+        }
+        let cat = Catalogue::current();
+        let mut lines = vec![];
+        for row in &r.rows {
+            lines.extend(self.lines_of(&cat, row).await?);
+        }
+        let mut names = HashMap::new();
+        for row in r.rows.iter().filter(|x| x.ref_kind == "name") {
+            if let Some(n) =
+                sqlx::query_scalar::<_, String>("SELECT name FROM ip_names WHERE id = ?")
+                    .bind(row.ref_id)
+                    .fetch_optional(&self.read)
+                    .await?
+            {
+                names.insert(row.ref_id, n);
+            }
+        }
+        // The first row of a kind: its name and lookup day.
+        let name = |kind: &str| {
+            r.rows.iter().find(|x| x.kind == kind).map(|x| {
+                let n = names.get(&x.ref_id).cloned();
+                (
+                    n.unwrap_or_else(|| format!("name #{}", x.ref_id)),
+                    day(&x.last_ts),
+                )
+            })
+        };
+        let cpe = lines
+            .iter()
+            .find(|l| l.kind == "device.cpe")
+            .map(|l| match l.port {
+                Some(p) => format!("{} answered on {p} in {}", l.what, l.source),
+                None => format!("{} in {}", l.what, l.source),
+            })
+            .unwrap_or_else(|| "A consumer router answered".into());
+        let pooled = " a line that is reassigned, on such networks daily to fortnightly. \
+                      The next holder is someone else.";
+        let sentence = match r.state {
+            Sharing::SubscriberPooled => {
+                let (n, d) = name("name.pool").unwrap_or_default();
+                format!(
+                    "{cpe} and the operator names this address {n} (PTR looked up {d}): \
+                     a consumer router fronts this address, so one subscriber holds it at a \
+                     time, and the line is reassigned, on such networks daily to fortnightly. \
+                     The next holder is someone else. This argues against a carrier pool, not \
+                     against reassignment."
+                )
+            }
+            Sharing::Subscriber => format!(
+                "{cpe}: a consumer router fronts this address, so one subscriber holds it and \
+                 several of their devices may share it. This argues against a carrier pool."
+            ),
+            Sharing::CarrierPool => {
+                let (n, d) = name("name.cgn").unwrap_or_default();
+                format!(
+                    "The operator names this address {n} (PTR looked up {d}): a carrier-NAT \
+                     pool by its own naming, shared by unrelated subscribers. Not verified by \
+                     behaviour; nothing we hold can verify it."
+                )
+            }
+            Sharing::MobilePool => match name("name.mobile") {
+                Some((n, d)) => format!(
+                    "The operator names this address {n} (PTR looked up {d}): a mobile pool, \
+                     where an address usually holds a subscriber for a day or less. By naming \
+                     only."
+                ),
+                None => {
+                    let src = r
+                        .rows
+                        .iter()
+                        .find(|x| holds(x, EYEBALL_MOBILE))
+                        .map(|x| as_source(&x.ref_kind))
+                        .unwrap_or("AS-type list");
+                    format!(
+                        "The {src} classes this network as mobile: a mobile pool, where an \
+                         address usually holds a subscriber for a day or less. By the network's \
+                         type only."
+                    )
+                }
+            },
+            Sharing::PooledLine => {
+                let (n, d) = name("name.pool").unwrap_or_default();
+                format!("The operator names this address {n} (PTR looked up {d}):{pooled}")
+            }
+            Sharing::ConsumerLine => {
+                let (n, _) = name("name.consumer").unwrap_or_default();
+                format!(
+                    "The name says a consumer line ({n}); whether it is shared is not observed."
+                )
+            }
+            Sharing::Insufficient => "No evidence either way. An address without a name or a \
+                 scan result is not thereby single-user, and not thereby shared."
+                .into(),
+            Sharing::Operator => unreachable!("returned above"),
+        };
+        Ok(Some(SharingView {
+            state: r.state,
+            label: r.state.label(),
+            v: r.v,
+            sentence,
+            direction: SHARING_DIRECTION,
             lines,
         }))
     }
@@ -1398,23 +1815,25 @@ impl Store {
                     })
                     .collect()
             }
-            "name.consumer" | "name.scanner" => {
+            "name.consumer" | "name.pool" | "name.cgn" | "name.mobile" | "name.scanner" => {
                 let name: Option<String> =
                     sqlx::query_scalar("SELECT name FROM ip_names WHERE id = ?")
                         .bind(r.ref_id)
                         .fetch_optional(&self.read)
                         .await?;
-                let pattern = if r.kind == "name.consumer" {
-                    "consumer-line"
-                } else {
-                    "scanner"
+                let pattern = match r.kind.as_str() {
+                    "name.consumer" => "consumer-line",
+                    "name.pool" => "pooled-line",
+                    "name.cgn" => "carrier-NAT",
+                    "name.mobile" => "mobile",
+                    _ => "scanner",
                 };
                 name.map(|n| {
                     line(
                         format!("named {n} ({pattern} pattern {})", r.value),
                         None,
                         "reverse DNS".into(),
-                        None,
+                        Some(format!("#name-{}", r.ref_id)),
                         &r.last_ts,
                     )
                 })
@@ -1539,24 +1958,76 @@ pub(crate) mod tests {
         }
     }
 
-    /// Each name pattern matches its samples; no consumer pattern matches a
-    /// rented fleet's name.
+    /// Each name pattern matches its samples; no consumer, pool, carrier-NAT
+    /// or mobile pattern matches a rented fleet's name, and no pattern at
+    /// all matches the data pass's false hit `expresspools.us`.
     #[test]
     fn name_patterns_match_their_samples_and_no_rented_name() {
         let names = rented_names();
         assert!(names.len() > 300, "{}", names.len());
         let c = builtin();
-        for p in c.consumer.iter().chain(&c.scanner) {
+        assert!(!c.pool.is_empty() && !c.cgn.is_empty() && !c.mobile.is_empty());
+        let eyeball = || {
+            c.consumer
+                .iter()
+                .chain(&c.pool)
+                .chain(&c.cgn)
+                .chain(&c.mobile)
+        };
+        for p in eyeball().chain(&c.scanner) {
             for s in &p.samples {
                 assert!(p.re.is_match(s), "{} on {s}", p.id);
             }
         }
-        for p in &c.consumer {
+        for p in eyeball() {
             for n in &names {
                 assert!(!p.re.is_match(n), "{} matches the rented name {n}", p.id);
             }
         }
-        assert!(!c.consumer.iter().any(|p| p.re.is_match("dynatrace.com")));
+        for n in [
+            "dynatrace.com",
+            "expresspools.us",
+            "www.expresspools.us",
+            "natural.example.com",
+            "nat0.example.com",
+            "signature.example.net",
+            "azpdee5gzoqn.stretchoid.com",
+            "lteam.example.org",
+        ] {
+            assert!(!eyeball().any(|p| p.re.is_match(n)), "{n}");
+        }
+        assert!(!c.scanner.iter().any(|p| p.re.is_match("expresspools.us")));
+        // The hermes names of the data pass land in their class.
+        let class = |n: &str| {
+            [
+                ("pool", &c.pool),
+                ("cgn", &c.cgn),
+                ("mobile", &c.mobile),
+                ("consumer", &c.consumer),
+            ]
+            .into_iter()
+            .filter(|(_, l)| l.iter().any(|p| p.re.is_match(n)))
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(class("185-167-53-49.cgn-wdsl.neomedia.it"), ["cgn"]);
+        assert_eq!(
+            class("27-130-212-30.24.nat.nky2-cgn02.myaisfibre.com"),
+            ["cgn"]
+        );
+        assert_eq!(
+            class("vc-nat-gp-s-41-13-9-159.umts.vodacom.co.za"),
+            ["cgn", "mobile"]
+        );
+        assert_eq!(class("79-117-84-127.digimobil.es"), ["mobile"]);
+        assert_eq!(class("ppp-167-140.tm.net.my"), ["pool"]);
+        assert_eq!(class("dynamic-0-0-0-0.pool.telefonica.de"), ["pool"]);
+        assert_eq!(class("0-0-0-0.dynamic.ttnet.com.tr"), ["pool"]);
+        assert_eq!(
+            class("ip-188-193-002-090.vkd89.pools.vodafone-ip.de"),
+            ["pool"]
+        );
+        assert_eq!(class("0-0-0-0.adsl.example.net"), ["consumer"]);
     }
 
     /// Per port and kind the first entry wins: a FRITZ!Box's TR-069 service
@@ -1675,8 +2146,8 @@ pub(crate) mod tests {
         assert_eq!(out.stale, 1);
         assert_eq!(
             kinds(&out, 7),
-            [kv("name.consumer", "dynamic")],
-            "first consumer pattern only"
+            [kv("name.pool", "dynamic")],
+            "first pool pattern only"
         );
         let r = out.rows.iter().find(|r| r.ip_id == 1).unwrap();
         assert_eq!((r.ref_kind.as_str(), r.ref_id), ("scan", 11));
@@ -1688,6 +2159,43 @@ pub(crate) mod tests {
         );
         assert_eq!(out.unmatched_devicetype, [("PBX".to_string(), 1)]);
         assert_eq!(out.unmatched_os, [("Linux 5.4".to_string(), 1)]);
+    }
+
+    /// Names are exempt from the 24-hour device staleness and dropped only
+    /// when looked up more than 30 days before the address's last_seen.
+    #[test]
+    fn names_go_stale_after_thirty_days_not_a_day() {
+        let mut i = Input::default();
+        for id in 1..=2 {
+            i.ips.push((
+                id,
+                format!("192.0.2.{id}"),
+                None,
+                "2026-10-31 12:00:00".into(),
+                true,
+            ));
+        }
+        i.names = vec![
+            (
+                70,
+                1,
+                "0.cgn.example.it".into(),
+                "2026-10-01 12:00:00".into(),
+                "2026-10-02 12:00:00".into(),
+            ),
+            (
+                71,
+                2,
+                "0.cgn.example.it".into(),
+                "2026-09-01 12:00:00".into(),
+                "2026-09-30 11:00:00".into(),
+            ),
+        ];
+        let out = compute(&i, builtin());
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(kinds(&out, 1), [kv("name.cgn", "cgn")], "29 days: used");
+        assert!(kinds(&out, 2).is_empty(), "30 days and an hour: stale");
+        assert_eq!(out.stale, 0, "the stale count is device rows only");
     }
 
     /// The bundled AS-type list switches the `net.*` rows, and with them
@@ -1766,6 +2274,7 @@ pub(crate) mod tests {
             ref_id: 1,
             first_ts: String::new(),
             last_ts: String::new(),
+            v: EVIDENCE_V,
         }
     }
 
@@ -1810,6 +2319,160 @@ pub(crate) mod tests {
         assert_eq!(kinds, ["device.cpe", "name.consumer"]);
         assert_eq!(Rule::Unknown.label(), None, "rule 7 shows nothing");
         assert_eq!(Rule::Declared.label(), None);
+    }
+
+    fn kv_row(kind: &str, value: &str) -> EvidenceRow {
+        EvidenceRow {
+            value: value.into(),
+            ..row(kind)
+        }
+    }
+
+    /// The shared reading's rules 1 to 8 go first-match in the doc's
+    /// order and carry every row they rest on; nothing adds up.
+    #[test]
+    fn the_shared_reading_goes_first_match() {
+        let read = |kinds: &[&str]| {
+            let rows: Vec<EvidenceRow> = kinds.iter().map(|k| row(k)).collect();
+            reading(&rows, false)
+        };
+        let shown = |r: &Reading| r.rows.iter().map(|r| r.kind.clone()).collect::<Vec<_>>();
+        // Rule 1: the gate beats a planted carrier-NAT name.
+        for gate in ["net.hosting", "name.scanner", "fleet.key", "fleet.canary"] {
+            let r = read(&[gate, "name.cgn", "device.cpe"]);
+            assert_eq!(r.state, Sharing::Operator, "{gate}");
+            assert_eq!(shown(&r), [gate]);
+        }
+        assert_eq!(
+            reading(&[row("name.cgn")], true).state,
+            Sharing::Operator,
+            "a Tor exit"
+        );
+        // Rule 2: a CPE on a pooled line, with both rows.
+        let r = read(&["device.cpe", "name.pool"]);
+        assert_eq!((r.state, r.state.rule()), (Sharing::SubscriberPooled, 2));
+        assert_eq!(shown(&r), ["device.cpe", "name.pool"]);
+        // Rule 3: a CPE alone, and a CPE beats a carrier-NAT or mobile name.
+        assert_eq!(read(&["device.cpe"]).state, Sharing::Subscriber);
+        let r = read(&["device.cpe", "name.cgn", "name.mobile"]);
+        assert_eq!(r.state, Sharing::Subscriber);
+        assert_eq!(shown(&r), ["device.cpe"]);
+        // Rule 4: carrier-NAT and mobile names read rule 4 with both rows,
+        // carrier-NAT and pool names likewise; not a higher level.
+        let r = read(&["name.cgn", "name.mobile"]);
+        assert_eq!((r.state, r.state.rule()), (Sharing::CarrierPool, 4));
+        assert_eq!(shown(&r), ["name.cgn", "name.mobile"]);
+        assert_eq!(
+            shown(&read(&["name.cgn", "name.pool"])),
+            ["name.cgn", "name.pool"]
+        );
+        // Rule 5: a mobile name, or net.eyeball = mobile (set by nothing
+        // today); a fixed-line net.eyeball row is no evidence here.
+        assert_eq!(read(&["name.mobile"]).state, Sharing::MobilePool);
+        let r = reading(&[kv_row("net.eyeball", "mobile")], false);
+        assert_eq!(r.state, Sharing::MobilePool);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            reading(&[kv_row("net.eyeball", "fixed")], false).state,
+            Sharing::Insufficient
+        );
+        // Rules 6 to 8.
+        assert_eq!(read(&["name.pool"]).state, Sharing::PooledLine);
+        assert_eq!(
+            read(&["name.pool", "name.consumer"]).state,
+            Sharing::PooledLine
+        );
+        assert_eq!(read(&["name.consumer"]).state, Sharing::ConsumerLine);
+        let r = read(&[]);
+        assert_eq!((r.state, r.state.rule()), (Sharing::Insufficient, 8));
+        assert!(r.rows.is_empty());
+        assert_eq!(r.v, EVIDENCE_V);
+        assert_eq!(
+            read(&["device.proxy", "fleet.dense", "net.eyeball"]).state,
+            Sharing::Insufficient,
+            "rows of no rule move nothing"
+        );
+        // Named states only: no numerals, keys round-trip.
+        for s in Sharing::ALL {
+            assert_eq!(Sharing::from_key(s.key()), Some(s));
+            assert!(!s.label().chars().any(|c| c.is_ascii_digit()), "{s:?}");
+            assert!(!s.key().chars().any(|c| c.is_ascii_digit()), "{s:?}");
+        }
+        assert_eq!(Sharing::from_key("4"), None);
+    }
+
+    /// The `/ips?reading=` filter's SQL, built from the same table, agrees
+    /// with [`reading`] on every state.
+    #[tokio::test]
+    async fn the_reading_filter_agrees_with_the_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let cases: &[(&[(&str, &str)], bool)] = &[
+            (&[], false),
+            (&[("name.cgn", "cgn")], true),
+            (&[("net.hosting", "hosting"), ("name.cgn", "nat")], false),
+            (
+                &[("device.cpe", "fritzbox"), ("name.pool", "dynamic")],
+                false,
+            ),
+            (&[("device.cpe", "fritzbox"), ("name.cgn", "cgn")], false),
+            (&[("name.cgn", "nat"), ("name.mobile", "umts")], false),
+            (&[("name.mobile", "mobile")], false),
+            (&[("net.eyeball", "mobile")], false),
+            (&[("net.eyeball", "fixed")], false),
+            (&[("name.pool", "ppp")], false),
+            (&[("name.consumer", "dsl")], false),
+            (&[("device.proxy", "socks")], false),
+        ];
+        let mut want: BTreeMap<&str, BTreeSet<i64>> = BTreeMap::new();
+        for (n, (rows, tor)) in cases.iter().enumerate() {
+            let ip = s
+                .upsert_ip(format!("192.0.2.{}", n + 1).parse().unwrap())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE ips SET is_tor_exit = ? WHERE id = ?")
+                .bind(*tor)
+                .bind(ip.id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+            let mut ev = vec![];
+            for (kind, value) in *rows {
+                let r = EvidenceRow {
+                    ip_id: ip.id,
+                    ref_id: ip.id,
+                    ..kv_row(kind, value)
+                };
+                sqlx::query(
+                    "INSERT INTO ip_evidence (ip_id, kind, value, ref_kind, ref_id, first_ts, last_ts, v)
+                     VALUES (?,?,?,?,?,?,?,?)",
+                )
+                .bind(r.ip_id)
+                .bind(&r.kind)
+                .bind(&r.value)
+                .bind(&r.ref_kind)
+                .bind(r.ref_id)
+                .bind(&r.first_ts)
+                .bind(&r.last_ts)
+                .bind(r.v)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+                ev.push(r);
+            }
+            want.entry(reading(&ev, *tor).state.key())
+                .or_default()
+                .insert(ip.id);
+        }
+        assert_eq!(want.len(), 8, "every state is exercised: {want:?}");
+        for st in Sharing::ALL {
+            let f = crate::store::browse::IpFilter {
+                reading: Some(st.key().into()),
+                ..Default::default()
+            };
+            let got: BTreeSet<i64> = s.matching_ip_ids(&f).await.unwrap().into_iter().collect();
+            assert_eq!(got, want[st.key()], "{st:?}");
+        }
     }
 
     /// The address a recorded nmap XML of a TR-069 router scanned, and the

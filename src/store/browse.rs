@@ -94,6 +94,9 @@ pub struct IpFilter {
     /// Admin only: has an evidence row of this kind (`device.cpe`,
     /// `device.proxy`, … of `store::evidence::KINDS`).
     pub evidence: Option<String>,
+    /// Admin only: the shared reading is in this state (a
+    /// `store::evidence::Sharing` key, `shared-pool`, `insufficient`, …).
+    pub reading: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -524,6 +527,10 @@ fn ip_filter_sql(f: &IpFilter, a: Audience) -> Option<IpFilterSql> {
             wheres.push(
                 "EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id AND e.kind = ?)".into(),
             );
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.reading) {
+            wheres.push(format!("({}) = ?", crate::store::evidence::reading_sql()));
             binds.push(v);
         }
     }
