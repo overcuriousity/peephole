@@ -454,6 +454,8 @@ pub(crate) struct Input {
     /// Canaries served to another address that came back from this one in
     /// a header or the body: using ip id, value hash, using request id, ts.
     canaries: Vec<(i64, i64, i64, String)>,
+    /// Tor exits (rule 1).
+    tor: BTreeSet<i64>,
 }
 
 impl Input {
@@ -513,6 +515,11 @@ impl Input {
             )
             .fetch_all(&mut *conn)
             .await?,
+            tor: sqlx::query_scalar("SELECT id FROM ips WHERE is_tor_exit = 1")
+                .fetch_all(&mut *conn)
+                .await?
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -720,6 +727,10 @@ pub struct Report {
     pub as_types: usize,
     pub unmatched_devicetype: Vec<(String, usize)>,
     pub unmatched_os: Vec<(String, usize)>,
+    /// Addresses per verdict rule (1 to 6; 7 is everything else), and per
+    /// row kind a rule-2 verdict rests on.
+    pub rules: BTreeMap<u8, usize>,
+    pub fleet_by: BTreeMap<String, usize>,
     pub seconds: f64,
 }
 
@@ -745,6 +756,25 @@ impl std::fmt::Display for Report {
         } else {
             writeln!(f, "AS-type list: {} ASNs", self.as_types)?;
         }
+        write!(f, "verdicts (addresses with evidence):")?;
+        for n in 1..=7u8 {
+            write!(f, " rule {n} {}", self.rules.get(&n).unwrap_or(&0))?;
+        }
+        writeln!(f)?;
+        let by: Vec<String> = self
+            .fleet_by
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        writeln!(
+            f,
+            "rule 2 rests on: {}",
+            if by.is_empty() {
+                "none".into()
+            } else {
+                by.join(", ")
+            }
+        )?;
         for (title, list) in [
             ("unmatched device types", &self.unmatched_devicetype),
             ("unmatched OS guesses", &self.unmatched_os),
@@ -793,6 +823,20 @@ impl Store {
             ips.entry(&r.kind).or_default().insert(r.ip_id);
         }
         report.ips = ips.into_iter().map(|(k, s)| (k.into(), s.len())).collect();
+        let mut per_ip: BTreeMap<i64, Vec<EvidenceRow>> = BTreeMap::new();
+        for r in &out.rows {
+            per_ip.entry(r.ip_id).or_default().push(r.clone());
+        }
+        for (ip, rows) in &per_ip {
+            let v = verdict(rows, input.tor.contains(ip));
+            *report.rules.entry(v.rule.number()).or_default() += 1;
+            if v.rule == Rule::RentedFleet {
+                let kinds: BTreeSet<&str> = v.rows.iter().map(|r| r.kind.as_str()).collect();
+                for k in kinds {
+                    *report.fleet_by.entry(k.to_string()).or_default() += 1;
+                }
+            }
+        }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM ip_evidence")
