@@ -3,7 +3,8 @@
 # installer smoke test:
 #   tools/package.sh <binary> <target triple> <build name> <commit> <out dir>
 # The tarball peephole-<target>.tar.gz holds the binary (the signature rules
-# are built into it), deploy/, install.sh from this checkout, and VERSION
+# are built into it), deploy/, install.sh from this checkout,
+# THIRD_PARTY_NOTICES.md (the licences of the data built in), and VERSION
 # ("<build name> <UTC date> <commit>"; install.sh reads it).
 set -euo pipefail
 [ "$#" -eq 5 ] || { echo "usage: $0 <binary> <target triple> <build name> <commit> <out dir>" >&2; exit 2; }
@@ -18,6 +19,7 @@ mkdir -p "${stage}/${asset}/deploy"
 install -m 0755 "$bin" "${stage}/${asset}/peephole"
 cp deploy/peephole.service deploy/config.example.toml deploy/nginx.example.conf "${stage}/${asset}/deploy/"
 install -m 0755 install.sh "${stage}/${asset}/install.sh"
+cp THIRD_PARTY_NOTICES.md "${stage}/${asset}/"
 printf '%s %s %s\n' "$build" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$commit" > "${stage}/${asset}/VERSION"
 tar -C "$stage" -czf "${out}/${asset}.tar.gz" "$asset"
 ( cd "$out" && sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256" )

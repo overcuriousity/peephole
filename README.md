@@ -116,3 +116,6 @@ security key with the one-time token the installer prints. Details:
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT License](LICENSE-MIT), at your option.
+
+Third-party data shipped with peephole (the X4BNet datacenter ASN list,
+MIT) is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
