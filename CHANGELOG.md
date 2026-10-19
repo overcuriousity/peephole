@@ -5,22 +5,44 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [0.21.0] - 2026-10-19
 
-Shared-address reading (MIK-596). The admin names, for each source
-address, whether the evidence says it is likely shared (a carrier-grade
-NAT, a mobile carrier, a pooled dynamic line) or one subscriber's own
-network, with the rule and the rows it rests on, never a score. The
-export and the blocklist carry the same reading so a consumer can see
-when an entry stands for many households. No new migration, no new
-setting, no protocol version bump. The reading is a cost warning, not a
-verdict: a pool or mobile address changes hands within hours, so read it
-as "blocking this may hit others", not as "this was not the scanner".
+Device evidence (MIK-586, MIK-587) and shared-address reading
+(MIK-596). Each node derives typed evidence about a source address from
+rows it already holds and shows a device verdict on the admin IP page.
+On top of it the admin names, for each source address, whether the
+evidence says it is likely shared (a carrier-grade NAT, a mobile carrier,
+a pooled dynamic line) or one subscriber's own network, with the rule and
+the rows it rests on, never a score. The export and the blocklist carry
+the same reading so a consumer can see when an entry stands for many
+households. One database migration (0047, additive), applied on start.
+No new setting, no protocol version bump. The reading is a cost warning,
+not a verdict: a pool or mobile address changes hands within hours, so
+read it as "blocking this may hit others", not as "this was not the
+scanner".
 
 ### Added
+- Device evidence: a node-local `ip_evidence` table (migration 0047)
+  holds typed observations about an address, derived from the node's own
+  scans, names, host keys and canaries (`device.cpe`, `device.proxy`,
+  `name.*`, `fleet.*`, `net.hosting`). The hourly campaign pass recomputes
+  it in one transaction; it is never replicated, never exported and never
+  written by a person (MIK-586).
+- Admin IP page: a device/evidence verdict with the rows it rests on, and
+  the IP directory filters on it with `/ips?evidence=<kind>`. The evidence
+  recompute report counts verdicts by rule (MIK-586).
+- `net.hosting` from the X4BNet `lists_vpn` datacenter ASN list. A
+  snapshot is built into the binary (`rules/evidence/x4bnet/`, MIT notice
+  in `NOTICE`); `rules/evidence/as-supplement.toml` adds scanner ASNs the
+  list misses, each with a reason and a date. Each node now fetches the
+  list from GitHub at startup and then daily, on the Tor exit list's
+  cadence and backoff, into `<data_dir>/x4b-datacenter-asn.txt`: a new
+  outbound request. A failed or implausible fetch keeps the loaded list.
+  The admin system page shows the last fetch, or the snapshot's date
+  (MIK-587, MIK-608).
 - Operator-naming catalogue: `rules/evidence/names.toml` gains `cgn`,
   `mobile` and `pool` classes (tokens such as `cgnat`, `lsn`, `lte`,
   `mobil`, `dynamic`, `ppp`), split out of the consumer entries so the
   reading can tell a pooled line from a consumer one. New evidence kinds
-  `name.cgn`, `name.mobile` and `name.pool`; evidence version 2 → 3
+  `name.cgn`, `name.mobile` and `name.pool`; evidence version 3
   (MIK-647).
 - Admin IP page: an "Address sharing" card under the device verdict
   applies the eight rules of [Shared addresses](docs/shared-addresses.md)
@@ -45,6 +67,9 @@ as "blocking this may hit others", not as "this was not the scanner".
   adds an entry (MIK-646).
 
 ### Changed
+- Scan levels 1 to 3 also probe the relay/proxy ports 1080, 4145, 8118
+  and 9050 and the consumer-device ports 7547, 8291, 8089, 5555 and
+  37777. Operators see these probes on the wire (MIK-586).
 - The sharing card follows the UX review: the caveat and direction text
   come before the sentence, a neutral badge without a rule number in its
   tooltip, a separate link to `/ips?reading=`, the `/ips` chip shows the
