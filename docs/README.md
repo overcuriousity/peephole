@@ -8,5 +8,6 @@ Start with the page for what you want to do.
 - **Running a node:** [Operations](operations.md). Install, nginx, upgrades, day to day, cluster administration.
 - **Understanding what gets flagged:** [Detection](detection.md). Classification, rules, enrichment, counter-scans, exempt scanners.
 - **What is next:** [Roadmap](roadmap.md).
+- **Proposals under assessment:** [Compromised sources](compromised-sources.md). Whether hijacked endpoints can be told from rented scanners with our own signals; not shipped behaviour.
 
 The [changelog](../CHANGELOG.md) lists what changed in each release.
