@@ -1635,6 +1635,9 @@ pub struct Line {
     pub source: String,
     pub href: Option<String>,
     pub date: String,
+    /// The first day this was seen (`date` is the last); only the
+    /// shared-reading card shows it.
+    pub first: String,
 }
 
 /// The verdict as the IP page shows it.
@@ -1674,6 +1677,24 @@ fn as_source(ref_kind: &str) -> &'static str {
         "x4bnet" => "X4BNet datacenter ASN list",
         "supplement" => "our own classification",
         _ => "AS-type list",
+    }
+}
+
+/// How an `ip_names.source` was looked up, in a sentence.
+fn lookup_name(source: &str) -> &'static str {
+    match source {
+        "ptr" => "PTR",
+        "rdns" => "reverse DNS",
+        _ => "DNS",
+    }
+}
+
+/// The same, in a table cell, as `_names.html` writes it.
+fn short_lookup(source: &str) -> &'static str {
+    match source {
+        "ptr" => "PTR",
+        "rdns" => "rDNS",
+        _ => "DNS",
     }
 }
 
@@ -1775,23 +1796,24 @@ impl Store {
         }
         let mut names = HashMap::new();
         for row in r.rows.iter().filter(|x| x.ref_kind == "name") {
-            if let Some(n) =
-                sqlx::query_scalar::<_, String>("SELECT name FROM ip_names WHERE id = ?")
-                    .bind(row.ref_id)
-                    .fetch_optional(&self.read)
-                    .await?
+            if let Some(n) = sqlx::query_as::<_, (String, String)>(
+                "SELECT name, source FROM ip_names WHERE id = ?",
+            )
+            .bind(row.ref_id)
+            .fetch_optional(&self.read)
+            .await?
             {
                 names.insert(row.ref_id, n);
             }
         }
-        // The first row of a kind: its name and lookup day.
+        // The first row of a kind: its name and "<lookup> looked up <day>".
         let name = |kind: &str| {
             r.rows.iter().find(|x| x.kind == kind).map(|x| {
-                let n = names.get(&x.ref_id).cloned();
-                (
-                    n.unwrap_or_else(|| format!("name #{}", x.ref_id)),
-                    day(&x.last_ts),
-                )
+                let (n, lookup) = match names.get(&x.ref_id) {
+                    Some((n, src)) => (n.clone(), lookup_name(src)),
+                    None => (format!("name #{}", x.ref_id), "PTR"),
+                };
+                (n, format!("{lookup} looked up {}", day(&x.last_ts)))
             })
         };
         let cpe = lines
@@ -1808,7 +1830,7 @@ impl Store {
             Sharing::SubscriberPooled => {
                 let (n, d) = name("name.pool").unwrap_or_default();
                 format!(
-                    "{cpe} and the operator names this address {n} (PTR looked up {d}): \
+                    "{cpe} and the operator names this address {n} ({d}): \
                      a consumer router fronts this address, so one subscriber holds it at a \
                      time, and the line is reassigned, on such networks daily to fortnightly. \
                      The next holder is someone else. This argues against a carrier pool, not \
@@ -1822,14 +1844,14 @@ impl Store {
             Sharing::CarrierPool => {
                 let (n, d) = name("name.cgn").unwrap_or_default();
                 format!(
-                    "The operator names this address {n} (PTR looked up {d}): a carrier-NAT \
+                    "The operator names this address {n} ({d}): a carrier-NAT \
                      pool by its own naming, shared by unrelated subscribers. Not verified by \
                      behaviour; nothing we hold can verify it."
                 )
             }
             Sharing::MobilePool => match name("name.mobile") {
                 Some((n, d)) => format!(
-                    "The operator names this address {n} (PTR looked up {d}): a mobile pool, \
+                    "The operator names this address {n} ({d}): a mobile pool, \
                      where an address usually holds a subscriber for a day or less. By naming \
                      only."
                 ),
@@ -1849,7 +1871,7 @@ impl Store {
             },
             Sharing::PooledLine => {
                 let (n, d) = name("name.pool").unwrap_or_default();
-                format!("The operator names this address {n} (PTR looked up {d}):{pooled}")
+                format!("The operator names this address {n} ({d}):{pooled}")
             }
             Sharing::ConsumerLine => {
                 let (n, _) = name("name.consumer").unwrap_or_default();
@@ -1875,6 +1897,8 @@ impl Store {
     /// The lines one evidence row stands for (a device row: every port of
     /// its scan the entry matched).
     async fn lines_of(&self, cat: &Catalogue, r: &EvidenceRow) -> Result<Vec<Line>> {
+        // A device row's lines are one scan, seen once; any other row spans
+        // its first and last sighting.
         let line = |what: String, port, source: String, href, date: &str| Line {
             kind: r.kind.clone(),
             what,
@@ -1882,6 +1906,11 @@ impl Store {
             source,
             href,
             date: day(date),
+            first: day(if r.kind.starts_with("device.") {
+                date
+            } else {
+                &r.first_ts
+            }),
         };
         Ok(match r.kind.as_str() {
             "device.cpe" | "device.proxy" => {
@@ -2006,8 +2035,8 @@ impl Store {
                     .collect()
             }
             "name.consumer" | "name.pool" | "name.cgn" | "name.mobile" | "name.scanner" => {
-                let name: Option<String> =
-                    sqlx::query_scalar("SELECT name FROM ip_names WHERE id = ?")
+                let name: Option<(String, String)> =
+                    sqlx::query_as("SELECT name, source FROM ip_names WHERE id = ?")
                         .bind(r.ref_id)
                         .fetch_optional(&self.read)
                         .await?;
@@ -2018,11 +2047,11 @@ impl Store {
                     "name.mobile" => "mobile",
                     _ => "scanner",
                 };
-                name.map(|n| {
+                name.map(|(n, src)| {
                     line(
                         format!("named {n} ({pattern} pattern {})", r.value),
                         None,
-                        "reverse DNS".into(),
+                        short_lookup(&src).into(),
                         Some(format!("#name-{}", r.ref_id)),
                         &r.last_ts,
                     )
