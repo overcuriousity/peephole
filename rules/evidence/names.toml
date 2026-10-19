@@ -1,26 +1,23 @@
-# Name patterns for evidence rows (docs/detection.md, "Device evidence"),
-# read on the forward-confirmed reverse name of an address and the PTR
-# name nmap reported (`ip_names.source IN ('rdns','ptr')`), lower-cased.
-# Built into the binary like `rules/`; a change here bumps `EVIDENCE_V`.
+# Name patterns for evidence rows (docs/detection.md, "Device evidence";
+# docs/shared-addresses.md, "Evidence rows"), read on the forward-confirmed
+# reverse name of an address and the PTR name nmap reported
+# (`ip_names.source IN ('rdns','ptr')`), lower-cased. Built into the binary
+# like `rules/`; a change here bumps `EVIDENCE_V`.
 #
 # `consumer` → `name.consumer` (context only: a renter can set any PTR,
-# so a name never decides a verdict on its own). `scanner` →
-# `name.scanner` (counts only next to a hosting AS). Every `sample` must
-# match its own entry; no `consumer` entry may match a name of the top-20
-# rented fleets (tests/fixtures/rented-fleet-names.txt, digits as 0).
+# so a name never decides a verdict on its own). `pool` → `name.pool`
+# (the operator states the line is reassigned), `cgn` → `name.cgn` (a
+# carrier-NAT pool by the operator's naming), `mobile` → `name.mobile`
+# (a mobile pool by its naming): the shared reading, which a hosting AS,
+# a scanner name or a fleet row overrides. `scanner` → `name.scanner`
+# (counts only next to a hosting AS). Every `sample` must match its own
+# entry; no `consumer`, `pool`, `cgn` or `mobile` entry may match a name
+# of the top-20 rented fleets (tests/fixtures/rented-fleet-names.txt,
+# digits as 0).
 #
 # Words count at label or dash boundaries, so "dyn" matches
-# `dyn-0.example.net` and `dynamic-adsl.example.vn`, not `dynatrace.com`.
-
-[[consumer]]
-id = "dynamic"
-pattern = '(^|[.-])dyn(amic)?([.-]|[0-9]|$)'
-sample = ["dynamic-adsl.viettel.vn", "dynamic-0.pool.telefonica.de", "dyn-0-0.example.net"]
-
-[[consumer]]
-id = "pool"
-pattern = '(^|[.-])(ip)?pool([.-]|[0-9]|$)'
-sample = ["0.pool.example-isp.de", "ippool0.example.net"]
+# `dyn-0.example.net` and `dynamic-adsl.example.vn`, not `dynatrace.com`,
+# and "pool" not `expresspools.us`.
 
 [[consumer]]
 id = "dsl"
@@ -51,6 +48,70 @@ sample = ["0-0-0-0.broadband.example.co.uk"]
 id = "fibre"
 pattern = '(^|[.-])(fttx|ftth|fttb|fibra|fiber)([.-]|[0-9]|$)'
 sample = ["0.ftth.example.ro", "0-0.fttx.example.pl", "0.fibra.example.es"]
+
+[[pool]]
+id = "dynamic"
+pattern = '(^|[.-])dyn(amic)?([.-]|[0-9]|$)'
+sample = ["dynamic-adsl.viettel.vn", "dynamic-0.pool.telefonica.de", "dyn-0-0.example.net"]
+
+[[pool]]
+id = "pool"
+pattern = '(^|[.-])(ip)?pools?([.-]|[0-9]|$)'
+sample = ["0.pool.example-isp.de", "ippool0.example.net", "ip-0-0-0-0.vkd0.pools.example-ip.de"]
+
+[[pool]]
+id = "ppp"
+pattern = '(^|[.-])ppp([.-]|[0-9]|$)'
+sample = ["ppp-0-0.example.net.my", "ppp0.example.net"]
+
+[[cgn]]
+id = "cgn"
+pattern = '(^|[.-])cgn(at)?([.-]|[0-9]|$)'
+sample = ["0-0-0-0.cgn-wdsl.example.it", "0-0-0-0.0.nat.nky0-cgn00.example.com", "cgnat-0.example.net"]
+
+[[cgn]]
+id = "lsn"
+pattern = '(^|[.-])lsn([.-]|[0-9]|$)'
+sample = ["lsn0.example.net", "0-0-0-0.lsn.example.org"]
+
+# "nat" only as a whole label or dash-delimited word: not `natural`,
+# `nat0`, `signature` or `donate`.
+[[cgn]]
+id = "nat"
+pattern = '(^|[.-])nat([.-]|$)'
+sample = ["vc-nat-gp-s-0-0-0-0.umts.example.co.za", "0-0-0-0.0.nat.example.com"]
+
+[[mobile]]
+id = "umts"
+pattern = '(^|[.-])umts([.-]|[0-9]|$)'
+sample = ["vc-nat-gp-s-0-0-0-0.umts.example.co.za"]
+
+[[mobile]]
+id = "lte"
+pattern = '(^|[.-])lte([.-]|[0-9]|$)'
+sample = ["0-0-0-0.lte.example.net"]
+
+[[mobile]]
+id = "gprs"
+pattern = '(^|[.-])gprs([.-]|[0-9]|$)'
+sample = ["gprs-0-0.example.ro"]
+
+[[mobile]]
+id = "generation"
+pattern = '(^|[.-])[345]g([.-]|$)'
+sample = ["0-0-0-0.4g.example.net", "5g-0.example.de"]
+
+# "mobil" also ends a word (`digimobil.es`, `0.vodamobile.example`): the
+# operator's brand carries it. "mob" only as a whole word.
+[[mobile]]
+id = "mobile"
+pattern = 'mobil(e)?([.-]|[0-9]|$)|(^|[.-])mob([.-]|[0-9]|$)'
+sample = ["0-0-0-0.digimobil.es", "0.mobile.example.net", "mob-0.example.pl"]
+
+[[mobile]]
+id = "wap"
+pattern = '(^|[.-])wap([.-]|[0-9]|$)'
+sample = ["wap0.example.net"]
 
 [[scanner]]
 id = "scanner"

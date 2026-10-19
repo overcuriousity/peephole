@@ -192,6 +192,8 @@ pub struct PageContext {
     pub scans: HashMap<i64, Vec<(ScanOut, Vec<PortOut>)>>,
     /// The agreed names per IP id (looked up or PTR), by name.
     pub names: HashMap<i64, Vec<NameOut>>,
+    /// The `shared` field per IP id, where the address has one.
+    pub shared: HashMap<i64, super::evidence::Shared>,
     pub fingerprints: HashMap<String, Vec<FpOut>>,
     /// Per request id: the uids of the rows whose served canaries it
     /// carried (light rows as `<batch uid>#<row>`).
@@ -433,6 +435,12 @@ impl Store {
         for n in names {
             c.names.entry(n.ip_id).or_default().push(n);
         }
+        c.shared = self
+            .shared_readings(Some(ip_ids))
+            .await?
+            .into_iter()
+            .map(|(id, _, sh)| (id, sh))
+            .collect();
         let claimed: Vec<i64> = sqlx::query_scalar(
             "SELECT DISTINCT ip_id FROM fp_claims WHERE ip_id IN (SELECT value FROM json_each(?))",
         )

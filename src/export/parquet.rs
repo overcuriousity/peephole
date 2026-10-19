@@ -16,7 +16,7 @@ use parquet::file::metadata::KeyValue;
 use std::sync::{Arc, Mutex};
 
 /// Version of this file layout (`peephole.format_version`).
-pub const FORMAT_VERSION: &str = "1";
+pub const FORMAT_VERSION: &str = "2";
 
 fn header_fields() -> Fields {
     Fields::from(vec![
@@ -105,6 +105,7 @@ fn schema() -> SchemaRef {
         s("fingerprints", false),
         s("message", false),
         s("timestamp_desc", false),
+        s("shared", true),
     ]))
 }
 
@@ -244,6 +245,13 @@ fn batch(schema: SchemaRef, rows: &[ExportRow]) -> Result<RecordBatch> {
                 .map(|m| m.as_deref()),
         ),
         strs(rows.iter().map(|r| Some(r.timestamp_desc()))),
+        strs(
+            rows.iter()
+                .map(|r| r.shared.as_ref().map(serde_json::Value::to_string))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|m| m.as_deref()),
+        ),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }

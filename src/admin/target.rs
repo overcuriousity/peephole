@@ -43,6 +43,9 @@ pub struct Target {
     /// The verdict over its evidence rows, where it says anything (admin
     /// only; node-local, never public).
     pub evidence: Option<crate::store::evidence::View>,
+    /// The shared reading (admin only; node-local, never public; nothing
+    /// for one operator's address).
+    pub sharing: Option<crate::store::evidence::SharingView>,
 }
 
 impl Target {
@@ -223,19 +226,21 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
-    let (campaign, agent, evidence) = if authed {
+    let (campaign, agent, evidence, sharing) = if authed {
         (
             state.store.campaign_of_ip(ip.id).await?,
             state.store.ip_has_agent_label(ip.id).await?,
             state.store.evidence_view(ip.id, ov.ip.is_tor_exit).await?,
+            state.store.sharing_view(ip.id, ov.ip.is_tor_exit).await?,
         )
     } else {
-        (None, false, None)
+        (None, false, None, None)
     };
     Ok(Some(Target {
         campaign,
         agent,
         evidence,
+        sharing,
         actions,
         probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),

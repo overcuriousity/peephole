@@ -386,6 +386,7 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         net: None,
         net_name: None,
         evidence: None,
+        reading: None,
     }
 }
 
@@ -410,6 +411,7 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("net", f.net.clone()),
         ("net_name", f.net_name.clone()),
         ("evidence", f.evidence.clone()),
+        ("reading", f.reading.clone()),
     ]
 }
 
@@ -480,6 +482,19 @@ pub(crate) fn chips(path: &str, pairs: &[(&str, Option<String>)]) -> Vec<Chip> {
         .collect()
 }
 
+/// The reading chip shows the state's label, not its key.
+fn reading_chip(mut chips: Vec<Chip>) -> Vec<Chip> {
+    for c in chips
+        .iter_mut()
+        .filter(|c| c.label == filter_label("reading"))
+    {
+        if let Some(st) = crate::store::evidence::Sharing::from_key(c.value.trim()) {
+            c.value = st.label().to_string();
+        }
+    }
+    chips
+}
+
 /// A query parameter as people read it.
 fn filter_label(k: &str) -> &'static str {
     match k {
@@ -514,6 +529,7 @@ fn filter_label(k: &str) -> &'static str {
         "net" => "Network",
         "net_name" => "Network name",
         "evidence" => "Evidence",
+        "reading" => "Address sharing",
         _ => "Filter",
     }
 }
@@ -565,7 +581,7 @@ async fn ips(
         count_max,
         qs: ip_qs(&f),
         hidden: hidden_fields(ip_pairs(&f)),
-        chips: chips("/ips", &ip_pairs(&f)),
+        chips: reading_chip(chips("/ips", &ip_pairs(&f))),
         f,
         page,
         bulk_total,
@@ -2259,6 +2275,181 @@ show_labels = {show_labels}
         // The public list ignores the filter.
         let (status, list) = get_with(&app, "/ips?evidence=device.proxy", None).await;
         assert_eq!(status, 200);
+        assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
+    }
+
+    /// The IP page shows the shared reading under the device verdict, with
+    /// the doc's sentences, its rows linked to their scan or name, and the
+    /// direction text; the IP list filters on it; admins only (MIK-647).
+    #[tokio::test]
+    async fn the_shared_reading_shows_and_filters_for_admins_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let (cpe_ip, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        let now = crate::store::data::now_ts();
+        let named = |ip: &str, name: &str| {
+            let (st, now, ip, name) = (st.clone(), now.clone(), ip.to_string(), name.to_string());
+            async move {
+                let row = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+                st.store
+                    .insert_request(&crate::store::requests::NewRequest {
+                        ip_id: row.id,
+                        method: "GET".into(),
+                        path: "/".into(),
+                        headers_json: "[]".into(),
+                        labels_json: "[]".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                if name.is_empty() {
+                    return 0;
+                }
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen)
+                     VALUES (?, ?, 'rdns', ?, ?) RETURNING id",
+                )
+                .bind(row.id)
+                .bind(&name)
+                .bind(&now)
+                .bind(&now)
+                .fetch_one(&st.store.pool)
+                .await
+                .unwrap()
+            }
+        };
+        let pool_name = named("203.0.113.47", "dynamic-0-0-0-0.pool.telefonica.de").await;
+        let cgn_name = named("203.0.113.48", "0-0-0-0.cgn-wdsl.example.it").await;
+        named("203.0.113.49", "").await;
+        assert!(cpe_ip > 0);
+        st.store.recompute_evidence().await.unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let day = &now[..10];
+
+        // Rule 2: the CPE and the pooled-line name, both linked.
+        let (status, page) = get_with(&app, "/ip/203.0.113.47", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(page.contains("id=\"sharing\""), "{page}");
+        assert!(
+            page.contains("one subscriber&#39;s network, on a pooled line"),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!(
+                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan} (level 1, {day}) \
+                 and the operator names this address dynamic-0-0-0-0.pool.telefonica.de \
+                 (reverse DNS looked up {day})"
+            )),
+            "{page}"
+        );
+        assert!(page.contains("not against reassignment."), "{page}");
+        assert!(
+            page.contains(&format!("href=\"#name-{pool_name}\"")),
+            "{page}"
+        );
+        assert!(page.contains(&format!("id=\"name-{pool_name}\"")), "{page}");
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+        // The reading sits under the device verdict.
+        let (ev, sh) = (
+            page.find("id=\"evidence\"").unwrap(),
+            page.find("id=\"sharing\"").unwrap(),
+        );
+        assert!(ev < sh);
+        let sharing = &page[sh..];
+        let sharing = &sharing[..sharing.find("</section>").unwrap()];
+        assert!(
+            sharing.contains(&format!("href=\"/admin/scans/{scan}\"")),
+            "{sharing}"
+        );
+        // MIK-652: the caveat leads, the badge is a neutral span with no rule
+        // number, the filter is its own link, both days in UTC, the real
+        // lookup word.
+        assert!(sharing.contains("<h2>Address sharing</h2>"), "{sharing}");
+        let (dir, sent) = (
+            sharing
+                .find("It is not a threat or suspicion score.")
+                .unwrap(),
+            sharing.find("not against reassignment.").unwrap(),
+        );
+        assert!(dir < sent, "{sharing}");
+        assert!(
+            sharing.contains("<span class=\"badge badge-reading\""),
+            "{sharing}"
+        );
+        assert!(!sharing.contains("data-status"), "{sharing}");
+        assert!(!sharing.contains("Rule "), "{sharing}");
+        assert!(
+            sharing.contains("href=\"/ips?reading=subscriber-pooled\">Other addresses"),
+            "{sharing}"
+        );
+        assert!(sharing.contains("<th>Kind</th>"), "{sharing}");
+        assert!(sharing.contains("<th>Seen (UTC)</th>"), "{sharing}");
+        assert!(sharing.contains(">rDNS</a>"), "{sharing}");
+
+        // Rule 4: the operator's naming, not verified by behaviour.
+        let (_, page) = get_with(&app, "/ip/203.0.113.48", Some(&cookie)).await;
+        assert!(
+            page.contains("shared pool, by the operator&#39;s naming"),
+            "{page}"
+        );
+        assert!(
+            page.contains("Not verified by behaviour; nothing we hold can verify it."),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!("href=\"#name-{cgn_name}\"")),
+            "{page}"
+        );
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+
+        // Rule 8: insufficient evidence, with the direction text.
+        let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
+        assert!(page.contains("insufficient evidence"), "{page}");
+        assert!(
+            page.contains("An address without a name or a scan result is not thereby single-user"),
+            "{page}"
+        );
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+
+        // The public page has none of it.
+        let (_, public) = get_with(&app, "/ip/203.0.113.48", None).await;
+        assert!(!public.contains("id=\"sharing\""), "{public}");
+        assert!(!public.contains("shared pool"), "{public}");
+
+        // The list filter, admins only.
+        for (state, ip, not) in [
+            ("subscriber-pooled", "203.0.113.47", "203.0.113.48"),
+            ("shared-pool", "203.0.113.48", "203.0.113.47"),
+            ("insufficient", "203.0.113.49", "203.0.113.48"),
+        ] {
+            let (status, list) =
+                get_with(&app, &format!("/ips?reading={state}"), Some(&cookie)).await;
+            assert_eq!(status, 200);
+            assert!(
+                list.contains(&format!("href=\"/ip/{ip}\"")),
+                "{state}: {list}"
+            );
+            assert!(
+                !list.contains(&format!("href=\"/ip/{not}\"")),
+                "{state}: {list}"
+            );
+        }
+        // The chip names the state, not its key.
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", Some(&cookie)).await;
+        assert!(
+            list.contains("Address sharing: <span class=\"mono\">shared pool, by the operator&#39;s naming</span>"),
+            "{list}"
+        );
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", None).await;
         assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
     }
 

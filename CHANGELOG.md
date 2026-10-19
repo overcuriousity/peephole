@@ -3,6 +3,81 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.21.0] - 2026-10-19
+
+Device evidence (MIK-586, MIK-587) and shared-address reading
+(MIK-596). Each node derives typed evidence about a source address from
+rows it already holds and shows a device verdict on the admin IP page.
+On top of it the admin names, for each source address, whether the
+evidence says it is likely shared (a carrier-grade NAT, a mobile carrier,
+a pooled dynamic line) or one subscriber's own network, with the rule and
+the rows it rests on, never a score. The export and the blocklist carry
+the same reading so a consumer can see when an entry stands for many
+households. One database migration (0047, additive), applied on start.
+No new setting, no protocol version bump. The reading is a cost warning,
+not a verdict: a pool or mobile address changes hands within hours, so
+read it as "blocking this may hit others", not as "this was not the
+scanner".
+
+### Added
+- Device evidence: a node-local `ip_evidence` table (migration 0047)
+  holds typed observations about an address, derived from the node's own
+  scans, names, host keys and canaries (`device.cpe`, `device.proxy`,
+  `name.*`, `fleet.*`, `net.hosting`). The hourly campaign pass recomputes
+  it in one transaction; it is never replicated, never exported and never
+  written by a person (MIK-586).
+- Admin IP page: a device/evidence verdict with the rows it rests on, and
+  the IP directory filters on it with `/ips?evidence=<kind>`. The evidence
+  recompute report counts verdicts by rule (MIK-586).
+- `net.hosting` from the X4BNet `lists_vpn` datacenter ASN list. A
+  snapshot is built into the binary (`rules/evidence/x4bnet/`, MIT notice
+  in `NOTICE`); `rules/evidence/as-supplement.toml` adds scanner ASNs the
+  list misses, each with a reason and a date. Each node now fetches the
+  list from GitHub at startup and then daily, on the Tor exit list's
+  cadence and backoff, into `<data_dir>/x4b-datacenter-asn.txt`: a new
+  outbound request. A failed or implausible fetch keeps the loaded list.
+  The admin system page shows the last fetch, or the snapshot's date
+  (MIK-587, MIK-608).
+- Operator-naming catalogue: `rules/evidence/names.toml` gains `cgn`,
+  `mobile` and `pool` classes (tokens such as `cgnat`, `lsn`, `lte`,
+  `mobil`, `dynamic`, `ppp`), split out of the consumer entries so the
+  reading can tell a pooled line from a consumer one. New evidence kinds
+  `name.cgn`, `name.mobile` and `name.pool`; evidence version 3
+  (MIK-647).
+- Admin IP page: an "Address sharing" card under the device verdict
+  applies the eight rules of [Shared addresses](docs/shared-addresses.md)
+  as one first-match table and shows the state, the rule, the direction
+  and every matched row, linked to its scan or name. Name rows are exempt
+  from the 24-hour device staleness; a name seen more than 30 days
+  before the address's `last_seen` no longer counts. The IP directory filters on it with `/ips?reading=<state>`,
+  and the evidence recompute report counts addresses per rule (MIK-647).
+- Export: a `shared` column `{state, rule, v, source, name}`, derived at
+  publish time by the exporting node from its own rows, never stored or
+  replicated. It is set only for rules 2, 4, 5 and 6 and only where the
+  name it rests on is one the `names` column lists, so a consumer can
+  recompute every value from the export and the bundled catalogue; rules
+  1, 3, 7 and 8 give null. Parquet `format_version` 2; the column is last
+  in CSV (MIK-646).
+- Blocklist: a `# shared <ip> rule=N v=N: …` comment line before an entry
+  with such a reading. Entry lines and membership are byte-identical to
+  a feed without the comments; the operator's name stays out of the feed
+  (MIK-646).
+- Blocklist `networks=1`: a /24 or /64 holding a shared address is never
+  collapsed into a network entry. The skip only narrows a feed, it never
+  adds an entry (MIK-646).
+
+### Changed
+- Scan levels 1 to 3 also probe the relay/proxy ports 1080, 4145, 8118
+  and 9050 and the consumer-device ports 7547, 8291, 8089, 5555 and
+  37777. Operators see these probes on the wire (MIK-586).
+- The sharing card follows the UX review: the caveat and direction text
+  come before the sentence, a neutral badge without a rule number in its
+  tooltip, a separate link to `/ips?reading=`, the `/ips` chip shows the
+  state's label, `Kind` and `Seen (UTC)` columns with first and last day,
+  the name's real lookup source (PTR / rDNS / DNS), and the Names line
+  jump clears the sticky header with a visible outline (MIK-652, MIK-662,
+  MIK-665).
+
 ## [0.20.0] - 2026-10-19
 
 Personas and AI agent detection (roadmap #2 and #3). Each node presents

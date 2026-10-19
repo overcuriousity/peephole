@@ -265,6 +265,8 @@ pub(crate) async fn apply_ip_name(
 /// a scan (`ptr`).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NameRow {
+    /// `ip_names.id`: the IP page anchors the name at `#name-<id>`.
+    pub id: i64,
     pub name: String,
     pub source: String,
     pub first_seen: String,
@@ -308,7 +310,7 @@ impl Store {
     /// The names of an address, agreed ones first.
     pub async fn names_for_ip(&self, ip_id: i64) -> Result<Vec<NameRow>> {
         Ok(sqlx::query_as::<_, NameRow>(
-            "SELECT name, source, first_seen, last_seen, agreed, asked, answered, votes
+            "SELECT id, name, source, first_seen, last_seen, agreed, asked, answered, votes
              FROM ip_names WHERE ip_id = ?
              ORDER BY agreed DESC, last_seen DESC, name LIMIT 200",
         )
