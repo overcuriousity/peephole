@@ -22,6 +22,7 @@
   <div class="tile"><span class="label">Unique IPs</span><div class="value">{{ crate::admin::views::thousands(stats.unique_ips) }}</div>
     <div class="hint">{% if let Some((d, dir)) = delta_ips %}<span class="delta" data-dir="{{ dir }}">{{ d }}</span> vs previous{% else %}all time{% endif %}</div></div>
   <div class="tile"><span class="label">New IPs</span><div class="value">{{ crate::admin::views::thousands(stats.new_ips) }}</div><div class="hint">first seen in range</div></div>
+  <div class="tile"><span class="label">New path shapes</span><div class="value">{{ crate::admin::views::thousands(stats.new_shapes) }}</div><div class="hint">first seen in range</div></div>
   <div class="tile"><span class="label">Countries</span><div class="value">{{ stats.countries }}</div></div>
   <div class="tile"><span class="label">Tor exits</span><div class="value">{{ stats.tor_ips }}</div></div>
   <div class="tile"><span class="label">Counter-scans</span><div class="value brand">{{ crate::admin::views::thousands(stats.scans_done) }}</div><div class="hint">{{ stats.scanned_ips }} sources</div></div>

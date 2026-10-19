@@ -15,6 +15,7 @@ pub mod intel;
 pub mod lock;
 pub mod model;
 pub mod net;
+pub mod notify;
 pub mod scan;
 pub mod sd_notify;
 pub mod settings;
@@ -329,6 +330,22 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let pool = store.pool.clone();
         async move { store::rdap_net::backfill(&pool).await }
     });
+
+    // Exploit waves, detected on this node's rows (after the shape backfill
+    // counts rule hits), pushed when `[notify]` is set.
+    background.spawn(
+        "waves",
+        notify::run(
+            store.clone(),
+            cfg.waves,
+            cfg.notify.clone(),
+            cfg.cluster
+                .as_ref()
+                .map_or_else(|| "standalone".to_string(), |c| c.node_name.clone()),
+            cfg.webauthn.as_ref().map(|w| w.origin.clone()),
+            shutdown_rx.clone(),
+        ),
+    );
 
     // Queue change notifications: trap + workers publish, admin SSE subscribes.
     let notifier = events::Notifier::new();

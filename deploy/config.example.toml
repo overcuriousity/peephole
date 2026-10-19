@@ -216,6 +216,24 @@ tor_wait_hours = 6
 # jitter_minutes = 5   # only after the delay plus a random 0..jitter per request
 # recent_rows = 50     # rows of the wall's "Recent requests" (last 24 h)
 
+# Exploit waves: a path shape no rule knows, asked for by many distinct IPs
+# within a short window (admin page /admin/paths). Detected on every node
+# from its own rows; node-local, never replicated.
+# [waves]
+# min_ips = 10          # distinct IPs that make a wave (2-100000)
+# window_minutes = 60   # within this many minutes (5-1440)
+
+# Push new waves (at most one push every 5 minutes, 10 waves in it, three
+# tries a wave). Absent: no push, no outbound connection. Each node with
+# [notify] pushes its own waves, so set it on one node of a cluster. The
+# push carries shape text (request content, cut to 120 characters) to the
+# destination you choose. url: https://, or http:// only to a loopback or
+# private address; the url and token are secrets and never logged.
+# [notify]
+# kind = "ntfy"                                # or "webhook" (a JSON POST)
+# url = "https://ntfy.example/<your-topic>"    # an ntfy topic is a credential
+# token = "<bearer token>"                     # optional: Authorization: Bearer …
+
 # Distributed mode: share requests, scan queue, results and intel with other
 # nodes (docs/protocol.md). The installer writes this section on every node;
 # without peers or an invite the node runs alone. Absent: standalone. The

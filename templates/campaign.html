@@ -62,6 +62,7 @@
 </section>
 <section class="card">
   <div class="card-head"><h2>Shapes</h2></div>
+  {% for s in self.waves() %}{% if let Some(w) = s.wave %}<p data-wave><span class="badge badge-wave">wave</span> started probing a path no rule knows: <code>{{ s.text }}</code> ({{ w.ips }} IPs in {{ w.minutes() }} min, first seen {{ crate::admin::views::minute(s.first_seen.as_str()) }})</p>{% endif %}{% endfor %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Shape</th><th class="num">Members</th><th class="num">IPs in dataset</th></tr></thead><tbody>
   {% for s in shapes %}<tr><td class="mono">{{ s.text }}</td><td class="num">{{ s.members }}</td><td class="num">{{ s.df }}</td></tr>{% endfor %}
   {% if shapes.is_empty() %}<tr><td colspan="3" class="empty">No path shape recorded.</td></tr>{% endif %}

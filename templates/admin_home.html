@@ -50,7 +50,7 @@
           <td class="mono">{{ r.method }}</td>
           <td class="path"><a href="/admin/requests/{{ r.id }}">{{ r.path }}</a></td>
           <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
+          <td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}{% if r.new_shape %}<span class="badge badge-new" title="path shape first seen in the last 24 h">new</span>{% endif %}{% if r.wave %}<span class="badge badge-wave" title="path shape formed an exploit wave">wave</span>{% endif %}</span></td>
         </tr>
       {% endfor %}
       {% if recent.is_empty() %}<tr data-empty><td colspan="6" class="empty">Nothing yet.</td></tr>{% endif %}

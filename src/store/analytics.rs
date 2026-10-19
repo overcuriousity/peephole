@@ -244,16 +244,18 @@ impl Store {
     /// row ids), oldest first: a live view that falls behind skips ahead.
     /// Replicated rows get new local ids, so a cursor on the id sees them.
     pub async fn requests_after(&self, after: i64, limit: i64) -> Result<Vec<RecentRequest>> {
-        let rows: Vec<RecentTuple> = sqlx::query_as(
+        let sql = format!(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
-                    i.country, i.is_tor_exit
+                    i.country, i.is_tor_exit, {}
              FROM requests r JOIN ips i ON r.ip_id = i.id
              WHERE r.id > ? ORDER BY r.id DESC LIMIT ?",
-        )
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&self.read)
-        .await?;
+            super::waves::feed_flags_sql()
+        );
+        let rows: Vec<RecentTuple> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.read)
+            .await?;
         Ok(rows.into_iter().rev().map(recent_from).collect())
     }
 
@@ -271,7 +273,7 @@ impl Store {
     pub async fn related_by_ip(&self, ip_id: i64, except: i64) -> Result<Vec<RecentRequest>> {
         let rows: Vec<RecentTuple> = sqlx::query_as(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
-                    i.country, i.is_tor_exit
+                    i.country, i.is_tor_exit, 0, 0
              FROM requests r JOIN ips i ON r.ip_id = i.id
              WHERE r.ip_id = ? AND r.id != ? ORDER BY r.ts DESC, r.id DESC LIMIT 10",
         )
@@ -289,7 +291,7 @@ impl Store {
         let since = format!("-{RELATED_JA4_DAYS} days");
         let rows: Vec<RecentTuple> = sqlx::query_as(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
-                    i.country, i.is_tor_exit
+                    i.country, i.is_tor_exit, 0, 0
              FROM requests r JOIN ips i ON r.ip_id = i.id
              WHERE r.ts >= datetime('now', ?) AND r.ja4 = ? AND r.ip_id != ?
              ORDER BY r.ts DESC, r.id DESC LIMIT 10",
