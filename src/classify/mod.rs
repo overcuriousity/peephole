@@ -2214,6 +2214,40 @@ mod tests {
         }
     }
 
+    /// Near misses seen on a live node (the MIK-565 gate): scanners whose
+    /// requests carry agent words without being sent by an agent.
+    #[test]
+    fn scanner_near_misses_are_not_agent_traces() {
+        let census = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"internet-census-mcp-scanner","version":"1.0.0"}}}"#;
+        let probe = r#"{"method":"initialize","params":{"clientInfo":{"name":"mcp-fingerprint-probe","version":"1.0"}}}"#;
+        let model_form =
+            br#"{"max_tokens": "", "quantization": "", "tool_function_calling": "", "vision": ""}"#;
+        let cases: [AgentReq; 6] = [
+            // A UA that merely starts like a framework name.
+            (
+                "GET",
+                "/",
+                &[("user-agent", "AutoGenX-Engine/9.1")] as &[(&str, &str)],
+                None,
+            ),
+            // Probes for agents' config files are recon, not agents.
+            ("GET", "/.codex/config.toml", &[], None),
+            ("GET", "/.langchain/config.json", &[], None),
+            // MCP scanners name themselves in clientInfo.
+            ("POST", "/mcp", &[], Some(census.as_bytes())),
+            ("POST", "/mcp", &[], Some(probe.as_bytes())),
+            // A JSON key containing "function_calling" is no tool-call tag.
+            ("POST", "/api/models", &[], Some(&model_form[..])),
+        ];
+        for (m, t, h, b) in cases {
+            let l = agent_verdict(m, t, h, b).labels;
+            assert!(
+                !l.iter().any(|x| x == ART || x == TOOL),
+                "{m} {t} {h:?}: {l:?}"
+            );
+        }
+    }
+
     #[test]
     fn agent_labels_alone_are_weak_bot_tells() {
         for (h, sev) in [
