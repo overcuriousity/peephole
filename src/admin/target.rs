@@ -38,6 +38,8 @@ pub struct Target {
     pub probes: Vec<crate::admin::probes::GroupView>,
     /// The campaign (key, number) the address is a member of (admin only).
     pub campaign: Option<(String, i64)>,
+    /// The address carries an agent label (admin only).
+    pub agent: bool,
 }
 
 impl Target {
@@ -218,13 +220,17 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
-    let campaign = if authed {
-        state.store.campaign_of_ip(ip.id).await?
+    let (campaign, agent) = if authed {
+        (
+            state.store.campaign_of_ip(ip.id).await?,
+            state.store.ip_has_agent_label(ip.id).await?,
+        )
     } else {
-        None
+        (None, false)
     };
     Ok(Some(Target {
         campaign,
+        agent,
         actions,
         probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),
