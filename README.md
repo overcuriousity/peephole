@@ -116,3 +116,6 @@ security key with the one-time token the installer prints. Details:
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT License](LICENSE-MIT), at your option.
+
+Third-party fingerprint methods carry their own notices, and JA4H and JA4X
+are under the FoxIO License 1.1 (non-commercial only): see [NOTICE](NOTICE).
