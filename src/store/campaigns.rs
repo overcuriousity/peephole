@@ -236,6 +236,8 @@ pub struct CampaignListItem {
     pub countries: Vec<(String, i64)>,
     /// (ASN, organisation, members).
     pub asns: Vec<(i64, Option<String>, i64)>,
+    /// Agent-driven: a member carries an agent label.
+    pub agent: bool,
 }
 
 /// A path shape the members asked for.
@@ -508,6 +510,7 @@ impl Store {
                 }
             }
         }
+        let agent = self.agent_campaigns(None).await?;
         let (country, asn, min) = (f.country(), f.asn(), f.min());
         let (from, to) = (CampaignFilter::day(&f.from), CampaignFilter::day(&f.to));
         let mut out: Vec<CampaignListItem> = self
@@ -530,6 +533,7 @@ impl Store {
                     asns.into_iter().map(|(a, (o, n))| (a, o, n)).collect();
                 asns.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
                 Some(CampaignListItem {
+                    agent: agent.contains(&row.key),
                     row,
                     countries,
                     asns,
@@ -636,6 +640,25 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.read)
         .await?)
+    }
+
+    /// The keys of the agent-driven campaigns (any member IP carries an
+    /// agent label), or only `key`'s if it is one; read from `ip_labels`,
+    /// never stored on `campaigns`.
+    pub async fn agent_campaigns(&self, key: Option<&str>) -> Result<BTreeSet<String>> {
+        let [art, tool] = crate::classify::AGENT_LABELS;
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT m.campaign_key FROM ip_labels l
+             JOIN campaign_members m ON m.ip_id = l.ip_id
+             WHERE l.label IN (?, ?) AND l.count > 0 AND (?3 IS NULL OR m.campaign_key = ?3)
+             GROUP BY m.campaign_key",
+        )
+        .bind(art)
+        .bind(tool)
+        .bind(key)
+        .fetch_all(&self.read)
+        .await?;
+        Ok(keys.into_iter().collect())
     }
 
     /// The campaign (key, number) an IP is a member of.
@@ -2628,5 +2651,86 @@ pub(crate) mod tests {
             section(&out, "agreement").contains(&"[+0.8, +1.0] 1"),
             "{out}"
         );
+    }
+
+    /// The agent mark: a campaign with a member labelled by either agent
+    /// rule, none on one whose members carry other labels (MIK-566).
+    #[tokio::test]
+    async fn agent_mark_comes_from_member_ip_labels() {
+        let (s, _d) = store().await;
+        for (key, num) in [("192.0.2.1", 1), ("192.0.2.3", 2), ("192.0.2.5", 3)] {
+            sqlx::query(
+                "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                   hard_edges, soft_edges, v, computed_at)
+                 VALUES (?, ?, 0, 2, '2026-10-01 00:00:00', '2026-10-01 00:00:00', 1, 0, 1, '')",
+            )
+            .bind(key)
+            .bind(num)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let members = [
+            (1, "192.0.2.1"),
+            (2, "192.0.2.1"),
+            (3, "192.0.2.3"),
+            (4, "192.0.2.3"),
+            (5, "192.0.2.5"),
+        ];
+        for (ip_id, key) in members {
+            sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, ?)")
+                .bind(ip_id)
+                .bind(key)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        // 2: artifact; 3: tooling; 5: other labels and a spent agent row.
+        for (ip_id, label, n) in [
+            (2, "ai-agent-artifact", 1),
+            (3, "ai-agent-tooling", 2),
+            (4, "sqli", 1),
+            (5, "wp", 3),
+            (5, "ai-agent-tooling", 0),
+        ] {
+            sqlx::query("INSERT INTO ip_labels (ip_id, label, count) VALUES (?, ?, ?)")
+                .bind(ip_id)
+                .bind(label)
+                .bind(n)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let all = s.agent_campaigns(None).await.unwrap();
+        assert_eq!(
+            all.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["192.0.2.1", "192.0.2.3"]
+        );
+        assert!(
+            s.agent_campaigns(Some("192.0.2.5"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.agent_campaigns(Some("192.0.2.3")).await.unwrap().len(), 1);
+        let marks: Vec<(String, bool)> = s
+            .campaign_index(&CampaignFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.row.key, c.agent))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                ("192.0.2.1".to_string(), true),
+                ("192.0.2.3".to_string(), true),
+                ("192.0.2.5".to_string(), false)
+            ]
+        );
+        assert!(s.ip_has_agent_label(2).await.unwrap());
+        assert!(s.ip_has_agent_label(3).await.unwrap());
+        assert!(!s.ip_has_agent_label(4).await.unwrap());
+        assert!(!s.ip_has_agent_label(5).await.unwrap());
     }
 }

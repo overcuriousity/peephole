@@ -127,6 +127,8 @@ struct CampaignPage {
     commands: Vec<CampaignCommand>,
     /// The merged Timeline, as `_events.html` reads it.
     t: CampaignTimeline,
+    /// Agent-driven: a member carries an agent label.
+    agent: bool,
 }
 
 /// Wave lines on a campaign's page, at most.
@@ -184,6 +186,7 @@ async fn campaign(
         .store
         .campaign_events(&key, None, CAMPAIGN_EVENTS)
         .await?;
+    let agent = !st.store.agent_campaigns(Some(&key)).await?.is_empty();
     render(&CampaignPage {
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
@@ -197,6 +200,7 @@ async fn campaign(
             labels: true,
         },
         edges,
+        agent,
         c,
     })
 }
@@ -207,6 +211,56 @@ mod tests {
     use crate::store::campaigns::tests::{feed, fixture, seed_artifacts, tls_fixture};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+
+    /// The agent marks (MIK-566): "agent-driven" on the list and the page
+    /// of a campaign with an agent-labelled member, the badge on that IP's
+    /// page; none on the unlabelled campaign or IP.
+    #[tokio::test]
+    async fn agent_marks_follow_ip_labels() {
+        let (state, cookie, app, _d) = app().await;
+        feed(&state.store, fixture()).await;
+        state.store.recompute_campaigns(true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO ip_labels (ip_id, label, count)
+             SELECT id, 'ai-agent-tooling', 1 FROM ips WHERE ip = '192.0.2.1'",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        let get = |path: &str| {
+            Request::get(path)
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+        };
+        let page = |p: &'static str| {
+            let app = app.clone();
+            let r = get(p);
+            async move {
+                let (st, _, body) = send(&app, r, Body::empty()).await;
+                assert_eq!(st, StatusCode::OK, "{p}");
+                body
+            }
+        };
+        let list = page("/admin/campaigns").await;
+        assert_eq!(list.matches("badge-agent").count(), 1, "{list}");
+        let row = list
+            .split("<tr>")
+            .find(|r| r.contains("badge-agent"))
+            .unwrap();
+        assert!(row.contains("/admin/campaigns/192.0.2.3"), "{row}");
+        assert!(
+            page("/admin/campaigns/192.0.2.3")
+                .await
+                .contains(">agent-driven</span>")
+        );
+        assert!(
+            !page("/admin/campaigns/198.51.100.10")
+                .await
+                .contains("badge-agent")
+        );
+        assert!(page("/ip/192.0.2.1").await.contains(">agent traces</span>"));
+        assert!(!page("/ip/192.0.2.2").await.contains("badge-agent"));
+    }
 
     #[tokio::test]
     async fn campaign_pages_render_and_need_a_session() {

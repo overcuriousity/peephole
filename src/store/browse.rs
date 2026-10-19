@@ -713,6 +713,19 @@ impl Count {
 }
 
 impl Store {
+    /// Whether an IP carries an agent label (the admin IP page's badge).
+    pub async fn ip_has_agent_label(&self, ip_id: i64) -> Result<bool> {
+        let [art, tool] = crate::classify::AGENT_LABELS;
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ip_labels WHERE ip_id = ? AND label IN (?, ?) AND count > 0)",
+        )
+        .bind(ip_id)
+        .bind(art)
+        .bind(tool)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Whether some IP carries `label` (admin count, as `/ips?label=`).
     pub async fn label_exists(&self, label: &str) -> Result<bool> {
         Ok(sqlx::query_scalar(

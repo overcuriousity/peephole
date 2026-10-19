@@ -395,7 +395,7 @@ const WEAK_LABELS: [&str; 5] = [
 
 /// Labels that say an LLM agent sent the request (its own output in the
 /// request, or its SDK's headers), not what the request was after.
-const AGENT_LABELS: [&str; 2] = ["ai-agent-artifact", "ai-agent-tooling"];
+pub const AGENT_LABELS: [&str; 2] = ["ai-agent-artifact", "ai-agent-tooling"];
 
 /// Labels the classifier gives without a rule having matched: the weak
 /// labels and the behaviour labels (method, proxy, bot tells). A request

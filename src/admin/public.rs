@@ -582,7 +582,7 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             .format("%Y-%m-%dT%H:%M")
             .to_string()
     };
-    let presets: [(&str, &str, &str, String); 12] = [
+    let presets: [(&str, &str, &str, String); 14] = [
         ("Last hour", "Received in the last hour", "from", since(1)),
         (
             "Last 24 h",
@@ -620,6 +620,18 @@ fn request_shortcuts(f: &RequestFilter, now: chrono::NaiveDateTime) -> Vec<Short
             "Logins with default credentials (admin:admin, Mirai pairs)",
             "label",
             "credential-attack".into(),
+        ),
+        (
+            "Agent artifact",
+            "Agent traces: an LLM agent's own output in the request",
+            "label",
+            "ai-agent-artifact".into(),
+        ),
+        (
+            "Agent tooling",
+            "Agent traces: an agent SDK or framework's headers",
+            "label",
+            "ai-agent-tooling".into(),
         ),
         ("POST", "Requests with method POST", "method", "POST".into()),
         (
@@ -1354,6 +1366,14 @@ mod tests {
         let none = RequestFilter::default();
         assert_eq!(get(&none, "MCP decoy").href, "/requests?answer=decoy%3Amcp");
         assert_eq!(get(&none, "LLM decoy").href, "/requests?answer=decoy%3Allm");
+        assert_eq!(
+            get(&none, "Agent artifact").href,
+            "/requests?label=ai-agent-artifact"
+        );
+        assert_eq!(
+            get(&none, "Agent tooling").href,
+            "/requests?label=ai-agent-tooling"
+        );
         let s = request_qs(&RequestFilter {
             session: Some("ab-cd".into()),
             ..Default::default()
