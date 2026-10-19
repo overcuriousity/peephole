@@ -7,7 +7,10 @@
 //! catalogues (`rules/evidence/*.toml`); recomputed with the hourly
 //! campaign pass, never replicated, never exported, never in the blocklist:
 //! a dynamic address can be personal data, and a device banner is
-//! forgeable by the party with the most to gain from it.
+//! forgeable by the party with the most to gain from it. The one exception
+//! is the shared reading's rules 2, 4, 5 and 6 ([`Shared`]), which the
+//! export and the blocklist feed carry as a cost warning, derived at
+//! publish time; the rows themselves still stay here.
 use super::Store;
 use crate::lock::RwLockExt;
 use anyhow::{Context, Result, bail};
@@ -1432,6 +1435,193 @@ pub fn reading_sql() -> String {
     sql
 }
 
+// ---- The shared reading at the boundaries --------------------------------
+
+/// Kinds one of which every shared field needs: the field rests on an
+/// operator's name only, so a mobile `net.eyeball` row alone sets none.
+const SHARED_KINDS: [&str; 3] = ["name.pool", "name.cgn", "name.mobile"];
+
+/// One `ip_evidence` row with its address and Tor flag, as
+/// [`Store::shared_readings`] reads it.
+type SharedRow = (
+    String,
+    bool,
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+);
+
+impl Sharing {
+    /// The readings the export and the blocklist feed carry: those that
+    /// say the address is, or sits on, a pool (rules 2, 4, 5 and 6).
+    pub fn is_shared(self) -> bool {
+        matches!(
+            self,
+            Sharing::SubscriberPooled
+                | Sharing::CarrierPool
+                | Sharing::MobilePool
+                | Sharing::PooledLine
+        )
+    }
+
+    /// The name kind a shared reading rests on.
+    fn name_kind(self) -> Option<&'static str> {
+        match self {
+            Sharing::SubscriberPooled | Sharing::PooledLine => Some("name.pool"),
+            Sharing::CarrierPool => Some("name.cgn"),
+            Sharing::MobilePool => Some("name.mobile"),
+            _ => None,
+        }
+    }
+}
+
+/// The shared reading as the export's `shared` column and the blocklist
+/// feed carry it (docs/detection.md, "Shared addresses"): computed by the
+/// publishing node at publish time from its own rows, never stored, never
+/// replicated. A cost warning about blocking the address, not a verdict on
+/// it, and never a number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Shared {
+    /// [`Sharing::key`].
+    pub state: &'static str,
+    pub rule: u8,
+    pub v: i64,
+    /// Who makes the claim: `operator naming`, or `operator naming and
+    /// scan` (rule 2).
+    pub source: &'static str,
+    /// The operator's name the claim rests on, as the export's `names`
+    /// column lists it.
+    pub name: String,
+}
+
+impl Shared {
+    /// The shared field of a reading; None unless it is rule 2, 4, 5 or 6
+    /// and the name it rests on is one the export lists (`names`: agreed
+    /// names only), so that every claim is checkable from the export.
+    /// `names`: agreed `ip_names` by id.
+    pub fn of(r: &Reading, names: &HashMap<i64, String>) -> Option<Shared> {
+        if !r.state.is_shared() {
+            return None;
+        }
+        let kind = r.state.name_kind()?;
+        let row = r
+            .rows
+            .iter()
+            .find(|x| x.kind == kind && x.ref_kind == "name")?;
+        let name = names.get(&row.ref_id)?.clone();
+        let source = match r.state {
+            Sharing::SubscriberPooled => "operator naming and scan",
+            _ => "operator naming",
+        };
+        Some(Shared {
+            state: r.state.key(),
+            rule: r.state.rule(),
+            v: r.v,
+            source,
+            name,
+        })
+    }
+
+    /// What the reading says, with who says it, in one line; never "detected".
+    pub fn text(&self) -> String {
+        let by = "the operator's naming";
+        let pooled = "the line is reassigned, the next holder is someone else";
+        match self.rule {
+            2 => {
+                format!("one subscriber's network, on a pooled line, by {by} and a scan; {pooled}")
+            }
+            4 => format!("shared pool, by {by}; not verified by behaviour"),
+            5 => format!("shared pool, mobile, by {by}; not verified by behaviour"),
+            _ => format!("pooled line, by {by}; {pooled}"),
+        }
+    }
+
+    /// The blocklist feed's comment line before the entry `entry`. The
+    /// name is left out: a PTR name is the operator's text, and a feed
+    /// line is read by firewall scripts.
+    pub fn note(&self, entry: &str) -> String {
+        format!(
+            "# shared {entry} rule={} v={}: {}",
+            self.rule,
+            self.v,
+            self.text()
+        )
+    }
+}
+
+impl Store {
+    /// The shared field of every address that has one, or of those among
+    /// `ip_ids`: (ip id, address, field). Only addresses with a pool, CGN,
+    /// mobile or mobile-network row are read, so the whole node costs a
+    /// few dozen readings.
+    pub async fn shared_readings(
+        &self,
+        ip_ids: Option<&[i64]>,
+    ) -> Result<Vec<(i64, String, Shared)>> {
+        let rows: Vec<(String, bool, EvidenceRow)> = sqlx::query_as::<_, SharedRow>(
+            "SELECT i.ip, i.is_tor_exit, e.ip_id, e.kind, e.value, e.ref_kind, e.ref_id,
+                    e.first_ts, e.last_ts, e.v
+             FROM ip_evidence e JOIN ips i ON i.id = e.ip_id
+             WHERE e.ip_id IN (SELECT ip_id FROM ip_evidence
+                               WHERE kind IN (SELECT value FROM json_each(?1)))
+               AND (?2 IS NULL OR e.ip_id IN (SELECT value FROM json_each(?2)))
+             ORDER BY e.ip_id, e.kind, e.last_ts DESC, e.ref_id",
+        )
+        .bind(serde_json::to_string(&SHARED_KINDS)?)
+        .bind(ip_ids.map(serde_json::to_string).transpose()?)
+        .fetch_all(&self.read)
+        .await?
+        .into_iter()
+        .map(
+            |(ip, tor, ip_id, kind, value, ref_kind, ref_id, first_ts, last_ts, v)| {
+                (
+                    ip,
+                    tor,
+                    EvidenceRow {
+                        ip_id,
+                        kind,
+                        value,
+                        ref_kind,
+                        ref_id,
+                        first_ts,
+                        last_ts,
+                        v,
+                    },
+                )
+            },
+        )
+        .collect();
+        let name_ids: Vec<i64> = rows
+            .iter()
+            .filter(|(_, _, r)| r.ref_kind == "name")
+            .map(|(_, _, r)| r.ref_id)
+            .collect();
+        let names: HashMap<i64, String> = sqlx::query_as(
+            "SELECT id, name FROM ip_names
+             WHERE agreed = 1 AND id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(&name_ids)?)
+        .fetch_all(&self.read)
+        .await?
+        .into_iter()
+        .collect();
+        let mut out = vec![];
+        for group in rows.chunk_by(|a, b| a.2.ip_id == b.2.ip_id) {
+            let (ip, tor, first) = &group[0];
+            let ev: Vec<EvidenceRow> = group.iter().map(|(_, _, r)| r.clone()).collect();
+            if let Some(s) = Shared::of(&reading(&ev, *tor), &names) {
+                out.push((first.ip_id, ip.clone(), s));
+            }
+        }
+        Ok(out)
+    }
+}
+
 // ---- The IP page ----------------------------------------------------------
 
 /// One evidence row as the IP page shows it.
@@ -2372,6 +2562,9 @@ pub(crate) mod tests {
         let r = reading(&[kv_row("net.eyeball", "mobile")], false);
         assert_eq!(r.state, Sharing::MobilePool);
         assert_eq!(r.rows.len(), 1);
+        // The page reads it, but the export and the feed carry a field
+        // only on an operator's name the export lists.
+        assert_eq!(Shared::of(&r, &HashMap::new()), None);
         assert_eq!(
             reading(&[kv_row("net.eyeball", "fixed")], false).state,
             Sharing::Insufficient
@@ -2660,7 +2853,9 @@ pub(crate) mod tests {
 
     /// `ip_evidence` stays on the node: no replication, export, dataset,
     /// API or blocklist code reads it, and an export of an address with
-    /// evidence carries none of it.
+    /// evidence carries none of it. The one way out is the shared field
+    /// ([`Shared`], through [`Store::shared_readings`]), which carries a
+    /// reading, never a row (MIK-646).
     #[tokio::test]
     async fn evidence_is_in_no_export_dataset_replication_or_blocklist_path() {
         fn sources(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2687,7 +2882,9 @@ pub(crate) mod tests {
         }
         assert!(files.len() > 20, "{files:?}");
         for f in &files {
-            let text = std::fs::read_to_string(f).unwrap();
+            let text = std::fs::read_to_string(f)
+                .unwrap()
+                .replace("evidence::Shared", "");
             for needle in [
                 "ip_evidence",
                 "evidence::",
@@ -2720,5 +2917,177 @@ pub(crate) mod tests {
         for needle in ["device.cpe", "\"tr069\"", "evidence"] {
             assert!(!out.contains(needle), "{needle} in the export");
         }
+    }
+
+    /// MIK-646: a consumer recomputes `shared` from the export's `names`
+    /// column with the published catalogue. Where no gate row applies
+    /// (rule 1: hosting, scanner name, fleet, Tor exit; rules 2 and 3: a
+    /// consumer router in a scan) the recompute is exact; where one does,
+    /// the gate only ever withholds a claim (rule 1, rule 3) or names a
+    /// scan beside the same name (rule 2), and every value set rests on a
+    /// name the column lists.
+    #[tokio::test]
+    async fn a_consumer_recomputes_shared_from_the_names_column() {
+        use futures::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        // (address, name, agreed, Tor exit, expected rule)
+        type Case<'a> = (&'a str, Option<&'a str>, bool, bool, Option<u8>);
+        let cases: &[Case] = &[
+            (
+                "192.0.2.1",
+                Some("0-0-0-1.cgn-wdsl.example.it"),
+                true,
+                false,
+                Some(4),
+            ),
+            (
+                "192.0.2.2",
+                Some("dynamic-2.pool.example.de"),
+                true,
+                false,
+                Some(6),
+            ),
+            (
+                "192.0.2.3",
+                Some("0-0-0-3.lte.example.net"),
+                true,
+                false,
+                Some(5),
+            ),
+            (
+                "192.0.2.4",
+                Some("0-0-0-4.broadband.example.co.uk"),
+                true,
+                false,
+                None,
+            ),
+            ("192.0.2.5", None, true, false, None),
+            ("192.0.2.6", Some("cgnat-6.example.net"), true, true, None),
+            ("192.0.2.7", Some("cgnat-7.example.net"), false, false, None),
+        ];
+        let add_name = |ip: i64, name: &str, agreed: bool| {
+            let pool = s.pool.clone();
+            let name = name.to_string();
+            async move {
+                sqlx::query(
+                    "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                     VALUES (?, ?, 'ptr', datetime('now'), datetime('now'), ?)",
+                )
+                .bind(ip)
+                .bind(name)
+                .bind(agreed)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        for (addr, name, agreed, tor, _) in cases {
+            let ip = s.upsert_ip(addr.parse().unwrap()).await.unwrap();
+            s.insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            sqlx::query("UPDATE ips SET is_tor_exit = ? WHERE id = ?")
+                .bind(*tor)
+                .bind(ip.id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+            if let Some(n) = name {
+                add_name(ip.id, n, *agreed).await;
+            }
+        }
+        // A FRITZ!Box-like router answering on a pooled line: rule 2.
+        let (cpe, _) = seed_tr069(&s).await;
+        add_name(cpe, "dynamic-47.pool.example.de", true).await;
+        s.recompute_evidence().await.unwrap();
+
+        let parts: Vec<axum::body::Bytes> = crate::export::stream_requests(
+            s.clone(),
+            crate::export::ExportFilter::default(),
+            crate::export::Format::Jsonl,
+            Default::default(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let out: String = parts.iter().map(|b| String::from_utf8_lossy(b)).collect();
+        let rows: HashMap<String, serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .map(|r| (r["ip"].as_str().unwrap().to_string(), r))
+            .collect();
+        assert_eq!(rows.len(), cases.len() + 1);
+
+        // The consumer's side: the bundled catalogue over `names` only.
+        let cat = Catalogue::builtin();
+        let recompute = |names: &serde_json::Value| -> Option<(u8, String)> {
+            let classes = [(4, &cat.cgn), (5, &cat.mobile), (6, &cat.pool)];
+            classes.iter().find_map(|(rule, list)| {
+                names.as_array()?.iter().find_map(|n| {
+                    let name = n["name"].as_str()?;
+                    list.iter()
+                        .any(|p| p.re.is_match(&name.to_lowercase()))
+                        .then(|| (*rule, name.to_string()))
+                })
+            })
+        };
+        let field = |r: &serde_json::Value| -> Option<(u8, String)> {
+            let sh = &r["shared"];
+            (!sh.is_null()).then(|| {
+                (
+                    sh["rule"].as_u64().unwrap() as u8,
+                    sh["name"].as_str().unwrap().to_string(),
+                )
+            })
+        };
+        for (addr, _, _, tor, want) in cases {
+            let r = &rows[*addr];
+            assert_eq!(field(r).map(|f| f.0), *want, "{addr}: {}", r["shared"]);
+            if *tor {
+                // Rule 1 withholds what the names alone would claim.
+                assert_eq!(recompute(&r["names"]).map(|c| c.0), Some(4), "{addr}");
+            } else {
+                assert_eq!(field(r), recompute(&r["names"]), "{addr}");
+            }
+        }
+        let r = &rows["203.0.113.47"];
+        assert_eq!(
+            r["shared"],
+            serde_json::json!({
+                "state": "subscriber-pooled",
+                "rule": 2,
+                "v": EVIDENCE_V,
+                "source": "operator naming and scan",
+                "name": "dynamic-47.pool.example.de",
+            })
+        );
+        // The names give the pooled line; the scans column gives the router.
+        assert_eq!(
+            recompute(&r["names"]),
+            Some((6, "dynamic-47.pool.example.de".into()))
+        );
+        assert!(r["scans"].to_string().contains("TP-LINK TR-069"));
+        let sh = &rows["192.0.2.1"]["shared"];
+        assert_eq!(
+            (
+                sh["state"].as_str(),
+                sh["source"].as_str(),
+                sh["v"].as_i64()
+            ),
+            (
+                Some("shared-pool"),
+                Some("operator naming"),
+                Some(EVIDENCE_V)
+            )
+        );
+        assert!(!out.contains("detected"));
     }
 }

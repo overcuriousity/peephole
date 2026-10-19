@@ -131,6 +131,9 @@ pub struct ExportRow {
     /// The address's agreed names (`ip_names`).
     pub names: Arc<str>,
     pub fingerprints: Arc<str>,
+    /// The address's shared reading where it is rule 2, 4, 5 or 6
+    /// ([`crate::store::evidence::Shared`]), derived at export time.
+    pub shared: Option<Value>,
 }
 
 /// Columns of the text exports, in order.
@@ -186,6 +189,7 @@ pub const COLUMNS: &[&str] = &[
     "message",
     "datetime",
     "timestamp_desc",
+    "shared",
 ];
 
 /// Neutralise spreadsheet formula injection: a cell that a spreadsheet would
@@ -348,6 +352,7 @@ impl ExportRow {
             "message": self.message(),
             "datetime": rfc3339(self.ts_ms),
             "timestamp_desc": self.timestamp_desc(),
+            "shared": self.shared,
         });
         match v {
             Value::Object(m) => m,
@@ -639,6 +644,10 @@ fn fill_ip(
     row.is_tor = as_of(&cols.tor, row.ts_ms);
     row.is_tor_relay = as_of(&cols.relay, row.ts_ms);
     row.campaign = ctx.campaigns.get(&ip_id).cloned();
+    row.shared = ctx
+        .shared
+        .get(&ip_id)
+        .map(|s| serde_json::to_value(s).expect("plain struct"));
 }
 
 fn request_row(
@@ -1719,10 +1728,8 @@ mod tests {
         );
         let b = ParquetRecordBatchReaderBuilder::try_new(pq).unwrap();
         let meta = b.metadata().file_metadata().key_value_metadata().unwrap();
-        assert!(
-            meta.iter()
-                .any(|kv| kv.key == "peephole.format_version" && kv.value.as_deref() == Some("1"))
-        );
+        assert!(meta.iter().any(|kv| kv.key == "peephole.format_version"
+            && kv.value.as_deref() == Some(parquet::FORMAT_VERSION)));
         let schema = b.schema().clone();
         // The same columns in the same order as the text exports, less
         // their RFC 3339 copy of `ts`.

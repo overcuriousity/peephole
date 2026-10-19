@@ -1,9 +1,11 @@
 # Shared addresses: can peephole tell that a source address is shared, carrier-NATed, mobile or pooled?
 
-This is an assessment of an unbuilt proposal, not a description of shipped
-behaviour, in the same register as [Compromised sources](compromised-sources.md):
-if a part of it is built, that part moves into [Detection](detection.md)
-and this file shrinks to the reasoning. Scope: the owner's follow-up on
+This is the assessment behind the shared reading, in the same register as
+[Compromised sources](compromised-sources.md). The narrow slice it
+recommends is built (MIK-647, MIK-646): what ships, the rules, the export
+column and the blocklist lines, is described in
+[Detection](detection.md#shared-addresses) and
+[the dataset](dataset.md#shared); this file keeps the reasoning. Scope: the owner's follow-up on
 MIK-574, "can we confidently detect wether the ip is a shared one, a
 mobile one, cgNAT or similar pooled ones? i am not strictly against a
 score, as ling as it is transparent". The no-score rule of the compromised
@@ -584,16 +586,13 @@ evidence row that matched, each with its kind, value, the raw row it
 points to, and `first_ts`/`last_ts`. Wording is about what was observed and
 who observed it.
 
-| # | rule | reading | shown as |
-|---|---|---|---|
-| 1 | `net.hosting`, `name.scanner`, `fleet.key` or `fleet.canary`, or a Tor exit | *not read: one operator's address* | nothing on this axis; the compromised-family verdict already describes the address |
-| 2 | `device.cpe` (or `scan.multistack`) and `name.pool` | *one subscriber's network, on a pooled line* | "A FRITZ!Box answered on 8089 in scan #… (level 3, 2026-10-14) and the operator names this address `…dynamic…` (PTR looked up …): a consumer router fronts this address, so one subscriber holds it at a time, and the line is reassigned, on such networks daily to fortnightly. The next holder is someone else. This argues against a carrier pool, not against reassignment." |
-| 3 | `device.cpe` (or `scan.multistack`) | *one subscriber's network* | "A FRITZ!Box answered on 8089 in scan #… (level 3, 2026-10-14): a consumer router fronts this address, so one subscriber holds it and several of their devices may share it. This argues against a carrier pool." |
-| 4 | `name.cgn` | *shared pool, by the operator's naming* | "The operator names this address `…cgn-wdsl…` (PTR looked up 2026-10-15): a carrier-NAT pool by its own naming, shared by unrelated subscribers. Not verified by behaviour; nothing we hold can verify it." |
-| 5 | `name.mobile`, or `net.eyeball` = `mobile` | *shared pool, mobile* | "The operator names this address `…umts…` (PTR looked up …): a mobile pool, where an address usually holds a subscriber for a day or less. By naming only." |
-| 6 | `name.pool` | *pooled line* | "The operator names this address `…dynamic…` (PTR looked up …): a line that is reassigned, on such networks daily to fortnightly. The next holder is someone else." |
-| 7 | `name.consumer` (any other entry) | *consumer line, sharing not read* | "The name says a consumer line (`…dsl…`); whether it is shared is not observed." |
-| 8 | otherwise | *insufficient evidence* | "No evidence either way. An address without a name or a scan result is not thereby single-user, and not thereby shared." |
+The table of rules 1 to 8, with what each reading shows, is in
+[Detection](detection.md#shared-addresses); the sentences are in the code
+(`src/store/evidence.rs`, `sharing_view`). In short: rule 1 strips hosting,
+scanner, fleet and Tor addresses; rules 2 and 3 are a consumer router
+answering (with and without a pooled name); rules 4, 5 and 6 are a
+carrier-NAT, mobile and pooled-line name; 7 another consumer name; 8 the
+default, insufficient evidence.
 
 Rule order is the forgery argument. Rule 1 removes every address a renter
 controls the PTR of, so a planted `cgn` name on rented space reads nothing
@@ -763,6 +762,15 @@ only, the build recommendation below changes.
 
 ## Recommendation
 
+*Built as recommended, after Head took the shared-surface recommendation
+with conditions (MIK-645): steps 1 and 2 in MIK-647, steps 3 and 4 in
+MIK-646. One difference from step 3: the export value also carries
+`source` and the `name` the claim rests on, and is set only where that
+name is one the export's `names` column lists, so that every value can be
+checked from the export itself; the blocklist line leaves the name out,
+since a PTR name is the operator's text and a feed line is read by
+firewall scripts.*
+
 **Build the narrow slice only if Head takes the shared-surface
 recommendation; if the reading stays local only, do not build it.** Local
 only, the slice puts about 60 sentences on the admin IP pages of one node
@@ -784,7 +792,7 @@ The slice, in order, each step with its check:
    `name.mobile` on 2 of the hermes data, and `expresspools.us` on none.
    Half a day.
 2. **Reading.** A function over an address's rows implementing rules 1 to
-   8, with the sentences above and the fixed direction text; shown on the
+   8, with the sentences of the reading table and the fixed direction text; shown on the
    admin IP page under the device verdict, with each row linked to its
    name or scan; `/ips?reading=<state>` as a list filter. Check: the three
    `cgn` candidates read rule 4, the Vodacom address reads rule 4 and

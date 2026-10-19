@@ -267,8 +267,44 @@ JavaScript).
 | `datetime` | Same as `ts`, RFC 3339 |
 | `timestamp_desc` | `HTTP request logged` or `HTTP request skipped` |
 
-The Parquet file carries `peephole.format_version` (`1`) and the export
-filter in its metadata.
+### Shared
+
+| Column | Type | Meaning |
+|---|---|---|
+| `shared` | object? | The address's shared reading where it is a pool or sits on one; null otherwise. Last column in CSV |
+
+```json
+{"state": "shared-pool", "rule": 4, "v": 3, "source": "operator naming", "name": "0-0-0-0.cgn-wdsl.example.it"}
+```
+
+Set by four readings of the [shared reading](detection.md#shared-addresses)
+only: `subscriber-pooled` (rule 2: a consumer router answered in a scan and
+the operator names the line pooled), `shared-pool` (rule 4: a carrier-NAT
+name), `shared-mobile` (rule 5: a mobile name) and `pooled-line` (rule 6:
+a pooled-line name such as `dynamic` or `pool`). `v` is the evidence
+version the reading rests on. `source` names who makes the claim:
+`operator naming`, or `operator naming and scan` for rule 2. `name` is the
+reverse or PTR name the claim rests on, one of the address's `names`. Null
+for every other reading, among them hosting, scanner, fleet and Tor exit
+addresses (rule 1) and an address where a consumer router answered without
+a pooled name (rule 3).
+
+The column is derived by the exporting node when the export runs, from its
+own rows; it is never stored and never replicated, and it adds no claim of
+its own. A consumer can check each value with the bundled name patterns
+(`rules/evidence/names.toml`, classes `cgn`, `mobile`, `pool`) against the
+`names` column. On an address with no hosting, scanner, fleet, Tor or
+router evidence that recompute gives the same value; the other gates only
+ever withhold a value (rules 1 and 3) or add the scan beside the same
+name (rule 2, whose router is in `scans`).
+
+**A cost warning, not a verdict.** A value means a block on the address
+hits other people. It is not verified by behaviour, and it goes stale
+quickly: 75 % of mobile associations are gone within a day. Use it to weigh the cost of a block, not to clear or convict an
+address.
+
+The Parquet file carries `peephole.format_version` (`2`; `1` had no
+`shared` column) and the export filter in its metadata.
 
 ## Canaries
 
