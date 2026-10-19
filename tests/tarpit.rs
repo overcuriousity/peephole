@@ -90,7 +90,7 @@ async fn until(store: &Store, sql: &str, n: i64) {
 async fn mark(addr: SocketAddr, store: &Store) {
     let answer = read_all(send(addr, "/", "User-Agent: () { :;}; /bin/bash -c id\r\n").await).await;
     assert!(
-        answer.starts_with("HTTP/1.1 404"),
+        answer.starts_with("HTTP/1.1 200"),
         "first contact: {answer}"
     );
     until(store, "SELECT COUNT(*) FROM requests WHERE severity = 4", 1).await;
@@ -149,6 +149,6 @@ async fn with_the_pool_full_the_answer_is_the_normal_one() {
         .collect();
     assert_eq!(
         answers,
-        [("/", "not-found"), ("/a", "tarpit"), ("/b", "not-found")]
+        [("/", "landing"), ("/a", "tarpit"), ("/b", "not-found")]
     );
 }

@@ -7,6 +7,7 @@
 use super::ai::{Ask, DecoyIn, MAX_FIELD, cut, rpc_id};
 use super::{Decoy, Input};
 use crate::model::ai_id::AiId;
+use crate::trap::persona::AiIdentity;
 use serde_json::Value;
 
 /// The five tools every node serves: canonical name (what is stored and
@@ -123,12 +124,16 @@ const RESOURCES: [(&str, &str); 4] = [
     ("file:///etc/passwd", "passwd"),
 ];
 
-/// `serverInfo` name and version.
-fn server_info(id: Option<&AiId>) -> (&'static str, String) {
-    match id {
+/// `serverInfo` name and version: the name from the persona's pool, or
+/// [`SERVERS`] for a row without one.
+fn server_info(ai: &AiIdentity) -> (&'static str, String) {
+    match &ai.id {
         None => ("internal-ops", "0.3.1".into()),
         Some(a) => (
-            SERVERS[a.raw[0] as usize % SERVERS.len()],
+            {
+                let pool = ai.persona.map_or(&SERVERS[..], |p| p.mcp_servers);
+                pool[a.raw[0] as usize % pool.len()]
+            },
             format!("{}.{}.{}", a.raw[1] % 3, a.raw[2] % 16, a.raw[3] % 32),
         ),
     }
@@ -383,7 +388,8 @@ pub fn render(inp: &Input, d: &DecoyIn, name: &str) -> Option<Decoy> {
 
 /// The JSON-RPC response to `name` (None: not a request with a response).
 pub fn message(inp: &Input, d: &DecoyIn, name: &str) -> Option<String> {
-    let ai = AiId::parse(d.i.as_deref());
+    let who = AiIdentity::derive(d.i.as_deref(), d.p.as_deref());
+    let ai = who.id;
     let id = d.rpc_id();
     let result = match name {
         "initialize" => {
@@ -392,7 +398,7 @@ pub fn message(inp: &Input, d: &DecoyIn, name: &str) -> Option<String> {
                 .as_deref()
                 .filter(|p| PROTOCOLS.contains(p))
                 .unwrap_or(LATEST);
-            let (name, version) = server_info(ai.as_ref());
+            let (name, version) = server_info(&who);
             json!({
                 "protocolVersion": proto,
                 "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
@@ -969,6 +975,44 @@ mod tests {
             rpc("initialize", &with(&ident(1), "{}"))["result"]["serverInfo"],
             rpc("initialize", &with(&ident(2), "{}"))["result"]["serverInfo"]
         );
+    }
+
+    #[test]
+    fn the_persona_picks_the_server_name_pool() {
+        let server = |din: String| {
+            rpc("initialize", &din)["result"]["serverInfo"]["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let under = |i: &str, p: &str| {
+            let v: serde_json::Value = serde_json::from_str(&with(i, "{}")).unwrap();
+            let mut o = v.as_object().unwrap().clone();
+            o.insert("p".into(), p.into());
+            serde_json::Value::Object(o).to_string()
+        };
+        for n in 0..16u8 {
+            let i = ident(n);
+            let (gpu, wp) = (server(under(&i, "gpu-box")), server(under(&i, "wordpress")));
+            assert_ne!(gpu, wp, "{i}");
+            let pool = |p: &str| crate::trap::persona::by_name(p).unwrap().mcp_servers;
+            assert!(pool("gpu-box").contains(&gpu.as_str()));
+            assert!(pool("wordpress").contains(&wp.as_str()));
+            // No or an unknown persona: the node-neutral pool (S1 rows).
+            let neutral = server(with(&i, "{}"));
+            assert!(SERVERS.contains(&neutral.as_str()));
+            assert_eq!(server(under(&i, "nope")), neutral);
+            // The persona changes the name only.
+            assert_eq!(
+                names(&i),
+                rpc("tools/list", &under(&i, "gpu-box"))["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["name"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

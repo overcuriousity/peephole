@@ -237,8 +237,14 @@ mod tests {
         ];
         let mut conn = s.pool.acquire().await.unwrap();
         let mut want = vec![];
-        for (n, (uid, method, path, body)) in cases.iter().enumerate() {
-            let (name, d) = choose(
+        // Under a persona (`"p"`) and as a row written before personas.
+        let runs = cases
+            .iter()
+            .flat_map(|c| [(c, Some("gpu-box")), (c, None)])
+            .enumerate();
+        for (n, ((uid, method, path, body), persona)) in runs {
+            let uid = format!("{uid}-{}", persona.unwrap_or("none"));
+            let (name, mut d) = choose(
                 &Ask {
                     method,
                     path,
@@ -247,10 +253,13 @@ mod tests {
                     body,
                 },
                 &ident,
+                "gpu-box",
             )
             .unwrap();
+            d.p = persona.map(str::to_string);
             let din = d.to_json();
             assert!(din.contains(&format!(r#""i":"{ident}""#)), "{din}");
+            assert_eq!(din.contains(r#""p":"gpu-box""#), persona.is_some(), "{din}");
             // As the trap rendered it when it answered.
             let served = crate::trap::decoy::render(
                 &crate::trap::decoy::Input {
@@ -273,7 +282,7 @@ mod tests {
                     hlc: n as u64 + 1,
                 },
                 &Record::Request(Box::new(crate::cluster::record::RequestRec {
-                    uid: (*uid).into(),
+                    uid: uid.clone(),
                     ts: "2026-10-04 10:00:00".into(),
                     ip: "198.51.100.4".into(),
                     method: (*method).into(),
@@ -290,13 +299,18 @@ mod tests {
             )
             .await
             .unwrap();
-            want.push((*uid, served));
+            want.push((uid, served));
         }
         drop(conn);
-        for (uid, served) in want {
+        for (uid, served) in &want {
             let (got, _) = render_uid(&s, uid).await.unwrap().unwrap();
-            assert_eq!(got, served, "{uid}");
+            assert_eq!(&got, served, "{uid}");
         }
+        // The persona is what the row was served under: gpu-box lists more
+        // models than the node-neutral identity.
+        let body = |u: &str| &want.iter().find(|(w, _)| w == u).unwrap().1.body;
+        assert_ne!(body("r3-gpu-box"), body("r3-none"));
+        assert_ne!(body("r1-gpu-box"), body("r1-none"));
     }
 
     #[tokio::test]

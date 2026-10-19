@@ -145,7 +145,7 @@ pub fn render(inp: &Input, d: &DecoyIn, ep: &str) -> Option<Decoy> {
     let api = d.api.as_deref().unwrap_or("openai");
     let model = d.model.as_deref().unwrap_or("");
     let stream = d.stream.unwrap_or(false);
-    let ms = Models::of(d.i.as_deref());
+    let ms = Models::of(d.i.as_deref(), d.p.as_deref());
     let listed = |m: &str| ms.listed(m);
     let (status, ct, body): Out = match (api, ep) {
         ("ollama", "version") => ok(json!({"version": ms.version})),
