@@ -9,7 +9,9 @@ or residential hijacked device without querying some commercial API, just
 from our own technical metrics?". Numbers come from the data-reality check
 on the hermes node (MIK-577, 2026-10-19, read-only, 11 days of data:
 184,159 requests from 6,543 sources) and from the schema under
-`src/store/migrations/`. Full addresses are not written here; prefixes are
+`src/store/migrations/`. Signal 8 was measured for this assessment a few
+hours after MIK-577 on the same node, at 185,035 requests; the gap is live
+traffic. Full addresses are not written here; prefixes are
 /24.
 
 ## Answer
@@ -196,8 +198,9 @@ suggests 7547 sits outside nmap's top 1000 (`--top-ports 1000` at levels
 2 and 3, `src/scan/profiles.rs`); if so, levels 1 to 3 never see the
 clearest CPE tell. The engineer checks `nmap-services` for 7547 and 8291. Adding a handful
 of CPE ports (`7547`, `8291`, `2000`, `8089`, `5555`, `37777`) to the
-level-1 and level-2 argument lists in `src/scan/profiles.rs` costs a few
-probes per scan and no retention. Scan budget otherwise unchanged;
+level-1, level-2 and level-3 argument lists in `src/scan/profiles.rs`
+(level 1 is `--top-ports 100`, levels 2 and 3 `--top-ports 1000`; level 4
+already scans every port) costs a few probes per scan and no retention. Scan budget otherwise unchanged;
 storage: one derived row per matched (address, signature), thousands of
 rows at most.
 
@@ -421,12 +424,20 @@ was observed.
 | # | rule | verdict | shown as |
 |---|---|---|---|
 | 1 | verified crawler or research scanner (existing FCrDNS check), or Tor exit | `declared` | existing badges; unchanged |
-| 2 | any `fleet.*`, or `net.hosting` with `name.scanner` | `rented fleet` | "one of N addresses sharing SSH key …" / "canary served to … came back from here" |
+| 2 | `fleet.key` or `fleet.canary`; or `fleet.dense` with `net.hosting`; or `net.hosting` with `name.scanner` | `rented fleet` | "one of N addresses sharing SSH key …" / "canary served to … came back from here" |
 | 3 | `net.hosting` alone | `rented` | "hosting AS" |
-| 4 | `device.cpe` and `net.eyeball`, and no `fleet.*`, and no `name.scanner` | `consumer device answered` | "a TP-Link TR-069 service answered on 7547 in scan #… (level 4, <date>); the line is in a consumer ISP AS" |
-| 5 | `device.proxy` and `net.eyeball`, and no `fleet.*` | `proxy software on a consumer line` | "3Proxy answered on 3128 in scan #…" |
-| 6 | `device.cpe` without `net.eyeball` | `consumer device on a non-ISP AS` | shown, flagged "device evidence only; AS is not a consumer ISP" |
+| 4 | `device.cpe` and `net.eyeball`, and no `fleet.key` / `fleet.canary`, and no `name.scanner` | `consumer device answered` | "a TP-Link TR-069 service answered on 7547 in scan #… (level 4, <date>); the line is in a consumer ISP AS" |
+| 5 | `device.proxy` and `net.eyeball`, and no `fleet.key` / `fleet.canary` | `proxy software on a consumer line` | "3Proxy answered on 3128 in scan #…" |
+| 6 | `device.cpe` or `device.proxy`, and no `net.*` row, and no `fleet.key` / `fleet.canary` | `device evidence only` | the device or proxy sentence of rule 4 or 5, then "AS type not classified" |
 | 7 | otherwise | `unknown` | nothing |
+
+`fleet.dense` on its own decides nothing: it only confirms a hosting AS
+(rule 2), never a consumer one, and it does not block rules 4 to 6, because
+a /24 of infected routers in one ISP is dense too. Rule 6 is where every
+`device.*` row lands when the address has no `net.*` row, which is every
+address until the AS-type list exists, and any address in an AS the list
+does not classify afterwards. Rule 3 catches `net.hosting` before rule 6,
+so rule 6 never describes a hosting address.
 
 Rules 4 to 6 never say "compromised", "hijacked" or "botnet". The data
 supports "a consumer device answered our scan on this address at this
@@ -435,9 +446,10 @@ not observable from here, and the text says so. `net.eyeball` with
 `value='mobile'` adds the fixed caveat "mobile ISP address: usually many
 subscribers (CGNAT)".
 
-Order matters against forgery: a planted public key (signal 4) or a dense
-eyeball /24 (signal 6) can only move an address *towards* rented (rule 2),
-which is the direction nobody wants to be moved; a fake CPE banner (signal
+Order matters against forgery: a planted public key (signal 4) can only
+move an address *towards* rented (rule 2), which is the direction nobody
+wants to be moved, and a flooded eyeball /24 (signal 6) moves nothing,
+because `fleet.dense` counts only next to `net.hosting`; a fake CPE banner (signal
 3) can reach rule 4 only on an address that is in no fleet and in an
 eyeball AS, so the renter must also buy ISP-proxy space, and even then
 earns a sentence on an admin page of the node that scanned them, not a
@@ -550,20 +562,31 @@ The slice, in order, each step with its check:
 3. **Verdict and IP page.** Rules 2 to 6 as a function over an address's
    evidence rows; the IP page shows the verdict sentence with each evidence
    row linked to its scan or name; an IP-list filter `evidence=device.cpe`.
-   Check: the eight MIK-577 examples read as rule 4 or 5 with the right
-   sentence; the Hydra and 3xK examples read as rule 2.
-4. **Scan profile.** Add the CPE ports to levels 1 and 2 in
-   `src/scan/profiles.rs` after checking nmap's top-1000 membership. Check:
-   the profile test asserts the ports; one level-1 scan of a lab box
-   answering on 7547 yields a `device.cpe` row.
+   Check, on the hermes DB without an AS-type list: the eight MIK-577
+   CPE examples read as rule 6 with the device, port, scan id and date in
+   the sentence and "AS type not classified" after it; the 507 sources
+   with proxy software read as rule 6 with the proxy sentence (today they
+   would show nothing); the 3xK cloned-key hosts read as rule 2 through
+   `fleet.key` and the Hydra canary hosts through `fleet.canary`; no
+   address reads as rule 3, 4 or 5, and no address reaches rule 2 through
+   `fleet.dense`.
+4. **Scan profile.** Add the CPE ports to levels 1 to 3 in
+   `src/scan/profiles.rs` after checking nmap's top-100 and top-1000
+   membership (the host has no `nmap-services` copy to check against; the
+   engineer does). Check: the profile test asserts the ports at each level;
+   one level-1 scan of a lab box answering on 7547 yields a `device.cpe`
+   row.
 5. **Docs.** The shipped part moves into `detection.md`; the roadmap's
    forwarding-header line is reworded as a `header-spoof` label.
 
 Not in the slice: the AS-type list (`net.hosting` / `net.eyeball`). Until
-MIK-576 names a source we can bundle, rules 4 and 5 run without the
-eyeball condition and show as rule 6 ("device evidence only"), which is
+MIK-576 names a source we can bundle, no `net.*` row exists, so rules 3, 4
+and 5 and the `fleet.dense` and `name.scanner` branches of rule 2 cannot
+fire; `fleet.dense` is computed but inert. What the slice ships is rules
+1, 2 (through `fleet.key` and `fleet.canary` only), 6 and 7. Rule 6 is
 still useful on the IP page and never leaves the node. When a list lands,
-it is one more bundled file and the eyeball condition switches on.
+it is one more bundled file, the `net.*` rows appear on the next recompute,
+and rules 3 to 5 and the rest of rule 2 switch on without a code change.
 
 Rough cost: about two engineer-days (catalogues and tests half a day,
 table and recompute one day, page and filter half a day), one additive
@@ -573,7 +596,8 @@ node of this size. Scan budget: a few extra probes per level-1 and level-2
 scan if step 4 is taken.
 
 What this buys the owner: on an IP page, "a Huawei TR-069 service answered
-on 7547 in the level-4 scan of <date>; the AS is a consumer ISP", with
+on 7547 in the level-4 scan of <date>; AS type not classified" (the last
+clause becomes "the AS is a consumer ISP" once the list lands), with
 the scan one click away, for the few dozen addresses per 6,500 where that
 is true. What it does not buy: a list of compromised devices, or any
 detection of residential-proxy exits that expose nothing, which remain
