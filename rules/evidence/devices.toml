@@ -1,0 +1,167 @@
+# Device and proxy signatures for evidence rows (docs/detection.md,
+# "Device evidence"). A signature reads one open port of a finished scan
+# (`ports`), the scan's OS guess (`scans.os_guess`) or a scan fact
+# (`scan_facts.kind`), never anything a person typed. Built into the binary
+# like `rules/`; a change here bumps `EVIDENCE_V` and recomputes.
+#
+# Fields: `id` (the row's value), `kind` (`proxy` → `device.proxy`, `cpe` →
+# `device.cpe`), `label` (what the IP page names when nmap gave no
+# product), `ports` (empty: any port), and the patterns, all of which must
+# match: `product`, `service` (regexes on nmap's port fields), `os_guess`
+# (a regex on the scan's OS guess, no port), `fact` (a scan-fact kind).
+# Every `sample` must match its own entry; no `cpe` entry may match a banner
+# of the top-20 rented fleets (tests/fixtures/rented-fleet-banners.tsv).
+# Product strings follow nmap-service-probes (nmap 542eda7c, 2026-08-07).
+#
+# Per open port the first matching entry of each kind wins, so order goes
+# from specific to generic.
+
+# --- Proxy software (device.proxy). The rented proxy fleets in the data
+# (3xK Tech's 3Proxy/Socks4A image, `http-proxy` on 9999) match these by
+# design: rule 2 places them through their shared keys before rule 6 is
+# reached.
+
+[[device]]
+id = "3proxy"
+kind = "proxy"
+label = "3Proxy"
+product = '^3Proxy\b'
+sample = [{ port = 7777, service = "http-proxy", product = "3Proxy http proxy" }]
+
+[[device]]
+id = "socks"
+kind = "proxy"
+label = "a SOCKS proxy"
+product = '(?i)^socks ?[45]a?$'
+sample = [
+  { port = 4444, service = "socks-proxy", product = "Socks4A" },
+  { port = 1080, service = "socks5", product = "Socks5" },
+]
+
+[[device]]
+id = "socks"
+kind = "proxy"
+label = "a SOCKS proxy"
+service = '^socks[45]$'
+sample = [{ port = 1080, service = "socks5" }]
+
+[[device]]
+id = "socks"
+kind = "proxy"
+label = "a SOCKS proxy"
+fact = "socks.method"
+sample = [{ port = 1080, fact = "socks.method" }]
+
+[[device]]
+id = "http-proxy"
+kind = "proxy"
+label = "an HTTP proxy"
+service = '^http-proxy$'
+sample = [
+  { port = 3128, service = "http-proxy" },
+  { port = 8080, service = "http-proxy", product = "Squid http proxy" },
+]
+
+# --- Consumer and IoT devices (device.cpe). An OS guess alone is used only
+# where it names one vendor's router OS: nmap's guesses "Android TV OS 11"
+# (38 sources, 28 of them in M247, Datacamp and Hydra hosting) and "3Com
+# OfficeConnect … wireless broadband router" (also on a top-20 rented
+# fleet) are fingerprint noise on rented hosts in the data, so neither is
+# here.
+
+[[device]]
+id = "mikrotik-btest"
+kind = "cpe"
+label = "MikroTik bandwidth-test"
+service = '^bandwidth-test$'
+sample = [{ port = 2000, service = "bandwidth-test", product = "MikroTik bandwidth-test server" }]
+
+[[device]]
+id = "mikrotik"
+kind = "cpe"
+label = "MikroTik RouterOS"
+product = '^MikroTik\b'
+sample = [
+  { port = 21, service = "ftp", product = "MikroTik router ftpd" },
+  { port = 22, service = "ssh", product = "MikroTik RouterOS sshd" },
+  { port = 80, service = "http", product = "MikroTik router config httpd" },
+  { port = 8291, service = "winbox", product = "MikroTik WinBox" },
+  { port = 1723, service = "pptp", product = "MikroTik" },
+]
+
+[[device]]
+id = "mikrotik"
+kind = "cpe"
+label = "MikroTik RouterOS"
+os_guess = '^MikroTik RouterOS\b'
+sample = [{ os_guess = "MikroTik RouterOS 6.15 (Linux 3.3.5)" }]
+
+[[device]]
+id = "fritzbox"
+kind = "cpe"
+label = "AVM FRITZ!Box"
+product = 'FRITZ!'
+sample = [
+  { port = 5060, service = "sip", product = "AVM FRITZ!OS SIP" },
+  { port = 8089, service = "http", product = "FRITZ!Box TR-069 service" },
+  { port = 21, service = "ftp", product = "AVM FRITZ!Box ftpd" },
+]
+
+[[device]]
+id = "fritzbox"
+kind = "cpe"
+label = "AVM FRITZ!Box"
+os_guess = '^AVM FRITZ!Box\b'
+sample = [{ os_guess = "AVM FRITZ!Box Fon 7170 ADSL modem" }]
+
+[[device]]
+id = "tr069"
+kind = "cpe"
+label = "TR-069 remote management"
+product = '\bTR-069\b'
+sample = [
+  { port = 7547, service = "http", product = "TP-LINK TR-069 remote access" },
+  { port = 7547, service = "http", product = "Huawei TR-069 remote access" },
+  { port = 7547, service = "http", product = "Westell broadband router TR-069" },
+]
+
+[[device]]
+id = "hikvision"
+kind = "cpe"
+label = "HikVision camera"
+product = '(?i)^hikvision\b'
+sample = [
+  { port = 8001, service = "hik-connect", product = "HikVision camera control" },
+  { port = 80, service = "http", product = "HikVision NVR or camera http config" },
+]
+
+[[device]]
+id = "dahua"
+kind = "cpe"
+label = "Dahua camera"
+product = '^Dahua\b'
+sample = [{ port = 37777, service = "http", product = "Dahua webcam httpd" }]
+
+[[device]]
+id = "openwrt-luci"
+kind = "cpe"
+label = "OpenWrt LuCI"
+product = '^LuCI'
+sample = [
+  { port = 80, service = "http", product = "LuCI Lua http config" },
+  { port = 80, service = "http", product = "LuCIttpd" },
+]
+
+[[device]]
+id = "openwrt-luci"
+kind = "cpe"
+label = "OpenWrt"
+os_guess = '^OpenWrt\b'
+sample = [{ os_guess = "OpenWrt 21.02 (Linux 5.4)" }]
+
+[[device]]
+id = "android-adb"
+kind = "cpe"
+label = "Android Debug Bridge"
+product = '^Android Debug Bridge\b'
+sample = [{ port = 5555, service = "adb", product = "Android Debug Bridge device" }]

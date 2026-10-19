@@ -60,8 +60,8 @@ pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watc
     }
 }
 
-/// Recompute the campaigns if their inputs changed. A failure is logged
-/// only: the next pass tries again.
+/// Recompute the campaigns if their inputs changed, then the evidence rows.
+/// A failure is logged only: the next pass tries again.
 pub async fn recompute_campaigns(store: &Store) {
     match store.recompute_campaigns(false).await {
         Ok(r) if r.unchanged => {}
@@ -73,6 +73,16 @@ pub async fn recompute_campaigns(store: &Store) {
             "campaigns recomputed"
         ),
         Err(e) => tracing::warn!(?e, "campaign recompute failed"),
+    }
+    // Evidence reads scans and names as well, which the campaign signature
+    // does not cover; a pass is a few thousand rows.
+    match store.recompute_evidence().await {
+        Ok(r) => tracing::debug!(
+            rows = r.rows.values().sum::<usize>(),
+            seconds = r.seconds,
+            "evidence recomputed"
+        ),
+        Err(e) => tracing::warn!(?e, "evidence recompute failed"),
     }
 }
 

@@ -1335,6 +1335,10 @@ pub(crate) async fn drop_orphan_ip(conn: &mut SqliteConnection, ip_id: i64) -> R
                 .execute(&mut *conn)
                 .await?;
         }
+        sqlx::query("DELETE FROM ip_evidence WHERE ip_id = ?")
+            .bind(ip_id)
+            .execute(&mut *conn)
+            .await?;
     }
     Ok(())
 }

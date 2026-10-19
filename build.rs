@@ -1,7 +1,7 @@
 //! Concatenates the CSS layers into one embedded stylesheet, stamps the
 //! asset URLs with a content hash, and bakes the release version and the
-//! source commit in, and lists the signature rules (`rules/*.toml`) the
-//! binary embeds.
+//! source commit in, and lists the signature rules (`rules/*.toml`) and
+//! the evidence catalogues (`rules/evidence/*.toml`) the binary embeds.
 use std::path::Path;
 use std::process::Command;
 
@@ -9,6 +9,7 @@ fn main() {
     build_stylesheet();
     stamp_assets();
     embed_rules();
+    embed_evidence();
     // The build's name: the commit for rolling builds, the tag for versioned
     // releases (both set by CI), "dev" otherwise.
     println!("cargo:rerun-if-env-changed=PEEPHOLE_VERSION");
@@ -133,4 +134,32 @@ fn embed_rules() {
     out.push_str("]\n");
     let dest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("builtin_rules.rs");
     std::fs::write(dest, out).expect("builtin_rules.rs");
+}
+
+/// The evidence catalogues (`rules/evidence/*.toml`, see
+/// `store::evidence`) by name. A file added there is built in without a
+/// code change (the AS-type list, when one is bundled).
+fn embed_evidence() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let dir = Path::new(&manifest).join("rules").join("evidence");
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("rules/evidence/")
+        .filter_map(|e| e.ok())
+        .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.is_file()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".toml") && !n.starts_with('.'))
+        .collect();
+    names.sort();
+    let mut out = String::from("&[\n");
+    for name in &names {
+        let path = dir.join(name);
+        out.push_str(&format!(
+            "    ({name:?}, include_str!({:?})),\n",
+            path.to_str().expect("rules path is UTF-8")
+        ));
+    }
+    out.push_str("]\n");
+    let dest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("builtin_evidence.rs");
+    std::fs::write(dest, out).expect("builtin_evidence.rs");
 }
