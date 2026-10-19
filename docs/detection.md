@@ -19,14 +19,15 @@ severity (0 when nothing matched) and drives the counter-scan level:
 
 | Weight | Meaning | Labels |
 |---|---|---|
-| 1 | single weak tell | `probe` (behavioural floor), `php-probe` |
-| 2 | automated reconnaissance | `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
+| 1 | single weak tell | `probe` (behavioural floor), `php-probe`, `ai-agent-tooling` |
+| 2 | automated reconnaissance | `ai-agent-artifact`, `scanner-ua`, `research-scanner`, `sensitive-path`, `path-scanner`, `ai-infra-probe`, `api-recon`, `proxy-probe`, `unusual-method`, `automation` |
 | 3 | exploit-adjacent | `form-interaction`, `write-method`, `xss`, `crlf-injection`, `webshell-probe`, `app-probe`, `cloud-infra-probe`, `credential-attack`, `mcp-probe`, `graphql-introspection`, `appliance-probe`, `iot-probe`, `inhuman-behavior` |
 | 4 | unambiguous exploit / post-exploitation | `sqli`, `rce`, `path-traversal`, `ssrf`, `ssti`, `nosqli`, `xxe`, `deserialization`, `webshell`, `mcp-abuse` |
 
 The counter-scan level is the weight, with one cap: a request whose labels
-only say someone looked (`probe`, `path-scanner`, `php-probe`) earns at
-most a level-1 scan, whatever its severity — a lone drive-by probe does
+only say someone looked (`probe`, `path-scanner`, `php-probe`) or who
+looked (`ai-agent-artifact`, `ai-agent-tooling`) earns at most a level-1
+scan, whatever its severity — a lone drive-by probe does
 not warrant a top-1000-port scan. Anything more specific scans at the
 weight, capped at 4. `severity` itself is not capped: it records what was
 seen.
@@ -43,7 +44,8 @@ Label badge colours follow the family: blue = reconnaissance (any
 `api-recon`/`graphql-introspection`), green = exposure (`sensitive-path`:
 secrets, config, repos, dumps, admin and debug pages), red = injection,
 violet = execution/impact, orange = interaction, solid = post-exploitation,
-grey = automation tells (including `proxy-probe`), neutral accent =
+grey = automation tells (including `proxy-probe` and the `ai-agent-*`
+labels), neutral accent =
 everything else. New labels need no UI work: a `something-probe` label is
 blue automatically, everything unknown is neutral.
 
@@ -51,6 +53,18 @@ The public dashboard's "What they were after" counts each request once per
 family it touched. `path-scanner` and `php-probe` say how a request came,
 not what it was after, so they count (as reconnaissance) only when no other
 label names a family; "other" likewise only when nothing else applies.
+
+`ai-agent-artifact` and `ai-agent-tooling` say who sent a request: an LLM
+agent. The first is the model's own output inside the request (chat-template
+tokens such as `<|im_start|>` or `[INST]`, tool-call tags and JSON, refusal
+or self-description text) in the target, the body or a header; the second
+is its tooling (SDK and agent-framework User-Agents, the OpenAI and
+Anthropic SDK headers, an MCP `initialize` whose `clientInfo` names a known
+agent client). Like the weak tells they count (as automation) only when no
+other label names a family, keep the level-1 scan cap, and do not suppress
+the `probe` floor: an agent request that did nothing else reads `probe`
+plus the agent label, and counts as hitting no rule. AI crawlers (GPTBot,
+ClaudeBot, …) are not agents here; they belong to the verified crawlers.
 
 ## Rules
 
@@ -67,6 +81,15 @@ recorded it. `peephole check-config` and the startup log show the number of
 rules and the start of their fingerprint. In a cluster, nodes check each
 other's classification by classifying again; see
 [Things to know](protocol.md#things-to-know).
+
+A rule fires when any of its matchers matches (`target_regex`,
+`body_regex`, `ua_regex`, `header_regex`, `path_exact`, optionally limited
+to `methods`). `unless_target_regex` is a veto, not a matcher: when it
+matches the target (raw or decoded) the rule does not fire, whatever else
+matched. `ai-agent-artifact` uses it to stay off the LLM chat and
+completion endpoints, where a chat-template token is a prompt aimed at the
+decoy rather than an agent's trace. A rule needs at least one matcher; a
+veto alone does not count.
 
 Weight rationale when adding rules: would you counter-scan a source that
 did *only* this? Recon gets 2, anything that touches an exploit gets 4
