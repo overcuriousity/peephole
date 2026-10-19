@@ -56,8 +56,8 @@ sample = ["dynamic-adsl.viettel.vn", "dynamic-0.pool.telefonica.de", "dyn-0-0.ex
 
 [[pool]]
 id = "pool"
-pattern = '(^|[.-])(ip)?pool([.-]|[0-9]|$)'
-sample = ["0.pool.example-isp.de", "ippool0.example.net"]
+pattern = '(^|[.-])(ip)?pools?([.-]|[0-9]|$)'
+sample = ["0.pool.example-isp.de", "ippool0.example.net", "ip-0-0-0-0.vkd0.pools.example-ip.de"]
 
 [[pool]]
 id = "ppp"

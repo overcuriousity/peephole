@@ -2023,6 +2023,10 @@ pub(crate) mod tests {
         assert_eq!(class("ppp-167-140.tm.net.my"), ["pool"]);
         assert_eq!(class("dynamic-0-0-0-0.pool.telefonica.de"), ["pool"]);
         assert_eq!(class("0-0-0-0.dynamic.ttnet.com.tr"), ["pool"]);
+        assert_eq!(
+            class("ip-188-193-002-090.vkd89.pools.vodafone-ip.de"),
+            ["pool"]
+        );
         assert_eq!(class("0-0-0-0.adsl.example.net"), ["consumer"]);
     }
 
