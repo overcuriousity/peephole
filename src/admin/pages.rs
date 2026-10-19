@@ -658,6 +658,7 @@ mod short_strings_tests {
         assert!(!html.contains("ssh2-enum-algos"), "{html}");
 
         let name = |source: &str, agreed: bool| crate::store::probes::NameRow {
+            id: 1,
             name: "host.example".into(),
             source: source.into(),
             first_seen: "2026-10-01 00:00:00".into(),
