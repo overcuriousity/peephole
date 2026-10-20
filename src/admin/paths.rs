@@ -50,7 +50,10 @@ fn parse_cursor(c: &str) -> Option<(&str, i64)> {
         && ts
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b" :.+-".contains(&b));
-    Some((ts, hash.parse().ok()?)).filter(|_| ok)
+    if !ok {
+        return None;
+    }
+    Some((ts, hash.parse().ok()?))
 }
 
 #[derive(Template)]
