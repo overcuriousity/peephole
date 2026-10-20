@@ -5,6 +5,38 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-20
+
+JSON dossiers, admin API keys and an OpenAPI description of `/api/v1`
+(MIK-712), with the six-group admin nav and campaign edge detail. Two
+database migrations, run in order on start: `0048_campaign_edge_detail`
+and `0049_api_keys` (`user_version` 49). One new setting block,
+`[limits]` `api_per_minute` / `api_burst`. No protocol version bump.
+
+### Added
+- JSON dossiers of an IP, an ASN, a request and a campaign at
+  `/api/v1/{ips,asns,requests,campaigns}/{id}/dossier` (MIK-749): one
+  versioned object (`dossier_v` 1) from the data the admin pages show,
+  with RFC 3339 times, capped lists that carry a `truncated` flag and a
+  total, and the edges between carried campaign members. No hashes,
+  internal ids, upload content or page tokens.
+- A "Copy JSON dossier" button on the IP (admin only), ASN, request and
+  campaign pages (MIK-750). One click copies the pretty-printed JSON
+  from `/admin/api/dossier/{kind}/{id}` (admin session); a modified
+  click or a browser without a clipboard opens it instead.
+- Admin API keys (MIK-751): mint a labelled key on System → Devices,
+  shown once, read-only unless "act" is ticked; listed apart from paired
+  devices and revoked the same way. Every `/api/v1` bearer token has its
+  own rate limit, `[limits] api_per_minute` (default 120) and
+  `api_burst` (default 30), answered with 429 `rate_limited` and
+  `Retry-After`.
+- `/api/v1/openapi.json` (MIK-752): a hand-written OpenAPI 3.1
+  description of `/api/v1`, served without a token and linked from the
+  public `/api` page. Tests fail when it and the served routes differ.
+- Campaign edge detail (MIK-635, MIK-759): a soft edge's row on the
+  campaign page opens to the shapes that tied the two IPs, their JA4 /
+  JA4H pairs, the agreement and the thresholds.
+
 ### Changed
 - The admin nav is six groups with a second row of pages (MIK-711):
   Overview (Now, Analytics) · Investigate (Lookup, Scans) · Evidence
@@ -29,6 +61,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   recent requests and the campaign evidence table read row by row on a
   phone with the severity stripe clear of the text. A missing value
   reads "—" everywhere in the admin UI.
+
+### Fixed
+- A free-market scanner's reference price on this node is its announced
+  ask (MIK-765). The copy was stepped up every selling hour with nothing
+  re-anchoring it and reached 5× to 4000× the asks; below protocol 9 it
+  steps as before.
 
 ## [0.22.1] - 2026-10-20
 
