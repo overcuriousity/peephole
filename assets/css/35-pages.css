@@ -173,3 +173,5 @@ a.tile:hover .label { color: var(--color-accent); }
   table.events td.what, table.events td.sev-cell { order: 3; }
   .table-wrap.wide table.events td.path { order: 4; flex-basis: 100%; width: auto; white-space: normal; overflow-wrap: anywhere; }
 }
+.paths-count { font-size: var(--text-sm); margin: 0 0 0.75rem; }
+.paths-pager { margin: 0.75rem 0 0; text-align: right; }
