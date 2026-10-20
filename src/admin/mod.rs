@@ -205,6 +205,10 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
             state.clone(),
             limit::enforce,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            market_scope,
+        ))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -212,6 +216,16 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
 /// Public-only router used by early tests; same middleware.
 pub fn router(state: Arc<AdminState>) -> Router {
     full_router(state)
+}
+
+/// Lets the admin nav know whether Market (the credits page) answers.
+async fn market_scope(
+    axum::extract::State(st): axum::extract::State<Arc<AdminState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let market = st.recorder.node().is_some();
+    views::MARKET.scope(market, next.run(req)).await
 }
 
 async fn security_headers(
