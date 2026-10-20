@@ -406,7 +406,10 @@ mod tests {
     use super::*;
 
     #[derive(Template)]
-    #[template(source = r#"{% include "_campaign_graph.html" %}"#, ext = "html")]
+    #[template(
+        source = r#"{% let small = false %}{% include "_campaign_graph.html" %}"#,
+        ext = "html"
+    )]
     struct Embed {
         chrome: Chrome,
         campaign_key: String,

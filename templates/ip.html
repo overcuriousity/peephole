@@ -4,7 +4,7 @@
 {% block content %}
 <div class="page-head ip-head">
   <div>
-    <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}{% if t.ov.ip.is_tor_exit %} <span class="badge badge-tor">tor exit</span>{% endif %}</h1>
+    <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h1>
     {% include "_ip_meta.html" %}
   </div>
   <div class="tiles">

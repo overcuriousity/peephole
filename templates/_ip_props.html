@@ -1,0 +1,10 @@
+{# An address's property strip (store::evidence::IpProps `p`), admin only (MIK-697): the shared reading by its name, never a number, then Tor exit, network kind, scanner or fleet, agent traces. `sentence`: the reading's full sentence where loaded, else empty; `scan_href`: where the scan action is, else empty. #}
+<span class="ip-props">
+  {%- if p.unscanned() %}<span class="badge badge-share" data-reading="unscanned" title="Insufficient evidence: no counter-scan of this address has finished. {{ p.reading.gist() }}">not scanned</span>{% if !scan_href.is_empty() %} <a class="small" href="{{ scan_href }}">scan →</a>{% endif %}
+  {%- else if let Some(r) = p.reading_shown() %}<a class="badge badge-share" data-reading="{{ r.key() }}"{% if r.is_shared() %} data-shared{% endif %} href="/ips?reading={{ r.key() }}" title="{% if sentence.is_empty() %}{{ r.gist() }}{% else %}{{ sentence }}{% endif %}">{{ r.label() }}</a>{% endif %}
+  {%- if p.tor %} <span class="badge badge-tor">tor exit</span>{% endif %}
+  {%- if let Some(n) = p.net_label() %} <span class="badge badge-net" title="Network kind, by the AS-type list">{{ n }}</span>{% endif %}
+  {%- if p.scanner %} <span class="badge badge-net" title="A scanner's name or a scanner AS">scanner</span>{% endif %}
+  {%- if p.fleet %} <span class="badge badge-net" title="A fleet row: a host key or canary shared with other addresses, or a dense prefix">fleet</span>{% endif %}
+  {%- if p.agent %} <span class="badge badge-agent" title="Some of its requests carry an AI-agent label (ai-agent-artifact or ai-agent-tooling)">agent traces</span>{% endif -%}
+</span>

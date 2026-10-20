@@ -1622,6 +1622,145 @@ impl Store {
     }
 }
 
+// ---- The property strip ---------------------------------------------------
+
+impl Sharing {
+    /// What the state rests on, in one sentence, for the strip's `title`
+    /// where the full sentence of [`Store::sharing_view`] is not loaded.
+    pub fn gist(self) -> &'static str {
+        match self {
+            Sharing::Operator => {
+                "A hosting AS, a scanner name, a fleet row or a Tor exit: one operator's \
+                 address, not read on this axis."
+            }
+            Sharing::SubscriberPooled => {
+                "A consumer router answered a counter-scan and the operator names the line \
+                 pooled: one subscriber holds it at a time, and the next holder is someone else."
+            }
+            Sharing::Subscriber => {
+                "A consumer router answered a counter-scan: one subscriber holds this address, \
+                 and several of their devices may share it."
+            }
+            Sharing::CarrierPool => {
+                "The operator names this address a carrier-NAT pool, shared by unrelated \
+                 subscribers. Not verified by behaviour."
+            }
+            Sharing::MobilePool => {
+                "A mobile pool, by the operator's naming or the network's type: an address \
+                 usually holds a subscriber for a day or less."
+            }
+            Sharing::PooledLine => {
+                "The operator names this address a pooled line: it is reassigned, and the next \
+                 holder is someone else."
+            }
+            Sharing::ConsumerLine => {
+                "The name says a consumer line; whether it is shared is not observed."
+            }
+            Sharing::Insufficient => {
+                "No name and no scan result says who shares this address; it is not thereby \
+                 single-user."
+            }
+        }
+    }
+}
+
+/// An address's properties as the strip shows them wherever the admin UI
+/// shows the address (`templates/_ip_props.html`, MIK-697): the shared
+/// reading, Tor exit, network kind, scanner or fleet, agent traces. Admin
+/// only; computed at render time, never stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpProps {
+    pub reading: Sharing,
+    pub tor: bool,
+    /// The `net.*` row's value: hosting, cloud, scanner, fixed or mobile.
+    pub net: Option<String>,
+    /// A scanner name, or a scanner AS.
+    pub scanner: bool,
+    /// A fleet row: a shared key, a canary handed on, a dense prefix.
+    pub fleet: bool,
+    /// Some of its requests carry an AI-agent label.
+    pub agent: bool,
+    /// A counter-scan of it finished.
+    pub scanned: bool,
+}
+
+impl IpProps {
+    /// The network kind as the strip names it.
+    pub fn net_label(&self) -> Option<&'static str> {
+        Some(match self.net.as_deref()? {
+            "hosting" => "hosting",
+            "cloud" => "cloud hosting",
+            "scanner" => "scanner network",
+            "fixed" => "eyeball",
+            "mobile" => "mobile",
+            _ => return None,
+        })
+    }
+
+    /// The reading the strip names; None for rule 1, which the Tor,
+    /// hosting, scanner and fleet marks already say.
+    pub fn reading_shown(&self) -> Option<Sharing> {
+        (self.reading != Sharing::Operator).then_some(self.reading)
+    }
+
+    /// Insufficient evidence because nothing scanned it yet.
+    pub fn unscanned(&self) -> bool {
+        self.reading == Sharing::Insufficient && !self.scanned
+    }
+}
+
+type PropsRow = (String, String, bool, Option<String>, bool, bool, bool, bool);
+
+impl Store {
+    /// The property strip of each recorded address among `ips`, by
+    /// address, in one query (the reading by [`reading_sql`]).
+    pub async fn ip_props(&self, ips: &[&str]) -> Result<HashMap<String, IpProps>> {
+        if ips.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let [art, tool] = crate::classify::AGENT_LABELS;
+        let sql = format!(
+            "SELECT i.ip, {}, i.is_tor_exit,
+                    (SELECT e.value FROM ip_evidence e WHERE e.ip_id = i.id
+                       AND e.kind IN ('net.hosting', 'net.eyeball')
+                     ORDER BY e.last_ts DESC LIMIT 1),
+                    EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id
+                              AND (e.kind = 'name.scanner'
+                                   OR (e.kind = 'net.hosting' AND e.value = 'scanner'))),
+                    EXISTS (SELECT 1 FROM ip_evidence e WHERE e.ip_id = i.id
+                              AND e.kind IN ('fleet.key', 'fleet.canary', 'fleet.dense')),
+                    EXISTS (SELECT 1 FROM ip_labels l WHERE l.ip_id = i.id
+                              AND l.label IN (?2, ?3) AND l.count > 0),
+                    EXISTS (SELECT 1 FROM scans s WHERE s.ip_id = i.id
+                              AND s.finished_at IS NOT NULL)
+             FROM ips i WHERE i.ip IN (SELECT value FROM json_each(?1))",
+            reading_sql()
+        );
+        // Built from the constant rule table only; the addresses are bound.
+        let rows: Vec<PropsRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(serde_json::to_string(ips)?)
+            .bind(art)
+            .bind(tool)
+            .fetch_all(&self.read)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ip, reading, tor, net, scanner, fleet, agent, scanned)| {
+                let props = IpProps {
+                    reading: Sharing::from_key(&reading).unwrap_or(Sharing::Insufficient),
+                    tor,
+                    net,
+                    scanner,
+                    fleet,
+                    agent,
+                    scanned,
+                };
+                (ip, props)
+            })
+            .collect())
+    }
+}
+
 // ---- The IP page ----------------------------------------------------------
 
 /// One evidence row as the IP page shows it.
