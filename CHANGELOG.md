@@ -3,6 +3,16 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Admin "New paths" (`/admin/paths`) says how many shapes the window and
+  filter hold ("Showing 200 of 13,834 shapes") and pages past the first
+  200 with an "older →" link (keyset, no `OFFSET`) and "← newest" back.
+  Before, every window showed the newest 200 rows with no count, so the
+  24 h / 7 days / 30 days / all toggle looked dead (MIK-687).
+
 ## [0.21.0] - 2026-10-19
 
 Device evidence (MIK-586, MIK-587) and shared-address reading
