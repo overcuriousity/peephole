@@ -52,7 +52,7 @@
     <tr data-sev="{{ r.severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
-      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if let Some(p) = props.get(r.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", r.ip) %}{% include "_ip_props.html" %}{% else if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
       <td class="path"><a href="{{ crate::admin::views::pivot_href("path", r.path.as_str()) }}">{{ r.path }}</a>{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>

@@ -2,9 +2,10 @@
 <section class="card" id="evidence" data-section="evidence">
   <div class="card-head"><h2>Evidence</h2><span class="badge badge-status" data-status="queued" title="Rule {{ ev.rule.number() }} of the verdict table (docs/detection.md)">{{ ev.label }}</span></div>
   <p>{{ ev.sentence }}</p>
-  {% if let Some(c) = ev.caveat %}<p class="small muted">{{ c }}</p>{% endif %}
+  {% if let Some(c) = ev.caveat %}<p class="evidence-caveat">{{ c }}</p>{% endif %}
+  {% if let Some(n) = ev.as_note %}<p class="small muted">{{ n }}</p>{% endif %}
   <div class="table-wrap wide"><table>
-    <thead><tr><th>Evidence</th><th>Observed</th><th>Port</th><th>From</th><th>Date</th></tr></thead>
+    <thead><tr><th>Evidence</th><th>Observed</th><th>Port</th><th>From</th><th>Date (UTC)</th></tr></thead>
     <tbody>{% for l in ev.lines %}<tr>
       <td class="mono">{{ l.kind }}</td>
       <td>{{ l.what }}</td>

@@ -129,12 +129,41 @@ struct CampaignPage {
     t: CampaignTimeline,
     /// Agent-driven: a member carries an agent label.
     agent: bool,
+    /// The members' property strips, by address.
+    props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
 }
 
 /// Wave lines on a campaign's page, at most.
 pub const CAMPAIGN_WAVES: usize = 3;
 
 impl CampaignPage {
+    /// What ties the group, for the header line (MIK-689 #3): with no hard
+    /// link, the strongest path similarity it rests on.
+    fn strength(&self) -> String {
+        let (hard, soft) = (self.c.row.hard_edges, self.c.row.soft_edges);
+        if hard > 0 {
+            return format!(
+                "{hard} hard link{}, {soft} soft",
+                if hard == 1 { "" } else { "s" }
+            );
+        }
+        let best = self
+            .edges
+            .iter()
+            .filter(|v| !v.hard())
+            .filter_map(|v| v.e.score)
+            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+        let links = if soft == 1 {
+            "soft link only"
+        } else {
+            "soft links only"
+        };
+        match best {
+            Some(x) => format!("{links}: path similarity {x:.2}"),
+            None => links.to_string(),
+        }
+    }
+
     /// The listed shapes that formed a wave, for the Shapes card.
     fn waves(&self) -> Vec<&CampaignShape> {
         self.shapes
@@ -187,7 +216,11 @@ async fn campaign(
         .campaign_events(&key, None, CAMPAIGN_EVENTS)
         .await?;
     let agent = !st.store.agent_campaigns(Some(&key)).await?.is_empty();
+    let props =
+        crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
+            .await?;
     render(&CampaignPage {
+        props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
         calendar,
@@ -259,6 +292,16 @@ mod tests {
                 .contains("badge-agent")
         );
         assert!(page("/ip/192.0.2.1").await.contains(">agent traces</span>"));
+        // MIK-697: each member row carries its property strip; the
+        // header says what ties the group (MIK-689 #3).
+        let camp = page("/admin/campaigns/192.0.2.3").await;
+        let row = camp
+            .split("<tr>")
+            .find(|r| r.contains("href=\"/ip/192.0.2.1\">192.0.2.1</a>"))
+            .unwrap();
+        assert!(row.contains("class=\"ip-props\""), "{row}");
+        assert!(row.contains(">agent traces</span>"), "{row}");
+        assert!(camp.contains("class=\"campaign-strength"), "{camp}");
         assert!(!page("/ip/192.0.2.2").await.contains("badge-agent"));
     }
 

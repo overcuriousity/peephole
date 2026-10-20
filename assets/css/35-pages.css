@@ -154,3 +154,20 @@ a.tile:hover .label { color: var(--color-accent); }
 .ledger-more { margin-top: 1.25rem; padding-top: 0.75rem; border-top: 1px solid var(--color-border-subtle); }
 .ledger-more > summary { cursor: pointer; font-weight: 500; color: var(--color-fg-secondary); }
 .tile-balance .value { color: var(--color-fg-primary); }
+.campaign-strength { font-weight: 500; color: var(--color-fg-primary); }
+.campaign-strength.soft { color: var(--color-warning); }
+.events-intel { display: inline-flex; align-items: center; gap: 0.35rem; margin-bottom: 0.4rem; font-size: var(--text-sm); color: var(--color-fg-secondary); cursor: pointer; }
+.events-wrap:not(:has(.events-intel-toggle:checked)) tr[data-kind="intel"] { display: none; }
+/* MIK-689 #7: below 600 px a Timeline row stacks (time, IP, what, severity; then the path; then the rest) instead of scrolling its columns off. */
+@media (max-width: 37.5rem) {
+  .table-wrap.wide table.events { width: 100%; }
+  table.events thead { display: none; }
+  table.events, table.events tbody { display: block; }
+  table.events tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.6rem; padding: 0.45rem 0; border-bottom: 1px solid var(--color-border-subtle); }
+  table.events td { display: block; border: 0; padding: 0; order: 5; }
+  table.events td:empty { display: none; }
+  table.events td.ts { order: 1; }
+  table.events td.ip { order: 2; }
+  table.events td.what, table.events td.sev-cell { order: 3; }
+  .table-wrap.wide table.events td.path { order: 4; flex-basis: 100%; width: auto; white-space: normal; overflow-wrap: anywhere; }
+}

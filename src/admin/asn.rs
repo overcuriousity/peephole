@@ -4,10 +4,11 @@
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
-use crate::admin::public::{IntelFact, urlencode};
+use crate::admin::public::{IntelFact, page_props, urlencode};
 use crate::admin::views::Chrome;
 use crate::store::asn::{Rollup, RollupKey};
 use crate::store::browse::{IpFilter, IpSummary};
+use crate::store::evidence::IpProps;
 use askama::Template;
 use axum::{
     Router,
@@ -15,6 +16,7 @@ use axum::{
     response::Html,
     routing::get,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// IPs listed on the page; the rest are on `/ips?asn=N` (`/ips?net=H`).
@@ -52,6 +54,7 @@ struct AsnPage {
     /// `_ip_row.html`: no bulk delete here; the bar scale.
     can_delete: bool,
     count_max: i64,
+    props: HashMap<String, IpProps>,
 }
 
 #[derive(Template)]
@@ -66,6 +69,7 @@ struct NetPage {
     base: String,
     can_delete: bool,
     count_max: i64,
+    props: HashMap<String, IpProps>,
 }
 
 /// The network's busiest IPs, when it has any.
@@ -92,7 +96,9 @@ async fn asn(
         ..Default::default()
     };
     let ips = top_ips(&st, &r, f).await?;
+    let props = page_props(&st, true, ips.iter().map(|i| i.ip.as_str())).await?;
     render(&AsnPage {
+        props,
         chrome: Chrome::new(true, "ips"),
         count_max: ips.iter().map(|i| i.request_count).max().unwrap_or(0),
         base: format!("asn={asn}"),
@@ -134,7 +140,9 @@ async fn net(
         },
         None => vec![],
     };
+    let props = page_props(&st, true, ips.iter().map(|i| i.ip.as_str())).await?;
     render(&NetPage {
+        props,
         chrome: Chrome::new(true, "ips"),
         count_max: ips.iter().map(|i| i.request_count).max().unwrap_or(0),
         base: format!("net={}", urlencode(&handle)),
