@@ -18,7 +18,7 @@ use axum::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/market";
+const PAGE: &str = "/admin/network/credits";
 /// Rows shown per list.
 const ROWS: usize = 100;
 
@@ -26,10 +26,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
         .route("/admin/market/send", post(send))
-        .route(
-            "/admin/cluster/credits",
-            get(|uri: axum::http::Uri| async move { crate::admin::views::moved(PAGE, &uri) }),
-        )
 }
 
 /// When a lot of `day` is gone, seen from `today`.

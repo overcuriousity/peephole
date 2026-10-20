@@ -604,11 +604,11 @@
 
   window.peephole = window.peephole || {};
   window.peephole.ago = ago;
-  // Old /admin/fingerprints#<anchor> links land on the Links index after
+  // Old /admin/evidence/links#<anchor> links land on the Links index after
   // the 308 (browsers keep the fragment); the server resolves the anchor.
-  if (location.pathname === "/admin/links" && location.hash.length > 1 && !location.search) {
+  if (location.pathname === "/admin/evidence/links" && location.hash.length > 1 && !location.search) {
     var anchor = location.hash.slice(1);
     try { anchor = decodeURIComponent(anchor); } catch (e) {}
-    location.replace("/admin/links?anchor=" + encodeURIComponent(anchor));
+    location.replace("/admin/evidence/links?anchor=" + encodeURIComponent(anchor));
   }
 })();

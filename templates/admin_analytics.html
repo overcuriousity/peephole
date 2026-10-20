@@ -1,10 +1,10 @@
 {% extends "layout.html" %}
 {% block title %}peephole — analytics{% endblock %}
 {% block content %}
-{% let sub = "analytics" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("overview", "analytics") %}{% include "_admin_nav.html" %}
 <div class="page-head">
-  <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/links/canaries?range={{ range.key() }}">Canaries</a></p></div>
-  {% let base = "/admin/analytics" %}{% let keep = String::new() %}{% include "_range.html" %}
+  <div><h1>Analytics</h1><p class="muted">{{ range.label() }} · canary reuse: <a href="/admin/evidence/canaries?range={{ range.key() }}">Canaries</a></p></div>
+  {% let base = "/admin/overview/analytics" %}{% let keep = String::new() %}{% include "_range.html" %}
 </div>
 
 <div class="tiles">
@@ -71,7 +71,7 @@
         <li><a class="mono" href="/requests?label=ai-agent-tooling">ai-agent-tooling</a>: an LLM SDK or agent framework by its User-Agent or SDK headers, or an MCP client that names a known agent.</li>
         <li><a class="mono" href="/requests?label=ai-agent-artifact">ai-agent-artifact</a>: model output inside a request, such as chat-template tokens, tool-call JSON or refusal text.</li>
       </ul>
-      <p class="muted">Scanners probing the fake AI are not traces: see <a href="/admin/decoys">Decoys</a>. Requests stored before v0.20.0 were never checked for these labels.</p>
+      <p class="muted">Scanners probing the fake AI are not traces: see <a href="/admin/traps/mcp">Decoys</a>. Requests stored before v0.20.0 were never checked for these labels.</p>
       {% else %}
       <p>{{ t.agent_ips }} of {{ t.ips }} IPs ({{ crate::admin::views::pct(t.agent_ips, t.ips) }} %) · {{ t.agent_campaigns }} of {{ t.campaigns }} active campaigns agent-driven</p>
       <div class="table-wrap"><table class="an-table">
@@ -151,7 +151,7 @@
     <section class="card">
       <h2>Counter-scans</h2>
       <ul class="shares">{% for n in a.scan_levels %}<li><a href="{{ level_href(n.name) }}">{{ n.name }}</a><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = max.levels %}{% include "_bar.html" %}</li>{% endfor %}</ul>
-      <div class="chips">{% for n in a.job_status %}<a class="badge badge-status" data-status="{{ n.name }}" href="/admin/scans?status={{ n.name|urlencode }}#history">{{ n.name }} {{ n.count }}</a>{% endfor %}</div>
+      <div class="chips">{% for n in a.job_status %}<a class="badge badge-status" data-status="{{ n.name }}" href="/admin/investigate/scans?status={{ n.name|urlencode }}#history">{{ n.name }} {{ n.count }}</a>{% endfor %}</div>
       {% if a.scan_levels.is_empty() && a.job_status.is_empty() %}<p class="empty">None.</p>{% endif %}
     </section>
   </div>

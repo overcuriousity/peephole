@@ -2132,7 +2132,7 @@ impl Store {
                     r.ref_id,
                     day(&at)
                 );
-                let href = Some(format!("/admin/scans/{}", r.ref_id));
+                let href = Some(format!("/admin/investigate/scans/{}", r.ref_id));
                 cat.hits(&ports, os.as_deref(), &facts)
                     .into_iter()
                     .filter(|h| h.kind.row_kind() == r.kind && h.id == r.value)
@@ -2190,7 +2190,7 @@ impl Store {
                         what,
                         Some(port),
                         format!("scan #{s}"),
-                        Some(format!("/admin/scans/{s}")),
+                        Some(format!("/admin/investigate/scans/{s}")),
                         &r.last_ts,
                     )],
                     None => vec![line(what, Some(port), "a probe".into(), link, &r.last_ts)],
@@ -2958,7 +2958,7 @@ pub(crate) mod tests {
         assert_eq!(v.as_note, Some("AS type not classified."));
         assert_eq!(
             v.lines[0].href.as_deref(),
-            Some(&*format!("/admin/scans/{scan}"))
+            Some(&*format!("/admin/investigate/scans/{scan}"))
         );
         assert_eq!(v.caveat, Some(DEVICE_CAVEAT));
         // A Tor exit is rule 1: nothing new on the page.

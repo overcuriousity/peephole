@@ -1,9 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}peephole — settings{% endblock %}
 {% block content %}
-{% let sub = "system" %}{% include "_admin_nav.html" %}
-{% let subtab = "settings" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Settings</h1><p class="muted">Scan pace is on <a href="/admin/scans#pace">Scans</a>.</p></div></div>
+{% let nav = crate::admin::views::Nav::new("system", "settings") %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Settings</h1><p class="muted">Scan pace is on <a href="/admin/investigate/scans#pace">Scans</a>.</p></div></div>
 <div class="stack">
 <section class="card"><h2>Cooldown and roles</h2>
 {% include "_node_settings.html" %}

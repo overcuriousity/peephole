@@ -2,7 +2,7 @@
 {% block title %}peephole — scans{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "scans" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("investigate", "scans") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Scans</h1></div></div>
 {% if let Some(n) = pace.notice %}<div class="banner banner-success">{{ n }}</div>{% endif %}
 {% if let Some(e) = pace.error %}<div class="banner banner-warning">Pace not saved: {{ e }}</div>{% endif %}
@@ -39,8 +39,8 @@
   <details class="muted"><summary>How jobs are assigned</summary><p>0 pauses a scanner. Paid jobs go to the scanner that is cheapest per delivered result at the job's level: its price divided by its success rate there (last 24 h, timeouts aside, measured every hour). A job waits up to 30 min for a cheaper live scanner, then goes to whoever asks. A scanner that fails a level often wins it only if its price makes up for it. Scanners with fewer than 5 scans at a level set no bar. Every job is funded at the scanner's price, which may be 0; a job no scanner asking can be paid for waits. Hover a scanner in the history for why it got the job.</p></details>
   </div>
   {% endif %}
-  {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
-  {% if pace.m.refused_24h > 0 %}<p class="muted pace-retry"><a href="/admin/scans?status=refused#history">{{ pace.m.refused_24h }} refused in 24 h →</a></p>{% endif %}
+  {% if pace.m.failed_24h > 0 %}<p class="muted pace-retry"><a href="/admin/investigate/scans?status=failed#history">{{ pace.m.failed_24h }} failed in 24 h →</a></p>{% endif %}
+  {% if pace.m.refused_24h > 0 %}<p class="muted pace-retry"><a href="/admin/investigate/scans?status=refused#history">{{ pace.m.refused_24h }} refused in 24 h →</a></p>{% endif %}
 </section>
 <section class="card">
   <div class="card-head"><h2>Live queue</h2><span class="row"><span class="muted" data-queue-total{% if active_total <= crate::admin::scans::LIVE_ROWS %} hidden{% endif %}>newest {{ crate::admin::scans::LIVE_ROWS }} of {{ active_total }}</span><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
@@ -52,7 +52,7 @@
 </section>
 <section class="card" id="history">
   <div class="card-head"><h2>History</h2></div>
-  <form class="filters" method="get" action="/admin/scans#history">
+  <form class="filters" method="get" action="/admin/investigate/scans#history">
     <label>Status <select name="status"><option value="">any finished</option>
       {% for st in statuses %}<option value="{{ st }}"{% if f.status.as_deref() == Some(st) %} selected{% endif %}>{{ st }}</option>{% endfor %}</select></label>
     <label>Level <input name="level" size="3" value="{% if let Some(l) = f.level %}{{ l }}{% endif %}"></label>
@@ -68,7 +68,7 @@
         <td>{{ r.level }}</td>
         <td><span class="badge badge-status" data-status="{{ r.status }}">{{ r.status }}</span>{% if r.is_retry %} <span class="badge" title="Retry of an earlier failed scan">retry</span>{% endif %}</td>
         <td class="ts">{{ r.finished_at.as_deref().unwrap_or("") }}</td>
-        <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}{% if r.retried %} · <span class="muted">retried</span>{% endif %}</td>
+        <td class="wrap">{% if let Some(sid) = r.scan_id %}<a class="mono" href="/admin/investigate/scans/{{ sid }}">scan #{{ sid }}</a> · {{ r.open_ports }} open{% if let Some(os) = r.os_guess %} · {{ os }}{% endif %}{% else if let Some(e) = r.error %}<span class="mono">{{ e }}</span>{% endif %}{% if r.retried %} · <span class="muted">retried</span>{% endif %}</td>
         <td class="muted">{% if let Some(s) = r.scanner %}<span{% if let Some(h) = r.handout %} title="{{ h }}"{% endif %}>{{ s }}</span>{% endif %}{% if let Some(a) = r.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
       </tr>
     {% endfor %}
@@ -78,9 +78,9 @@
   {# Absolute links: a pace error renders this page under the form's URL. #}
   {% if history.prev().is_some() || history.next().is_some() %}
   <nav class="pagination" aria-label="Pagination">
-    <span>{% if let Some(p) = history.prev() %}<a class="btn btn-sm" href="/admin/scans?{{ qs }}page={{ p }}#history">← Previous</a>{% endif %}</span>
+    <span>{% if let Some(p) = history.prev() %}<a class="btn btn-sm" href="/admin/investigate/scans?{{ qs }}page={{ p }}#history">← Previous</a>{% endif %}</span>
     <span class="muted">page {{ history.page }}</span>
-    <span>{% if let Some(n) = history.next() %}<a class="btn btn-sm" href="/admin/scans?{{ qs }}page={{ n }}#history">Next →</a>{% endif %}</span>
+    <span>{% if let Some(n) = history.next() %}<a class="btn btn-sm" href="/admin/investigate/scans?{{ qs }}page={{ n }}#history">Next →</a>{% endif %}</span>
   </nav>
   {% endif %}
 </section>

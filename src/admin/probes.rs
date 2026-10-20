@@ -408,7 +408,7 @@ pub struct PortView {
     pub outcome: String,
     /// `(label, value, mono)`.
     pub facts: Vec<(String, String, bool)>,
-    /// `(link kind key, value)` for `/admin/links/{kind}/{value}`.
+    /// `(link kind key, value)` for `/admin/evidence/links/{kind}/{value}`.
     pub links: Vec<(String, String)>,
     pub redirects: Vec<HopView>,
     /// The detail as recorded, for comparisons.
@@ -826,13 +826,16 @@ async fn request(
 ) -> AppResult<Response> {
     let form = ProbeForm::parse(&body);
     let Ok(ip) = form.ip.trim().parse::<IpAddr>() else {
-        return Ok(redirect_with_error("/admin/lookup", "Not an IP address."));
+        return Ok(redirect_with_error(
+            "/admin/investigate/lookup",
+            "Not an IP address.",
+        ));
     };
     let ip = crate::net::canonical(ip);
     let back = format!("/ip/{ip}#actions");
     let Some(row) = state.store.ip_by_addr(&ip.to_string()).await? else {
         return Ok(redirect_with_error(
-            &format!("/admin/lookup?ip={ip}"),
+            &format!("/admin/investigate/lookup?ip={ip}"),
             "No probe: the address is not in the dataset.",
         ));
     };

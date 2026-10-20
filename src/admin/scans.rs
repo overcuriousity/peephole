@@ -24,9 +24,9 @@ pub const LIVE_ROWS: i64 = 500;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/scans", get(page))
-        .route("/admin/scans/{id}", get(scan_page))
-        .route("/admin/scans/{id}/xml", get(scan_xml))
+        .route("/admin/investigate/scans", get(page))
+        .route("/admin/investigate/scans/{id}", get(scan_page))
+        .route("/admin/investigate/scans/{id}/xml", get(scan_xml))
         .route("/admin/scans/{id}/delete", post(scan_delete))
         .route("/admin/queue", get(queue_moved))
         .route("/admin/queue/pace", post(queue_pace))
@@ -124,16 +124,16 @@ fn history_qs(f: &JobFilter) -> String {
 }
 
 /// The Queue page became part of Scans; its filter and page carry over.
-async fn queue_moved(Query(q): Query<ScansQuery>) -> Redirect {
+async fn queue_moved(_u: SessionUser, Query(q): Query<ScansQuery>) -> Redirect {
     let mut qs = history_qs(&q.filter());
     if let Some(p) = q.page.filter(|p| *p > 1) {
         qs.push_str(&format!("page={p}&"));
     }
     if qs.is_empty() {
-        Redirect::permanent("/admin/scans")
+        Redirect::permanent("/admin/investigate/scans")
     } else {
         Redirect::permanent(&format!(
-            "/admin/scans?{}#history",
+            "/admin/investigate/scans?{}#history",
             qs.trim_end_matches('&')
         ))
     }
@@ -297,7 +297,7 @@ async fn queue_pace(
         Err(_) => Err("workers must be a number".into()),
     };
     match outcome {
-        Ok(()) => Ok(Redirect::to("/admin/scans?saved=1").into_response()),
+        Ok(()) => Ok(Redirect::to("/admin/investigate/scans?saved=1").into_response()),
         Err(e) => {
             let pace = pace_view(&st, None, Some(e)).await?;
             let body = render_page(&st, &ScansQuery::default(), pace).await?;
@@ -461,7 +461,10 @@ async fn scan_delete(
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(redirect_with_notice("/admin/scans", &deleted_msg(out)))
+    Ok(redirect_with_notice(
+        "/admin/investigate/scans",
+        &deleted_msg(out),
+    ))
 }
 
 #[cfg(test)]

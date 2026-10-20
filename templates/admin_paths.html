@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — new paths{% endblock %}
 {% block content %}
-{% let sub = "paths" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("evidence", "paths") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>New paths</h1><p class="muted">Path shapes by when this node first saw them, newest first; a wave is a shape no rule knows asked for by many IPs within an hour.</p>{% if keeps_days > 0 %}<p class="muted" data-retention>First seen on this node (keeps {{ keeps_days }} days).</p>{% endif %}</div></div>
 <div class="stack">
 <section class="card">
@@ -14,7 +14,7 @@
     <td class="num">{{ r.ips }}</td>
     <td>{% match r.rule_hits %}{% when Some(0) %}<span class="badge badge-wave">none</span>{% when Some(_) %}known{% when None %}<span class="muted">pending</span>{% endmatch %}</td>
     <td>{% if let Some(w) = r.wave %}<span class="badge badge-wave" title="detected {{ crate::admin::views::minute(w.detected_at.as_str()) }}">{{ w.ips }} IPs in {{ w.minutes() }} min</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-    <td>{% for (num, key, members) in r.campaigns.top %}<a href="/admin/campaigns/{{ key }}" title="members: {{ members }}">#{{ num }}</a>{% if !loop.last %}, {% endif %}{% endfor %}{% if r.campaigns.more > 0 %} <span class="muted">+{{ r.campaigns.more }}</span>{% endif %}{% if r.campaigns.top.is_empty() %}<span class="muted">—</span>{% endif %}</td>
+    <td>{% for (num, key, members) in r.campaigns.top %}<a href="/admin/evidence/campaigns/{{ key }}" title="members: {{ members }}">#{{ num }}</a>{% if !loop.last %}, {% endif %}{% endfor %}{% if r.campaigns.more > 0 %} <span class="muted">+{{ r.campaigns.more }}</span>{% endif %}{% if r.campaigns.top.is_empty() %}<span class="muted">—</span>{% endif %}</td>
   </tr>{% endfor %}
   {% if rows.is_empty() %}<tr><td colspan="7" class="empty">No new path{% if unknown %} no rule knows{% endif %}.</td></tr>{% endif %}
   </tbody></table></div>

@@ -12,7 +12,7 @@ use crate::store::stats::Range;
 use askama::Template;
 use axum::{
     Json, Router,
-    extract::{Path, Query, RawQuery, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
@@ -21,17 +21,11 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/links", get(index))
-        .route("/admin/links/canaries", get(canaries))
-        .route("/admin/links/canaries/served/{id}", get(decoy_canaries))
-        .route("/admin/links/{kind}/{value}", get(item))
+        .route("/admin/evidence/links", get(index))
+        .route("/admin/evidence/canaries", get(canaries))
+        .route("/admin/evidence/canaries/served/{id}", get(decoy_canaries))
+        .route("/admin/evidence/links/{kind}/{value}", get(item))
         .route("/admin/api/links/graph", get(graph))
-        // Moved in the Links rework; the redirects reveal nothing.
-        .route(
-            "/admin/fingerprints",
-            get(|| async { Redirect::permanent("/admin/links") }),
-        )
-        .route("/admin/canaries", get(canaries_moved))
 }
 
 fn chrome() -> Chrome {
@@ -94,7 +88,7 @@ async fn index(
             let group_start = i > 0 && !k.identity() && LinkKind::LIST[i - 1].identity();
             (
                 *k,
-                format!("/admin/links?{}", qs.trim_end_matches('&')),
+                format!("/admin/evidence/links?{}", qs.trim_end_matches('&')),
                 group_start,
             )
         })
@@ -237,14 +231,6 @@ async fn graph(
         .link_graph(&focus, q.depth(), &q.types(), q.all.as_deref() == Some("1"))
         .await?;
     Ok(Json(g).into_response())
-}
-
-/// Canaries moved under Links; the filter carries over.
-async fn canaries_moved(RawQuery(q): RawQuery) -> Redirect {
-    match q.filter(|q| !q.is_empty()) {
-        Some(q) => Redirect::permanent(&format!("/admin/links/canaries?{q}")),
-        None => Redirect::permanent("/admin/links/canaries"),
-    }
 }
 
 #[derive(serde::Deserialize, Default)]

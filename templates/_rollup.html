@@ -14,7 +14,7 @@
   {% if !r.open_ports.is_empty() %}<h3>Open ports</h3>
   <div class="chips">{% for (p, n) in r.open_ports %}<a class="chip" href="/ips?{{ base }}&amp;port={{ p }}"><span class="mono">{{ p }}</span> <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
   {% if !r.campaigns.is_empty() %}<h3>Campaigns</h3>
-  <div class="chips">{% for (key, num, n) in r.campaigns %}<a class="chip" href="/admin/campaigns/{{ key }}">#{{ num }} <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
+  <div class="chips">{% for (key, num, n) in r.campaigns %}<a class="chip" href="/admin/evidence/campaigns/{{ key }}">#{{ num }} <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
 </section>
 {% endif %}
 <section class="card">

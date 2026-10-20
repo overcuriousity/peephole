@@ -31,7 +31,7 @@ pub struct Pusher {
     client: reqwest::Client,
     cfg: NotifyConfig,
     node: String,
-    /// `<webauthn.origin>/admin/paths`, on a node with the web role.
+    /// `<webauthn.origin>/admin/evidence/paths`, on a node with the web role.
     page: Option<String>,
 }
 
@@ -47,7 +47,7 @@ impl Pusher {
             client,
             cfg,
             node,
-            page: admin_origin.map(|o| format!("{}/admin/paths", o.trim_end_matches('/'))),
+            page: admin_origin.map(|o| format!("{}/admin/evidence/paths", o.trim_end_matches('/'))),
         }
     }
 
@@ -314,7 +314,7 @@ mod tests {
                     "ips": 12,
                     "window_minutes": 60,
                     "window_start": "2026-10-04 12:00:00",
-                    "url": "https://admin.example/admin/paths",
+                    "url": "https://admin.example/admin/evidence/paths",
                 }],
             })
         );

@@ -1,14 +1,13 @@
 {% extends "layout.html" %}
 {% block title %}peephole — cluster{% endblock %}
 {% block content %}
-{% let sub = "cluster" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "members") %}{% include "_admin_nav.html" %}
 {% if standalone %}
 <div class="page-head"><div><h1>Cluster</h1></div></div>
 <section class="card"><h2>Standalone</h2>
   <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/operations.md#cluster-administration">Cluster administration</a>.</p>
-  <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/scans#pace">Scans</a>.</p></section>
+  <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/investigate/scans#pace">Scans</a>.</p></section>
 {% else %}
-{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
 <div class="page-head"><div><h1>Cluster</h1></div></div>
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 {% if let Some(u) = unserved %}<div class="banner banner-warning">History incomplete for {{ u }}: waiting for a full member.</div>{% endif %}
@@ -18,16 +17,16 @@
     <tbody>
     {% for m in rows %}
       <tr{% if !m.active %} class="muted"{% endif %}>
-        <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a> <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</td>
+        <td><a href="/admin/network/members/{{ m.key }}"><b>{{ m.name }}</b></a> <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</td>
         <td>{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</td>
         <td>{{ m.last_seen }}</td>
         <td>{{ m.lag }}</td>
         {% if let Some((r, sc)) = shares.get(m.key.as_str()) %}<td class="num">{{ r }}</td><td class="num">{{ sc }}</td>{% else %}<td class="num">0</td><td class="num">0</td>{% endif %}
-        <td>{% let issues = m.issues() %}{% if !issues.is_empty() %}<a class="badge badge-status" data-status="running" href="/admin/cluster/node/{{ m.key }}" title="{{ issues.join(" · ") }}{% if m.skew.is_some() %}. Run NTP on every node: scan cooldowns compare timestamps from different nodes.{% endif %}" aria-label="{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}: {{ issues.join("; ") }}">{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}</a>{% endif %}</td>
+        <td>{% let issues = m.issues() %}{% if !issues.is_empty() %}<a class="badge badge-status" data-status="running" href="/admin/network/members/{{ m.key }}" title="{{ issues.join(" · ") }}{% if m.skew.is_some() %}. Run NTP on every node: scan cooldowns compare timestamps from different nodes.{% endif %}" aria-label="{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}: {{ issues.join("; ") }}">{{ issues.len() }} issue{% if issues.len() != 1 %}s{% endif %}</a>{% endif %}</td>
       </tr>
     {% endfor %}
     {% if let Some((r, sc)) = unshared %}<tr class="muted"><td colspan="4" title="Recorded before this node joined; not attributed to a member">not shared yet</td><td class="num">{{ r }}</td><td class="num">{{ sc }}</td><td></td></tr>{% endif %}
-    {% if rows.len() == 1 %}<tr><td colspan="7" class="empty">No other members yet. Create an invite on <a href="/admin/cluster/access">Access</a>, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
+    {% if rows.len() == 1 %}<tr><td colspan="7" class="empty">No other members yet. Create an invite on <a href="/admin/network/access">Access</a>, or list peers in <code>[[cluster.peers]]</code>.</td></tr>{% endif %}
     </tbody>
   </table></div>
 </section>

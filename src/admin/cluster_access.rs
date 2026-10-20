@@ -1,4 +1,4 @@
-//! Cluster › Access: who may join, and joining or leaving.
+//! Network › Access: who may join, and joining or leaving.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::cluster::{InviteView, back_to, invites, node};
@@ -14,11 +14,11 @@ use axum::{
 };
 use std::sync::Arc;
 
-const ACCESS: &str = "/admin/cluster/access";
+const ACCESS: &str = "/admin/network/access";
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/cluster/access", get(page))
+        .route("/admin/network/access", get(page))
         .route("/admin/cluster/invite", post(create_invite))
         .route("/admin/cluster/invite/revoke", post(revoke_invite))
         .route("/admin/cluster/join", post(join))

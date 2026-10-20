@@ -2069,7 +2069,7 @@ show_labels = {show_labels}
             html.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
             "{html}"
         );
-        let item = "/admin/links/ua/Mozilla%2F5.0%20%28X11%29";
+        let item = "/admin/evidence/links/ua/Mozilla%2F5.0%20%28X11%29";
         assert!(
             html.contains(&format!(r#"href="{item}">Mozilla/5.0 (X11)</a>"#)),
             "{html}"
@@ -2084,9 +2084,14 @@ show_labels = {show_labels}
             "{page}"
         );
         // One IP: listed only with `shared=0`, under its own tab.
-        let (_, index) = get_with(&app, "/admin/links?kind=ua", Some(&cookie)).await;
+        let (_, index) = get_with(&app, "/admin/evidence/links?kind=ua", Some(&cookie)).await;
         assert!(!index.contains(item), "{index}");
-        let (status, index) = get_with(&app, "/admin/links?kind=ua&shared=0", Some(&cookie)).await;
+        let (status, index) = get_with(
+            &app,
+            "/admin/evidence/links?kind=ua&shared=0",
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(
             index.contains(item) && index.contains(" aria-current=\"true\">User agent</a>"),
@@ -2175,10 +2180,14 @@ show_labels = {show_labels}
         .unwrap();
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
-        let (status, html) =
-            get_with(&app, &format!("/admin/links/ja4/{ja4}"), Some(&cookie)).await;
+        let (status, html) = get_with(
+            &app,
+            &format!("/admin/evidence/links/ja4/{ja4}"),
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
-        let badge = r#"href="/admin/campaigns/203.0.113.60">member of campaign #7</a>"#;
+        let badge = r#"href="/admin/evidence/campaigns/203.0.113.60">member of campaign #7</a>"#;
         assert_eq!(html.matches(badge).count(), 1, "{html}");
         assert_eq!(html.matches("member of campaign").count(), 1, "{html}");
         assert!(html.contains("203.0.113.61"), "{html}");
@@ -2291,7 +2300,7 @@ show_labels = {show_labels}
         );
         assert!(admin.contains("AS type not classified"), "{admin}");
         assert!(
-            admin.contains(&format!("href=\"/admin/scans/{scan}\"")),
+            admin.contains(&format!("href=\"/admin/investigate/scans/{scan}\"")),
             "{admin}"
         );
         let (status, public) = get_with(&app, "/ip/203.0.113.47", None).await;
@@ -2399,7 +2408,7 @@ show_labels = {show_labels}
         let sharing = &page[sh..];
         let sharing = &sharing[..sharing.find("</section>").unwrap()];
         assert!(
-            sharing.contains(&format!("href=\"/admin/scans/{scan}\"")),
+            sharing.contains(&format!("href=\"/admin/investigate/scans/{scan}\"")),
             "{sharing}"
         );
         // MIK-652: the caveat leads, the badge is a neutral span with no rule
@@ -2589,7 +2598,10 @@ show_labels = {show_labels}
         let (status, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(html.contains("<h2>Lures</h2>"), "{html}");
-        assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
+        assert!(
+            html.contains(&format!("/admin/traps/uploads/{uid}\"")),
+            "{html}"
+        );
         assert!(
             html.contains(r#"href="/requests?cmd=whoami" title="whoami">whoami</a></td>"#),
             "{html}"
@@ -2602,7 +2614,7 @@ show_labels = {show_labels}
         let (status, public) = get_with(&app, "/ip/203.0.113.30", None).await;
         assert_eq!(status, 200);
         assert!(!public.contains("<h2>Lures</h2>"), "{public}");
-        assert!(!public.contains("/admin/uploads/"), "{public}");
+        assert!(!public.contains("/admin/traps/uploads/"), "{public}");
         assert!(!public.contains("whoami"), "{public}");
         // An address with neither: no section.
         let (_, none) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
@@ -2748,13 +2760,17 @@ show_labels = {show_labels}
         let (_, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(html.matches("\">upload</a>").count(), IP_DROPS, "{html}");
         assert_eq!(html.matches(">id</a></td>").count(), IP_DROPS, "{html}");
-        assert!(html.contains("/admin/uploads?ip=203.0.113.30\""), "{html}");
+        assert!(
+            html.contains("/admin/traps/uploads?ip=203.0.113.30\""),
+            "{html}"
+        );
         assert!(
             html.contains("/requests?ip=203.0.113.30&amp;answer=webshell\""),
             "{html}"
         );
         // The full list holds this address's uploads only.
-        let (status, list) = get_with(&app, "/admin/uploads?ip=203.0.113.30", Some(&cookie)).await;
+        let (status, list) =
+            get_with(&app, "/admin/traps/uploads?ip=203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert_eq!(
             list.matches("href=\"/ip/203.0.113.30\">203.0.113.30</a></td>")
@@ -2800,7 +2816,10 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (status, up) = get_with(&app, &format!("/admin/requests/{up_id}"), Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(up.contains(&format!("/admin/uploads/{uid}\"")), "{up}");
+        assert!(
+            up.contains(&format!("/admin/traps/uploads/{uid}\"")),
+            "{up}"
+        );
         assert!(
             up.contains("bytes · <span class=\"mono\">put</span>"),
             "{up}"
@@ -2815,7 +2834,7 @@ show_labels = {show_labels}
             "{cmd}"
         );
         assert!(cmd.contains("member of campaign #7"), "{cmd}");
-        assert!(!cmd.contains("/admin/uploads/"), "{cmd}");
+        assert!(!cmd.contains("/admin/traps/uploads/"), "{cmd}");
         // Without a session the page is not served at all.
         for id in [up_id, cmd_id] {
             let (status, body) = get_with(&app, &format!("/admin/requests/{id}"), None).await;
@@ -2895,7 +2914,10 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let port = r#"href="/ips?port=22""#;
         let product = r#"href="/ips?product=OpenSSH%209.6p1""#;
-        for page in [format!("/admin/scans/{id}"), "/ip/203.0.113.9".into()] {
+        for page in [
+            format!("/admin/investigate/scans/{id}"),
+            "/ip/203.0.113.9".into(),
+        ] {
             let (status, html) = get_with(&app, &page, Some(&cookie)).await;
             assert_eq!(status, 200, "{page}");
             assert!(html.contains(port), "{page}: {html}");
@@ -2914,7 +2936,12 @@ show_labels = {show_labels}
         let (st, _d, id) = scanned_state().await;
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
-        let (status, xml) = get_with(&app, &format!("/admin/scans/{id}/xml"), Some(&cookie)).await;
+        let (status, xml) = get_with(
+            &app,
+            &format!("/admin/investigate/scans/{id}/xml"),
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(xml.contains("Hello [[scanner]]"), "{xml}");
         assert!(!xml.contains("198.51.100.5"));
@@ -3119,7 +3146,7 @@ show_labels = {show_labels}
         let (st, _dir) = state(true).await;
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st);
-        let (status, _) = get_with(&app, "/admin/decoys", None).await;
+        let (status, _) = get_with(&app, "/admin/traps/mcp", None).await;
         assert_ne!(status, 200, "admin only");
         for (tab, heading) in [
             ("mcp", "Sessions"),
@@ -3127,23 +3154,190 @@ show_labels = {show_labels}
             ("web", "Web decoys"),
         ] {
             let (status, body) =
-                get_with(&app, &format!("/admin/decoys?tab={tab}"), Some(&cookie)).await;
+                get_with(&app, &format!("/admin/traps/{tab}"), Some(&cookie)).await;
             assert_eq!(status, 200, "{tab}");
             assert!(body.contains(heading), "{tab}: {body}");
             assert!(
-                body.contains(r#"href="/admin/decoys" aria-current="true""#),
-                "nav marks Decoys"
+                body.contains(r#"href="/admin/traps/mcp" aria-current="true">Traps</a>"#),
+                "nav marks Traps"
             );
         }
-        let (_, body) = get_with(&app, "/admin/decoys?tab=llm&range=7d", Some(&cookie)).await;
+        let (_, body) = get_with(&app, "/admin/traps/llm?range=7d", Some(&cookie)).await;
         assert!(
-            body.contains("/admin/decoys?tab=mcp&#38;range=7d"),
+            body.contains(r#"href="/admin/traps/mcp?range=7d">MCP</a>"#),
             "tabs keep the range"
         );
         assert!(
-            body.contains("/admin/decoys?tab=llm&amp;range=30d"),
+            body.contains(r#"href="/admin/traps/uploads">Uploads</a>"#),
+            "uploads has no range"
+        );
+        assert!(
+            body.contains("/admin/traps/llm?range=30d"),
             "range keeps the tab"
         );
+    }
+
+    /// Status and `Location` of a GET, redirects not followed.
+    async fn location(app: &axum::Router, path: &str, cookie: Option<&str>) -> (u16, String) {
+        let mut req = axum::http::Request::get(path);
+        if let Some(c) = cookie {
+            req = req.header(axum::http::header::COOKIE, c);
+        }
+        let r = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let loc = r
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .map(|l| l.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (r.status().as_u16(), loc)
+    }
+
+    /// MIK-711 §3: every old admin GET URL answers 308 to its place in the
+    /// tree, query kept, in one hop, and only with a session.
+    #[tokio::test]
+    async fn old_admin_urls_answer_308_to_the_tree() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let key = "00".repeat(32);
+        let cases: Vec<(String, String)> = [
+            (
+                "/admin/analytics?range=7d",
+                "/admin/overview/analytics?range=7d",
+            ),
+            (
+                "/admin/lookup?ip=192.0.2.1",
+                "/admin/investigate/lookup?ip=192.0.2.1",
+            ),
+            ("/admin/scans", "/admin/investigate/scans"),
+            (
+                "/admin/scans?status=done",
+                "/admin/investigate/scans?status=done",
+            ),
+            ("/admin/scans/7", "/admin/investigate/scans/7"),
+            ("/admin/scans/7/xml", "/admin/investigate/scans/7/xml"),
+            ("/admin/queue", "/admin/investigate/scans"),
+            (
+                "/admin/queue?status=failed",
+                "/admin/investigate/scans?status=failed#history",
+            ),
+            ("/admin/campaigns?q=x", "/admin/evidence/campaigns?q=x"),
+            (
+                "/admin/campaigns/192.0.2.3",
+                "/admin/evidence/campaigns/192.0.2.3",
+            ),
+            ("/admin/links?kind=ssh", "/admin/evidence/links?kind=ssh"),
+            ("/admin/links/ja4/t13d", "/admin/evidence/links/ja4/t13d"),
+            (
+                "/admin/links/canaries?range=all",
+                "/admin/evidence/canaries?range=all",
+            ),
+            (
+                "/admin/links/canaries/served/3",
+                "/admin/evidence/canaries/served/3",
+            ),
+            (
+                "/admin/canaries?range=all&ip=203.0.113.9",
+                "/admin/evidence/canaries?range=all&ip=203.0.113.9",
+            ),
+            ("/admin/fingerprints", "/admin/evidence/links"),
+            ("/admin/paths?since=all", "/admin/evidence/paths?since=all"),
+            ("/admin/decoys", "/admin/traps/mcp"),
+            ("/admin/decoys?tab=mcp", "/admin/traps/mcp"),
+            (
+                "/admin/decoys?tab=llm&range=7d",
+                "/admin/traps/llm?range=7d",
+            ),
+            (
+                "/admin/decoys?range=30d&tab=web",
+                "/admin/traps/web?range=30d",
+            ),
+            ("/admin/uploads?sha256=ab", "/admin/traps/uploads?sha256=ab"),
+            ("/admin/uploads/u1", "/admin/traps/uploads/u1"),
+            (
+                "/admin/uploads/u1/content.zip",
+                "/admin/traps/uploads/u1/content.zip",
+            ),
+            ("/admin/cluster", "/admin/network/members"),
+            ("/admin/cluster/access", "/admin/network/access"),
+            ("/admin/cluster/ownership", "/admin/network/ownership"),
+            ("/admin/cluster/credits?x=1", "/admin/network/credits?x=1"),
+            ("/admin/market", "/admin/network/credits"),
+            ("/admin/system", "/admin/system/status"),
+            ("/admin/inbox", "/admin/system/inbox"),
+            ("/admin/devices", "/admin/system/devices"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .chain([
+            (
+                format!("/admin/cluster/node/{key}"),
+                format!("/admin/network/members/{key}"),
+            ),
+            (
+                format!("/admin/cluster/node/{key}/fork-proof"),
+                format!("/admin/network/members/{key}/fork-proof"),
+            ),
+        ])
+        .collect();
+        for (old, new) in &cases {
+            assert_eq!(
+                location(&app, old, Some(&cookie)).await,
+                (308, new.clone()),
+                "{old}"
+            );
+            assert_eq!(
+                location(&app, old, None).await,
+                (303, "/login".to_string()),
+                "{old} needs a session"
+            );
+        }
+        // Group roots land on their first child.
+        for (root, first) in [
+            ("/admin/overview", "/admin"),
+            ("/admin/investigate", "/admin/investigate/lookup"),
+            ("/admin/evidence", "/admin/evidence/campaigns"),
+            ("/admin/traps", "/admin/traps/mcp"),
+            ("/admin/network", "/admin/network/members"),
+        ] {
+            assert_eq!(
+                location(&app, root, Some(&cookie)).await,
+                (302, first.to_string()),
+                "{root}"
+            );
+        }
+    }
+
+    /// MIK-711: each group's pages mark the group and the child as current.
+    #[tokio::test]
+    async fn each_admin_group_marks_its_group_and_child() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        for (path, group, child) in [
+            ("/admin", "Overview", "Now"),
+            ("/admin/investigate/scans", "Investigate", "Scans"),
+            ("/admin/evidence/canaries", "Evidence", "Canaries"),
+            ("/admin/traps/llm", "Traps", "LLM"),
+            ("/admin/network/members", "Network", "Members"),
+            ("/admin/system/devices", "System", "Devices"),
+        ] {
+            let (status, body) = get_with(&app, path, Some(&cookie)).await;
+            assert_eq!(status, 200, "{path}");
+            assert!(
+                body.contains(&format!(r#" aria-current="true">{group}</a>"#)),
+                "{path}: group {group}"
+            );
+            assert!(
+                body.contains(&format!(r#"aria-label="{group} pages""#))
+                    && body.contains(&format!(r#" aria-current="page">{child}</a>"#)),
+                "{path}: child {child}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3694,8 +3888,8 @@ show_labels = {show_labels}
         let (status, cmd) = get_with(&app, "/requests?cmd=whoami", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(cmd.contains("/s.php"), "{cmd}");
-        assert!(ev.contains("/admin/uploads/"), "{ev}");
-        assert!(ev.contains("/admin/scans/"), "{ev}");
+        assert!(ev.contains("/admin/traps/uploads/"), "{ev}");
+        assert!(ev.contains("/admin/investigate/scans/"), "{ev}");
         assert!(ev.contains("192.0.2.99"), "{ev}");
         assert!(ev.contains("<th>Node</th>"), "{ev}");
         // A bad cursor is the first page.

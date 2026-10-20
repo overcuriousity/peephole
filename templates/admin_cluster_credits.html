@@ -2,7 +2,7 @@
 {% block title %}peephole — market{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "market" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "credits") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Market</h1><p class="muted">Every figure is this node's own count.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
@@ -91,7 +91,7 @@
   <div class="table-wrap"><table>
     <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Pool (7 days)</th><th class="num">Sales (7 days)</th><th class="num" title="Hours up today, as the members report; 12 earn the day's pool share">Up today</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
-      <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
+      <td><a href="/admin/network/members/{{ m.key }}"><b>{{ m.name }}</b></a></td>
       <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.pool }}</td><td class="num">{{ m.sales }}</td>
       <td class="num">{{ m.up }} h {% if m.qualifies %}<span class="badge" data-status="done">qualifies</span>{% else %}<span class="muted small">does not qualify</span>{% endif %}</td>
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>

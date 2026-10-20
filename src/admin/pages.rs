@@ -19,19 +19,13 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/analytics", get(analytics))
+        .route("/admin/overview/analytics", get(analytics))
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
         .route("/admin/ips/{addr}/delete", post(ip_delete))
         .route("/admin/requests/bulk-delete", post(bulk_delete_requests))
         .route("/admin/ips/bulk-delete", post(bulk_delete_ips))
         .route("/admin/system/inbox", get(inbox))
-        .route(
-            "/admin/inbox",
-            get(|uri: axum::http::Uri| async move {
-                crate::admin::views::moved("/admin/system/inbox", &uri)
-            }),
-        )
         .route("/admin/claims/{id}/delete", post(claim_delete))
 }
 
@@ -139,7 +133,7 @@ impl AnalyticsPage {
     /// A scan level (`level 2`) in the scans history.
     fn level_href(&self, name: &str) -> String {
         format!(
-            "/admin/scans?level={}#history",
+            "/admin/investigate/scans?level={}#history",
             name.trim_start_matches("level ")
         )
     }
@@ -499,7 +493,7 @@ mod delete_notice_tests {
         let value = c.split(';').next().unwrap();
         assert!(!value.contains(' '), "cookie value must be encoded: {c}");
         assert!(c.contains("hid+3+record"), "{c}");
-        let r = redirect_with_error("/admin/cluster", &"é".repeat(2000));
+        let r = redirect_with_error("/admin/network/members", &"é".repeat(2000));
         let c = r.headers()[axum::http::header::SET_COOKIE]
             .to_str()
             .unwrap();
@@ -533,7 +527,7 @@ mod short_strings_tests {
         };
         let cases: [(&str, &[&str], &[&str]); 11] = [
             (
-                "/admin/links",
+                "/admin/evidence/links",
                 &[
                     "mean one operator; JA4, JA4H, HASSH and JA4X the same software; favicon, JARM, page and 404 hashes the same product.",
                     "<option value=\"1\">shared</option>",
@@ -546,19 +540,19 @@ mod short_strings_tests {
                 &["point to one operator", "two or more IPs</option>"],
             ),
             (
-                "/admin/links/canaries",
+                "/admin/evidence/canaries",
                 &[
                     "Credentials served in decoys and their later uses; the period is when they were served.",
                 ],
                 &["the requests that used them again"],
             ),
             (
-                "/admin/uploads",
+                "/admin/traps/uploads",
                 &["Files dropped on the trap, kept by hash; download only as a zip (password"],
                 &["never served, run, shown or unpacked"],
             ),
             (
-                "/admin/decoys",
+                "/admin/traps/mcp",
                 &[
                     "What the fake MCP server and LLM gateway drew out.</p>",
                     "<div class=\"hint\">distinct sessions</div>",
@@ -578,7 +572,7 @@ mod short_strings_tests {
                 &["not an address, network"],
             ),
             (
-                "/admin/lookup",
+                "/admin/investigate/lookup",
                 &[
                     "What the cluster knows about an address and what providers say now.</p>",
                     "placeholder=\"IP, host, URL or a list\"",
@@ -586,17 +580,17 @@ mod short_strings_tests {
                 &["every reachable provider", "placeholder=\"203.0.113.7"],
             ),
             (
-                "/admin/analytics",
+                "/admin/overview/analytics",
                 &[
                     "<span class=\"muted\">direct HTTP/1 only</span>",
-                    "<h2 title=\"JA4 (FoxIO): the TLS ClientHello the source sent us",
-                    "<h2 title=\"HASSH-server: a hash of the algorithm lists",
+                    "<h2><a class=\"gloss\" href=\"#glossary\" title=\"JA4 (FoxIO): the TLS ClientHello the source sent us",
+                    "<h2><a class=\"gloss\" href=\"#glossary\" title=\"HASSH-server: a hash of the algorithm lists",
                     "<summary>What the fingerprints mean</summary>",
                 ],
                 &["not through an HTTP proxy"],
             ),
             (
-                "/admin/scans",
+                "/admin/investigate/scans",
                 &["<h1>Scans</h1></div>"],
                 &["Pace, the live queue"],
             ),

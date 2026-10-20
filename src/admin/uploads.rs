@@ -25,9 +25,9 @@ pub const ZIP_PASSWORD: &str = "infected";
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/uploads", get(list))
-        .route("/admin/uploads/{uid}", get(detail))
-        .route("/admin/uploads/{uid}/content.zip", get(content_zip))
+        .route("/admin/traps/uploads", get(list))
+        .route("/admin/traps/uploads/{uid}", get(detail))
+        .route("/admin/traps/uploads/{uid}/content.zip", get(content_zip))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -234,9 +234,9 @@ pub(crate) mod tests {
         let (st, _cookie, app, _d) = app().await;
         upload(&st, "u1", "a.php", b"<?php", true).await;
         for path in [
-            "/admin/uploads",
-            "/admin/uploads/u1",
-            "/admin/uploads/u1/content.zip",
+            "/admin/traps/uploads",
+            "/admin/traps/uploads/u1",
+            "/admin/traps/uploads/u1/content.zip",
         ] {
             let (status, h, body) = send(&app, Request::get(path), Body::empty()).await;
             assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
@@ -260,23 +260,27 @@ pub(crate) mod tests {
                 .header("cookie", cookie.clone())
                 .header("sec-fetch-site", "same-origin")
         };
-        let (status, _, body) = send(&app, get("/admin/uploads"), Body::empty()).await;
+        let (status, _, body) = send(&app, get("/admin/traps/uploads"), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("&#60;b&#62;x&#60;/b&#62;"), "{body}");
         assert!(!body.contains("<b>x</b>"));
         assert!(!body.contains("<?php"));
-        assert!(body.contains("/admin/uploads/held/content.zip"));
-        assert!(!body.contains("/admin/uploads/gone/content.zip"));
+        assert!(body.contains("/admin/traps/uploads/held/content.zip"));
+        assert!(!body.contains("/admin/traps/uploads/gone/content.zip"));
         assert!(body.contains("content not held"));
 
-        let (status, _, body) = send(&app, get("/admin/uploads/gone"), Body::empty()).await;
+        let (status, _, body) = send(&app, get("/admin/traps/uploads/gone"), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("content not held") && body.contains("dropped_rate"));
         assert!(!body.contains("content.zip"));
-        let (status, _, _) =
-            send(&app, get("/admin/uploads/gone/content.zip"), Body::empty()).await;
+        let (status, _, _) = send(
+            &app,
+            get("/admin/traps/uploads/gone/content.zip"),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _, _) = send(&app, get("/admin/uploads/nope"), Body::empty()).await;
+        let (status, _, _) = send(&app, get("/admin/traps/uploads/nope"), Body::empty()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -293,28 +297,29 @@ pub(crate) mod tests {
                 .header("cookie", cookie.clone())
                 .header("sec-fetch-site", "same-origin")
         };
-        let href = format!("href=\"/admin/uploads?sha256={hash}\"");
-        let (status, _, body) = send(&app, get("/admin/uploads/ua".into()), Body::empty()).await;
+        let href = format!("href=\"/admin/traps/uploads?sha256={hash}\"");
+        let (status, _, body) =
+            send(&app, get("/admin/traps/uploads/ua".into()), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(&href), "{body}");
-        let (_, _, body) = send(&app, get("/admin/uploads".into()), Body::empty()).await;
+        let (_, _, body) = send(&app, get("/admin/traps/uploads".into()), Body::empty()).await;
         assert!(body.contains(&href), "{body}");
 
         for q in [hash.clone(), hash.to_uppercase()] {
             let (status, _, body) = send(
                 &app,
-                get(format!("/admin/uploads?sha256={q}")),
+                get(format!("/admin/traps/uploads?sha256={q}")),
                 Body::empty(),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
-            assert!(body.contains("/admin/uploads/ua\""), "{body}");
-            assert!(!body.contains("/admin/uploads/ub\""), "{body}");
+            assert!(body.contains("/admin/traps/uploads/ua\""), "{body}");
+            assert!(!body.contains("/admin/traps/uploads/ub\""), "{body}");
         }
         for bad in ["zz", "abcd", &format!("{hash}00")] {
             let (status, _, _) = send(
                 &app,
-                get(format!("/admin/uploads?sha256={bad}")),
+                get(format!("/admin/traps/uploads?sha256={bad}")),
                 Body::empty(),
             )
             .await;
@@ -330,7 +335,7 @@ pub(crate) mod tests {
         let hash = data_encoding::HEXLOWER.encode(&r.sha256);
         let res = tower::ServiceExt::oneshot(
             app.clone(),
-            Request::get("/admin/uploads/z/content.zip")
+            Request::get("/admin/traps/uploads/z/content.zip")
                 .header("cookie", cookie)
                 .header("sec-fetch-site", "same-origin")
                 .body(Body::empty())

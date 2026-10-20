@@ -19,7 +19,7 @@ use chrono::{Duration, Utc};
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new().route("/admin/paths", get(index))
+    Router::new().route("/admin/evidence/paths", get(index))
 }
 
 /// Rows on the page.
@@ -54,7 +54,7 @@ struct PathsPage {
 impl PathsPage {
     fn href(since: &str, unknown: bool) -> String {
         format!(
-            "/admin/paths?since={since}{}",
+            "/admin/evidence/paths?since={since}{}",
             if unknown { "&unknown=1" } else { "" }
         )
     }
@@ -140,15 +140,18 @@ mod tests {
             }
         };
 
-        for p in ["/admin/paths", "/admin/paths?since=all&unknown=1"] {
+        for p in [
+            "/admin/evidence/paths",
+            "/admin/evidence/paths?since=all&unknown=1",
+        ] {
             let (st, h, _) = send(&app, get(p, false), Body::empty()).await;
             assert_eq!(st, StatusCode::SEE_OTHER, "{p}");
             assert_eq!(h["location"], "/login", "{p}");
         }
-        let (st, _, page) = send(&app, get("/admin/paths", true), Body::empty()).await;
+        let (st, _, page) = send(&app, get("/admin/evidence/paths", true), Body::empty()).await;
         assert_eq!(st, StatusCode::OK);
         for want in [
-            "aria-current=\"true\">New paths",
+            "aria-current=\"page\">New paths",
             "<th>Rule</th><th>Wave</th><th>Campaigns</th>",
             "aria-current=\"true\">7 days",
         ] {
@@ -157,7 +160,12 @@ mod tests {
         // The nav entry follows Campaigns.
         assert!(page.find(">Campaigns</a>").unwrap() < page.find(">New paths</a>").unwrap());
 
-        let (_, _, all) = send(&app, get("/admin/paths?since=all", true), Body::empty()).await;
+        let (_, _, all) = send(
+            &app,
+            get("/admin/evidence/paths?since=all", true),
+            Body::empty(),
+        )
+        .await;
         let row = |page: &str, text: &str| -> String {
             let at = page
                 .find(&format!("<td class=\"mono\">{text}</td>"))
@@ -167,7 +175,9 @@ mod tests {
         let alpha = row(&all, "/alpha");
         assert!(alpha.contains("badge-wave\">none</span>"), "{alpha}");
         assert!(
-            alpha.contains("<a href=\"/admin/campaigns/192.0.2.3\" title=\"members: 1\">#1</a>"),
+            alpha.contains(
+                "<a href=\"/admin/evidence/campaigns/192.0.2.3\" title=\"members: 1\">#1</a>"
+            ),
             "{alpha}"
         );
         assert!(row(&all, "/beta").contains("<td>known</td>"));
@@ -175,7 +185,7 @@ mod tests {
 
         let (_, _, unknown) = send(
             &app,
-            get("/admin/paths?since=all&unknown=1", true),
+            get("/admin/evidence/paths?since=all&unknown=1", true),
             Body::empty(),
         )
         .await;
@@ -188,7 +198,12 @@ mod tests {
             "{unknown}"
         );
         // The fixture is older than a day.
-        let (_, _, day) = send(&app, get("/admin/paths?since=24h", true), Body::empty()).await;
+        let (_, _, day) = send(
+            &app,
+            get("/admin/evidence/paths?since=24h", true),
+            Body::empty(),
+        )
+        .await;
         assert!(!day.contains("/alpha"), "{day}");
         assert!(day.contains("No new path."), "{day}");
     }
