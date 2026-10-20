@@ -293,7 +293,8 @@ pub struct Table {
     /// This node's own selling price; None: it does not scan.
     pub sell_mc: Option<u32>,
     /// Every scanner this node counts (itself included), with this node's
-    /// copy of its price: the reference an arbiter offers against.
+    /// copy of its price: the reference an arbiter offers against; for a
+    /// scanner bought from at its ask, that ask.
     pub scanners: Vec<ScannerPrice>,
     /// None: this node does not probe.
     pub probe_mc: Option<u32>,
@@ -754,6 +755,12 @@ async fn scanner_current(
     Ok((legacy.unwrap_or_else(|| start(announced)), 1.0))
 }
 
+/// This node's next copy of a scanner's price: the scanner's `ask` when
+/// this node buys from it at its ask, else one [`sales_step`] from `cur`.
+fn scanner_reference(cur: Mc, raise: bool, hours: f64, ask: Option<u32>) -> u32 {
+    ask.unwrap_or_else(|| as_mc(sales_step(cur, raise, hours)))
+}
+
 fn as_mc(p: Mc) -> u32 {
     p.min(u32::MAX as Mc) as u32
 }
@@ -926,7 +933,15 @@ pub async fn refresh(node: &Node) -> Result<Arc<Table>> {
         let finished = granted.get(&s.node).map(Vec::as_slice).unwrap_or(&[]);
         let period_ms = (hours.clamp(0.0, 1.0) * 3_600_000.0) as u64;
         let raise = scanner_raises(finished, now_ms, period_ms, s.can_do);
-        let price_mc = as_mc(sales_step(cur, raise, hours));
+        // A scanner this node buys from at its ask (both in the free
+        // market) needs no copy to cap it: the copy is that ask (MIK-765).
+        let ask = (s.node != me)
+            .then(|| members.get(&s.node).map(|m| m.proto_max))
+            .flatten()
+            .filter(|p| super::jobs::under_bid(node.proto.1, *p))
+            .and_then(|_| node.status.known(&s.node))
+            .and_then(|k| k.hb.scan_price_mc);
+        let price_mc = scanner_reference(cur, raise, hours, ask);
         node.store
             .intel_set(&scanner_key(&s.node), &format!("{price_mc}@{now_ms}"))
             .await?;
@@ -1706,6 +1721,23 @@ mod tests {
         node.store.intel_set(&price_key(SCAN), "500").await.unwrap();
         refresh(&node).await.unwrap();
         assert_eq!(node.store.intel_get(&price_key(SCAN)).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_free_market_scanners_copy_stays_at_its_ask() {
+        // Sold every hour for 48 hours: the copy is the ask, not 48 raises.
+        let (mut market, mut capped) = (100 as Mc, 100 as Mc);
+        for _ in 0..48 {
+            market = scanner_reference(market, true, 1.0, Some(100)) as Mc;
+            capped = scanner_reference(capped, true, 1.0, None) as Mc;
+        }
+        assert_eq!(market, 100);
+        // Below protocol 9 the copy still steps (capped at u32::MAX).
+        assert_eq!(capped, u32::MAX as Mc);
+        assert_eq!(
+            scanner_reference(100, true, 1.0, None),
+            as_mc(sales_step(100, true, 1.0))
+        );
     }
 
     #[test]
