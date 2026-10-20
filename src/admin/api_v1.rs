@@ -64,7 +64,8 @@ fn internal(e: anyhow::Error) -> Response {
 /// Device-token extractor for `/api/v1/*`: reads `Authorization: Bearer`
 /// only, never cookies. The hash is the lookup key (indexed exact match, so
 /// constant-time by construction); revoked and unknown tokens are 401, a
-/// token without the `read` scope is 403.
+/// token without the `read` scope is 403, a token over its `[limits]`
+/// budget is 429 `rate_limited` with `Retry-After`.
 pub struct DeviceAuth(pub Device);
 
 impl FromRequestParts<Arc<AdminState>> for DeviceAuth {
@@ -80,7 +81,24 @@ impl FromRequestParts<Arc<AdminState>> for DeviceAuth {
                 "a bearer token is required",
             ));
         };
-        match state.store.validate_device_token(token).await {
+        let device = state.store.validate_device_token(token).await;
+        // Each token has its own budget (`[limits]`), so one key cannot run
+        // the queries hot on a small host. Keyed by the device id, never the
+        // token.
+        if let Ok(Some(d)) = &device
+            && !state.limits.api_key.allow(d.id.clone())
+        {
+            let secs = state.limits.api_key.retry_after_secs();
+            let mut r = err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many requests with this token; slow down",
+            );
+            r.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+            return Err(r);
+        }
+        match device {
             Ok(Some(d)) if d.has_scope("read") => Ok(DeviceAuth(d)),
             Ok(Some(_)) => Err(err(
                 StatusCode::FORBIDDEN,
@@ -2271,6 +2289,48 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+    }
+
+    #[tokio::test]
+    async fn each_token_is_rate_limited_on_its_own() {
+        let (state, _cookie, app, _d) = app().await;
+        assert_eq!(
+            state.limits.api_key.retry_after_secs(),
+            1,
+            "default 120 a minute: a token every half second"
+        );
+        let (_, a) = state
+            .store
+            .create_api_key("a", "read", "admin")
+            .await
+            .unwrap();
+        let (_, b) = state
+            .store
+            .create_api_key("b", "read", "admin")
+            .await
+            .unwrap();
+        let burst = crate::config::LimitsConfig::default().api_burst;
+        for _ in 0..burst {
+            let (st, v) = send(&app, authed("GET", "/api/v1/ips", &a)).await;
+            assert_eq!(st, 200, "{v}");
+        }
+        let r = app
+            .clone()
+            .oneshot(authed("GET", "/api/v1/ips", &a))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 429);
+        assert_eq!(r.headers()[axum::http::header::RETRY_AFTER], "1");
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+        // Another key has its own budget; an unknown token is still 401.
+        let (st, _) = send(&app, authed("GET", "/api/v1/ips", &b)).await;
+        assert_eq!(st, 200);
+        let (st, _) = send(&app, authed("GET", "/api/v1/ips", "nope")).await;
+        assert_eq!(st, 401);
     }
 
     /// A device paired straight through the store: its token.
