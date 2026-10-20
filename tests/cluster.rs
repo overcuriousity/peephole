@@ -2611,8 +2611,14 @@ async fn geo_results_come_from_a_node_that_has_the_database() {
             .unwrap(),
         0
     );
-    eventually("a has b's request", || async {
+    // Replication commits b's request before it reloads the member cache
+    // that enrichment reads b's protocol from: wait for both.
+    eventually("a has b's request and knows b trades", || async {
         count(&na, "SELECT COUNT(*) FROM requests").await == 1
+            && na
+                .members()
+                .get(&b.id)
+                .is_some_and(|m| peephole::credits::pay::trades_market(m.proto_max))
     })
     .await;
     assert_eq!(
