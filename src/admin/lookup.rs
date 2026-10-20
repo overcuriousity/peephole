@@ -1240,7 +1240,10 @@ secure_cookies = false
         assert!(html.contains("in the dataset"));
         // MIK-697: the recorded address carries its property strip, here
         // unscanned, with the scan action of the Actions card.
-        assert!(html.contains(">not scanned</span>"), "{html}");
+        assert!(
+            html.contains(">insufficient evidence · not scanned</span>"),
+            "{html}"
+        );
         assert!(html.contains("href=\"#actions\">scan →</a>"), "{html}");
         // GeoLite2 is not loaded: listed as declined, with the reason.
         assert!(html.contains("MaxMind GeoLite2") && html.contains("not available on this node"));

@@ -264,7 +264,7 @@ behind it, signal by signal, is in
 
 | # | When | Reading |
 |---|---|---|
-| 1 | `net.hosting`, `name.scanner`, `fleet.key`, `fleet.canary`, or a Tor exit | not read: one operator's address |
+| 1 | `net.hosting`, `name.scanner`, `fleet.key`, `fleet.canary`, or a Tor exit | one operator's address |
 | 2 | `device.cpe` and `name.pool` | one subscriber's network, on a pooled line |
 | 3 | `device.cpe` | one subscriber's network |
 | 4 | `name.cgn` | shared pool, by the operator's naming |

@@ -2506,7 +2506,11 @@ show_labels = {show_labels}
         assert!(strip.contains("not against reassignment."), "{strip}");
         // Unscanned: says so, with the scan action.
         let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
-        assert!(page.contains(">not scanned</span>"), "{page}");
+        // MIK-718: named as the filter names it.
+        assert!(
+            page.contains(">insufficient evidence · not scanned</span>"),
+            "{page}"
+        );
         assert!(page.contains("href=\"#actions\">scan →</a>"), "{page}");
         for ip in ["203.0.113.47", "203.0.113.49"] {
             let (_, public) = get_with(&app, &format!("/ip/{ip}"), None).await;
@@ -2536,6 +2540,30 @@ show_labels = {show_labels}
             list.contains("<option value=\"shared-pool\" selected>"),
             "{list}"
         );
+        // MIK-718: grouped one party, shared, not read.
+        let groups: Vec<_> = ["one party", "shared", "not read"]
+            .map(|g| list.find(&format!("<optgroup label=\"{g}\">")).expect(g))
+            .into();
+        assert!(groups.is_sorted(), "{list}");
+        assert!(
+            list.contains("<option value=\"operator\">one operator&#39;s address</option>"),
+            "{list}"
+        );
+        // A queued scan: the strip says so and offers none.
+        st.recorder
+            .enqueue_manual_addr("203.0.113.49", 2)
+            .await
+            .unwrap();
+        let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
+        assert!(page.contains(">scan queued</span>"), "{page}");
+        assert!(!page.contains("scan →</a>"), "{page}");
+        let (_, list) = get_with(&app, "/ips", Some(&cookie)).await;
+        let row = list
+            .split("<tr")
+            .find(|r| r.contains("href=\"/ip/203.0.113.49\""))
+            .expect("row");
+        assert!(row.contains(">scan queued</span>"), "{row}");
+        assert!(!row.contains("scan →</a>"), "{row}");
         let (_, public) = get_with(&app, "/ips", None).await;
         assert!(public.contains("href=\"/ip/203.0.113.47\""), "{public}");
         assert!(!public.contains("ip-props"), "{public}");
@@ -2685,7 +2713,13 @@ show_labels = {show_labels}
         let (status, html) =
             get_with(&app, &format!("/admin/requests/{served}"), Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(html.contains(">Fingerprint</abbr></dt>"), "{html}");
+        assert!(html.contains(">Fingerprint</abbr></a></dt>"), "{html}");
+        // MIK-718: the fingerprint names open the glossary.
+        assert!(
+            html.contains("<a class=\"gloss\" href=\"#glossary\">"),
+            "{html}"
+        );
+        assert!(html.contains("id=\"glossary\""), "{html}");
         assert!(html.contains(">fphash</a>"), "{html}");
         assert!(!html.contains("<h2>Fingerprint</h2>"), "{html}");
         let (status, html) =
