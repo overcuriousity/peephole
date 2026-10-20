@@ -17,7 +17,7 @@ peephole export --redistributable --min-severity 2 | zstd > severe.parquet.zst
 peephole export --help
 ```
 
-The same export, with the same filters, is **Admin → Export** on a web node.
+The same export, with the same filters, is **Admin → System → Export** on a web node.
 Both stream: a file of any size needs little memory. Parquet is the format
 for analysis (typed columns, compressed, read by pandas, polars, DuckDB,
 Spark and Arrow in every language); CSV and JSON Lines carry the Timesketch

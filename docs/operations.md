@@ -300,7 +300,7 @@ Configuration lives in `/etc/peephole/config.toml`; restart after editing
 (`systemctl restart peephole`). A key peephole does not know (misspelled,
 or from a newer version) is ignored with a warning in the startup log and in
 `check-config`, which names it by its full path (`scan.never_scan_directory`). The number of scan workers and the roles
-are runtime settings, changed from **Admin → Scans** and **Admin → System**
+are runtime settings, changed from **Admin → Investigate → Scans** and **Admin → System**
 or `peephole settings` without a restart. The rest of the scan pace is
 fixed: a scan times out after 30 minutes (levels 4 and 5 after 2 hours), and an
 address is scanned again at the same level after 24 hours at the earliest.
@@ -338,12 +338,12 @@ restart with neither a key nor a password set prints a new one once it has
 expired. Setting a password or enrolling a key ends that automatic token.
 `peephole admin reset-token` issues a new one (and voids the old) if it is
 lost, or every key is; a token from the shell works even with a password or
-keys set. Further keys are enrolled from **Admin → Keys**. Admin
+keys set. Further keys are enrolled from **Admin → System → Security keys**. Admin
 sessions last at most 12 hours and end after an hour without use, on logout,
 on the next sign-in, or when the key they signed in with is deleted.
 
 The sign-in method is `passkey` (the default), `password` or `both`, chosen
-under **Admin → Keys** or with `peephole admin login-method`. A method that
+under **Admin → System → Security keys** or with `peephole admin login-method`. A method that
 would leave no way in is refused: `password` needs a password set,
 `passkey` an enrolled key, `both` at least one of them. `peephole admin
 password` sets or changes the password from the shell (it also turns
@@ -357,7 +357,7 @@ about it and its IP as Parquet (default), CSV or Timesketch JSON Lines, to
 `--min-severity` narrow it, `--redistributable` leaves out the GeoIP and
 API results whose terms forbid passing them on. It reads the database the
 running service writes, so it needs no stop. The web interface has the same
-export under **Admin → Export**. Columns, weights and the two modes:
+export under **Admin → System → Export**. Columns, weights and the two modes:
 [docs/dataset.md](dataset.md).
 
 **Blocklist feed.** A web node serves `GET /api/blocklist` on its public
@@ -404,7 +404,7 @@ JA4H, HASSH and JA4X, filterable, each with a graph of the IPs it was seen
 on and what else links them), canary reuse, the false-positive inbox,
 deletion (standalone nodes only) and the dataset export.
 
-The Campaigns area (`/admin/campaigns`) lists the groups of source IPs the
+The Campaigns area (`/admin/evidence/campaigns`) lists the groups of source IPs the
 hourly recompute tied together: by a shared SSH host key, TLS certificate,
 browser fingerprint or canary (hard edges), or by near-identical sets of
 path shapes (soft edges; a shared JA4 and JA4H only lowers the bar for one,
@@ -428,7 +428,7 @@ two-edge rule held back, the pairs dropped for a reversed order (none under
 the default parameters), and how many candidate pairs had enough shared
 shapes for an order to count.
 
-**New paths and exploit waves.** `/admin/paths` ("New paths") lists the path
+**New paths and exploit waves.** `/admin/evidence/paths` ("New paths") lists the path
 shapes this node has seen, newest first: the shape, when it was first and
 last seen, how many distinct IPs asked for it, whether a rule matched it,
 its wave and the campaigns of the IPs that asked (`?since=24h|7d|30d|all`,
@@ -480,7 +480,7 @@ The trap presents as one of five products: `wordpress`, `fortinet`,
 `gpu-box`, `gitlab`, `exchange-owa`. Nothing to configure: the node key
 picks one for the bare IP and every Host that is not a public DNS name,
 and each public DNS name the node is reached by gets its own, fixed for
-that key and name. Admin → Cluster → a node shows its IP persona; each
+that key and name. Admin → Network → a member shows its IP persona; each
 request shows the one it was answered as. A standalone node has no key
 and presents as the same persona as every other standalone node. A new
 node key (rejoining as a new node) changes the personas; rows keep the
@@ -507,7 +507,7 @@ joins; a running node picks a join up without a restart.
 peephole cluster id                       # this node's key
 peephole cluster invite --label friends   # on a member: a reusable invite (a week, 10 uses)
 peephole cluster invites                  # list them; invite-revoke <id> closes one
-peephole cluster join <token>             # on the new node; or Admin → Cluster
+peephole cluster join <token>             # on the new node; or Admin → Network → Access
 peephole cluster members                  # who is in, and their standing
 peephole cluster agreement <node>         # its requests our rules classify differently
 peephole cluster block <node>             # this node ignores a peer (unblock undoes it)
@@ -526,7 +526,7 @@ peephole credits uptime                  # members' reported hours up, 7 days
 peephole credits send <node> <amount>     # send credits to a member
 ```
 
-`peephole cluster join <token>` or Admin → Cluster joins with an invite
+`peephole cluster join <token>` or Admin → Network → Access joins with an invite
 from a member. How membership, invites and blocking work:
 [Membership and trust](protocol.md#membership-and-trust). What the credits
 commands count: [Credits](protocol.md#credits).
@@ -548,7 +548,7 @@ can and cannot do: [Relays and outbound-only nodes](protocol.md#relays-and-outbo
    it, which makes it a managing node.
 2. On each other node of yours, claim it there: `peephole owner claim`
    (reads the key from standard input, so it stays out of the shell
-   history), or Cluster › Ownership › "Already have a key?". A node cannot
+   history), or Network › Ownership › "Already have a key?". A node cannot
    be claimed from another one: whoever claims it needs its admin site or
    shell. Pass `--keep` (or tick "Also manage my other nodes from here") to
    make it a managing node too.
@@ -556,7 +556,7 @@ can and cannot do: [Relays and outbound-only nodes](protocol.md#relays-and-outbo
    unblock and purge peers there, revoke its invites, have it leave, or
    release it. Each node lists the commands it received under Cluster ›
    Ownership.
-4. If the key leaks, rotate it on a managing node (Cluster › Ownership).
+4. If the key leaks, rotate it on a managing node (Network › Ownership).
    `peephole owner forget-key` makes a node stop keeping the key (it stays
    owned); `peephole owner release` leaves it without an owner.
 

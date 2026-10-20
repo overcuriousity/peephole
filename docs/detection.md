@@ -123,7 +123,7 @@ and looked up again when the address returns:
 An address is looked up again only when it comes back, after 30 days, then
 45, 67.5, … (`[enrichment] refresh_after_days`). Every result records which
 provider and which node it came from, and every lookup is kept in a history
-(Admin → Export → full lookup history). The results of AbuseIPDB, Shodan
+(Admin → System → Export → full lookup history). The results of AbuseIPDB, Shodan
 and Shodan InternetDB are admin-only: the IP page shows them, and the IP list filters by
 abuse score, provider tag and "looked up / not yet".
 
@@ -151,7 +151,7 @@ intrusive and only ever bought:
 | 5 | the top 1000 ports with nmap's `vuln` scripts, minus those that ask third parties; only bought, never queued automatically |
 
 From level 2 the scan reads the source's SSH host keys, TLS certificates and
-HTTP ETags, so sources that share one show up as linked (Admin → Links).
+HTTP ETags, so sources that share one show up as linked (Admin → Evidence → Links).
 
 The top lists are nmap 7.95's (`--top-ports 100` and `1000`), written out
 as port lists, because nmap's `-p` can only narrow a top list. Levels 1 to
@@ -422,6 +422,6 @@ a list file cannot prove who holds an address tomorrow.
 
 ### Seeing who was refused
 
-Admin → Scans lists every refused scan job with its reason
+Admin → Investigate → Scans lists every refused scan job with its reason
 (`status=refused`), e.g. `verified crawler (177.186.132.66.censys-scanner.com)`;
 the pace card links the last 24 hours' refusals.

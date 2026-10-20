@@ -6,6 +6,15 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Changed
+- The admin nav is six groups with a second row of pages (MIK-711):
+  Overview (Now, Analytics) · Investigate (Lookup, Scans) · Evidence
+  (Campaigns, Links, Canaries, New paths) · Traps (MCP, LLM, Web,
+  Uploads) · Network (Members, Access, Ownership, Credits) · System
+  (Status, Settings, Inbox, Devices, Security keys, Export). URLs follow
+  the tree (`/admin/{group}/{page}`); every old admin page URL answers
+  308 to its new one with the query kept, signed in only. Form actions
+  keep their paths. On a phone the groups are a 3 × 2 grid and the pages
+  wrap; nothing scrolls sideways.
 - Admin UI follow-up to the v0.22.0 UX review (MIK-718): the IP
   property strip says "scan queued" while a counter-scan is queued or
   running, and names the unscanned state as the filter does

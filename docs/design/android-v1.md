@@ -678,7 +678,7 @@ Unpair always clears the token and instance locally. When the instance
 offers a device self-revoke endpoint (MIK-22 decides; **TBD — api-v1**),
 the app calls it first, best effort. The local clear is the fallback, not
 the only path: a token deleted only on the phone stays valid on the
-instance until an admin revokes it on Admin → Devices. So whenever the
+instance until an admin revokes it on Admin → System → Devices. So whenever the
 server revoke did not happen (no endpoint, offline, or it failed), the
 confirmation says so: "Removed from this device. {instance} still lists
 it on its Devices page until an admin revokes it there."
@@ -734,7 +734,7 @@ it on its Devices page until an admin revokes it there."
    cost-confirm screen is the only money surface.
 3. Unpair: local clear always, plus a best-effort server self-revoke if
    MIK-22 adds an endpoint for it (§6.9). Admin-side revoke already exists
-   (Admin → Devices, `401` afterwards).
+   (Admin → System → Devices, `401` afterwards).
 4. Notifications row dropped from v1 (§6.9).
 
 ## 9. Still outstanding
