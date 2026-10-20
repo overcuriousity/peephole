@@ -2047,6 +2047,79 @@ mod tests {
         }
     }
 
+    /// The body of `GET /api/v1/ips/{addr}` is the Android app's contract:
+    /// moving its helpers into `dossier` (MIK-749) must not change a byte.
+    #[tokio::test]
+    async fn ip_detail_body_is_byte_for_byte_stable() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        let row = state
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: row.id,
+                method: "GET".into(),
+                path: "/.env".into(),
+                headers_json: "[]".into(),
+                labels_json: r#"["sensitive-path"]"#.into(),
+                severity: 3,
+                ts: Some("2026-01-02 03:04:05".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .set_ip_geo(row.id, Some("DE"), Some(6805), Some("Telefonica Germany"))
+            .await
+            .unwrap();
+        state
+            .store
+            .local()
+            .record_intel(
+                "203.0.113.9",
+                crate::intel::TOR_RELAYS,
+                None,
+                serde_json::json!({"relay": true, "exit": false}),
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "UPDATE ips SET first_seen = '2026-01-02 03:04:05', last_seen = '2026-01-03 04:05:06'",
+            "UPDATE ip_intel SET fetched_at = '2026-01-04T05:06:07Z'",
+            "UPDATE ip_intel_log SET fetched_at = '2026-01-04T05:06:07Z'",
+        ] {
+            sqlx::query(sql).execute(&state.store.pool).await.unwrap();
+        }
+        let r = app
+            .clone()
+            .oneshot(authed("GET", "/api/v1/ips/203.0.113.9", &token))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&b), GOLDEN_IP_DETAIL);
+    }
+
+    /// Captured from the body before the move (MIK-749).
+    const GOLDEN_IP_DETAIL: &str = concat!(
+        r#"{"families":[{"count":1,"name":"exposure"}],"first_seen":"2026-01-02T03:04:05Z","#,
+        r#""geo":{"asn":6805,"asn_org":"Telefonica Germany","country":"DE"},"intel":{"abuse"#,
+        r#"ipdb":null,"maxmind-geolite2":{"data":{"asn":6805,"asn_org":"Telefonica Germany""#,
+        r#","country":"DE"},"fetched_at":"2026-01-04T05:06:07Z"},"rdap":null,"shodan":null,"#,
+        r#""shodan-internetdb":null,"tor-relays":{"data":{"exit":false,"relay":true},"fetch"#,
+        r#"ed_at":"2026-01-04T05:06:07Z"}},"ip":"203.0.113.9","is_tor":false,"is_tor_relay""#,
+        r#":true,"labels":["sensitive-path"],"last_seen":"2026-01-03T04:05:06Z","names":[],"#,
+        r#""neighbours":{"net":"203.0.113.0/24","other_ips":0,"same_asn":0},"rank":1,"reque"#,
+        r#"st_count":1,"scans":[],"severity":3,"unseen":false}"#,
+    );
+
     #[tokio::test]
     async fn ip_detail_is_the_dataset_on_one_address() {
         let (state, cookie, app, _d) = app().await;
