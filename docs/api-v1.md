@@ -490,7 +490,8 @@ creates no quote and writes no audit entry.
 - The quote is bound to the device, the address, the level and
   `credits_mc`. It lives 2 minutes and is spent once.
 - `credits` is the floor: the cheapest live scanner's price × 4^(level-1),
-  the low end of the Actions card's range and what the scan budget must
+  a scanner's price being what the arbiter pays it (a free-market
+  scanner's ask), the low end of the Actions card's range and what the scan budget must
   cover. The arbiter pays whichever scanner wins the job, so the charge
   lies between `credits` and `credits_max` (the dearest live scanner's
   price × the same factor). Show the range.
@@ -506,6 +507,16 @@ When there is nothing to buy, `409` and no quote, with one of these codes:
 | `on_its_way` | a job of this level is queued or running (`status`)       |
 | `no_price`   | no live scanner announces a price                         |
 | `no_budget`  | the scan budget does not cover the floor                  |
+
+A `no_budget` error carries the numbers, in millicredits, and says them in
+its `message`: `need_mc` (the floor), `balance_mc` (the node's balance) and
+`committed_mc` (what of it this node's own scans in flight hold):
+
+```json
+{ "error": { "code": "no_budget",
+  "message": "it costs at least 1.28 credits; the balance is 1.00 credits, 0.50 of them committed to scans in flight",
+  "need_mc": 1280, "balance_mc": 1000, "committed_mc": 500 } }
+```
 
 ### `POST /api/v1/ips/{addr}/scan`
 

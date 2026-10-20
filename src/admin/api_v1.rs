@@ -924,10 +924,14 @@ fn not_sold(n: NotSold) -> Response {
             json!({"status": status}),
         ),
         NotSold::NoPrice => conflict("no_price", "no live scanner announces a price", json!({})),
-        NotSold::NoBudget => conflict(
+        NotSold::NoBudget {
+            need_mc,
+            balance_mc,
+            committed_mc,
+        } => conflict(
             "no_budget",
-            "the scan budget does not cover this",
-            json!({}),
+            &n.budget_text().unwrap_or_default(),
+            json!({"need_mc": need_mc, "balance_mc": balance_mc, "committed_mc": committed_mc}),
         ),
     }
 }
@@ -950,15 +954,18 @@ async fn scan_prices(
     if let Err(r) = scan_row(&state, &addr).await {
         return *r;
     }
-    let table = state.recorder.node().map(|n| n.price_table());
+    let asks = state
+        .recorder
+        .node()
+        .map(|n| crate::admin::scan_buy::asks(n));
     let levels: Vec<Value> = (1u8..=5)
         .filter_map(|level| {
-            let p = match &table {
+            let p = match &asks {
                 None => crate::admin::scan_buy::Price {
                     floor_mc: 0,
                     max_mc: 0,
                 },
-                Some(t) => crate::admin::scan_buy::price_range(&t.scanners, level)?,
+                Some(a) => crate::admin::scan_buy::price_range(a, level)?,
             };
             let (floor, floor_mc) = credits(p.floor_mc);
             let (max, max_mc) = credits(p.max_mc);
