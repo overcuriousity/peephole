@@ -30,6 +30,20 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   phone with the severity stripe clear of the text. A missing value
   reads "—" everywhere in the admin UI.
 
+### Fixed
+- The intel lookup rounds' candidate query reads an IP's first request
+  from a covering index (`idx_requests_ip_id`, migration 0049) instead
+  of reading all of the IP's requests and sorting them. On hermes it ran
+  about 3 times a minute and took 1 to 13 s; on a copy of that database
+  it takes 12 to 29 ms (MIK-775). The rDNS and probe candidate queries use the
+  same lookup.
+- Rows a node stored from a newer peer's records before its upgrade
+  (without the fields its build did not know, such as `persona`) are
+  completed from the kept payloads once after the upgrade, and the
+  payloads are dropped. The "row does not reproduce its record" warning
+  is logged at most once per 10 minutes, with the count of suppressed
+  ones; each one is at debug (MIK-775).
+
 ## [0.22.1] - 2026-10-20
 
 Hotfix for the counter-scan price check (MIK-748). No database

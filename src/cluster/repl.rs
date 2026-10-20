@@ -1743,23 +1743,134 @@ async fn apply_record(
             }
             if ROW_BACKED.contains(&e.kind.as_str()) {
                 // Keep the payload unless the row reproduces it exactly.
-                if let (Some(uid), Some(payload)) = (&e.uid, &e.payload)
-                    && let Some(rebuilt) = data::rebuild(conn, &e.kind, uid).await?
-                    && super::rpc::cbor::encode(&rebuilt)? == *payload
-                {
-                    sqlx::query("UPDATE repl_log SET payload = NULL WHERE origin = ? AND seq = ?")
-                        .bind(&e.origin.0[..])
-                        .bind(e.seq as i64)
-                        .execute(&mut *conn)
-                        .await?;
-                } else {
-                    warn!(kind = %e.kind, uid = ?e.uid, "row does not reproduce its record; payload kept");
+                let dropped = match (&e.uid, &e.payload) {
+                    (Some(uid), Some(payload)) => {
+                        drop_rebuilt_payload(conn, &e.origin.0, e.seq as i64, &e.kind, uid, payload)
+                            .await?
+                    }
+                    _ => false,
+                };
+                if !dropped {
+                    kept_warning(&e.kind, e.uid.as_deref());
                 }
             }
         }
         Effect::Ignored => {}
     }
     Ok(Settled::default())
+}
+
+/// Drop a row-backed entry's payload if its row reproduces it byte for
+/// byte. Whether it did.
+async fn drop_rebuilt_payload(
+    conn: &mut SqliteConnection,
+    origin: &[u8],
+    seq: i64,
+    kind: &str,
+    uid: &str,
+    payload: &[u8],
+) -> Result<bool> {
+    let Some(rebuilt) = data::rebuild(conn, kind, uid).await? else {
+        return Ok(false);
+    };
+    if super::rpc::cbor::encode(&rebuilt)? != payload {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE repl_log SET payload = NULL WHERE origin = ? AND seq = ?")
+        .bind(origin)
+        .bind(seq)
+        .execute(&mut *conn)
+        .await?;
+    Ok(true)
+}
+
+/// Least time between two "payload kept" warnings.
+const KEPT_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Warn that a row does not reproduce its record, at most once per
+/// [`KEPT_WARN_EVERY`] with the count since; each one at debug. A peer on
+/// a newer build sends fields this build drops, so until the upgrade
+/// every one of its records does (MIK-775: 4178 lines in a day).
+fn kept_warning(kind: &str, uid: Option<&str>) {
+    use crate::lock::MutexExt;
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+    debug!(kind, uid, "row does not reproduce its record; payload kept");
+    let mut last = LAST.lock_or_recover();
+    match &mut *last {
+        Some((at, n)) if at.elapsed() < KEPT_WARN_EVERY => *n += 1,
+        _ => {
+            let since = last.map_or(0, |(_, n)| n);
+            warn!(
+                kind,
+                uid,
+                suppressed = since,
+                "row does not reproduce its record (a peer on a newer build?); payload kept"
+            );
+            *last = Some((std::time::Instant::now(), 0));
+        }
+    }
+}
+
+/// Settings key: the schema version [`resettle_kept`] last ran at.
+const RESETTLED_KEY: &str = "repl.resettled_schema";
+/// Kept payloads re-checked per write transaction by [`resettle_kept`].
+const RESETTLE_BATCH: usize = 200;
+
+/// Row-backed entries whose row did not reproduce them, applied by a build
+/// that did not know some of their fields, once more after an upgrade: the
+/// rows take the fields they lack ([`data::refill`]), and payloads then
+/// reproduced are dropped. Once per schema version. Returns how many were
+/// dropped (MIK-775).
+pub async fn resettle_kept(pool: &sqlx::SqlitePool) -> Result<u64> {
+    let schema: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
+    let ran: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(RESETTLED_KEY)
+        .fetch_optional(pool)
+        .await?;
+    if ran.as_deref() == Some(schema.to_string().as_str()) {
+        return Ok(0);
+    }
+    type Kept = (Vec<u8>, i64, i64, String, String, Vec<u8>);
+    let kept: Vec<Kept> = sqlx::query_as(
+        "SELECT origin, seq, hlc, kind, uid, payload FROM repl_log
+         WHERE applied = 1 AND payload IS NOT NULL AND uid IS NOT NULL
+           AND kind IN ('request', 'skip_batch')",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut dropped = 0;
+    for chunk in kept.chunks(RESETTLE_BATCH) {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (origin, seq, at, kind, uid, payload) in chunk {
+            let (Ok(id), Ok(r)) = (
+                NodeId::from_slice(origin),
+                super::rpc::cbor::decode::<Record>(payload),
+            ) else {
+                continue;
+            };
+            let ctx = Ctx {
+                origin: Some(&id),
+                hlc: *at as u64,
+            };
+            data::refill(&mut tx, ctx, &r).await?;
+            if drop_rebuilt_payload(&mut tx, origin, *seq, kind, uid, payload).await? {
+                dropped += 1;
+            }
+        }
+        tx.commit().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(RESETTLED_KEY)
+    .bind(schema.to_string())
+    .execute(pool)
+    .await?;
+    Ok(dropped)
 }
 
 /// A takeover of scan jobs. Every node decides for itself whether it is
@@ -2211,6 +2322,67 @@ mod tests {
             .fetch_all(&node.store.pool)
             .await
             .unwrap()
+    }
+
+    /// A node before persona applied a newer peer's requests without it and
+    /// kept their payloads (MIK-775: 18475 on hermes). After the upgrade
+    /// the rows are completed and the payloads dropped, once.
+    #[tokio::test]
+    async fn kept_payloads_are_resettled_once_after_an_upgrade() {
+        let (_d, node) = test_node(0).await;
+        let a = Identity::generate().unwrap();
+        super::append(&node, &[Record::MemberAdd(info(a.id, "a"))])
+            .await
+            .unwrap();
+        let mut e = request(&a, 1, "/p");
+        let Some(Record::Request(mut r)) = e.record() else {
+            unreachable!()
+        };
+        r.persona = Some("gitlab".into());
+        e = WireEntry::sign(&a, 1, e.hlc, &Record::Request(r)).unwrap();
+        let st = super::apply_batch(&node, vec![e.clone()]).await.unwrap();
+        assert_eq!((st.applied, st.rejected), (1, 0), "{st:?}");
+        let payload = || async {
+            sqlx::query_scalar::<_, Option<Vec<u8>>>(
+                "SELECT payload FROM repl_log WHERE origin = ? AND seq = 1",
+            )
+            .bind(&a.id.0[..])
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(payload().await, None, "reproduced: dropped");
+
+        // What the older build left: no persona, the payload kept.
+        sqlx::query("UPDATE requests SET persona = NULL")
+            .execute(&node.store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repl_log SET payload = ? WHERE origin = ? AND seq = 1")
+            .bind(e.payload.as_deref())
+            .bind(&a.id.0[..])
+            .execute(&node.store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(super::RESETTLED_KEY)
+            .execute(&node.store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(super::resettle_kept(&node.store.pool).await.unwrap(), 1);
+        let persona: Option<String> = sqlx::query_scalar("SELECT persona FROM requests")
+            .fetch_one(&node.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(persona.as_deref(), Some("gitlab"));
+        assert_eq!(payload().await, None);
+        // Once per schema version.
+        sqlx::query("UPDATE requests SET persona = NULL")
+            .execute(&node.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(super::resettle_kept(&node.store.pool).await.unwrap(), 0);
     }
 
     /// A node of an earlier version meets a record kind it does not know
