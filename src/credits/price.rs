@@ -218,8 +218,9 @@ pub struct Capacity {
     pub scanners: Vec<ScannerCapacity>,
     pub per_day: f64,
     pub used_per_day: f64,
-    /// Used over capacity, at most 1; 1 with no capacity at all.
-    pub utilization: f64,
+    /// Used over capacity, at most 1; None with no capacity at all, where
+    /// there is nothing to use.
+    pub utilization: Option<f64>,
 }
 
 pub fn capacity(scanners: &[Scanner]) -> Capacity {
@@ -258,11 +259,7 @@ pub fn capacity(scanners: &[Scanner]) -> Capacity {
     let per_day: f64 = per_scanner.iter().map(|s| s.can_do).sum::<f64>() * 24.0;
     let used_per_day: f64 = per_scanner.iter().map(|s| s.did).sum::<f64>() * 24.0;
     Capacity {
-        utilization: if per_day <= 0.0 {
-            1.0
-        } else {
-            (used_per_day / per_day).min(1.0)
-        },
+        utilization: (per_day > 0.0).then(|| (used_per_day / per_day).min(1.0)),
         scanners: per_scanner,
         per_day,
         used_per_day,
@@ -1097,7 +1094,7 @@ mod tests {
         );
         assert_eq!((c.scanners[0].did, c.scanners[1].did), (2.0, 10.0));
         assert_eq!((c.per_day, c.used_per_day), (1200.0, 288.0));
-        assert_eq!(c.utilization, 0.24);
+        assert_eq!(c.utilization, Some(0.24));
 
         // Fewer than 5 jobs: the cluster's mean scan time (here 120 s over
         // 2 + 58 jobs: 2×600 + 58×(6000/58)).
@@ -1111,17 +1108,17 @@ mod tests {
             c.scanners[0].can_do,
             3600.0 / crate::scan::pace::DEFAULT_SCAN_SECS
         );
-        // A paused scanner can do nothing; with no capacity at all the
-        // cluster counts as saturated.
+        // A paused scanner can do nothing; with no capacity at all there is
+        // no utilization, not 0/0 read as 100 %.
         let c = capacity(&[
             scanner(6, 0, 30, Some(60.0), 9, 3),
             scanner(7, 2, 0, None, 0, 0),
         ]);
-        assert_eq!((c.per_day, c.utilization), (0.0, 1.0));
-        assert_eq!(capacity(&[]).utilization, 1.0);
+        assert_eq!((c.per_day, c.utilization), (0.0, None));
+        assert_eq!(capacity(&[]).utilization, None);
         // More done than the current pace allows: at most 1.
         let c = capacity(&[scanner(8, 1, 1, Some(60.0), 99, 99)]);
-        assert_eq!(c.utilization, 1.0);
+        assert_eq!(c.utilization, Some(1.0));
     }
 
     #[test]
