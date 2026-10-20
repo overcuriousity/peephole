@@ -64,6 +64,7 @@ pub fn buyer(token: &str) -> Device {
         created_at: String::new(),
         last_seen_at: String::new(),
         revoked_at: None,
+        kind: crate::store::devices::KIND_DEVICE.into(),
     }
 }
 

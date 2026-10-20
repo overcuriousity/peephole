@@ -22,6 +22,8 @@ pub mod settings;
 pub mod settings_cli;
 pub mod store;
 pub mod supervise;
+#[cfg(test)]
+pub(crate) mod test_log;
 pub mod trap;
 
 use anyhow::{Context, Result};

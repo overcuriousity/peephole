@@ -1,8 +1,8 @@
 {% extends "layout.html" %}
-{% block title %}peephole — devices{% endblock %}
+{% block title %}peephole — devices and API keys{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("system", "devices") %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Devices</h1><p class="muted">Phones and tools paired with <span class="mono">/api/v1</span>.</p></div></div>
+<div class="page-head"><div><h1>Devices and API keys</h1><p class="muted">Phones and tools paired with <span class="mono">/api/v1</span>, and keys minted for it.</p></div></div>
 <div class="stack">
 <section class="card">
   <div class="card-head"><h2>Pair a device</h2></div>
@@ -32,6 +32,37 @@
         <td>{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
           <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-dev-{{ loop.index }}">Revoke</button>
           <dialog id="dlg-dev-{{ loop.index }}"><h3>Revoke "{{ d.name }}"?</h3><p class="muted">Its token stops working at once. Pair again for a new one.</p>
+            <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
+              <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
+        {% endif %}</td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>{% endif %}
+</section>
+<section class="card" id="api-keys">
+  <div class="card-head"><h2>API keys</h2></div>
+  {% if let Some(k) = new_key %}
+  <p>The key for "{{ k.label }}" (scopes <span class="mono">{{ k.scopes }}</span>). <strong>Shown once:</strong> copy it now; it cannot be shown again.</p>
+  <pre class="panel mono break" data-copy>{{ k.token }}</pre>
+  <form method="get" action="/admin/system/devices"><button class="btn" type="submit">Done</button></form>
+  {% else %}
+  <form method="post" action="/admin/devices/keys" class="stack">
+    <p class="muted">For scripts and tools: send it as <span class="mono">Authorization: Bearer</span>. <span class="mono">read</span> is always granted; <span class="mono">act</span> also starts probes and buys counter-scans, under the same daily credit cap as a device.</p>
+    <label>Label <input type="text" name="label" required maxlength="80" placeholder="e.g. SIEM enrichment"></label>
+    <label><input type="checkbox" name="act" value="1"> Also grant <span class="mono">act</span></label>
+    <div><button class="btn btn-primary" type="submit">Create key</button></div>
+  </form>
+  {% endif %}
+  {% if keys.is_empty() %}<p class="muted">No API keys yet.</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Label</th><th>Scopes</th><th>Created by</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+    <tbody>{% for d in keys %}
+      <tr>
+        <td>{{ d.name }}</td><td class="mono">{{ d.scopes }}</td><td>{{ d.paired_by }}</td>
+        <td class="ts">{{ d.created_at }}</td><td class="ts">{{ d.last_seen_at }}</td>
+        <td>{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
+          <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-key-{{ loop.index }}">Revoke</button>
+          <dialog id="dlg-key-{{ loop.index }}"><h3>Revoke key "{{ d.name }}"?</h3><p class="muted">It stops working at once. Create a new one if still needed.</p>
             <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
               <button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Revoke</button></form></dialog>
         {% endif %}</td>

@@ -11,6 +11,11 @@ use anyhow::Result;
 /// Minutes a pairing code may be redeemed.
 pub const PAIRING_CODE_MINUTES: i64 = 5;
 
+/// `devices.kind` of a device paired by code.
+pub const KIND_DEVICE: &str = "device";
+/// `devices.kind` of an admin-minted API key.
+pub const KIND_API_KEY: &str = "api_key";
+
 /// A paired device. `token_hash` never leaves the store.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Device {
@@ -24,6 +29,9 @@ pub struct Device {
     pub created_at: String,
     pub last_seen_at: String,
     pub revoked_at: Option<String>,
+    /// [`KIND_DEVICE`] (paired by code) or [`KIND_API_KEY`] (minted by an
+    /// admin on the Devices page).
+    pub kind: String,
 }
 
 impl Device {
@@ -35,6 +43,9 @@ impl Device {
     }
     pub fn revoked(&self) -> bool {
         self.revoked_at.is_some()
+    }
+    pub fn is_api_key(&self) -> bool {
+        self.kind == KIND_API_KEY
     }
 }
 
@@ -48,7 +59,40 @@ fn random_b64url(bytes: usize) -> String {
 }
 
 const DEVICE_COLS: &str =
-    "id, name, token_hash, scopes, paired_by, created_at, last_seen_at, revoked_at";
+    "id, name, token_hash, scopes, paired_by, created_at, last_seen_at, revoked_at, kind";
+
+/// A fresh device token: 256-bit, base64url. Paired devices and API keys
+/// share it.
+fn new_device_token() -> String {
+    random_b64url(32)
+}
+
+/// Insert a live device of `kind` with a fresh token; returns the row and
+/// the token (only its hash is stored).
+async fn insert_device<'e, E: sqlx::SqliteExecutor<'e>>(
+    db: E,
+    name: &str,
+    scopes: &str,
+    paired_by: &str,
+    kind: &str,
+) -> Result<(Device, String)> {
+    debug_assert!(kind == KIND_DEVICE || kind == KIND_API_KEY);
+    let token = new_device_token();
+    let device = sqlx::query_as::<_, Device>(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO devices (id, name, token_hash, scopes, paired_by, created_at, last_seen_at, kind)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)
+         RETURNING {DEVICE_COLS}"
+    )))
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(name)
+    .bind(token_hash(&token))
+    .bind(scopes)
+    .bind(paired_by)
+    .bind(kind)
+    .fetch_one(db)
+    .await?;
+    Ok((device, token))
+}
 
 impl Store {
     /// Mint a single-use pairing code (192-bit), valid for
@@ -92,22 +136,23 @@ impl Store {
         let Some((scopes, paired_by)) = found else {
             return Ok(None);
         };
-        let token = random_b64url(32);
-        let id = uuid::Uuid::new_v4().to_string();
-        let device = sqlx::query_as::<_, Device>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO devices (id, name, token_hash, scopes, paired_by, created_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-             RETURNING {DEVICE_COLS}"
-        )))
-        .bind(&id)
-        .bind(name)
-        .bind(token_hash(&token))
-        .bind(&scopes)
-        .bind(&paired_by)
-        .fetch_one(&mut *tx)
-        .await?;
+        let (device, token) =
+            insert_device(&mut *tx, name, &scopes, &paired_by, KIND_DEVICE).await?;
         tx.commit().await?;
         Ok(Some((device, token)))
+    }
+
+    /// Mint an API key: a device row of kind [`KIND_API_KEY`] that was never
+    /// paired. `label` names it on the Devices page, `created_by` is the
+    /// minting admin (stored in `paired_by`). Returns the row and the token,
+    /// which exists only in this return value: the store keeps its hash.
+    pub async fn create_api_key(
+        &self,
+        label: &str,
+        scopes: &str,
+        created_by: &str,
+    ) -> Result<(Device, String)> {
+        insert_device(&self.pool, label, scopes, created_by, KIND_API_KEY).await
     }
 
     /// The device a bearer token belongs to: live (not revoked) only.
@@ -504,6 +549,52 @@ mod tests {
         assert!(!s.revoke_device(&device.id).await.unwrap());
         assert!(!s.revoke_device("no-such-id").await.unwrap());
         assert!(s.list_devices().await.unwrap()[0].revoked());
+    }
+
+    #[tokio::test]
+    async fn an_api_key_is_a_device_that_was_never_paired() {
+        let (_d, s) = test_store().await;
+        // A paired device is kind 'device' (the column default covers rows
+        // from before the migration).
+        let code = s.mint_pairing_code("read", "admin").await.unwrap();
+        let (paired, _) = s
+            .redeem_pairing_code(&code, "Pixel 8")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paired.kind, KIND_DEVICE);
+        let (key, token) = s
+            .create_api_key("scraper", "read", "yubikey-5")
+            .await
+            .unwrap();
+        assert!(key.is_api_key());
+        assert_eq!(
+            (key.name.as_str(), key.paired_by.as_str()),
+            ("scraper", "yubikey-5")
+        );
+        assert_eq!(token.len(), 43, "256-bit base64url");
+        // Only the hash is at rest; the token is in no column of any row.
+        assert_eq!(key.token_hash, token_hash(&token));
+        let hits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM devices WHERE id = ?1 OR name = ?1 OR token_hash = ?1
+               OR scopes = ?1 OR paired_by = ?1 OR kind = ?1",
+        )
+        .bind(&token)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(hits, 0);
+        let seen = s.validate_device_token(&token).await.unwrap().unwrap();
+        assert_eq!(
+            (seen.id.as_str(), seen.kind.as_str()),
+            (key.id.as_str(), KIND_API_KEY)
+        );
+        let listed = s.list_devices().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.iter().filter(|d| d.is_api_key()).count(), 1);
+        // Revoked like a device.
+        assert!(s.revoke_device(&key.id).await.unwrap());
+        assert!(s.validate_device_token(&token).await.unwrap().is_none());
     }
 
     #[tokio::test]
