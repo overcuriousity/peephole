@@ -1574,4 +1574,42 @@ mod tests {
         assert!(campaign(&state, "192.0.2.1").await.unwrap().is_none());
         assert!(campaign(&state, "nope").await.unwrap().is_none());
     }
+
+    /// `docs/openapi.json` declares what each kind serialises: every key
+    /// declared, every required key present, nothing undeclared; one level
+    /// into `limits`, `truncated` and `node`.
+    #[tokio::test]
+    async fn openapi_dossier_schemas_match_the_serializer() {
+        fn check(schema: &Value, v: &Value, at: &str) {
+            let declared = schema["properties"].as_object().unwrap();
+            let got = v.as_object().unwrap();
+            for k in got.keys() {
+                assert!(declared.contains_key(k), "{at}: `{k}` is not in the schema");
+            }
+            for k in schema["required"].as_array().unwrap() {
+                let k = k.as_str().unwrap();
+                assert!(got.contains_key(k), "{at}: required `{k}` is missing");
+            }
+        }
+        let doc: Value = serde_json::from_str(crate::admin::api_v1::OPENAPI).unwrap();
+        let (state, request, _d) = seeded().await;
+        for d in all_four(&state, request).await {
+            let name = match d["kind"].as_str().unwrap() {
+                "ip" => "IpDossier",
+                "asn" => "AsnDossier",
+                "request" => "RequestDossier",
+                "campaign" => "CampaignDossier",
+                k => panic!("kind {k}"),
+            };
+            let schema = &doc["components"]["schemas"][name];
+            check(schema, &d, name);
+            for nested in ["limits", "truncated", "node"] {
+                check(
+                    &schema["properties"][nested],
+                    &d[nested],
+                    &format!("{name}.{nested}"),
+                );
+            }
+        }
+    }
 }

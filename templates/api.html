@@ -40,5 +40,9 @@ curl -fsS https://&lt;this host&gt;/api/blocklist | grep -v '^#' | grep -v : \
   <h2>GET /healthz</h2>
   <p><span class="mono">ok</span> while the database answers, otherwise HTTP 503 <span class="mono">unavailable</span>. For load balancers and monitoring.</p>
 </section>
+<section class="card api-endpoint">
+  <h2>GET /api/v1/openapi.json</h2>
+  <p>The <a href="/api/v1/openapi.json">OpenAPI 3.1 description</a> of <span class="mono">/api/v1</span>, the machine API for the companion app and scripts. That API takes a device token or an API key an admin mints; the description itself needs none.</p>
+</section>
 </div>
 {% endblock %}
