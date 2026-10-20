@@ -118,9 +118,10 @@
 </section>
 
 {% if let Some(adm) = t.admin %}
+{% include "_fingerprint_glossary.html" %}
 {% if !adm.fingerprints.is_empty() %}
 <section class="card" data-section="fingerprints">
-  <div class="card-head"><h2>Fingerprints</h2></div>
+  <div class="card-head"><h2 title="{{ crate::admin::glossary::help("fp") }}">Browser fingerprints</h2></div>
   {% for f in adm.fingerprints %}
     <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
       {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>

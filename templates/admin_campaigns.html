@@ -13,7 +13,7 @@
     <label>To (UTC) <input name="to" type="date" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
     <button class="btn btn-primary" type="submit">Filter</button>
   </form>
-  <div class="table-wrap"><table class="table"><thead><tr><th>Campaign</th><th class="num">Size</th><th>First seen</th><th>Last seen</th><th>ASNs</th><th>Countries</th><th class="num" title="Shared host key, certificate, fingerprint or canary">Hard edges</th><th class="num" title="Path similarity">Soft edges</th></tr></thead><tbody>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Campaign</th><th class="num">Size</th><th>First seen</th><th>Last seen</th><th>ASNs</th><th>Countries</th><th class="num" title="Shared identity: SSH host key, TLS certificate, browser fingerprint or canary">Hard edges</th><th class="num" title="Similar behaviour: near-identical rare path shapes, within the time window">Soft edges</th></tr></thead><tbody>
   {% for c in items %}<tr>
     <td><a href="/admin/campaigns/{{ c.row.key }}">#{{ c.row.num }}</a> <span class="mono muted">{{ c.row.key }}</span>{% if c.agent %} <span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}</td>
     <td class="num">{{ c.row.size }}</td>
@@ -24,6 +24,7 @@
   </tr>{% endfor %}
   {% if items.is_empty() %}<tr><td colspan="8" class="empty">No campaign{% if f.country.is_some() || f.asn.is_some() || f.min.is_some() || f.from.is_some() || f.to.is_some() %} matches{% endif %}.</td></tr>{% endif %}
   </tbody></table></div>
+  {% include "_edge_legend.html" %}
 </section>
 <section class="card">
   <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs · no edge</span></div>

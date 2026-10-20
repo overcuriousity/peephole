@@ -21,7 +21,7 @@
     <label>Sort <select name="sort"><option value="ips">IPs</option><option value="sightings"{% if f.sort.as_deref() == Some("sightings") %} selected{% endif %}>sightings</option><option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option></select></label>
     <button class="btn btn-primary" type="submit">Filter</button>
   </form>
-  <div class="table-wrap"><table class="table"><thead><tr><th>{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
+  <div class="table-wrap"><table class="table"><thead><tr><th title="{{ crate::admin::glossary::help(kind.key()) }}">{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
   {% for r in page.items %}<tr>
     <td class="mono hk-fp"><a href="{{ crate::admin::views::link_href(kind.key(), r.value.as_str()) }}">{{ r.value }}</a>{% let value = r.value.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</td>
     <td class="num">{{ r.ips }}</td><td class="num">{{ crate::admin::views::thousands(r.sightings) }}</td>
@@ -32,4 +32,5 @@
   {% include "_pagination.html" %}
 </section>
 </div>
+{% include "_fingerprint_glossary.html" %}
 {% endblock %}

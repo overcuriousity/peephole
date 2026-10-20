@@ -13,6 +13,7 @@ pub mod credits;
 pub mod decoys;
 pub mod devices;
 pub mod error;
+pub mod glossary;
 pub mod limit;
 pub mod links;
 pub mod lookup;

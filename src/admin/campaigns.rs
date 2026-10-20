@@ -364,6 +364,7 @@ mod tests {
             "SHA256:image",
             "Last recompute",
             "aria-current=\"true\">Campaigns",
+            "<dt>Soft edge</dt><dd class=\"plain\">The two IPs behave alike",
         ] {
             assert!(list.contains(want), "{want} missing:\n{list}");
         }
@@ -384,7 +385,13 @@ mod tests {
             "SHA256:operator",
             // The campaign graph (S4) sits between Members and Evidence.
             "data-focus=\"campaign:192.0.2.3\"",
-            "<i class=\"line soft\"></i>shared paths",
+            "<i class=\"line soft\"></i>soft: shared paths",
+            // The edge legend and the fingerprint glossary (MIK-710).
+            "<dt>Hard edge</dt><dd class=\"plain\">The two IPs share an identity",
+            "on more than 50 IPs is shared infrastructure",
+            "active within 30 days of each other",
+            "join only on 2 soft edges",
+            "<summary>What the fingerprints mean</summary>",
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
@@ -421,7 +428,7 @@ mod tests {
         }
         // The merged Timeline: the calendar and one events table with the
         // member's address on every row, no older pages.
-        let tl = &a[at("data-section=\"timeline\"")..at("<h2>Shapes</h2>")];
+        let tl = &a[at("data-section=\"timeline\"")..at("Shapes</h2>")];
         for want in [
             "data-calendar=",
             "<table class=\"events\">",
@@ -435,7 +442,7 @@ mod tests {
         }
         assert!(!tl.contains("Older →"), "{tl}");
         // The wave line sits in the Shapes card.
-        let shapes = &a[at("<h2>Shapes</h2>")..];
+        let shapes = &a[at("Shapes</h2>")..];
         assert!(
             shapes.contains(
                 "started probing a path no rule knows: <code>/gamma</code> (12 IPs in 60 min, first seen 2026-09-01 10:00)"

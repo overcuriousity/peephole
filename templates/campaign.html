@@ -33,11 +33,12 @@
   <div class="table-wrap"><table class="table"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
   {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
-    <td>{{ v.kind_name }}</td>
+    <td title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
     <td>{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}</td>
     <td class="ts">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
+  {% include "_edge_legend.html" %}
 </section>
 <section class="card" data-section="artifacts">
   <div class="card-head"><h2>Artifacts</h2></div>
@@ -63,7 +64,7 @@
   {% include "_events.html" %}
 </section>
 <section class="card">
-  <div class="card-head"><h2>Shapes</h2></div>
+  <div class="card-head"><h2 title="{{ crate::admin::glossary::help("path-shape") }}">Shapes</h2></div>
   {% for s in self.waves() %}{% if let Some(w) = s.wave %}<p data-wave><span class="badge badge-wave">wave</span> started probing a path no rule knows: <code>{{ s.text }}</code> ({{ w.ips }} IPs in {{ w.minutes() }} min, first seen {{ crate::admin::views::minute(s.first_seen.as_str()) }})</p>{% endif %}{% endfor %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Shape</th><th class="num">Members</th><th class="num">IPs in dataset</th></tr></thead><tbody>
   {% for s in shapes %}<tr><td class="mono">{{ s.text }}</td><td class="num">{{ s.members }}</td><td class="num">{{ s.df }}</td></tr>{% endfor %}
@@ -71,4 +72,5 @@
   </tbody></table></div>
 </section>
 </div>
+{% include "_fingerprint_glossary.html" %}
 {% endblock %}

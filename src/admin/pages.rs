@@ -528,6 +528,11 @@ mod short_strings_tests {
                 &[
                     "mean one operator; JA4, JA4H, HASSH and JA4X the same software; favicon, JARM, page and 404 hashes the same product.",
                     "<option value=\"1\">shared</option>",
+                    // One glossary for every fingerprint (MIK-710).
+                    "<summary>What the fingerprints mean</summary>",
+                    "<dt>JARM</dt><dd class=\"plain\">JARM (Salesforce): how the source",
+                    "<dt>Path shape</dt><dd class=\"plain\">A request path with the parts",
+                    "<th title=\"A hash of what the trap page",
                 ],
                 &["point to one operator", "two or more IPs</option>"],
             ),
@@ -573,7 +578,12 @@ mod short_strings_tests {
             ),
             (
                 "/admin/analytics",
-                &["<span class=\"muted\">direct HTTP/1 only</span>"],
+                &[
+                    "<span class=\"muted\">direct HTTP/1 only</span>",
+                    "<h2 title=\"JA4 (FoxIO): the TLS ClientHello the source sent us",
+                    "<h2 title=\"HASSH-server: a hash of the algorithm lists",
+                    "<summary>What the fingerprints mean</summary>",
+                ],
                 &["not through an HTTP proxy"],
             ),
             (
