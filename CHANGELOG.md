@@ -58,6 +58,11 @@ moved and answer with a redirect (see Changed).
   overview and credits tiles show a dash with no meter. A price move is
   shown as this node's only when it has a price now; beside a dash there
   is no move badge (MIK-688).
+- Admin "New paths" (`/admin/paths`) says how many shapes the window and
+  filter hold ("Showing 200 of 13,834 shapes") and pages past the first
+  200 with an "older →" link (keyset, no `OFFSET`) and "← newest" back.
+  Before, every window showed the newest 200 rows with no count, so the
+  24 h / 7 days / 30 days / all toggle looked dead (MIK-687).
 
 ## [0.21.0] - 2026-10-19
 
