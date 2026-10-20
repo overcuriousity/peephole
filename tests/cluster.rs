@@ -9024,8 +9024,10 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
         .unwrap();
     let api = reqwest::Client::new();
     // Set right before each call: the credits loop refreshes the table.
+    // The node scans itself: its selling price is what it pays.
     let price = |mc: Option<u32>| {
         na.node.set_price_table(Arc::new(Table {
+            sell_mc: mc,
             scanners: mc
                 .map(|price_mc| ScannerPrice {
                     node: na.id(),
@@ -9153,12 +9155,15 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
         "{v}"
     );
 
-    // A price, but the budget does not cover it.
-    price(Some(DEAR));
-    assert_eq!(
-        web_quote(2).await,
-        Err("the scan budget does not cover this".to_string())
+    // A price, but the budget does not cover it: the refusal names the
+    // price, the balance and what is committed (MIK-748).
+    let short = format!(
+        "it costs at least {} credits; the balance is {} credits, 0.00 of them committed to scans in flight",
+        peephole::credits::show(DEAR as u64 * 4),
+        peephole::credits::show(balance().await)
     );
+    price(Some(DEAR));
+    assert_eq!(web_quote(2).await, Err(short.clone()));
     price(Some(DEAR));
     let (st, v) = quote(2).await;
     assert_eq!(
@@ -9166,6 +9171,10 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
         (conflict, &"no_budget".into()),
         "{v}"
     );
+    assert_eq!(v["error"]["message"], short.as_str(), "{v}");
+    assert_eq!(v["error"]["need_mc"], DEAR as u64 * 4, "{v}");
+    assert_eq!(v["error"]["balance_mc"], balance().await, "{v}");
+    assert_eq!(v["error"]["committed_mc"], 0, "{v}");
 
     // A quote taken while the scan was free, bought after the scanners
     // went away or the price rose past the budget: the buy checks again,
@@ -9182,7 +9191,7 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
     price(Some(DEAR));
     assert_eq!(
         post_form(2, Some(q)).await,
-        "No scan: the scan budget does not cover this. Nothing was charged."
+        format!("No scan: {short}. Nothing was charged.")
     );
     price(Some(0));
     let (st, q) = quote(2).await;
@@ -9215,6 +9224,86 @@ async fn a_scan_without_price_or_budget_is_refused_and_spends_nothing() {
         ),
         before
     );
+}
+
+/// A bought scan is priced at what the arbiter pays the scanner: a free
+/// market (protocol 9) scanner's ask, not this node's copy of its price,
+/// which the sales rule can lift far above the ask (MIK-748). A balance
+/// that covers the ask but not the copy buys a level 3 scan at the ask.
+#[tokio::test]
+async fn a_bought_scan_is_priced_at_the_ask_not_the_copy() {
+    use peephole::credits::price::{self, ScannerPrice, Table};
+    let tools = tempfile::tempdir().unwrap();
+    let (ia, a) = new_node("node-alpha");
+    let (ib, b) = new_node("node-bravo");
+    let na = boot(ia, &a, &[&b], DEFAULT).await;
+    let nb = boot(
+        ib,
+        &b,
+        &[&a],
+        Opts {
+            scanner: Some(fake_nmap_args(tools.path())),
+            ..DEFAULT
+        },
+    )
+    .await;
+    fund_listeners(&[&na, &nb], &[a.id]).await;
+    market_known(&na, b.id).await;
+    let ask = price::refresh(&nb.node)
+        .await
+        .unwrap()
+        .price_of(price::SCAN)
+        .unwrap();
+    eventually("a hears b's ask", || async {
+        na.node.status.known(&b.id).and_then(|k| k.hb.scan_price_mc) == Some(ask)
+    })
+    .await;
+    let me = na.node.members().get(&b.id).unwrap().proto_max;
+    assert!(peephole::credits::jobs::under_bid(na.node.proto.1, me));
+    let ip = "203.0.113.52";
+    na.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+    let balance = peephole::credits::book_fresh(&na.node)
+        .await
+        .unwrap()
+        .balance(&a.id);
+    // A copy whose level 3 price the balance does not cover.
+    let copy = (balance / 16 + 1) as u32;
+    assert!((ask as u64 * 16) <= balance, "{ask} × 16 > {balance}");
+    let code = na
+        .store
+        .mint_pairing_code("read,act", "admin")
+        .await
+        .unwrap();
+    let (_, token) = na
+        .store
+        .redeem_pairing_code(&code, "Pixel 8")
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, base, _) = admin_on_jar(&na).await;
+    // Set right before the call: the credits loop refreshes the table.
+    na.node.set_price_table(Arc::new(Table {
+        scanners: vec![ScannerPrice {
+            node: b.id,
+            price_mc: copy,
+            paid: 0.0,
+            supply: 0.0,
+        }],
+        ..Default::default()
+    }));
+    let at_ask = peephole::credits::jobs::price_for(&na.node, &b.id).unwrap() as u64 * 16;
+    assert!(at_ask <= balance, "{at_ask} > {balance}");
+    let r = reqwest::Client::new()
+        .get(format!("{base}/api/v1/ips/{ip}/scan/quote?level=3"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(st, reqwest::StatusCode::OK, "{v}");
+    assert_eq!(v["credits_mc"], at_ask, "{v}");
+    assert_eq!(v["credits_max_mc"], at_ask, "{v}");
 }
 
 /// What a browser sends with each request to the admin's own pages: a

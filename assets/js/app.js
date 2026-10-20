@@ -368,6 +368,7 @@
     clearInterval(qd.tick);
     cur.quote = null;
     q$("[data-q-price]").textContent = "…";
+    q$(".quote-price").hidden = false;
     q$("[data-q-what]").textContent = "";
     q$("[data-q-error]").textContent = "";
     quoteState("asking", "Getting the price…");
@@ -406,7 +407,8 @@
       })
       .catch(function (e) {
         if (seq !== qd.seq) return;
-        q$("[data-q-price]").textContent = "—";
+        // No price to show: the error says why.
+        q$(".quote-price").hidden = true;
         q$("[data-q-error]").textContent = e.message || String(e);
         quoteState("error", "");
       });
