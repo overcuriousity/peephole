@@ -386,6 +386,31 @@ MCP server takes its name from a pool that fits the product (`ml-ops`,
 and a `gpu-box` gateway lists 7-9 local models, 2-3 of them 27B-70B ones.
 Tool names, extra tools, resources and upstream models stay the node's.
 
+## Campaigns: what ties two addresses
+
+The hourly campaign pass (`store::campaigns`) joins two addresses only on
+evidence of one operator:
+
+- **Hard edges**, one shared value: a browser fingerprint, an SSH host
+  key, a TLS certificate, or a canary served to one address and used by
+  the other. A value on more than 50 addresses is a shared image or a
+  default and ties nothing.
+- **Soft edges**, path similarity: the two asked for the same rare path
+  shapes (weighted Jaccard of 0.60 or more, at least 3 shapes on at most
+  50 addresses each, active within 30 days of each other). A shared JA4
+  and JA4H pair, or the shapes asked for in the same order, lowers the
+  score needed to 0.45. JA4 and JA4H never tie two addresses on their own.
+
+User agent, JA4 alone, JA4H alone, HASSH, JA4X, JARM, favicon and the
+HTTP body, 404 and ETag hashes do not feed campaigns: they identify the
+software or the product, which many unrelated operators share, not the
+operator. They stay pivots on the Links page.
+
+A campaign's page lists every edge. A soft edge's row opens to the score
+and the threshold it met, the order agreement (−1 to 1), the shared
+(JA4, JA4H) pairs and the shared shapes with how many addresses asked for
+each, the rarest 100 of them, as the pass that made the edge saw them.
+
 ## Scanners we do not counter-scan
 
 peephole answers reconnaissance with a counter-scan of the source — except

@@ -50,6 +50,8 @@ pub const ORDER_AGREE: f64 = 0.5;
 /// An order agreement at or below this: the pair forms no edge (a tuning
 /// value; [`Params::V2`] has no veto).
 pub const ORDER_VETO: f64 = -0.3;
+/// Shared shapes stored per `paths` edge for its page, the rarest first.
+pub const EDGE_SHAPES_MAX: usize = 100;
 /// How often maintenance recomputes (when the inputs changed).
 pub const RECOMPUTE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -286,6 +288,16 @@ pub struct Edge {
     pub agreement: Option<f64>,
 }
 
+/// What tied a `paths` edge, as the pass stored it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeDetail {
+    /// The shared shapes (text, document frequency), the rarest
+    /// [`EDGE_SHAPES_MAX`] first.
+    pub shapes: Vec<(String, i64)>,
+    /// The (JA4, JA4H) pairs both IPs sent.
+    pub tls: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Campaign {
     pub row: CampaignRow,
@@ -350,6 +362,8 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for sql in [
             "DELETE FROM campaign_edges",
+            "DELETE FROM campaign_edge_shapes",
+            "DELETE FROM campaign_edge_tls",
             "DELETE FROM campaign_members",
             "DELETE FROM campaigns",
         ] {
@@ -399,6 +413,24 @@ impl Store {
             .bind(e.agreement)
             .execute(&mut *tx)
             .await?;
+            for (shape, df) in &e.shapes {
+                sqlx::query("INSERT INTO campaign_edge_shapes (a, b, shape, df) VALUES (?,?,?,?)")
+                    .bind(e.a)
+                    .bind(e.b)
+                    .bind(shape)
+                    .bind(df)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            for (ja4, ja4h) in &e.tls {
+                sqlx::query("INSERT INTO campaign_edge_tls (a, b, ja4, ja4h) VALUES (?,?,?,?)")
+                    .bind(e.a)
+                    .bind(e.b)
+                    .bind(ja4)
+                    .bind(ja4h)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         report.seconds = started.elapsed().as_secs_f64();
         for (key, value) in [
@@ -483,6 +515,36 @@ impl Store {
             members,
             edges,
         }))
+    }
+
+    /// The detail of each `paths` edge of a campaign, by (a, b) ip ids.
+    pub async fn campaign_edge_detail(&self, key: &str) -> Result<HashMap<(i64, i64), EdgeDetail>> {
+        let shapes: Vec<(i64, i64, String, i64)> = sqlx::query_as(
+            "SELECT e.a, e.b, COALESCE(s.text, '#' || e.shape), e.df
+             FROM campaign_edge_shapes e
+             JOIN campaign_members m ON m.ip_id = e.a
+             LEFT JOIN shapes s ON s.hash = e.shape
+             WHERE m.campaign_key = ? ORDER BY e.a, e.b, e.df, e.shape",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        let tls: Vec<(i64, i64, String, String)> = sqlx::query_as(
+            "SELECT e.a, e.b, e.ja4, e.ja4h FROM campaign_edge_tls e
+             JOIN campaign_members m ON m.ip_id = e.a
+             WHERE m.campaign_key = ? ORDER BY e.a, e.b, e.ja4, e.ja4h",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: HashMap<(i64, i64), EdgeDetail> = HashMap::new();
+        for (a, b, text, df) in shapes {
+            out.entry((a, b)).or_default().shapes.push((text, df));
+        }
+        for (a, b, ja4, ja4h) in tls {
+            out.entry((a, b)).or_default().tls.push((ja4, ja4h));
+        }
+        Ok(out)
     }
 
     /// The campaigns `f` lets through, most recently active first, with
@@ -784,6 +846,9 @@ struct EdgeOut {
     agreement: Option<f64>,
     first_ts: String,
     last_ts: String,
+    /// As [`Link::shapes`], [`Link::tls`].
+    shapes: Vec<(i64, i64)>,
+    tls: Vec<(String, String)>,
 }
 
 struct Output {
@@ -822,6 +887,10 @@ struct Link {
     agreement: Option<f64>,
     first: Option<String>,
     last: Option<String>,
+    /// A `paths` edge's shared shapes and their document frequency, the
+    /// rarest [`EDGE_SHAPES_MAX`]; its shared (JA4, JA4H) pairs.
+    shapes: Vec<(i64, i64)>,
+    tls: Vec<(String, String)>,
 }
 
 /// A first and last time, either unknown.
@@ -962,6 +1031,8 @@ fn compute(input: &Input, p: &Params) -> Output {
                     agreement: None,
                     first: span.0,
                     last: span.1,
+                    shapes: vec![],
+                    tls: vec![],
                 });
             }
         }
@@ -1029,6 +1100,7 @@ fn compute(input: &Input, p: &Params) -> Output {
         let mut span: Span = (None, None);
         // (shape, first asked by a, by b), for the order term.
         let mut firsts: Vec<(i64, &str, &str)> = vec![];
+        let mut common: Vec<i64> = vec![];
         while x < sa.len() || y < sb.len() {
             let ord = match (sa.get(x), sb.get(y)) {
                 (Some(p), Some(q)) => p.0.cmp(&q.0),
@@ -1050,6 +1122,7 @@ fn compute(input: &Input, p: &Params) -> Output {
                     shared_w += w;
                     union_w += w;
                     shared += 1;
+                    common.push(q.0);
                     shared_rare += rare(q.0) as usize;
                     widen(&mut span, Some(q.1.min(r.1)), Some(q.2.max(r.2)));
                     if p.order {
@@ -1085,7 +1158,11 @@ fn compute(input: &Input, p: &Params) -> Output {
             vetoed += 1;
             continue;
         }
-        let fp_support = tls[a].iter().any(|p| tls[b].contains(p));
+        let both: Vec<(String, String)> = tls[a]
+            .intersection(&tls[b])
+            .map(|&(x, y)| (x.to_string(), y.to_string()))
+            .collect();
+        let fp_support = !both.is_empty();
         let support = fp_support || agreement.is_some_and(|x| x >= p.agree);
         if score < if support { PATHS_T_SUPPORTED } else { PATHS_T } {
             continue;
@@ -1101,6 +1178,14 @@ fn compute(input: &Input, p: &Params) -> Output {
             agreement,
             first: span.0,
             last: span.1,
+            shapes: {
+                let mut v: Vec<(i64, i64)> =
+                    common.iter().map(|&s| (s, df[&s].len() as i64)).collect();
+                v.sort_by_key(|&(s, d)| (d, s));
+                v.truncate(EDGE_SHAPES_MAX);
+                v
+            },
+            tls: both,
         });
     }
 
@@ -1225,6 +1310,8 @@ fn compute(input: &Input, p: &Params) -> Output {
             agreement: l.agreement,
             first_ts: l.first.unwrap_or_default(),
             last_ts: l.last.unwrap_or_default(),
+            shapes: l.shapes,
+            tls: l.tls,
         })
         .collect();
     Output {
@@ -2264,7 +2351,7 @@ pub(crate) mod tests {
 
         // The page says when the order agrees.
         use crate::admin::campaigns::EdgeView;
-        let reason = |b: &Campaign| EdgeView::new(b.edges[0].clone()).reason;
+        let reason = |b: &Campaign| EdgeView::new(b.edges[0].clone(), Default::default()).reason;
         assert!(!reason(&b).contains("order"), "{}", reason(&b));
         sqlx::query("UPDATE campaign_edges SET agreement = ? WHERE kind = 'paths'")
             .bind(ORDER_AGREE)

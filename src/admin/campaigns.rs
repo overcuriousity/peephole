@@ -7,8 +7,8 @@ use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::{Chrome, link_href};
 use crate::store::browse::{CALENDAR_DAYS, CalendarDay, canonical_ip};
 use crate::store::campaigns::{
-    Campaign, CampaignCommand, CampaignFilter, CampaignListItem, CampaignShape, Edge,
-    HARD_FANOUT_MAX, ORDER_AGREE, Report,
+    Campaign, CampaignCommand, CampaignFilter, CampaignListItem, CampaignShape, DF_RARE, Edge,
+    EdgeDetail, HARD_FANOUT_MAX, MIN_SHARED_RARE, ORDER_AGREE, PATHS_T, PATHS_T_SUPPORTED, Report,
 };
 use crate::store::events::EventPage;
 use crate::store::links::LinkKind;
@@ -75,10 +75,12 @@ pub struct EdgeView {
     pub reason: String,
     /// The shared value and its Links page (hard kinds).
     pub value: Option<(String, String)>,
+    /// What tied a `paths` edge, as the pass stored it.
+    pub detail: EdgeDetail,
 }
 
 impl EdgeView {
-    pub fn new(e: Edge) -> Self {
+    pub fn new(e: Edge, detail: EdgeDetail) -> Self {
         let kind = LinkKind::parse(&e.kind);
         let kind_name = kind.map_or("Path similarity", |k| k.name());
         let reason = match e.kind.as_str() {
@@ -104,7 +106,72 @@ impl EdgeView {
             kind_name,
             reason,
             value,
+            detail,
         }
+    }
+
+    /// Whether a JA4/JA4H match or the order agreement lowered the score
+    /// a `paths` edge needs.
+    fn supported(&self) -> bool {
+        self.e.fp_support || self.e.agreement.is_some_and(|x| x >= ORDER_AGREE)
+    }
+
+    /// The score test a `paths` edge passed, in words.
+    pub fn score_rule(&self) -> String {
+        let score = self.e.score.unwrap_or(0.0);
+        if self.supported() {
+            format!("score {score:.2} ≥ {PATHS_T_SUPPORTED:.2} (supported)")
+        } else {
+            format!(
+                "score {score:.2} ≥ {PATHS_T:.2} (unsupported; {PATHS_T_SUPPORTED:.2} with support)"
+            )
+        }
+    }
+
+    /// The order agreement and the threshold it met, in words.
+    pub fn agreement_rule(&self) -> String {
+        match self.e.agreement {
+            Some(x) if x >= ORDER_AGREE => {
+                format!("order agreement {x:+.2} ≥ {ORDER_AGREE:.2}: supports")
+            }
+            Some(x) => format!("order agreement {x:+.2} < {ORDER_AGREE:.2}: no support"),
+            None => "order agreement unknown (too few shared shapes in order)".into(),
+        }
+    }
+
+    /// The shared shapes listed, with their document frequency, whether
+    /// rare, and how many more the edge shares.
+    pub fn shapes(&self) -> Vec<(&str, i64, bool)> {
+        self.detail
+            .shapes
+            .iter()
+            .map(|(t, df)| (t.as_str(), *df, *df as usize <= DF_RARE))
+            .collect()
+    }
+
+    pub fn more_shapes(&self) -> i64 {
+        self.e.shared.unwrap_or(0) - self.detail.shapes.len() as i64
+    }
+
+    /// The rule for rare shapes, in words.
+    pub fn rare_rule(&self) -> String {
+        format!("rare: on at most {DF_RARE} IPs; an edge needs {MIN_SHARED_RARE}")
+    }
+
+    /// The shared (JA4, JA4H) pairs with their Links pages.
+    pub fn tls(&self) -> Vec<(&str, String, &str, String)> {
+        self.detail
+            .tls
+            .iter()
+            .map(|(x, y)| {
+                (
+                    x.as_str(),
+                    link_href("ja4", x),
+                    y.as_str(),
+                    link_href("ja4h", y),
+                )
+            })
+            .collect()
     }
 
     /// Paths edges are soft; the rest point to one operator.
@@ -203,9 +270,16 @@ async fn campaign(
     let Some(mut c) = st.store.campaign(&key).await? else {
         return Err(AppError::NotFound);
     };
+    let mut detail = st.store.campaign_edge_detail(&key).await?;
     let edges = std::mem::take(&mut c.edges)
         .into_iter()
-        .map(EdgeView::new)
+        .map(|e| {
+            let d = match e.kind.as_str() {
+                "paths" => detail.remove(&(e.a_id, e.b_id)).unwrap_or_default(),
+                _ => EdgeDetail::default(),
+            };
+            EdgeView::new(e, d)
+        })
         .collect();
     let calendar = st.store.campaign_calendar(&key).await?;
     let shapes = st.store.campaign_shapes(&key).await?;
@@ -506,5 +580,89 @@ mod tests {
         assert!(!single.contains("member of campaign"));
         let (_, _, public) = send(&app, get("/ip/192.0.2.1", false), Body::empty()).await;
         assert!(!public.contains("member of campaign"));
+    }
+
+    /// MIK-635: a soft edge's row expands to what tied it, the same shapes
+    /// and (JA4, JA4H) pair the pass used.
+    #[tokio::test]
+    async fn soft_edges_show_what_tied_them() {
+        let (state, cookie, app, _d) = app().await;
+        feed(&state.store, fixture()).await;
+        tls_fixture(&state.store).await;
+        state.store.recompute_campaigns(true).await.unwrap();
+        // The shapes both IPs of pair (d) asked for, with how many IPs did,
+        // from the request rows (pair (d) has no light rows).
+        let want: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT s.text, (SELECT COUNT(DISTINCT r.ip_id) FROM requests r WHERE r.shape = s.hash)
+             FROM shapes s WHERE s.hash IN (
+               SELECT shape FROM requests WHERE ip_id = (SELECT id FROM ips WHERE ip = ?1)
+               INTERSECT
+               SELECT shape FROM requests WHERE ip_id = (SELECT id FROM ips WHERE ip = ?2))
+             ORDER BY 2, s.hash",
+        )
+        .bind("198.51.100.30")
+        .bind("198.51.100.31")
+        .fetch_all(&state.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(want.len(), 8, "{want:?}");
+        let page = |p: &'static str| {
+            let app = app.clone();
+            let r = Request::get(p)
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie);
+            async move {
+                let (st, _, body) = send(&app, r, Body::empty()).await;
+                assert_eq!(st, StatusCode::OK, "{p}");
+                body
+            }
+        };
+        let d = page("/admin/evidence/campaigns/198.51.100.30").await;
+        let details = d
+            .split("<details class=\"edge-detail\">")
+            .nth(1)
+            .and_then(|x| x.split("</details>").next())
+            .unwrap_or_else(|| panic!("no edge detail:\n{d}"));
+        let rows: Vec<(String, i64)> = details
+            .split("<td class=\"mono break\">")
+            .skip(1)
+            .map(|r| {
+                let (text, rest) = r.split_once("</td><td class=\"num\">").unwrap();
+                let df = rest.split_once("</td>").unwrap().0.parse().unwrap();
+                (text.to_string(), df)
+            })
+            .collect();
+        assert_eq!(rows, want, "{details}");
+        assert_eq!(details.matches("<td>rare</td>").count(), 8, "{details}");
+        for want in [
+            "href=\"/admin/evidence/links/ja4/t13d1516h2_x\">t13d1516h2_x</a>",
+            "href=\"/admin/evidence/links/ja4h/ge11nn05enus_y\">ge11nn05enus_y</a>",
+            "(supported)</li>",
+            "≥ 0.45",
+            "order agreement unknown",
+            "rare: on at most 50 IPs; an edge needs 3",
+        ] {
+            assert!(details.contains(want), "{want} missing:\n{details}");
+        }
+        assert!(!details.contains("more shared"), "{details}");
+        // No pair, and only the rarest EDGE_SHAPES_MAX of 131 listed.
+        let b = page("/admin/evidence/campaigns/198.51.100.10").await;
+        assert!(!b.contains("/admin/evidence/links/ja4/"), "{b}");
+        assert!(b.contains("≥ 0.60 (unsupported; 0.45 with support)"), "{b}");
+        assert!(
+            b.contains("31 more shared, more common shapes not listed"),
+            "{b}"
+        );
+        assert_eq!(
+            b.matches("<td class=\"mono break\">").count(),
+            crate::store::campaigns::EDGE_SHAPES_MAX,
+            "{b}"
+        );
+        // Hard edges stay a plain row.
+        assert!(
+            !page("/admin/evidence/campaigns/192.0.2.3")
+                .await
+                .contains("edge-detail")
+        );
     }
 }

@@ -34,7 +34,18 @@
   {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
     <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
-    <td class="why">{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}</td>
+    <td class="why">{% if v.hard() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
+      <ul>
+        <li>{{ v.score_rule() }}</li>
+        <li>{{ v.agreement_rule() }}</li>
+        {% for (ja4, ja4_href, ja4h, ja4h_href) in v.tls() %}<li>JA4/JA4H match: <a class="mono hk-fp" href="{{ ja4_href }}">{{ ja4 }}</a> + <a class="mono hk-fp" href="{{ ja4h_href }}">{{ ja4h }}</a></li>{% endfor %}
+      </ul>
+      <table class="table"><thead><tr><th>Shared shape</th><th class="num">IPs</th><th></th></tr></thead><tbody>
+      {% for (text, df, rare) in v.shapes() %}<tr><td class="mono break">{{ text }}</td><td class="num">{{ df }}</td><td>{% if rare %}rare{% endif %}</td></tr>{% endfor %}
+      {% if v.shapes().is_empty() %}<tr><td colspan="3" class="empty">Not stored for this edge; the next recompute adds it.</td></tr>{% endif %}
+      </tbody></table>
+      <p class="muted">{{ v.rare_rule() }}{% if v.more_shapes() > 0 %} · {{ v.more_shapes() }} more shared, more common shapes not listed{% endif %}</p>
+    </details>{% endif %}</td>
     <td class="ts first">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts last">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
