@@ -55,22 +55,30 @@
 
   <div class="grid-2">
     <section class="card">
-      <div class="card-head"><h2>Personas</h2><span class="muted">all nodes · follow-up = another request from the IP within 24 h of its first</span></div>
+      <div class="card-head"><h2>Personas</h2><span class="muted">all nodes · requests per family; a request can carry several · follow-up = another request from the IP within 24 h of its first</span></div>
       <div class="table-wrap"><table class="an-table">
-        <thead><tr><th>Persona</th><th class="num">Requests</th><th class="num">IPs</th><th class="num">Follow-up</th></tr></thead>
-        <tbody>{% for p in a.personas %}<tr><td class="name"><span class="mono">{{ p.name }}</span>{% let v = p.requests %}{% let max = max.personas %}{% include "_bar.html" %}<div class="muted">{% for f in p.families %}{{ crate::admin::views::family_name(f.name) }} {{ crate::admin::views::pct(f.count, p.requests) }} %{% if !loop.last %} · {% endif %}{% endfor %}</div></td><td class="num">{{ crate::admin::views::thousands(p.requests) }}</td><td class="num">{{ p.ips }}</td><td class="num">{{ crate::admin::views::pct(p.followed, p.ips) }} %</td></tr>{% endfor %}
+        <thead><tr><th>Persona</th><th class="num">Requests</th><th class="num">IPs</th><th class="num nowrap">Follow-up</th></tr></thead>
+        <tbody>{% for p in a.personas %}<tr><td class="name"><a class="mono" href="/requests?persona={{ crate::admin::public::urlencode(p.name) }}">{{ p.name }}</a>{% let v = p.requests %}{% let max = max.personas %}{% include "_bar.html" %}<div class="muted">{% for f in p.families %}<span class="nowrap">{{ crate::admin::views::family_name(f.name) }} {{ crate::admin::views::thousands(f.count) }}</span>{% if !loop.last %} · {% endif %}{% endfor %}</div></td><td class="num">{{ crate::admin::views::thousands(p.requests) }}</td><td class="num">{{ p.ips }}</td><td class="num">{{ crate::admin::views::pct(p.followed, p.ips) }} %</td></tr>{% endfor %}
         {% if a.personas.is_empty() %}<tr><td colspan="4" class="empty">None (rows from before personas carry none).</td></tr>{% endif %}</tbody>
       </table></div>
     </section>
     <section class="card">
       <div class="card-head"><h2>AI agent traces</h2><a href="/requests?label=ai-agent-artifact">requests →</a></div>
       {% let t = a.agent.total %}
+      {% if t.agent_ips == 0 && t.agent_campaigns == 0 %}
+      <p>None in this range. A trace is a request with one of these labels:</p>
+      <ul>
+        <li><a class="mono" href="/requests?label=ai-agent-tooling">ai-agent-tooling</a>: an LLM SDK or agent framework by its User-Agent or SDK headers, or an MCP client that names a known agent.</li>
+        <li><a class="mono" href="/requests?label=ai-agent-artifact">ai-agent-artifact</a>: model output inside a request, such as chat-template tokens, tool-call JSON or refusal text.</li>
+      </ul>
+      <p class="muted">Scanners probing the fake AI are not traces: see <a href="/admin/decoys">Decoys</a>. Requests stored before v0.20.0 were never checked for these labels.</p>
+      {% else %}
       <p>{{ t.agent_ips }} of {{ t.ips }} IPs ({{ crate::admin::views::pct(t.agent_ips, t.ips) }} %) · {{ t.agent_campaigns }} of {{ t.campaigns }} active campaigns agent-driven</p>
       <div class="table-wrap"><table class="an-table">
         <thead><tr><th>{% if range.hourly() %}Hour{% else %}Day{% endif %} (UTC)</th><th class="num">Agent IPs</th><th class="num">Share</th><th class="num">Agent campaigns</th></tr></thead>
-        <tbody>{% for b in a.agent.series.iter().rev() %}{% if b.agent_ips > 0 || b.agent_campaigns > 0 %}<tr><td class="mono">{{ b.ts }}</td><td class="num">{{ b.agent_ips }} / {{ b.ips }}</td><td class="num">{{ crate::admin::views::pct(b.agent_ips, b.ips) }} %</td><td class="num">{{ b.agent_campaigns }} / {{ b.campaigns }}</td></tr>{% endif %}{% endfor %}
-        {% if t.agent_ips == 0 %}<tr><td colspan="4" class="empty">None.</td></tr>{% endif %}</tbody>
+        <tbody>{% for b in a.agent.series.iter().rev() %}{% if b.agent_ips > 0 || b.agent_campaigns > 0 %}<tr><td class="mono">{{ b.ts }}</td><td class="num">{{ b.agent_ips }} / {{ b.ips }}</td><td class="num">{{ crate::admin::views::pct(b.agent_ips, b.ips) }} %</td><td class="num">{{ b.agent_campaigns }} / {{ b.campaigns }}</td></tr>{% endif %}{% endfor %}</tbody>
       </table></div>
+      {% endif %}
     </section>
   </div>
 
