@@ -1315,6 +1315,28 @@ impl Sharing {
         Sharing::Insufficient,
     ];
 
+    /// The states as the `/ips` filter groups them: one party, shared,
+    /// not read.
+    pub const GROUPS: [(&'static str, &'static [Sharing]); 3] = [
+        (
+            "one party",
+            &[
+                Sharing::Operator,
+                Sharing::Subscriber,
+                Sharing::SubscriberPooled,
+            ],
+        ),
+        (
+            "shared",
+            &[
+                Sharing::CarrierPool,
+                Sharing::MobilePool,
+                Sharing::PooledLine,
+            ],
+        ),
+        ("not read", &[Sharing::ConsumerLine, Sharing::Insufficient]),
+    ];
+
     /// Its rule in the reading table.
     pub fn rule(self) -> u8 {
         match self {
@@ -1350,7 +1372,7 @@ impl Sharing {
     /// The reading as the IP page names it.
     pub fn label(self) -> &'static str {
         match self {
-            Sharing::Operator => "not read: one operator's address",
+            Sharing::Operator => "one operator's address",
             Sharing::SubscriberPooled => "one subscriber's network, on a pooled line",
             Sharing::Subscriber => "one subscriber's network",
             Sharing::CarrierPool => "shared pool, by the operator's naming",
@@ -1682,6 +1704,8 @@ pub struct IpProps {
     pub agent: bool,
     /// A counter-scan of it finished.
     pub scanned: bool,
+    /// A counter-scan of it is queued or running.
+    pub scan_pending: bool,
 }
 
 impl IpProps {
@@ -1709,7 +1733,17 @@ impl IpProps {
     }
 }
 
-type PropsRow = (String, String, bool, Option<String>, bool, bool, bool, bool);
+type PropsRow = (
+    String,
+    String,
+    bool,
+    Option<String>,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+);
 
 impl Store {
     /// The property strip of each recorded address among `ips`, by
@@ -1732,7 +1766,9 @@ impl Store {
                     EXISTS (SELECT 1 FROM ip_labels l WHERE l.ip_id = i.id
                               AND l.label IN (?2, ?3) AND l.count > 0),
                     EXISTS (SELECT 1 FROM scans s WHERE s.ip_id = i.id
-                              AND s.finished_at IS NOT NULL)
+                              AND s.finished_at IS NOT NULL),
+                    EXISTS (SELECT 1 FROM scan_jobs j WHERE j.ip_id = i.id
+                              AND j.status IN ('queued', 'running'))
              FROM ips i WHERE i.ip IN (SELECT value FROM json_each(?1))",
             reading_sql()
         );
@@ -1745,18 +1781,21 @@ impl Store {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(ip, reading, tor, net, scanner, fleet, agent, scanned)| {
-                let props = IpProps {
-                    reading: Sharing::from_key(&reading).unwrap_or(Sharing::Insufficient),
-                    tor,
-                    net,
-                    scanner,
-                    fleet,
-                    agent,
-                    scanned,
-                };
-                (ip, props)
-            })
+            .map(
+                |(ip, reading, tor, net, scanner, fleet, agent, scanned, scan_pending)| {
+                    let props = IpProps {
+                        reading: Sharing::from_key(&reading).unwrap_or(Sharing::Insufficient),
+                        tor,
+                        net,
+                        scanner,
+                        fleet,
+                        agent,
+                        scanned,
+                        scan_pending,
+                    };
+                    (ip, props)
+                },
+            )
             .collect())
     }
 }
@@ -2093,7 +2132,7 @@ impl Store {
                     r.ref_id,
                     day(&at)
                 );
-                let href = Some(format!("/admin/scans/{}", r.ref_id));
+                let href = Some(format!("/admin/investigate/scans/{}", r.ref_id));
                 cat.hits(&ports, os.as_deref(), &facts)
                     .into_iter()
                     .filter(|h| h.kind.row_kind() == r.kind && h.id == r.value)
@@ -2151,7 +2190,7 @@ impl Store {
                         what,
                         Some(port),
                         format!("scan #{s}"),
-                        Some(format!("/admin/scans/{s}")),
+                        Some(format!("/admin/investigate/scans/{s}")),
                         &r.last_ts,
                     )],
                     None => vec![line(what, Some(port), "a probe".into(), link, &r.last_ts)],
@@ -2919,7 +2958,7 @@ pub(crate) mod tests {
         assert_eq!(v.as_note, Some("AS type not classified."));
         assert_eq!(
             v.lines[0].href.as_deref(),
-            Some(&*format!("/admin/scans/{scan}"))
+            Some(&*format!("/admin/investigate/scans/{scan}"))
         );
         assert_eq!(v.caveat, Some(DEVICE_CAVEAT));
         // A Tor exit is rule 1: nothing new on the page.

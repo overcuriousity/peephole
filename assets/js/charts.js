@@ -307,15 +307,17 @@
     var W = Math.max(widthOf(host, 800), 240), H = opts.height || 200, L = 46, B = 22, T = 10, R = 8;
     var vals = [];
     layers.forEach(function (l) { (l.values || []).concat(l.hi || []).forEach(function (v) { if (v != null) vals.push(v); }); });
-    if (!xs.length || !vals.length) return empty(host, W, H);
+    if (!xs.length || !vals.length || (opts.zeroEmpty && !vals.some(function (v) { return v; }))) return empty(host, W, H);
     var s = svg(host, W, H), max = niceMax(Math.max.apply(null, vals)), plotH = H - B - T;
     var x0 = xs[0], span = Math.max(1, xs[xs.length - 1] - x0);
     var X = function (h) { return L + ((h - x0) / span) * (W - L - R); }, Y = function (v) { return T + plotH - (v / max) * plotH; };
     var grid = el("g", { "class": "grid" }, s), axis = el("g", { "class": "axis" }, s);
-    [0, 0.5, 1].forEach(function (f) {
+    // A rounded tick equal to the one above it is left out (no "1 / 1 / 0").
+    var ticks = [0, 0.5, 1].map(function (f) { return opts.fmt ? opts.fmt(f * max) : compact(Math.round(f * max)); });
+    [0, 0.5, 1].forEach(function (f, i) {
       var y = T + plotH - f * plotH;
       el("line", { x1: L, x2: W - R, y1: y, y2: y }, grid);
-      text(axis, L - 6, y + 3, opts.fmt ? opts.fmt(f * max) : compact(Math.round(f * max)), "", "end");
+      if (ticks[i] !== ticks[i + 1]) text(axis, L - 6, y + 3, ticks[i], "", "end");
     });
     // A tick at each UTC midnight in range.
     for (var h = Math.ceil(x0 / 24) * 24; h <= xs[xs.length - 1]; h += 24) {
@@ -371,7 +373,7 @@
         var dem = pts.map(function (p) { return p.demand; }), sup = pts.map(function (p) { return p.supply; });
         hourChart(dsHost, xs, [{ cls: "line supply", values: sup }, { cls: "line demand", values: dem }], function (i) {
           return hourLabel(xs[i]) + "<br>sold here <b>" + dem[i].toFixed(1) + "</b> · offered here <b>" + sup[i].toFixed(1) + "</b> per hour";
-        }, { height: 120, fmt: function (v) { return compact(Math.round(v)); } });
+        }, { height: 120, zeroEmpty: true, fmt: function (v) { return compact(Math.round(v)); } });
       }
       if (twin) {
         var t = "<table><caption>" + esc(series.label) + ": price per hour (UTC)</caption><tr><th>Hour</th><th>This node</th><th>Members, lowest</th><th>Median</th><th>Highest</th><th>Sold here</th><th>Offered here</th></tr>";

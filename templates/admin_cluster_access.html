@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — cluster access{% endblock %}
 {% block content %}
-{% let sub = "cluster" %}{% include "_admin_nav.html" %}
-{% let subtab = "access" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "access") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Access</h1><p class="muted">Invites, joining and leaving.</p></div></div>
 <div class="stack">
 {% if let Some(t) = invite %}

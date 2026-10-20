@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — export{% endblock %}
 {% block content %}
-{% let sub = "system" %}{% include "_admin_nav.html" %}
-{% let subtab = "export" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("system", "export") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Export</h1><p class="muted">Every request and what is known about it; claim e-mails excluded. Shell: <code>peephole export</code> · <a href="https://github.com/overcuriousity/peephole/blob/master/docs/dataset.md">columns</a></p></div></div>
 <form class="filters card" method="get" action="/admin/export/download">
   <label>Table <select name="table"><option value="requests">Requests</option><option value="uploads">Uploads (Parquet)</option></select></label>

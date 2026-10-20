@@ -339,7 +339,7 @@ pub struct LinkFilter {
     pub sort: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub page: Option<i64>,
-    /// An anchor of the old fingerprints page (`/admin/fingerprints#<x>`).
+    /// An anchor of the old fingerprints page (`/admin/evidence/links#<x>`).
     pub anchor: Option<String>,
 }
 

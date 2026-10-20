@@ -1,4 +1,4 @@
-// The link graph of /admin/links/<kind>/<value>: the focus, the IPs it was
+// The link graph of /admin/evidence/links/<kind>/<value>: the focus, the IPs it was
 // seen on and what else links them. Also a campaign's graph: data-focus
 // `campaign:<key>` asks for its members and evidence edges, data-center
 // names the node laid out in the middle. Data from /admin/api/links/graph; laid
@@ -246,7 +246,7 @@
   // ---- panel ------------------------------------------------------------
   function href(n) {
     if (n.kind === "ip") return "/ip/" + encodeURIComponent(n.value);
-    return "/admin/links/" + n.kind + "/" + encodeURIComponent(n.value) + location.search;
+    return "/admin/evidence/links/" + n.kind + "/" + encodeURIComponent(n.value) + location.search;
   }
   function select(n) {
     if (selected && selected.el) selected.el.classList.remove("selected");

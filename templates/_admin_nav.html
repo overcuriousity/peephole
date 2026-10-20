@@ -1,5 +1,6 @@
-<nav class="seg subnav" aria-label="Admin sections">
-  {% for (key, href, label) in [("home", "/admin", "Overview"), ("analytics", "/admin/analytics", "Analytics"), ("lookup", "/admin/lookup", "Lookup"), ("scans", "/admin/scans", "Scans"), ("links", "/admin/links", "Links"), ("campaigns", "/admin/campaigns", "Campaigns"), ("paths", "/admin/paths", "New paths"), ("decoys", "/admin/decoys", "Decoys"), ("uploads", "/admin/uploads", "Uploads"), ("devices", "/admin/devices", "Devices"), ("cluster", "/admin/cluster", "Cluster"), ("market", "/admin/market", "Market"), ("system", "/admin/system", "System")] %}
-  {% if *key != "market" || chrome.market %}<a href="{{ href }}"{% if *key == sub %} aria-current="true"{% endif %}>{{ label }}</a>{% endif %}
+<nav class="seg subnav groups" aria-label="Admin sections">
+  {% for g in crate::admin::views::ADMIN_TREE %}
+  <a href="{{ g.href() }}"{% if g.key == nav.group %} aria-current="true"{% endif %}>{{ g.label }}</a>
   {% endfor %}
 </nav>
+{% include "_subtabs.html" %}

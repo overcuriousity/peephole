@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — system{% endblock %}
 {% block content %}
-{% let sub = "system" %}{% include "_admin_nav.html" %}
-{% let subtab = "status" %}{% let tabs = crate::admin::views::SYSTEM_TABS %}{% let tabs_label = "System pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("system", "status") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>System</h1><p class="muted">Intel feeds and what this node runs.</p></div></div>
 {% if intel.stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 <div class="stack">
@@ -33,7 +32,7 @@
     <dt>Version</dt><dd class="mono">{{ chrome.version }}</dd>
     <dt>Rules</dt><dd><span class="mono" title="Fingerprint of the rules built into this binary: {{ rules }}">{{ rules_short }}</span> <span class="muted small">built in</span></dd>
     {% if let Some(addrs) = public_addrs %}<dt>Public address (seen by peers)</dt><dd>{% if addrs.is_empty() %}<span class="muted">none reported</span>{% endif %}{% for a in addrs %}<div class="mono">{{ a }}</div>{% endfor %}</dd>{% endif %}
-    <dt>Upload store</dt><dd>{{ uploads }} <a class="small" href="/admin/uploads">uploads</a></dd>
+    <dt>Upload store</dt><dd>{{ uploads }} <a class="small" href="/admin/traps/uploads">uploads</a></dd>
     {% if let Some(t) = tarpit %}<dt>Tarpit</dt><dd>{{ t }} <a class="small" href="/requests?answer=tarpit">requests</a></dd>{% endif %}
   </dl>
 </section>

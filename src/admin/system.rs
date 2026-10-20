@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/system", get(status))
+        .route("/admin/system/status", get(status))
         .route("/admin/system/settings", get(settings))
         .route("/admin/system/keys", get(keys))
         .route("/admin/keys/delete", post(key_delete))

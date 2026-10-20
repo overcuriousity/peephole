@@ -77,12 +77,12 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
     };
     let mut v = vec![];
     if let Some(d) = s.detached {
-        v.push(warn(d.to_string(), "/admin/cluster"));
+        v.push(warn(d.to_string(), "/admin/network/members"));
     }
     if let Some(u) = &s.unserved {
         v.push(warn(
             format!("History incomplete for {u}: waiting for a full member."),
-            "/admin/cluster",
+            "/admin/network/members",
         ));
     }
     // Out of the cluster, every member looks offline: nothing to act on.
@@ -92,7 +92,7 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
         &s.nodes[..]
     };
     for n in nodes {
-        let href = format!("/admin/cluster/node/{}", n.key);
+        let href = format!("/admin/network/members/{}", n.key);
         if !n.live {
             // One item per offline member: what else is wrong rides along.
             let mut text = if n.last_seen == "never" {
@@ -121,7 +121,7 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
                 s.failed_24h,
                 if s.failed_24h == 1 { "" } else { "s" }
             ),
-            "/admin/scans?status=failed#history",
+            "/admin/investigate/scans?status=failed#history",
         ));
     }
     if let Some(n) = &s.growing {
@@ -130,25 +130,25 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
                 "The scan queue grows by about {} jobs per hour.",
                 n.trim_start_matches('+')
             ),
-            "/admin/scans#pace",
+            "/admin/investigate/scans#pace",
         ));
     }
     if let Some(t) = &s.timeouts {
         v.push(warn(
             format!("{t} of scans hit the timeout."),
-            "/admin/scans#pace",
+            "/admin/investigate/scans#pace",
         ));
     }
     if s.intel_stale {
         v.push(warn(
             "Tor exit list or GeoIP data missing or older than 48 h.".into(),
-            "/admin/system",
+            "/admin/system/status",
         ));
     }
     for (name, key) in &s.forked {
         v.push(warn(
             format!("{name} showed two histories: its credits are void here."),
-            &format!("/admin/cluster/node/{key}"),
+            &format!("/admin/network/members/{key}"),
         ));
     }
     if !s.custom_argv.is_empty() {
@@ -158,11 +158,14 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
                 "This node sets scan.level_argv for level {}: its scans there earn no scanner share.",
                 levels.join(", ")
             ),
-            "/admin/market",
+            "/admin/network/credits",
         ));
     }
     if let Some(c) = &s.expiring {
-        v.push(warn(format!("{c} credits expire today."), "/admin/market"));
+        v.push(warn(
+            format!("{c} credits expire today."),
+            "/admin/network/credits",
+        ));
     }
     v
 }
@@ -402,7 +405,7 @@ async fn cluster_figures(
                 .map_or_else(String::new, |u| format!("{:.0}", u * 100.0)),
         ),
         audits,
-        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
+        scan: t.sell_mc.map_or_else(|| "—".into(), |m| show(m as u64)),
         price_range: keyed
             .iter()
             .min()
@@ -522,16 +525,19 @@ mod tests {
                 "{href} {text}: {items:?}"
             )
         };
-        find("/admin/scans?status=failed#history", "3 scans failed");
-        find("/admin/scans#pace", "by about 4.0 jobs");
-        find("/admin/scans#pace", "25%");
-        find("/admin/system", "older than 48 h");
-        find("/admin/cluster/node/b-key", "not seen for 2.0 h");
         find(
-            "/admin/cluster/node/c-key",
+            "/admin/investigate/scans?status=failed#history",
+            "3 scans failed",
+        );
+        find("/admin/investigate/scans#pace", "by about 4.0 jobs");
+        find("/admin/investigate/scans#pace", "25%");
+        find("/admin/system/status", "older than 48 h");
+        find("/admin/network/members/b-key", "not seen for 2.0 h");
+        find(
+            "/admin/network/members/c-key",
             "clock +3.5 min · incompatible version",
         );
-        find("/admin/cluster", "writer");
+        find("/admin/network/members", "writer");
         assert_eq!(items.len(), 7);
         assert!(items.iter().all(|a| a.level == Level::Warn));
     }
@@ -629,7 +635,7 @@ mod tests {
                 "3.25 credits expire today.",
             ]
         );
-        assert_eq!(v[0].href, "/admin/cluster/node/key-x");
-        assert_eq!(v[2].href, "/admin/market");
+        assert_eq!(v[0].href, "/admin/network/members/key-x");
+        assert_eq!(v[2].href, "/admin/network/credits");
     }
 }

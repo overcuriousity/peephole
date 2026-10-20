@@ -1,9 +1,9 @@
-//! Admin › Decoys: what the MCP and LLM decoys drew out, and how often the
+//! Admin › Traps (MCP, LLM, Web): what the MCP and LLM decoys drew out, and how often the
 //! web decoys were served.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppResult, render};
-use crate::admin::views::Chrome;
+use crate::admin::views::{Chrome, Nav};
 use crate::store::browse::Page;
 use crate::store::decoys::{LlmSummary, McpFunnel, McpSession, ModelRow, PromptRow, ToolCall};
 use crate::store::stats::{Named, Range};
@@ -17,13 +17,15 @@ use axum::{
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new().route("/admin/decoys", get(page))
+    Router::new()
+        .route("/admin/traps/mcp", get(|u, st, q| page(u, st, q, "mcp")))
+        .route("/admin/traps/llm", get(|u, st, q| page(u, st, q, "llm")))
+        .route("/admin/traps/web", get(|u, st, q| page(u, st, q, "web")))
 }
 
 #[derive(serde::Deserialize, Default)]
 pub struct DecoysQuery {
     pub range: Option<String>,
-    pub tab: Option<String>,
     pub tool: Option<String>,
     pub page: Option<u32>,
 }
@@ -33,8 +35,8 @@ pub struct DecoysQuery {
 struct DecoysPage {
     chrome: Chrome,
     range: Range,
-    /// The sub-tab links, each carrying the current range.
-    tabs: Vec<(&'static str, String, &'static str)>,
+    /// The nav; the decoy children carry the current range.
+    nav: Nav,
     tab: &'static str,
     tool: Option<String>,
     /// Query string for the pager (ends in `&`).
@@ -53,32 +55,20 @@ async fn page(
     _u: SessionUser,
     State(st): State<Arc<AdminState>>,
     Query(q): Query<DecoysQuery>,
+    tab: &'static str,
 ) -> AppResult<Response> {
     let range = Range::parse(q.range.as_deref());
-    let tab = match q.tab.as_deref() {
-        Some("llm") => "llm",
-        Some("web") => "web",
-        _ => "mcp",
-    };
     let page = q.page.unwrap_or(1);
     let tool = q.tool.filter(|t| !t.trim().is_empty());
-    let mut qs = format!("tab={tab}&range={}&", range.key());
+    let mut qs = format!("range={}&", range.key());
     if let (Some(t), "mcp") = (&tool, tab) {
         qs.push_str(&format!("tool={}&", crate::admin::public::urlencode(t)));
     }
     let mut p = DecoysPage {
         chrome: Chrome::new(true, "admin"),
         range,
-        tabs: crate::admin::views::DECOYS_TABS
-            .iter()
-            .map(|(k, _, l)| {
-                (
-                    *k,
-                    format!("/admin/decoys?tab={k}&range={}", range.key()),
-                    *l,
-                )
-            })
-            .collect(),
+        nav: Nav::new("traps", tab)
+            .carrying(format!("range={}", range.key()), &["mcp", "llm", "web"]),
         tab,
         tool: tool.clone(),
         qs,

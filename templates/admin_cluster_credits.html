@@ -2,13 +2,13 @@
 {% block title %}peephole — market{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "market" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "credits") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Market</h1><p class="muted">Every figure is this node's own count.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
   <div class="tile"><span class="label">Up today</span><div class="value">{{ today_up.0 }}<span class="of"> hours</span></div><div class="hint">{% if today_up.1 %}12 h earns a pool share{% else %}not an advertised listener: no pool share{% endif %}</div></div>
-  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if price.scan != "–" %}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}" title="this node's scan price, over 24 h">{{ c }}</span>{% endif %}{% endif %}</div><div class="hint">{% if price.scan == "–" %}not a scanner{% else %}{{ price.scan_paid }} paid of {{ price.scan_target }}/h{% endif %}</div></div>
+  <div class="tile"><span class="label">Scan price</span><div class="value">{{ price.scan }}{% if price.scan != "—" %}{% if let Some((c, trend)) = scan_change %} <span class="delta-chip" data-trend="{{ trend }}" title="this node's scan price, over 24 h">{{ c }}</span>{% endif %}{% endif %}</div><div class="hint">{% if price.scan == "—" %}not a scanner{% else %}{{ price.scan_paid }} paid of {{ price.scan_target }}/h{% endif %}</div></div>
   <div class="tile"><span class="label">Scan capacity used</span>{% if let Some(u) = price.utilization %}<div class="value">{{ u }}<span class="of"> %</span></div><svg class="meter" viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="4" rx="2"/><rect class="fill" width="{{ u }}" height="4" rx="2"/></svg><div class="hint">{{ price.capacity_per_hour }} scans an hour possible</div>{% else %}<div class="value">—</div><div class="hint">not a scanner: no scan capacity</div>{% endif %}</div>
 </div>
 <section class="card market" id="market">
@@ -58,7 +58,7 @@
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
     <tbody>{% for o in price.offers %}<tr><td>{{ o.0 }}</td><td class="num">{{ o.1 }}</td><td class="num">{{ o.2 }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
-  <h3>Market <span class="muted small">last refresh · 7-day volumes</span></h3>
+  <h3 class="section-gap">Market <span class="muted small">last refresh · 7-day volumes</span></h3>
   <div class="table-wrap"><table>
     <thead><tr><th>Good</th><th class="num">Ask here</th><th class="num" title="The most this node's automatic buyers pay for one">Bid here</th><th class="num">Sold</th><th class="num">Bought</th><th class="num" title="Asks above the bid this node's automatic buyers refused">Over bid</th></tr></thead>
     <tbody>{% for t in trades %}<tr><td>{{ t.good }}</td><td class="num">{{ t.ask }}</td><td class="num">{{ t.bid }}</td><td class="num">{{ t.sold }}</td><td class="num">{{ t.bought }}</td><td class="num">{{ t.over_bid }}</td></tr>{% endfor %}</tbody>
@@ -91,7 +91,7 @@
   <div class="table-wrap"><table>
     <thead><tr><th>Member</th><th class="num">Credits</th><th class="num">Earned, 7 days</th><th class="num">Spent, 7 days</th><th class="num">Pool (7 days)</th><th class="num">Sales (7 days)</th><th class="num" title="Hours up today, as the members report; 12 earn the day's pool share">Up today</th><th></th></tr></thead>
     <tbody>{% for m in members %}<tr>
-      <td><a href="/admin/cluster/node/{{ m.key }}"><b>{{ m.name }}</b></a></td>
+      <td><a href="/admin/network/members/{{ m.key }}"><b>{{ m.name }}</b></a></td>
       <td class="num">{{ m.balance }}</td><td class="num">{{ m.earned }}</td><td class="num">{{ m.spent }}</td><td class="num">{{ m.pool }}</td><td class="num">{{ m.sales }}</td>
       <td class="num">{{ m.up }} h {% if m.qualifies %}<span class="badge" data-status="done">qualifies</span>{% else %}<span class="muted small">does not qualify</span>{% endif %}</td>
       <td>{% if !m.standing.is_empty() %}<span class="badge badge-status" data-status="running">not earning here: {{ m.standing }}</span>{% endif %}</td>

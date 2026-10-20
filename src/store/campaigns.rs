@@ -183,7 +183,7 @@ pub struct Member {
     pub requests: i64,
 }
 
-/// The admin list's filter (`/admin/campaigns`); empty or unparsable
+/// The admin list's filter (`/admin/evidence/campaigns`); empty or unparsable
 /// values are ignored.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct CampaignFilter {

@@ -4,7 +4,7 @@
   <div class="card-head"><h2>Resolved: <span class="mono">{{ n.name }}</span></h2>{% if let Some(note) = n.note %}<span class="muted">{{ note }}</span>{% endif %}</div>
   {% if n.rows.is_empty() %}<p class="muted">No public address.</p>{% else %}
   <ul class="small">
-    {% for v in n.rows %}<li>{% if v.agreed %}<a class="mono" href="/admin/lookup?ip={{ v.ip }}">{{ v.ip }}</a>{% else %}<span class="mono">{{ v.ip }}</span>{% endif %} — {{ v.verdict }}</li>{% endfor %}
+    {% for v in n.rows %}<li>{% if v.agreed %}<a class="mono" href="/admin/investigate/lookup?ip={{ v.ip }}">{{ v.ip }}</a>{% else %}<span class="mono">{{ v.ip }}</span>{% endif %} — {{ v.verdict }}</li>{% endfor %}
   </ul>
   {% endif %}
   {% if !n.resolvers.is_empty() %}<p class="muted small">Asked: {{ n.resolvers.join(", ") }}</p>{% endif %}
