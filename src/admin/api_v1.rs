@@ -2115,6 +2115,97 @@ mod tests {
         assert_eq!(st, StatusCode::UNAUTHORIZED);
     }
 
+    /// The pages' "Copy JSON dossier" route (MIK-750): the admin session's,
+    /// never a device token's, and the same body as the API's.
+    #[tokio::test]
+    async fn admin_dossier_needs_session() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        let api = seed_dossiers(&state).await;
+        let req = api[2].split('/').nth(4).unwrap().to_string();
+        let admin = [
+            "/admin/api/dossier/ip/192.0.2.1".to_string(),
+            "/admin/api/dossier/asn/64500".into(),
+            format!("/admin/api/dossier/request/{req}"),
+            "/admin/api/dossier/campaign/192.0.2.3".into(),
+        ];
+        let session = |path: &str| {
+            Request::get(path)
+                .header("cookie", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (path, api_path) in admin.iter().zip(&api) {
+            let (st, v) = send(&app, session(path)).await;
+            assert_eq!(st, 200, "{path}: {v}");
+            assert_eq!(v["dossier_v"], 1, "{path}");
+            let (_, mut from_api) = send(&app, authed("GET", api_path, &token)).await;
+            let mut v = v;
+            v["generated_at"] = serde_json::Value::Null;
+            from_api["generated_at"] = serde_json::Value::Null;
+            assert_eq!(v, from_api, "{path}");
+            // No cookie, or a device token instead: the login page.
+            for r in [
+                Request::get(path.as_str()).body(Body::empty()).unwrap(),
+                authed("GET", path, &token),
+            ] {
+                let r = app.clone().oneshot(r).await.unwrap();
+                assert_eq!(r.status(), StatusCode::SEE_OTHER, "{path}");
+                assert_eq!(r.headers()["location"], "/login", "{path}");
+            }
+        }
+        for path in [
+            "/admin/api/dossier/ip/198.51.100.99",
+            "/admin/api/dossier/asn/1",
+            "/admin/api/dossier/request/999999",
+            "/admin/api/dossier/campaign/nope",
+            "/admin/api/dossier/nope/1",
+        ] {
+            let r = app.clone().oneshot(session(path)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    /// The four pages link their dossier for the admin; the public IP page
+    /// does not (owner, MIK-712 Q3).
+    #[tokio::test]
+    async fn dossier_links_on_the_admin_pages_only() {
+        let (state, cookie, app, _d) = app().await;
+        let api = seed_dossiers(&state).await;
+        let req = api[2].split('/').nth(4).unwrap().to_string();
+        let page = |path: String, cookie: Option<&str>| {
+            let app = app.clone();
+            let mut r = Request::get(path);
+            if let Some(c) = cookie {
+                r = r.header("cookie", c);
+            }
+            async move {
+                let r = app.oneshot(r.body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                String::from_utf8(b.to_vec()).unwrap()
+            }
+        };
+        for (path, href) in [
+            ("/ip/192.0.2.1".to_string(), "ip/192.0.2.1".to_string()),
+            ("/admin/asn/64500".into(), "asn/64500".into()),
+            (format!("/admin/requests/{req}"), format!("request/{req}")),
+            (
+                "/admin/evidence/campaigns/192.0.2.3".into(),
+                "campaign/192.0.2.3".into(),
+            ),
+        ] {
+            let html = page(path.clone(), Some(&cookie)).await;
+            let link = format!("data-copy-dossier href=\"/admin/api/dossier/{href}\"");
+            assert_eq!(html.matches(&link).count(), 1, "{path}: {html}");
+        }
+        let public = page("/ip/192.0.2.1".into(), None).await;
+        assert!(!public.contains("dossier"), "{public}");
+    }
+
     #[tokio::test]
     async fn dossier_404() {
         let (state, cookie, app, _d) = app().await;
