@@ -74,6 +74,7 @@
       a.addEventListener("click", function (e) {
         if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
         e.preventDefault();
+        a.setAttribute("aria-busy", "true");
         var text = fetch(a.href, { credentials: "same-origin", headers: { Accept: "application/json" } }).then(function (r) {
           if (!r.ok || !/json/.test(r.headers.get("content-type") || "")) throw new Error("dossier " + r.status);
           return r.json();
@@ -82,9 +83,15 @@
           ? navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(function (t) { return new Blob([t], { type: "text/plain" }); }) })])
           : text.then(function (t) { return navigator.clipboard.writeText(t); });
         copied.then(function () {
+          a.removeAttribute("aria-busy");
+          // Hold the width so "Copied" does not shift its neighbours.
+          a.style.minWidth = a.offsetWidth + "px"; a.style.justifyContent = "center";
           a.setAttribute("data-copied", ""); a.textContent = "Copied";
-          setTimeout(function () { a.removeAttribute("data-copied"); a.textContent = label; }, 1500);
-        }, function () { location.href = a.href; });
+          setTimeout(function () {
+            a.removeAttribute("data-copied"); a.textContent = label;
+            a.style.minWidth = ""; a.style.justifyContent = "";
+          }, 1500);
+        }, function () { a.removeAttribute("aria-busy"); location.href = a.href; });
       });
     });
   }
