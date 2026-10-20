@@ -7,6 +7,14 @@ pub struct Chrome {
     pub active: &'static str,
     pub stamp: &'static str,
     pub version: &'static str,
+    /// The admin nav shows Market: this node is in a cluster.
+    pub market: bool,
+}
+
+tokio::task_local! {
+    /// Whether this node runs a cluster (the Market page answers), set by
+    /// the admin router's middleware for the nav.
+    pub(crate) static MARKET: bool;
 }
 
 /// The project's source repository.
@@ -32,6 +40,7 @@ impl Chrome {
             active,
             stamp: STAMP,
             version: VERSION,
+            market: MARKET.try_with(|m| *m).unwrap_or(false),
         }
     }
 }
@@ -325,14 +334,28 @@ pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
     ("members", "/admin/cluster", "Members"),
     ("access", "/admin/cluster/access", "Access"),
     ("ownership", "/admin/cluster/ownership", "Ownership"),
-    ("credits", "/admin/cluster/credits", "Credits"),
 ];
 pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
     ("status", "/admin/system", "Status"),
     ("settings", "/admin/system/settings", "Settings"),
     ("keys", "/admin/system/keys", "Keys"),
     ("export", "/admin/system/export", "Export"),
+    ("inbox", "/admin/system/inbox", "Inbox"),
 ];
+
+/// A page that moved: 301 to `to`, keeping the query string.
+pub fn moved(to: &str, uri: &axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let loc = match uri.query() {
+        Some(q) => format!("{to}?{q}"),
+        None => to.to_string(),
+    };
+    (
+        axum::http::StatusCode::MOVED_PERMANENTLY,
+        [(axum::http::header::LOCATION, loc)],
+    )
+        .into_response()
+}
 
 #[cfg(test)]
 mod tests {

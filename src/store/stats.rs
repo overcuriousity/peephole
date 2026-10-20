@@ -238,6 +238,13 @@ pub struct CampaignTile {
     pub families: Vec<Named>,
 }
 
+impl CampaignTile {
+    /// Whether the wall has families to show for it.
+    pub fn has_families(c: &Option<Self>) -> bool {
+        c.as_ref().is_some_and(|c| !c.families.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MapCounts {
     pub range: &'static str,

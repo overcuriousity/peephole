@@ -3,10 +3,61 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
-## [Unreleased]
+## [0.22.0] - 2026-10-20
+
+Admin UI polish (MIK-686): the wall, the navigation, the IP pages and
+the campaign and credits pages say more in plain words. No database
+migration, no new setting, no protocol version bump. Two admin URLs
+moved and answer with a redirect (see Changed).
+
+### Added
+- One IP property strip (shared reading by its named state, Tor exit,
+  network kind, scanner or fleet, agent traces) on every admin IP
+  surface: the IP page, the lookup result, the `/ips`, ASN and network
+  lists, campaign members and request rows. An address with too little
+  evidence and no finished counter-scan reads "not scanned", with a link
+  to the scan action. `/ips` gets an "Address sharing" select. Public
+  pages keep the bare Tor badge (MIK-697).
+- The ASN page shows registrant, country, registry, AS kind, abuse
+  contact and ranges, from data the node already holds; a missing value
+  reads "not known" (MIK-710).
+- A glossary line per fingerprint kind and the path shape, as hover
+  titles on the request, analytics, links, IP and campaign pages and as
+  a visible glossary block; a hard/soft edge legend on the campaign list,
+  the campaign page and its graph (MIK-710).
+- `/requests?persona=` filters requests by persona; the analytics
+  persona rows link to it (MIK-696).
+
+### Changed
+- URL change: `/admin/inbox` answers 301 to `/admin/system/inbox`, and
+  `/admin/cluster/credits` answers 301 to `/admin/market` (query string
+  kept). Inbox now sits under System; Credits is a top-level Market tab,
+  shown only when the node runs a cluster (the page is 404 otherwise).
+  The send form posts to `/admin/market/send`; the old
+  `/admin/cluster/credits/send` is gone, with no redirect (MIK-696).
+- Wall: the fake-AI card ranks MCP methods, names a foreign tool under
+  the models' rule and replaces the bare "other" with what the folded
+  row holds; campaigns and personas share one full-width card; recent
+  requests stack below 600 px (MIK-696).
+- Analytics: the agent-traces empty state says what counts as a trace
+  and that rows from before v0.20.0 were never checked (MIK-696).
+- Credits: "Reference here" becomes "Our price per scan", with a note on
+  what it is computed from and when the 1.25 cap applies; credits tables
+  label their times UTC (MIK-696, MIK-710).
+- Campaign page: the header says what ties the group ("soft link only:
+  path similarity 0.64"), small groups get a shorter graph, the Timeline
+  folds intel-lookup rows behind a toggle and stacks below 600 px
+  (MIK-689).
+- Device evidence card: the caveat sits under the finding, the sentence
+  names the port, the AS note is its own line, and device rows and
+  counter-scan headings carry "job # · scan #" (MIK-689).
+- Docs: `net.eyeball` needs a written ASdb grant (MIK-694).
 
 ### Fixed
-
+- Scan capacity used no longer reads 100 % at zero capacity: the
+  overview and credits tiles show a dash with no meter. A price move is
+  shown as this node's only when it has a price now; beside a dash there
+  is no move badge (MIK-688).
 - Admin "New paths" (`/admin/paths`) says how many shapes the window and
   filter hold ("Showing 200 of 13,834 shapes") and pages past the first
   200 with an "older →" link (keyset, no `OFFSET`) and "← newest" back.

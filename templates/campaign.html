@@ -6,6 +6,7 @@
 <div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
 <div class="meta">
   {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
+  <span class="campaign-strength{% if c.row.hard_edges == 0 %} soft{% endif %}">{{ self.strength() }} · <a href="/admin/links">what counts →</a></span>
   <span>{{ c.row.size }} IPs</span>
   <span>key <span class="mono">{{ c.row.key }}</span></span>
   <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>
@@ -18,7 +19,7 @@
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>
   {% for m in c.members %}<tr>
-    <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a></td>
+    <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a>{% if let Some(p) = props.get(m.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", m.ip) %}{% include "_ip_props.html" %}{% endif %}</td>
     <td>{% let country = m.country %}{% include "_country.html" %}</td>
     <td>{% if let Some(a) = m.asn %}{{ m.asn_org.as_deref().unwrap_or_default() }} <span class="mono muted">AS{{ a }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
     <td class="ts">{{ crate::admin::views::minute(m.first_seen.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(m.last_seen.as_str()) }}</td>
@@ -26,17 +27,18 @@
   </tr>{% endfor %}
   </tbody></table></div>
 </section>
-{% let campaign_key = c.row.key.clone() %}{% include "_campaign_graph.html" %}
+{% let campaign_key = c.row.key.clone() %}{% let small = c.members.len() <= 3 %}{% include "_campaign_graph.html" %}
 <section class="card">
   <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft · <a href="/admin/links">what counts →</a></span></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
   {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
-    <td>{{ v.kind_name }}</td>
+    <td title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
     <td>{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}</td>
     <td class="ts">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
+  {% include "_edge_legend.html" %}
 </section>
 <section class="card" data-section="artifacts">
   <div class="card-head"><h2>Artifacts</h2></div>
@@ -62,7 +64,7 @@
   {% include "_events.html" %}
 </section>
 <section class="card">
-  <div class="card-head"><h2>Shapes</h2></div>
+  <div class="card-head"><h2 title="{{ crate::admin::glossary::help("path-shape") }}">Shapes</h2></div>
   {% for s in self.waves() %}{% if let Some(w) = s.wave %}<p data-wave><span class="badge badge-wave">wave</span> started probing a path no rule knows: <code>{{ s.text }}</code> ({{ w.ips }} IPs in {{ w.minutes() }} min, first seen {{ crate::admin::views::minute(s.first_seen.as_str()) }})</p>{% endif %}{% endfor %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Shape</th><th class="num">Members</th><th class="num">IPs in dataset</th></tr></thead><tbody>
   {% for s in shapes %}<tr><td class="mono">{{ s.text }}</td><td class="num">{{ s.members }}</td><td class="num">{{ s.df }}</td></tr>{% endfor %}
@@ -70,4 +72,5 @@
   </tbody></table></div>
 </section>
 </div>
+{% include "_fingerprint_glossary.html" %}
 {% endblock %}

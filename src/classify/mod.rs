@@ -2222,12 +2222,27 @@ mod tests {
         let probe = r#"{"method":"initialize","params":{"clientInfo":{"name":"mcp-fingerprint-probe","version":"1.0"}}}"#;
         let model_form =
             br#"{"max_tokens": "", "quantization": "", "tool_function_calling": "", "vision": ""}"#;
-        let cases: [AgentReq; 6] = [
+        let cases: [AgentReq; 7] = [
             // A UA that merely starts like a framework name.
             (
                 "GET",
                 "/",
                 &[("user-agent", "AutoGenX-Engine/9.1")] as &[(&str, &str)],
+                None,
+            ),
+            // As it came (MIK-696): one address, a dummy key, no body. No
+            // AutoGen release sends this; an LLM-endpoint scanner.
+            (
+                "POST",
+                "/v1/chat/completions",
+                &[
+                    ("user-agent", "AutoGenX-Engine/9.1"),
+                    (
+                        "authorization",
+                        "Bearer sk-dummy-token-openai-compatible-12345",
+                    ),
+                    ("content-type", "application/json"),
+                ],
                 None,
             ),
             // Probes for agents' config files are recon, not agents.

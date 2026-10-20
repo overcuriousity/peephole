@@ -9,6 +9,8 @@ use anyhow::Result;
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct ScanSummary {
     pub id: i64,
+    /// The job that ran it, as the Jobs table numbers it.
+    pub job_id: i64,
     pub ip_id: i64,
     pub ip: String,
     pub level: i64,
@@ -191,7 +193,7 @@ impl RequestDetail {
 }
 
 const SCAN_SELECT: &str =
-    "SELECT s.id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
+    "SELECT s.id, s.job_id, s.ip_id, i.ip, s.level, s.started_at, s.finished_at, s.os_guess,
             s.audit_of, s.audit_result, s.scrubbed,
             (SELECT COUNT(*) FROM ports p WHERE p.scan_id = s.id AND p.state = 'open') AS open_ports,
             (SELECT name FROM members m WHERE m.id = s.origin) AS node

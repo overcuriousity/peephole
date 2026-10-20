@@ -1,4 +1,4 @@
-//! Cluster › Credits: what this node holds, earned and spent, what every
+//! Market: the credits page; what this node holds, earned and spent, what every
 //! member holds in this node's view, and how the price comes about.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
@@ -18,14 +18,18 @@ use axum::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/cluster/credits";
+const PAGE: &str = "/admin/market";
 /// Rows shown per list.
 const ROWS: usize = 100;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
-        .route("/admin/cluster/credits/send", post(send))
+        .route("/admin/market/send", post(send))
+        .route(
+            "/admin/cluster/credits",
+            get(|uri: axum::http::Uri| async move { crate::admin::views::moved(PAGE, &uri) }),
+        )
 }
 
 /// When a lot of `day` is gone, seen from `today`.
@@ -973,6 +977,14 @@ mod tests {
         assert!(!html.contains("destroyed"));
         assert!(html.contains("node-bravo") && html.contains("30 / 36"));
         assert!(html.contains("<b>0.05</b>"), "cheapest at L1 in bold");
+        // The scanner price column says what it is (MIK-710).
+        assert!(html.contains(">Our price per scan</th>"), "{html}");
+        assert!(
+            html.contains("<p class=\"muted small\">Our price per scan: what this node reckons")
+        );
+        assert!(!html.contains("Reference here"));
+        assert!(html.contains("it pays at most 1.25 times this figure"));
+        assert!(!html.contains("protocol 9"), "no protocol jargon");
         assert!(html.contains(">0.10<"), "L2: 0.05 at half the success rate");
         assert!(html.contains("per delivered result"));
         assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));

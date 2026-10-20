@@ -158,14 +158,11 @@ pub fn attention(s: &Signals) -> Vec<Attention> {
                 "This node sets scan.level_argv for level {}: its scans there earn no scanner share.",
                 levels.join(", ")
             ),
-            "/admin/cluster/credits",
+            "/admin/market",
         ));
     }
     if let Some(c) = &s.expiring {
-        v.push(warn(
-            format!("{c} credits expire today."),
-            "/admin/cluster/credits",
-        ));
+        v.push(warn(format!("{c} credits expire today."), "/admin/market"));
     }
     v
 }
@@ -633,6 +630,6 @@ mod tests {
             ]
         );
         assert_eq!(v[0].href, "/admin/cluster/node/key-x");
-        assert_eq!(v[2].href, "/admin/cluster/credits");
+        assert_eq!(v[2].href, "/admin/market");
     }
 }

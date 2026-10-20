@@ -25,7 +25,13 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/ips/{addr}/delete", post(ip_delete))
         .route("/admin/requests/bulk-delete", post(bulk_delete_requests))
         .route("/admin/ips/bulk-delete", post(bulk_delete_ips))
-        .route("/admin/inbox", get(inbox))
+        .route("/admin/system/inbox", get(inbox))
+        .route(
+            "/admin/inbox",
+            get(|uri: axum::http::Uri| async move {
+                crate::admin::views::moved("/admin/system/inbox", &uri)
+            }),
+        )
         .route("/admin/claims/{id}/delete", post(claim_delete))
 }
 
@@ -343,7 +349,10 @@ async fn claim_delete(
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(redirect_with_notice("/admin/inbox", &deleted_msg(out)))
+    Ok(redirect_with_notice(
+        "/admin/system/inbox",
+        &deleted_msg(out),
+    ))
 }
 
 /// Parsed bulk form: checked row keys, or "everything matching the filter".
@@ -528,6 +537,11 @@ mod short_strings_tests {
                 &[
                     "mean one operator; JA4, JA4H, HASSH and JA4X the same software; favicon, JARM, page and 404 hashes the same product.",
                     "<option value=\"1\">shared</option>",
+                    // One glossary for every fingerprint (MIK-710).
+                    "<summary>What the fingerprints mean</summary>",
+                    "<dt>JARM</dt><dd class=\"plain\">JARM (Salesforce): how the source",
+                    "<dt>Path shape</dt><dd class=\"plain\">A request path with the parts",
+                    "<th title=\"A hash of what the trap page",
                 ],
                 &["point to one operator", "two or more IPs</option>"],
             ),
@@ -573,7 +587,12 @@ mod short_strings_tests {
             ),
             (
                 "/admin/analytics",
-                &["<span class=\"muted\">direct HTTP/1 only</span>"],
+                &[
+                    "<span class=\"muted\">direct HTTP/1 only</span>",
+                    "<h2 title=\"JA4 (FoxIO): the TLS ClientHello the source sent us",
+                    "<h2 title=\"HASSH-server: a hash of the algorithm lists",
+                    "<summary>What the fingerprints mean</summary>",
+                ],
                 &["not through an HTTP proxy"],
             ),
             (

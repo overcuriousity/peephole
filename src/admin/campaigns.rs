@@ -129,12 +129,41 @@ struct CampaignPage {
     t: CampaignTimeline,
     /// Agent-driven: a member carries an agent label.
     agent: bool,
+    /// The members' property strips, by address.
+    props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
 }
 
 /// Wave lines on a campaign's page, at most.
 pub const CAMPAIGN_WAVES: usize = 3;
 
 impl CampaignPage {
+    /// What ties the group, for the header line (MIK-689 #3): with no hard
+    /// link, the strongest path similarity it rests on.
+    fn strength(&self) -> String {
+        let (hard, soft) = (self.c.row.hard_edges, self.c.row.soft_edges);
+        if hard > 0 {
+            return format!(
+                "{hard} hard link{}, {soft} soft",
+                if hard == 1 { "" } else { "s" }
+            );
+        }
+        let best = self
+            .edges
+            .iter()
+            .filter(|v| !v.hard())
+            .filter_map(|v| v.e.score)
+            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+        let links = if soft == 1 {
+            "soft link only"
+        } else {
+            "soft links only"
+        };
+        match best {
+            Some(x) => format!("{links}: path similarity {x:.2}"),
+            None => links.to_string(),
+        }
+    }
+
     /// The listed shapes that formed a wave, for the Shapes card.
     fn waves(&self) -> Vec<&CampaignShape> {
         self.shapes
@@ -187,7 +216,11 @@ async fn campaign(
         .campaign_events(&key, None, CAMPAIGN_EVENTS)
         .await?;
     let agent = !st.store.agent_campaigns(Some(&key)).await?.is_empty();
+    let props =
+        crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
+            .await?;
     render(&CampaignPage {
+        props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
         calendar,
@@ -259,6 +292,16 @@ mod tests {
                 .contains("badge-agent")
         );
         assert!(page("/ip/192.0.2.1").await.contains(">agent traces</span>"));
+        // MIK-697: each member row carries its property strip; the
+        // header says what ties the group (MIK-689 #3).
+        let camp = page("/admin/campaigns/192.0.2.3").await;
+        let row = camp
+            .split("<tr>")
+            .find(|r| r.contains("href=\"/ip/192.0.2.1\">192.0.2.1</a>"))
+            .unwrap();
+        assert!(row.contains("class=\"ip-props\""), "{row}");
+        assert!(row.contains(">agent traces</span>"), "{row}");
+        assert!(camp.contains("class=\"campaign-strength"), "{camp}");
         assert!(!page("/ip/192.0.2.2").await.contains("badge-agent"));
     }
 
@@ -321,6 +364,7 @@ mod tests {
             "SHA256:image",
             "Last recompute",
             "aria-current=\"true\">Campaigns",
+            "<dt>Soft edge</dt><dd class=\"plain\">The two IPs behave alike",
         ] {
             assert!(list.contains(want), "{want} missing:\n{list}");
         }
@@ -341,7 +385,13 @@ mod tests {
             "SHA256:operator",
             // The campaign graph (S4) sits between Members and Evidence.
             "data-focus=\"campaign:192.0.2.3\"",
-            "<i class=\"line soft\"></i>shared paths",
+            "<i class=\"line soft\"></i>soft: shared paths",
+            // The edge legend and the fingerprint glossary (MIK-710).
+            "<dt>Hard edge</dt><dd class=\"plain\">The two IPs share an identity",
+            "on more than 50 IPs is shared infrastructure",
+            "active within 30 days of each other",
+            "join only on 2 soft edges",
+            "<summary>What the fingerprints mean</summary>",
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
@@ -378,7 +428,7 @@ mod tests {
         }
         // The merged Timeline: the calendar and one events table with the
         // member's address on every row, no older pages.
-        let tl = &a[at("data-section=\"timeline\"")..at("<h2>Shapes</h2>")];
+        let tl = &a[at("data-section=\"timeline\"")..at("Shapes</h2>")];
         for want in [
             "data-calendar=",
             "<table class=\"events\">",
@@ -392,7 +442,7 @@ mod tests {
         }
         assert!(!tl.contains("Older →"), "{tl}");
         // The wave line sits in the Shapes card.
-        let shapes = &a[at("<h2>Shapes</h2>")..];
+        let shapes = &a[at("Shapes</h2>")..];
         assert!(
             shapes.contains(
                 "started probing a path no rule knows: <code>/gamma</code> (12 IPs in 60 min, first seen 2026-09-01 10:00)"

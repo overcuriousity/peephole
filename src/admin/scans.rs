@@ -600,6 +600,7 @@ mod tests {
             chrome: chrome(),
             s: ScanSummary {
                 id: 1,
+                job_id: 1,
                 ip_id: 1,
                 ip: "203.0.113.7".into(),
                 level: 3,
@@ -664,6 +665,7 @@ mod tests {
             chrome: chrome(),
             s: ScanSummary {
                 id: 1,
+                job_id: 1,
                 ip_id: 1,
                 ip: "203.0.113.7".into(),
                 level: 4,

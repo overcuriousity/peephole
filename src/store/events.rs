@@ -188,6 +188,13 @@ pub struct EventPage {
     pub next: Option<Cursor>,
 }
 
+impl EventPage {
+    /// Intel-lookup rows on the page, which the Timeline folds away.
+    pub fn intel_count(&self) -> usize {
+        self.items.iter().filter(|e| e.k == "intel").count()
+    }
+}
+
 enum Bind {
     I(i64),
     S(String),

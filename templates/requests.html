@@ -14,11 +14,12 @@
   <label>From (UTC) <input name="from" type="datetime-local" value="{{ f.from.as_deref().unwrap_or_default() }}"></label>
   <label>To (UTC) <input name="to" type="datetime-local" value="{{ f.to.as_deref().unwrap_or_default() }}"></label>
   <label>User agent <input name="ua" size="16" value="{{ f.ua.as_deref().unwrap_or_default() }}"></label>
+  <label>Persona <input name="persona" size="10" value="{{ f.persona.as_deref().unwrap_or_default() }}"></label>
   <label>Method <input name="method" size="7" value="{{ f.method.as_deref().unwrap_or_default() }}"></label>
   <label>Transport <input name="transport" size="7" value="{{ f.transport.as_deref().unwrap_or_default() }}"></label>
   <label>Answer <input name="answer" size="12" value="{{ f.answer.as_deref().unwrap_or_default() }}"></label>
-  <label>JA4 <input name="ja4" size="20" value="{{ f.ja4.as_deref().unwrap_or_default() }}"></label>
-  <label>JA4H <input name="ja4h" size="20" value="{{ f.ja4h.as_deref().unwrap_or_default() }}"></label>
+  <label><abbr title="{{ crate::admin::glossary::help("ja4") }}">JA4</abbr> <input name="ja4" size="20" value="{{ f.ja4.as_deref().unwrap_or_default() }}"></label>
+  <label><abbr title="{{ crate::admin::glossary::help("ja4h") }}">JA4H</abbr> <input name="ja4h" size="20" value="{{ f.ja4h.as_deref().unwrap_or_default() }}"></label>
   {% if !nodes.is_empty() %}<label>Node <select name="node"><option value="">any</option>
     {% for n in nodes %}<option value="{{ n }}"{% if f.node.as_deref() == Some(n.as_str()) %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>{% endif %}
   {# Set by links, not by a field here: kept until removed by its chip. #}
@@ -52,7 +53,7 @@
     <tr data-sev="{{ r.severity }}">
       {% if can_delete %}<td class="check"><input type="checkbox" name="ids" value="{{ r.id }}" aria-label="Select request {{ r.id }}"></td>{% endif %}
       <td class="ts">{{ r.ts }}</td>
-      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
+      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = true %}{% include "_copy.html" %}{% if let Some(p) = props.get(r.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", r.ip) %}{% include "_ip_props.html" %}{% else if r.is_tor %} <span class="badge badge-tor">tor</span>{% endif %}</td>
       <td class="mono">{{ r.method }}</td>
       <td class="path"><a href="{{ crate::admin::views::pivot_href("path", r.path.as_str()) }}">{{ r.path }}</a>{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>

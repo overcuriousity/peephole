@@ -1,10 +1,9 @@
 {% extends "layout.html" %}
-{% block title %}peephole — cluster credits{% endblock %}
+{% block title %}peephole — market{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "cluster" %}{% include "_admin_nav.html" %}
-{% let subtab = "credits" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
-<div class="page-head"><div><h1>Credits</h1><p class="muted">Every figure is this node's own count.</p></div></div>
+{% let sub = "market" %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Market</h1><p class="muted">Every figure is this node's own count.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
@@ -50,9 +49,10 @@
   {% endif %}
   {% if !price.scanners.is_empty() %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
+    <thead><tr><th>Scanner</th><th class="num" title="The price per scan the scanner itself announces, in credits">Announces</th><th class="num" title="This node's own figure for one scan by this scanner, in credits">Our price per scan</th><th class="num" title="Paid scans it ran in the past hour, against 90% of its capacity">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
     <tbody>{% for s in price.scanners %}<tr><td>{{ s.name }}</td><td class="num">{{ s.announced }}</td><td class="num">{{ s.reference }}</td><td class="num">{{ s.paid }}</td>{% for c in s.levels %}<td class="num" title="{{ c.basis }}">{% if c.cheapest %}<b>{{ c.price }}</b>{% else %}{{ c.price }}{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
+  </table></div>
+  <p class="muted small">Our price per scan: what this node reckons one scan by that scanner is worth, in credits, from the paid scans other nodes' jobs got from it in the past hour (dearer when it is near capacity, cheaper when it sells nothing). When this node hires that scanner and either of the two runs an older version, it pays at most 1.25 times this figure; between two current nodes the price is agreed by bid instead.</p>{% endif %}
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>
@@ -68,7 +68,7 @@
 <section class="card"><div class="card-head"><h2>Relays leased</h2><span class="muted">this node cannot be dialled: these relays hold its outbox</span></div>
   {% if leases.is_empty() %}<p class="muted">No relay leased: nothing can reach this node's outbox yet.</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Relay</th><th>Until</th><th class="num">Price (credits / h)</th></tr></thead>
+    <thead><tr><th>Relay</th><th>Until (UTC)</th><th class="num">Price (credits / h)</th></tr></thead>
     <tbody>{% for r in leases %}<tr><td>{{ r.relay }}</td><td>{{ r.until }}</td><td class="num">{{ r.price }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>
@@ -82,7 +82,7 @@
 <section class="card"><div class="card-head"><h2>Where credits come from</h2></div>
   <p>This node: {{ today_up.0 }} hours up today so far; the day's pool is credited an hour after it ends (UTC).</p>
   {% if !income.is_empty() %}<div class="table-wrap"><table>
-    <thead><tr><th>Day</th><th class="num">Pool</th></tr></thead>
+    <thead><tr><th>Day (UTC)</th><th class="num">Pool</th></tr></thead>
     <tbody>{% for (d, p) in income %}<tr><td class="mono">{{ d }}</td><td class="num">{{ p }}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
 </section>
@@ -117,7 +117,7 @@
   <div class="ledger-part"><div class="card-head"><h3>Spent</h3><span class="muted">lookups this node paid for</span></div>
   {% if spent.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
   <div class="table-wrap wide"><table>
-    <thead><tr><th>When</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th>State</th></tr></thead>
+    <thead><tr><th>When (UTC)</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th>State</th></tr></thead>
     <tbody>{% for s in spent %}<tr>
       <td class="ts">{{ s.at }}</td><td>{{ s.server }}</td><td class="mono">{{ s.providers }}</td>
       <td class="num">{{ s.offered }}</td><td class="num">{{ s.charged }}</td><td>{{ s.state }}</td>
@@ -127,11 +127,11 @@
   <div class="ledger-part"><div class="card-head"><h3>Sent and received</h3></div>
   {% if moved.is_empty() %}<p class="muted">No transfers.</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>When</th><th>From</th><th>To</th><th class="num">Credits</th></tr></thead>
+    <thead><tr><th>When (UTC)</th><th>From</th><th>To</th><th class="num">Credits</th></tr></thead>
     <tbody>{% for m in moved %}<tr><td class="ts">{{ m.at }}</td><td>{{ m.from }}</td><td>{{ m.to }}</td><td class="num">{{ m.amount }}{% if m.short %} <span class="muted small">(less than named)</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>{% endif %}
   {% if !receivers.is_empty() %}
-  <form method="post" action="/admin/cluster/credits/send" class="filters">
+  <form method="post" action="/admin/market/send" class="filters">
     <label>Send to <select name="to">{% for r in receivers %}<option value="{{ r.0 }}">{{ r.1 }}</option>{% endfor %}</select></label>
     <label>Credits <input name="amount" size="8" inputmode="decimal" placeholder="0.5" required></label>
     <button class="btn" type="submit">Send</button>

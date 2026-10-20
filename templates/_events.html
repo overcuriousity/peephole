@@ -1,5 +1,7 @@
-{# The Timeline of `t` (`store::events`; the IP page, or a campaign's members with an IP column): one row per observation, newest first. Request rows keep the old Requests table's columns; the public cut (requests, scans, probes) reads like the wall's "Recent requests" (minute, cut path) and has no node, query, vantage IP, admin link or older pages. #}
-{% let adm = chrome.authed %}
+{# The Timeline of `t` (`store::events`; the IP page, or a campaign's members with an IP column): one row per observation, newest first; intel-lookup rows are folded behind a toggle (MIK-689 #6). Request rows keep the old Requests table's columns; the public cut (requests, scans, probes) reads like the wall's "Recent requests" (minute, cut path) and has no node, query, vantage IP, admin link or older pages. #}
+{% let adm = chrome.authed %}{% let intel = t.events.intel_count() %}
+<div class="events-wrap">
+{% if intel > 0 %}<label class="events-intel"><input type="checkbox" class="events-intel-toggle"> show {{ intel }} intel lookup{% if intel != 1 %}s{% endif %}</label>{% endif %}
 <div class="table-wrap wide"><table class="events">
   <thead><tr><th>Time (UTC)</th>{% if t.ip_column() %}<th>IP</th>{% endif %}<th>What</th><th>Path or detail</th><th>Sev</th>{% if t.labels %}<th>Labels</th>{% endif %}{% if adm %}<th>Node</th><th></th>{% endif %}</tr></thead>
   <tbody>
@@ -8,12 +10,12 @@
       <td class="ts">{% if adm %}{{ ev.ts }}{% else %}{{ crate::admin::views::minute(ev.ts) }}{% endif %}</td>
       {% if t.ip_column() %}<td class="ip">{% if let Some(a) = ev.ip %}<a href="/ip/{{ a }}">{{ a }}</a>{% endif %}</td>{% endif %}
       {% if ev.is_request() %}
-      <td class="mono">{% if ev.k == "webshell" %}<span class="badge badge-status">command</span>{% else %}{{ ev.method.as_deref().unwrap_or("") }}{% endif %}</td>
+      <td class="what">{% if ev.k == "webshell" %}<span class="badge badge-status">command</span>{% else %}<span class="badge badge-status mono">{{ ev.method.as_deref().unwrap_or("") }}</span>{% endif %}</td>
       <td class="path">{% if ev.k == "webshell" %}{% if let Some(c) = ev.summary %}<a class="mono" href="{{ crate::admin::views::pivot_href("cmd", c.as_str()) }}">{{ c }}</a>{% endif %} <span class="muted">{{ ev.method.as_deref().unwrap_or("") }} {{ ev.path.as_deref().unwrap_or("") }}</span>{% else %}{% if adm %}{{ ev.path.as_deref().unwrap_or("") }}{% else %}{{ crate::admin::views::public_path(ev.path.as_deref().unwrap_or("")) }}{% endif %}{% if let Some(q) = ev.query %}<span class="muted">?{{ q }}</span>{% endif %}{% endif %}</td>
-      <td>{% if let Some(sev) = ev.severity %}{% include "_severity.html" %}{% endif %}</td>
+      <td class="sev-cell">{% if let Some(sev) = ev.severity %}{% include "_severity.html" %}{% endif %}</td>
       {% if t.labels %}<td><span class="chips">{% for l in ev.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in ev.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
       {% else %}
-      <td><span class="badge badge-status">{% if ev.k == "scan" %}counter-scan{% else %}{{ ev.k }}{% endif %}</span></td>
+      <td class="what"><span class="badge badge-status">{% if ev.k == "scan" %}counter-scan{% else %}{{ ev.k }}{% endif %}</span></td>
       <td>{% if ev.k == "probe" %}{% if let Some(v) = ev.summary %}<span class="muted">from</span> <span class="mono">{{ v }}</span>{% endif %}{% else %}<span class="{% if ev.k == "fingerprint" || ev.k == "upload" %}mono {% endif %}break">{{ ev.summary.as_deref().unwrap_or("") }}</span>{% endif %}</td>
       <td></td>
       {% if t.labels %}<td></td>{% endif %}
@@ -27,4 +29,5 @@
   {% if t.events.items.is_empty() %}<tr><td colspan="{{ 4 + t.ip_column() as usize + t.labels as usize + 2 * adm as usize }}" class="empty">Nothing recorded.</td></tr>{% endif %}
   </tbody>
 </table></div>
+</div>
 {% if adm %}{% if let Some(h) = t.older_link() %}<p class="muted"><a href="{{ h }}">Older →</a></p>{% endif %}{% endif %}

@@ -142,6 +142,8 @@ pub struct RequestFilter {
     pub ua: Option<String>,
     /// Admin only: the command sent to a dropped webshell, exactly.
     pub cmd: Option<String>,
+    /// Admin only: the persona the node answered as.
+    pub persona: Option<String>,
     /// Admin only: `http`, `https`, …; `unknown` for a row without one.
     pub transport: Option<String>,
     /// Admin only: what the trap answered (`not-found`, `decoy:…`);
@@ -627,6 +629,10 @@ fn request_filter_sql(f: &RequestFilter, a: Audience, indexed: bool) -> (String,
         }
         if let Some(v) = nonempty(&f.cmd) {
             sql.push_str(" AND r.cmd = ?");
+            binds.push(v);
+        }
+        if let Some(v) = nonempty(&f.persona) {
+            sql.push_str(" AND r.persona = ?");
             binds.push(v);
         }
         if let Some(v) = nonempty(&f.session) {
@@ -1430,6 +1436,34 @@ mod tests {
         assert_eq!((ov6.net_count, ov6.rank, ov6.ranked), (0, 2, 3));
         let v6 = s.ip_by_addr("2001:db8::1").await.unwrap().unwrap();
         assert_eq!(v6.ip, "2001:db8::1");
+    }
+
+    #[tokio::test]
+    async fn requests_filter_by_persona() {
+        let s = seeded().await;
+        let ip = s.ip_by_addr("203.0.113.1").await.unwrap().unwrap();
+        // MIK-696: exact; the Analytics persona rows link here.
+        s.insert_request(&NewRequest {
+            ip_id: ip.id,
+            method: "GET".into(),
+            path: "/wp-login.php".into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            persona: Some("wordpress".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let by = |p: &str, a| {
+            let f = RequestFilter {
+                persona: Some(p.into()),
+                ..Default::default()
+            };
+            let s = &s;
+            async move { s.search_requests(&f, a).await.unwrap().items.len() }
+        };
+        assert_eq!(by("wordpress", Audience::Admin).await, 1);
+        assert_eq!(by("made-up", Audience::Admin).await, 0);
     }
 
     #[tokio::test]

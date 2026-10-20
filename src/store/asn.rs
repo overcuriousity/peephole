@@ -125,6 +125,72 @@ impl Store {
     }
 }
 
+/// What the ASN page shows besides the roll-up, all from data already
+/// held: each a value and the number of the ASN's IPs it holds for, most
+/// first, at most [`ROLLUP_TOP`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsnFacts {
+    /// The geo lookups' country.
+    pub countries: Vec<(String, i64)>,
+    /// RDAP: the registrant, the address range, the abuse e-mail.
+    pub orgs: Vec<(String, i64)>,
+    pub ranges: Vec<(String, i64)>,
+    pub abuse: Vec<(String, i64)>,
+    /// RDAP network: handle, name, IPs.
+    pub nets: Vec<(String, Option<String>, i64)>,
+}
+
+const COUNTRIES: &str = "SELECT country, count(*) AS n FROM ips
+     WHERE asn = ? AND country IS NOT NULL AND country <> ''
+     GROUP BY country ORDER BY n DESC, country LIMIT ?";
+const NETS: &str = "SELECT rdap_handle, max(rdap_name), count(*) AS n FROM ips
+     WHERE asn = ? AND rdap_handle IS NOT NULL
+     GROUP BY rdap_handle ORDER BY n DESC, rdap_handle LIMIT ?";
+/// A text field `{key}` of the ASN's IPs' RDAP rows, any origin. The rows
+/// come from peers: one that is not JSON, or not text at the key, is
+/// skipped (CASE, so the JSON functions never see a bad row).
+const RDAP_FIELD: &str = "SELECT v, count(DISTINCT ip) AS n FROM (
+       SELECT i.ip AS ip, CASE WHEN json_valid(d.data_json) THEN
+         CASE WHEN json_type(d.data_json, '$.{key}') = 'text'
+           THEN trim(json_extract(d.data_json, '$.{key}')) END END AS v
+       FROM ips i JOIN ip_intel d ON d.ip = i.ip AND d.provider = ?
+       WHERE i.asn = ?)
+     WHERE v IS NOT NULL AND v <> ''
+     GROUP BY v ORDER BY n DESC, v LIMIT ?";
+
+impl Store {
+    /// The [`AsnFacts`] of `asn`.
+    pub async fn asn_facts(&self, asn: i64) -> Result<AsnFacts> {
+        let field = |key: &str| sqlx::AssertSqlSafe(RDAP_FIELD.replace("{key}", key));
+        let mut rdap = vec![];
+        for key in ["org", "range", "abuse"] {
+            let rows: Vec<(String, i64)> = sqlx::query_as(field(key))
+                .bind(crate::intel::RDAP)
+                .bind(asn)
+                .bind(ROLLUP_TOP)
+                .fetch_all(&self.pool)
+                .await?;
+            rdap.push(rows);
+        }
+        let [orgs, ranges, abuse]: [_; 3] = rdap.try_into().expect("three fields");
+        Ok(AsnFacts {
+            countries: sqlx::query_as(COUNTRIES)
+                .bind(asn)
+                .bind(ROLLUP_TOP)
+                .fetch_all(&self.pool)
+                .await?,
+            nets: sqlx::query_as(NETS)
+                .bind(asn)
+                .bind(ROLLUP_TOP)
+                .fetch_all(&self.pool)
+                .await?,
+            orgs,
+            ranges,
+            abuse,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -227,6 +293,38 @@ pub(crate) mod tests {
         assert_eq!(r.open_ports, [(22, 1)], "the closed port is not counted");
         assert_eq!(r.campaigns, [("203.0.113.1".to_string(), 7, 2)]);
         assert!(s.rollup(&RollupKey::Asn(64999)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn asn_facts_count_what_the_ips_hold() {
+        let s = seeded().await;
+        sqlx::query(
+            "UPDATE ip_intel SET data_json = json_set(data_json, '$.abuse', 'abuse@example.net')
+             WHERE ip IN ('203.0.113.1', '203.0.113.2')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        // A peer's row that is not JSON is skipped, not an error.
+        sqlx::query(
+            "INSERT INTO ip_intel (ip, provider, origin, hlc, fetched_at, data_json)
+             VALUES ('203.0.113.1', 'rdap', x'01', 9, '2026-01-01 00:00:00', 'not json')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let f = s.asn_facts(64500).await.unwrap();
+        assert_eq!(f.countries, [("DE".to_string(), 2)]);
+        assert_eq!(f.orgs, [("Example Registrant".to_string(), 2)]);
+        assert_eq!(f.ranges, [("192.0.2.0 - 192.0.2.255".to_string(), 2)]);
+        assert_eq!(f.abuse, [("abuse@example.net".to_string(), 2)]);
+        assert_eq!(
+            f.nets,
+            [("NET-1".to_string(), Some("Example RDAP".to_string()), 2)]
+        );
+        let other = s.asn_facts(64501).await.unwrap();
+        assert!(other.abuse.is_empty(), "{other:?}");
+        assert_eq!(s.asn_facts(64999).await.unwrap(), AsnFacts::default());
     }
 
     /// Every roll-up query starts from the network's IPs, through its index.

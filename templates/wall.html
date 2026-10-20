@@ -68,37 +68,48 @@
       <table class="visually-hidden"><tbody>{% for n in stats.severity_distribution %}<tr><td>{{ n.name }}</td><td>{{ n.count }}</td></tr>{% endfor %}</tbody></table>
     </section>
     {% endif %}
-    {% if labels %}{% if let Some(c) = stats.campaigns %}{% if !c.families.is_empty() %}<section class="card">
-      <div class="card-head"><h2>What the campaigns were after</h2><span class="muted">requests of {{ c.active }} campaigns</span></div>
-      <ul class="families">
-        {% for f in c.families %}
-        <li>
-          <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
-          <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, campaign_family_max) }}" height="8"/></svg></span>
-          <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
-        </li>
-        {% endfor %}
-      </ul>
-    </section>{% endif %}{% endif %}{% endif %}
-    {% if labels && !stats.personas.is_empty() %}<section class="card">
-      <div class="card-head"><h2>What each persona drew</h2><span class="muted">all nodes · personas hit by ≥ {{ crate::store::stats::PORT_MIN_IPS }} IPs</span></div>
-      {% for p in stats.personas %}<h3 class="mono">{{ p.name }}</h3>
-      <ul class="families">
-        {% for f in p.families %}
-        <li>
-          <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
-          <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, persona_family_max) }}" height="8"/></svg></span>
-          <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
-        </li>
-        {% endfor %}
-      </ul>{% endfor %}
+    {% let campaign_mix = labels && crate::store::stats::CampaignTile::has_families(stats.campaigns) %}
+    {% let persona_mix = labels && !stats.personas.is_empty() %}
+    {% if campaign_mix || persona_mix %}<section class="card span-3">
+      <div class="card-head"><h2>Campaigns and personas</h2><span class="muted">requests by family</span></div>
+      <div class="mix-split">
+      {% if campaign_mix %}{% if let Some(c) = stats.campaigns %}<div class="mix-part">
+        <h3>What the campaigns were after <span class="muted">· requests of {{ c.active }} campaigns</span></h3>
+        <ul class="families">
+          {% for f in c.families %}
+          <li>
+            <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
+            <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, campaign_family_max) }}" height="8"/></svg></span>
+            <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>{% endif %}{% endif %}
+      {% if persona_mix %}<div class="mix-part">
+        <h3>What each persona drew <span class="muted">· all nodes, personas hit by ≥ {{ crate::store::stats::PORT_MIN_IPS }} IPs</span></h3>
+        <div class="persona-grid">
+        {% for p in stats.personas %}<div><h4 class="mono">{{ p.name }}</h4>
+        <ul class="families">
+          {% for f in p.families %}
+          <li>
+            <span class="fam-name"><i class="fam-dot fam-{{ f.name }}" aria-hidden="true"></i>{{ crate::admin::views::family_name(f.name) }}</span>
+            <span class="fam-bar"><svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><rect class="fam-fill fam-{{ f.name }}" width="{{ crate::admin::views::pct(f.count, persona_family_max) }}" height="8"/></svg></span>
+            <span class="fam-count num">{{ crate::admin::views::thousands(f.count) }}</span>
+          </li>
+          {% endfor %}
+        </ul></div>{% endfor %}
+        </div>
+      </div>{% endif %}
+      </div>
     </section>{% endif %}
     {% if let Some(ai) = stats.ai_decoys %}<section class="card">
       <div class="card-head"><h2>What they asked our fake AI</h2><span class="muted">{{ crate::admin::views::thousands(ai.total) }} requests</span></div>
-      {% if !ai.tools.is_empty() %}<h3>Tools called</h3>
-      <ol class="ranked">{% for n in ai.tools %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.tools_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
-      {% if !ai.models.is_empty() %}<h3>Models asked for</h3>
-      <ol class="ranked">{% for n in ai.models %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.models_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
+      {% if !ai.methods.is_empty() %}<h3>MCP methods</h3>
+      <ol class="ranked">{% for n in ai.methods %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.methods_max %}{% include "_bar.html" %}</li>{% endfor %}</ol>{% endif %}
+      {% if !ai.tools.is_empty() || ai.tools_rest.is_some() %}<h3>Tools called</h3>
+      <ol class="ranked">{% for n in ai.tools %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.tools_max %}{% include "_bar.html" %}</li>{% endfor %}{% if let Some(n) = ai.tools_rest %}<li class="ranked-rest"><span class="ranked-name muted">{{ n.name }}</span><span class="num">{{ n.count }}</span></li>{% endif %}</ol>{% endif %}
+      {% if !ai.models.is_empty() || ai.models_rest.is_some() %}<h3>Models asked for</h3>
+      <ol class="ranked">{% for n in ai.models %}<li><span class="ranked-name mono">{{ n.name }}</span><span class="num">{{ n.count }}</span>{% let v = n.count %}{% let max = ai.models_max %}{% include "_bar.html" %}</li>{% endfor %}{% if let Some(n) = ai.models_rest %}<li class="ranked-rest"><span class="ranked-name muted">{{ n.name }}</span><span class="num">{{ n.count }}</span></li>{% endif %}</ol>{% endif %}
       {% if !ai.apis.is_empty() %}<p class="muted">{% for n in ai.apis %}{{ n.name }} {{ n.count }}{% if !loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
     </section>{% endif %}
     {% if !stats.verbs.is_empty() %}<section class="card">
@@ -203,7 +214,7 @@
 
   <section class="card">
     <div class="card-head"><h2>Recent requests</h2><span class="muted">last 24 h · UTC</span></div>
-    <div class="table-wrap wide"><table>
+    <div class="table-wrap wide"><table class="stack-narrow">
       <thead><tr><th>Time (UTC)</th><th>IP</th><th>Method</th><th>Path</th><th>Sev</th>{% if labels %}<th>Labels</th>{% endif %}</tr></thead>
       <tbody>
       {% for r in recent %}
@@ -212,8 +223,8 @@
           <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if let Some(c) = r.country %} <span class="flag" title="{{ crate::admin::countries::country_name(c) }}">{{ crate::admin::countries::flag(c) }}</span>{% endif %}</td>
           <td class="mono">{{ r.method }}</td>
           <td class="path">{{ crate::admin::views::public_path(r.path) }}</td>
-          <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          {% if labels %}<td><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
+          <td class="sev">{% let sev = r.severity %}{% include "_severity.html" %}</td>
+          {% if labels %}<td class="labels"><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
         </tr>
       {% endfor %}
       {% if recent.is_empty() %}<tr><td colspan="{{ 5 + labels as usize }}" class="empty">Nothing yet.</td></tr>{% endif %}
