@@ -2258,6 +2258,15 @@ show_labels = {show_labels}
         }
     }
 
+    /// The job that ran scan `scan`.
+    async fn scan_job(st: &AdminState, scan: i64) -> i64 {
+        sqlx::query_scalar("SELECT job_id FROM scans WHERE id = ?")
+            .bind(scan)
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap()
+    }
+
     /// The IP page shows the verdict over the evidence rows and the IP list
     /// filters on them, for admins only, and
     /// nothing on either page claims more than was observed (MIK-586).
@@ -2265,6 +2274,7 @@ show_labels = {show_labels}
     async fn device_evidence_shows_and_filters_for_admins_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
         let (_, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        let job = scan_job(&st, scan).await;
         st.store.recompute_evidence().await.unwrap();
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
@@ -2273,7 +2283,7 @@ show_labels = {show_labels}
         assert!(admin.contains("device evidence only"), "{admin}");
         assert!(
             admin.contains(&format!(
-                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan}"
+                "TP-LINK TR-069 remote access answered on port 7547 in job #{job} · scan #{scan}"
             )),
             "{admin}"
         );
@@ -2309,6 +2319,7 @@ show_labels = {show_labels}
     async fn the_shared_reading_shows_and_filters_for_admins_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
         let (cpe_ip, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        let job = scan_job(&st, scan).await;
         let now = crate::store::data::now_ts();
         let named = |ip: &str, name: &str| {
             let (st, now, ip, name) = (st.clone(), now.clone(), ip.to_string(), name.to_string());
@@ -2360,7 +2371,8 @@ show_labels = {show_labels}
         );
         assert!(
             page.contains(&format!(
-                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan} (level 1, {day}) \
+                "TP-LINK TR-069 remote access answered on port 7547 in job #{job} · scan #{scan} \
+                 (level 1, {day} UTC) \
                  and the operator names this address dynamic-0-0-0-0.pool.telefonica.de \
                  (reverse DNS looked up {day})"
             )),

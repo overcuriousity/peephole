@@ -1787,6 +1787,8 @@ pub struct View {
     /// What was observed, in one sentence; never a claim about whose box
     /// it is.
     pub sentence: String,
+    /// What the AS type says, on its own line under the sentence.
+    pub as_note: Option<&'static str>,
     pub caveat: Option<&'static str>,
     pub lines: Vec<Line>,
 }
@@ -1885,7 +1887,7 @@ impl Store {
             .any(|r| r.kind == "net.eyeball" && r.value == "mobile");
         let first = |kinds: &[&str]| lines.iter().find(|l| kinds.contains(&l.kind.as_str()));
         let observed = |l: &Line| match l.port {
-            Some(p) => format!("{} answered on {p} in {}", l.what, l.source),
+            Some(p) => format!("{} answered on port {p} in {}", l.what, l.source),
             None => format!("{} in {}", l.what, l.source),
         };
         let sentence = match v.rule {
@@ -1895,16 +1897,19 @@ impl Store {
                     .unwrap_or_default()
             }
             Rule::Rented => "hosting AS".into(),
-            Rule::ConsumerDevice => first(&["device.cpe"])
-                .map(|l| format!("{}; the line is in a consumer ISP AS", observed(l)))
-                .unwrap_or_default(),
-            Rule::ProxyOnConsumer => first(&["device.proxy"])
-                .map(|l| format!("{}; the line is in a consumer ISP AS", observed(l)))
-                .unwrap_or_default(),
+            Rule::ConsumerDevice => first(&["device.cpe"]).map(observed).unwrap_or_default(),
+            Rule::ProxyOnConsumer => first(&["device.proxy"]).map(observed).unwrap_or_default(),
             Rule::DeviceOnly => first(&["device.cpe", "device.proxy"])
-                .map(|l| format!("{}; AS type not classified", observed(l)))
+                .map(observed)
                 .unwrap_or_default(),
             Rule::Declared | Rule::Unknown => unreachable!("no label"),
+        };
+        let as_note = match v.rule {
+            Rule::ConsumerDevice | Rule::ProxyOnConsumer => {
+                Some("The line is in a consumer ISP AS.")
+            }
+            Rule::DeviceOnly => Some("AS type not classified."),
+            _ => None,
         };
         let caveat = match v.rule {
             Rule::ConsumerDevice | Rule::ProxyOnConsumer if mobile => Some(MOBILE_CAVEAT),
@@ -1915,6 +1920,7 @@ impl Store {
             rule: v.rule,
             label,
             sentence,
+            as_note,
             caveat,
             lines,
         }))
@@ -1959,7 +1965,7 @@ impl Store {
             .iter()
             .find(|l| l.kind == "device.cpe")
             .map(|l| match l.port {
-                Some(p) => format!("{} answered on {p} in {}", l.what, l.source),
+                Some(p) => format!("{} answered on port {p} in {}", l.what, l.source),
                 None => format!("{} in {}", l.what, l.source),
             })
             .unwrap_or_else(|| "A consumer router answered".into());
@@ -2053,13 +2059,14 @@ impl Store {
         };
         Ok(match r.kind.as_str() {
             "device.cpe" | "device.proxy" => {
-                let Some((level, at, os)) = sqlx::query_as::<_, (i64, String, Option<String>)>(
-                    "SELECT level, finished_at, os_guess FROM scans
+                let Some((level, at, os, job)) =
+                    sqlx::query_as::<_, (i64, String, Option<String>, i64)>(
+                        "SELECT level, finished_at, os_guess, job_id FROM scans
                      WHERE id = ? AND finished_at IS NOT NULL",
-                )
-                .bind(r.ref_id)
-                .fetch_optional(&self.read)
-                .await?
+                    )
+                    .bind(r.ref_id)
+                    .fetch_optional(&self.read)
+                    .await?
                 else {
                     return Ok(vec![]);
                 };
@@ -2081,7 +2088,11 @@ impl Store {
                     .collect();
                 let facts: Vec<(Option<i64>, &str)> =
                     facts.iter().map(|(p, k)| (*p, k.as_str())).collect();
-                let source = format!("scan #{} (level {level}, {})", r.ref_id, day(&at));
+                let source = format!(
+                    "job #{job} · scan #{} (level {level}, {} UTC)",
+                    r.ref_id,
+                    day(&at)
+                );
                 let href = Some(format!("/admin/scans/{}", r.ref_id));
                 cat.hits(&ports, os.as_deref(), &facts)
                     .into_iter()
@@ -2890,16 +2901,22 @@ pub(crate) mod tests {
             ),
             ("device.cpe", "tr069", scan)
         );
+        let job: i64 = sqlx::query_scalar("SELECT job_id FROM scans WHERE id = ?")
+            .bind(scan)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
         let v = s.evidence_view(ip, false).await.unwrap().unwrap();
         assert_eq!(v.rule, Rule::DeviceOnly);
         let today = &crate::store::data::now_ts()[..10];
         assert_eq!(
             v.sentence,
             format!(
-                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan} \
-                 (level 1, {today}); AS type not classified"
+                "TP-LINK TR-069 remote access answered on port 7547 in job #{job} · scan #{scan} \
+                 (level 1, {today} UTC)"
             )
         );
+        assert_eq!(v.as_note, Some("AS type not classified."));
         assert_eq!(
             v.lines[0].href.as_deref(),
             Some(&*format!("/admin/scans/{scan}"))
@@ -3012,11 +3029,7 @@ pub(crate) mod tests {
         assert_eq!(s.evidence_view(ids[2], false).await.unwrap(), None);
         let v = s.evidence_view(device, false).await.unwrap().unwrap();
         assert_eq!(v.rule, Rule::DeviceOnly);
-        assert!(
-            v.sentence.ends_with("AS type not classified"),
-            "{}",
-            v.sentence
-        );
+        assert_eq!(v.as_note, Some("AS type not classified."));
     }
 
     /// `ip_evidence` stays on the node: no replication, export, dataset,
