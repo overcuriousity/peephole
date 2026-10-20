@@ -617,7 +617,7 @@ mod tests {
                 body
             }
         };
-        let d = page("/admin/campaigns/198.51.100.30").await;
+        let d = page("/admin/evidence/campaigns/198.51.100.30").await;
         let details = d
             .split("<details class=\"edge-detail\">")
             .nth(1)
@@ -646,7 +646,7 @@ mod tests {
         }
         assert!(!details.contains("more shared"), "{details}");
         // No pair, and only the rarest EDGE_SHAPES_MAX of 131 listed.
-        let b = page("/admin/campaigns/198.51.100.10").await;
+        let b = page("/admin/evidence/campaigns/198.51.100.10").await;
         assert!(!b.contains("/admin/links/ja4/"), "{b}");
         assert!(b.contains("≥ 0.60 (unsupported; 0.45 with support)"), "{b}");
         assert!(
@@ -660,7 +660,7 @@ mod tests {
         );
         // Hard edges stay a plain row.
         assert!(
-            !page("/admin/campaigns/192.0.2.3")
+            !page("/admin/evidence/campaigns/192.0.2.3")
                 .await
                 .contains("edge-detail")
         );
