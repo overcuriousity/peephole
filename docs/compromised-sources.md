@@ -443,7 +443,8 @@ was observed.
 a /24 of infected routers in one ISP is dense too. Rule 6 is where every
 `device.*` row lands when the address has no `net.*` row, which is every
 address outside a listed hosting AS: the bundled list classifies hosting
-only (MIK-587), so no address has `net.eyeball`. Rule 3 catches `net.hosting` before rule 6,
+only (MIK-587), so no address has `net.eyeball`. It stays that way until we hold a written ASdb grant
+(see [Before sharing](dataset.md#before-sharing)). Rule 3 catches `net.hosting` before rule 6,
 so rule 6 never describes a hosting address.
 
 Rules 4 to 6 never say "compromised", "hijacked" or "botnet". The data
