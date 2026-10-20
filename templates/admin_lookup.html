@@ -9,7 +9,7 @@
   <textarea id="lookup-q" class="mono" name="ip" rows="1" data-enter-submits placeholder="IP, host, URL or a list" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea>
   <button class="btn btn-primary" type="submit" data-busy="Looking up…">Look up{% if offer.balance.is_some() %} · ≤ <span class="num">{{ offer.total }}</span> credits{% if results.len() > 1 %} each{% endif %}{% endif %}</button>
   {% if let Some(b) = offer.balance %}
-  <a class="balance-chip" href="/admin/cluster/credits" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b></a>
+  <a class="balance-chip" href="/admin/market" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b></a>
   {% endif %}
   <p class="lookup-hint muted">Enter looks up · Shift+Enter adds a line · free providers answer at once, paid ones are offered below</p>
 </form>

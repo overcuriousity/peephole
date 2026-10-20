@@ -7270,9 +7270,12 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let page = format!("{base}/admin/cluster/credits");
+    let page = format!("{base}/admin/market");
     let html = text(&admin, page.clone()).await;
-    assert!(html.contains("Credits</a>"), "the tab is there");
+    assert!(
+        html.contains("href=\"/admin/market\" aria-current=\"true\">Market</a>"),
+        "the top-level tab is there"
+    );
     assert!(
         html.contains(&credits::show(held - cost)),
         "the balance: {html}"

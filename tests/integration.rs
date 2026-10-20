@@ -552,7 +552,7 @@ async fn admin_routes_redirect_without_session() {
         "/admin/links/canaries/served/1",
         "/admin/links/fp/x",
         "/admin/api/links/graph?focus=fp:x",
-        "/admin/inbox",
+        "/admin/system/inbox",
         "/admin/system",
         "/admin/system/settings",
         "/admin/system/export",
@@ -823,7 +823,12 @@ async fn admin_pages_and_deletes_with_session() {
     let html = get("/admin").await.unwrap().text().await.unwrap();
     assert!(!html.contains("data-queue"), "no queue card on Overview");
     assert!(!html.contains("<h2>Intel</h2>"), "intel lives on System");
-    assert!(html.contains("href=\"/admin/inbox\"") && html.contains("href=\"/admin/scans\""));
+    assert!(
+        html.contains("href=\"/admin/system/inbox\"") && html.contains("href=\"/admin/scans\"")
+    );
+    // No cluster: no Market tab, and its page is not there.
+    assert!(!html.contains("/admin/market"), "{html}");
+    assert_eq!(get("/admin/market").await.unwrap().status(), 404);
     assert!(html.contains("data-recent"), "recent activity stays");
     assert!(
         html.contains("Needs attention") && html.contains("failed in 24 h"),
@@ -934,6 +939,18 @@ async fn admin_pages_and_deletes_with_session() {
         html.contains("href=\"/admin/links/hassh/") && html.contains("href=\"/admin/links/ja4x/")
     );
     assert!(html.contains("href=\"/admin/links/canaries?range=all\""));
+    // No agent traces: what counts as one, instead of an empty table (MIK-696).
+    let traces = html.split("AI agent traces").nth(1).unwrap();
+    let traces = traces.split("</section>").next().unwrap();
+    for want in [
+        "href=\"/requests?label=ai-agent-tooling\"",
+        "href=\"/requests?label=ai-agent-artifact\"",
+        "href=\"/admin/decoys\"",
+        "before v0.20.0",
+    ] {
+        assert!(traces.contains(want), "{want}: {traces}");
+    }
+    assert!(!traces.contains("<table"), "{traces}");
     // Every Analytics row opens a filtered view.
     for want in [
         "href=\"/requests?ua=",
@@ -1211,8 +1228,17 @@ async fn admin_pages_and_deletes_with_session() {
     .await
     .unwrap();
     assert_eq!(j["nodes"][0]["id"], format!("ssh:{odd}"));
-    let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/inbox")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("lost@example.org"));
+    assert!(
+        html.contains("aria-current=\"true\">Inbox</a>"),
+        "a System subtab"
+    );
     let html = get("/admin/system/keys")
         .await
         .unwrap()
@@ -3138,13 +3164,15 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
         ">Lookup<",
         ">Scans<",
         ">Links<",
-        ">Inbox<",
         ">Cluster<",
         ">System<",
     ] {
         assert!(n.contains(want), "nav lacks {want}");
     }
+    // Inbox is a System page; Market needs a cluster (MIK-696).
     for gone in [
+        ">Inbox<",
+        ">Market<",
         ">Queue<",
         ">Fingerprints<",
         ">Canaries<",
@@ -3185,6 +3213,14 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     );
     let sys = get("/admin/system").await;
     assert_eq!(current(&sys).as_deref(), Some("System"));
+    assert!(
+        sys.contains("href=\"/admin/system/inbox\""),
+        "Inbox sub-tab"
+    );
+    assert_eq!(
+        current(&get("/admin/system/inbox").await).as_deref(),
+        Some("System")
+    );
     assert!(sys.contains("Tor exit list") && sys.contains("MaxMind GeoLite2"));
     assert!(sys.contains("built in"), "this binary's rules");
 }
@@ -3221,6 +3257,15 @@ async fn moved_admin_pages_redirect_permanently() {
     ] {
         let r = client.get(format!("{base}{from}")).send().await.unwrap();
         assert_eq!(r.status(), 308, "{from}");
+        assert_eq!(r.headers()["location"], to, "{from}");
+    }
+    // MIK-696 asked for 301: Inbox under System, Credits as Market.
+    for (from, to) in [
+        ("/admin/inbox", "/admin/system/inbox"),
+        ("/admin/cluster/credits?x=1", "/admin/market?x=1"),
+    ] {
+        let r = client.get(format!("{base}{from}")).send().await.unwrap();
+        assert_eq!(r.status(), 301, "{from}");
         assert_eq!(r.headers()["location"], to, "{from}");
     }
 }

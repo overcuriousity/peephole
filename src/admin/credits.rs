@@ -1,4 +1,4 @@
-//! Cluster › Credits: what this node holds, earned and spent, what every
+//! Market: the credits page; what this node holds, earned and spent, what every
 //! member holds in this node's view, and how the price comes about.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
@@ -18,14 +18,18 @@ use axum::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/cluster/credits";
+const PAGE: &str = "/admin/market";
 /// Rows shown per list.
 const ROWS: usize = 100;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
-        .route("/admin/cluster/credits/send", post(send))
+        .route("/admin/market/send", post(send))
+        .route(
+            "/admin/cluster/credits",
+            get(|uri: axum::http::Uri| async move { crate::admin::views::moved(PAGE, &uri) }),
+        )
 }
 
 /// When a lot of `day` is gone, seen from `today`.

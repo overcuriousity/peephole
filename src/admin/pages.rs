@@ -25,7 +25,13 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/admin/ips/{addr}/delete", post(ip_delete))
         .route("/admin/requests/bulk-delete", post(bulk_delete_requests))
         .route("/admin/ips/bulk-delete", post(bulk_delete_ips))
-        .route("/admin/inbox", get(inbox))
+        .route("/admin/system/inbox", get(inbox))
+        .route(
+            "/admin/inbox",
+            get(|uri: axum::http::Uri| async move {
+                crate::admin::views::moved("/admin/system/inbox", &uri)
+            }),
+        )
         .route("/admin/claims/{id}/delete", post(claim_delete))
 }
 
@@ -343,7 +349,10 @@ async fn claim_delete(
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(redirect_with_notice("/admin/inbox", &deleted_msg(out)))
+    Ok(redirect_with_notice(
+        "/admin/system/inbox",
+        &deleted_msg(out),
+    ))
 }
 
 /// Parsed bulk form: checked row keys, or "everything matching the filter".
