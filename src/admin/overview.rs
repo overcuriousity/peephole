@@ -257,8 +257,8 @@ pub struct ClusterFigures {
     pub earned: String,
     pub spent: String,
     pub expiring_today: String,
-    /// Scans a day the scanners can do, did, and the utilization in %.
-    /// Scans a day: possible, done, idle; and the utilization in %.
+    /// Scans a day: possible, done, idle; and the utilization in %, empty
+    /// with no scan capacity.
     pub capacity: (String, String, String, String),
     /// Counted audits of 7 days: agrees, differs, inconclusive.
     pub audits: (u32, u32, u32),
@@ -397,7 +397,9 @@ async fn cluster_figures(
                 "{:.0}",
                 (t.capacity.per_day - t.capacity.used_per_day).max(0.0)
             ),
-            format!("{:.0}", t.capacity.utilization * 100.0),
+            t.capacity
+                .utilization
+                .map_or_else(String::new, |u| format!("{:.0}", u * 100.0)),
         ),
         audits,
         scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),

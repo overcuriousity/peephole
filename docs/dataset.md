@@ -439,6 +439,13 @@ cluster.
   operators should not be identifiable from the file.
 - **Claim e-mails are never exported**, only `fp_claim`.
 - **Counts need `weight`.** See Rows.
+- **`net.eyeball` stays inert until we hold a written ASdb grant.**
+  The eyeball classification would come from Stanford ASdb, whose site
+  states no licence, so it is all rights reserved. No address carries
+  `net.eyeball` until we hold a written ASdb redistribution grant that
+  covers an MIT / Apache-2.0 open-source release, downstream commercial
+  reuse included. This is an open-source ship precondition, not part of
+  the commercial gate. The request is tracked in MIK-592.
 - **Fingerprint methods have their own licences.** Two are FoxIO
   License 1.1, which allows non-commercial use only (§2). Check before
   building a commercial product on them. Below: (a) implementing it in a

@@ -7518,7 +7518,10 @@ async fn the_overview_shows_the_clusters_credit_figures() {
         "this node's scan selling price"
     );
     assert!(html.contains("Forks") && html.contains("Audits"));
-    assert!(html.contains("0 idle"), "no scanner: nothing idle: {html}");
+    assert!(
+        html.contains("no scan capacity") && !html.contains(" idle<"),
+        "no scanner: no capacity, no meter (MIK-688): {html}"
+    );
 }
 
 /// A declined offer frees what it held before the asker offers again:
