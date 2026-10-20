@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — AS{{ asn }}{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} {% endif %}{% endif %}<span class="mono">AS{{ asn }}</span></h1></div></div>
+<div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} {% endif %}{% endif %}<span class="mono">AS{{ asn }}</span></h1></div>{% let dossier_kind = "asn" %}{% let dossier_id = asn %}{% include "_dossier_link.html" %}</div>
 {% if let Some(r) = r %}
 <div class="stack">
 <section class="card">

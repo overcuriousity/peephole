@@ -185,6 +185,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(dossier::routes())
         .merge(paths::routes())
         .merge(asn::routes())
         .merge(decoys::routes())

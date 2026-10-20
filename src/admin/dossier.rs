@@ -10,6 +10,8 @@
 //! config values, credit balances and prices.
 use crate::admin::AdminState;
 use crate::admin::api_v1::{rfc3339, summaries_json};
+use crate::admin::auth::SessionUser;
+use crate::admin::error::{AppError, AppResult};
 use crate::store::browse::{CalendarDay, canonical_ip};
 use crate::store::events::{Event, EventKind, EventPage};
 use crate::store::requests::IpRow;
@@ -17,6 +19,33 @@ use crate::store::stats::Bucket;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
+
+pub fn routes() -> axum::Router<std::sync::Arc<AdminState>> {
+    axum::Router::new().route(
+        "/admin/api/dossier/{kind}/{id}",
+        axum::routing::get(page_copy),
+    )
+}
+
+/// `GET /admin/api/dossier/{ip,asn,request,campaign}/{id}`: what
+/// `/api/v1/<kind>s/<id>/dossier` answers, for the admin session (the
+/// pages' "Copy JSON dossier" link, MIK-750). A device token is no
+/// session here, as on every admin page.
+async fn page_copy(
+    _u: SessionUser,
+    axum::extract::State(st): axum::extract::State<std::sync::Arc<AdminState>>,
+    axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
+) -> AppResult<axum::response::Response> {
+    use axum::{Json, response::IntoResponse};
+    let body = match kind.as_str() {
+        "ip" => ip(&st, &id).await?.map(|d| Json(d).into_response()),
+        "asn" => asn(&st, &id).await?.map(|d| Json(d).into_response()),
+        "request" => request(&st, &id).await?.map(|d| Json(d).into_response()),
+        "campaign" => campaign(&st, &id).await?.map(|d| Json(d).into_response()),
+        _ => None,
+    };
+    body.ok_or(AppError::NotFound)
+}
 
 /// The schema version: bumped when a field changes meaning or goes away
 /// (new fields do not bump it).
