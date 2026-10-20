@@ -29,6 +29,30 @@ chars), and only their SHA-256 is stored. Each token carries scopes:
 `read` is always granted at pairing; `act` is optional (a checkbox on the
 pairing form). A missing or wrong scope is `403`.
 
+### API keys
+
+For scripts and tools that cannot scan a pairing QR, an admin mints API keys
+on Admin → System → Devices ("API keys": a label of 1-80 characters, and an
+`act` checkbox, off by default). An API key is a device token in every
+respect: same format, same scopes, same 24-hour [spend cap](#spend-cap),
+same revocation and audit (`device_actions` names it by its label; "paired
+by" is the admin who minted it). The key is shown once, on the page that
+answers the Create button, and never again; copy it then. There is no limit
+on how many keys a node has.
+
+### Rate limit
+
+Each token, device or API key, has its own budget: `[limits] api_per_minute`
+requests a minute sustained (default 120) and `api_burst` at once (default
+30). Past it, `429 rate_limited` with `Retry-After` (seconds). This is on top
+of the per-IP limit on `/api/*`.
+
+```toml
+[limits]
+api_per_minute = 120  # 1-6000
+api_burst = 30        # 1-1000
+```
+
 ### Pairing
 
 Pairing starts on the admin UI (**Admin → System → Devices → Pair a device**, admin
@@ -84,9 +108,10 @@ rate-limited per client IP (10/min); on excess it answers `429` with
 
 ### Revocation
 
-Admin → System → Devices lists every device: name, scopes, who paired it, created,
-last seen. **Revoke** marks the device revoked; its token gets `401` on the
-next request. Revocation is final (pair again for a new token).
+Admin → System → Devices lists every device and API key: name, scopes, who
+paired or minted it, created, last seen. **Revoke** marks it revoked; its
+token gets `401` on the next request. Revocation is final (pair again, or
+mint a new key, for a new token).
 
 ## Errors
 
@@ -104,7 +129,7 @@ Every non-2xx response is JSON:
 | 404    | `not_found`    | address not in the dataset, unknown `/api/v1` path, a job not this device's |
 | 409    | see below      | a scan is not sold, or a quote cannot be spent    |
 | 422    | `refused`      | the probe gate refuses the address, or the scan guard an address not in the dataset (reason in `message`) |
-| 429    | `rate_limited` | per-IP limit hit (`Retry-After` header is set)    |
+| 429    | `rate_limited` | per-IP or per-token limit hit (`Retry-After` header is set) |
 | 429    | `spend_cap`    | the device's 24-hour spend cap is reached (see [Act endpoints](#act-endpoints)) |
 | 500    | `internal`     | storage failure; message is generic, never a leak |
 

@@ -378,42 +378,11 @@ mod tests {
         );
     }
 
-    thread_local! {
-        static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// Writes into this thread's capture, if one is running.
-    struct Capture;
-
-    impl std::io::Write for Capture {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            CAPTURED.with(|c| c.borrow_mut().as_mut().map(|v| v.extend_from_slice(b)));
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The log lines a push writes, at every level and from every crate.
-    /// A global subscriber (not `set_default`): with a scoped one, a test
-    /// on another thread registering the same callsite can cache "never"
-    /// for it (tracing-core `DefaultCallsite::register`), and the capture
-    /// comes back empty. Needs a current-thread runtime.
+    /// The log lines a push writes (see [`crate::test_log`]).
     async fn logs_of(p: &Pusher, s: &Store) -> String {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            let sub = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(|| Capture)
-                .finish();
-            tracing::subscriber::set_global_default(sub).expect("no other global subscriber");
-        });
-        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        p.push_pending(s, 60, now()).await;
-        let out = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
-        String::from_utf8(out).unwrap()
+        crate::test_log::capture(p.push_pending(s, 60, now()))
+            .await
+            .1
     }
 
     #[tokio::test(flavor = "current_thread")]
