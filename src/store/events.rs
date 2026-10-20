@@ -159,16 +159,16 @@ impl Event {
                 Some(format!("/admin/requests/{}", self.id))
             }
             EventKind::Upload => Some(format!(
-                "/admin/uploads/{}",
+                "/admin/traps/uploads/{}",
                 crate::admin::public::urlencode(r)
             )),
-            EventKind::Scan => Some(format!("/admin/scans/{}", self.id)),
+            EventKind::Scan => Some(format!("/admin/investigate/scans/{}", self.id)),
             EventKind::Fingerprint if !r.is_empty() => Some(format!(
-                "/admin/links/fp/{}",
+                "/admin/evidence/links/fp/{}",
                 crate::admin::public::urlencode(r)
             )),
             EventKind::Canary if !r.is_empty() => Some(format!(
-                "/admin/links/canaries/served/{}",
+                "/admin/evidence/canaries/served/{}",
                 crate::admin::public::urlencode(r)
             )),
             _ => None,
@@ -186,6 +186,13 @@ fn json_list(s: Option<&str>) -> Vec<String> {
 pub struct EventPage {
     pub items: Vec<Event>,
     pub next: Option<Cursor>,
+}
+
+impl EventPage {
+    /// Intel-lookup rows on the page, which the Timeline folds away.
+    pub fn intel_count(&self) -> usize {
+        self.items.iter().filter(|e| e.k == "intel").count()
+    }
 }
 
 enum Bind {
@@ -696,7 +703,10 @@ mod tests {
         let probe = &p.items[1];
         assert_eq!(probe.summary.as_deref(), Some("192.0.2.9"));
         assert_eq!(probe.href(), None);
-        assert_eq!(p.items[2].href().as_deref(), Some("/admin/links/fp/F"));
+        assert_eq!(
+            p.items[2].href().as_deref(),
+            Some("/admin/evidence/links/fp/F")
+        );
     }
 
     #[tokio::test]

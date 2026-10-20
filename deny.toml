@@ -10,7 +10,9 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # Every RustSec advisory (vulnerable, unsound, unmaintained) fails the
 # advisories check. To accept one knowingly, list it with a reason:
 # ignore = [{ id = "RUSTSEC-0000-0000", reason = "…" }]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained; build-time only via askama_derive, no runtime TOML parsing; no upgrade available. Drop when askama replaces it." },
+]
 
 [licenses]
 # Permissive licenses, plus MPL-2.0 (file-level copyleft; webauthn-rs).

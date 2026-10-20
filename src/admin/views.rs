@@ -7,6 +7,15 @@ pub struct Chrome {
     pub active: &'static str,
     pub stamp: &'static str,
     pub version: &'static str,
+    /// This node is in a cluster: the admin nav shows the Network pages
+    /// in `CLUSTER_ONLY` (they answer 404 on a standalone node).
+    pub market: bool,
+}
+
+tokio::task_local! {
+    /// Whether this node runs a cluster (the Market page answers), set by
+    /// the admin router's middleware for the nav.
+    pub(crate) static MARKET: bool;
 }
 
 /// The project's source repository.
@@ -32,6 +41,7 @@ impl Chrome {
             active,
             stamp: STAMP,
             version: VERSION,
+            market: MARKET.try_with(|m| *m).unwrap_or(false),
         }
     }
 }
@@ -271,23 +281,139 @@ pub fn duration<S: SevValue>(secs: S) -> String {
     }
 }
 
-/// Second-level tabs: `(key, href, label)`, drawn by `_subtabs.html`.
-pub const LINKS_TABS: &[(&str, &str, &str)] = &[
-    ("fingerprints", "/admin/links", "Fingerprints"),
-    ("canaries", "/admin/links/canaries", "Canaries"),
+/// One group of the admin nav (MIK-711): its key, label and children
+/// `(key, href, label)`. The group lands on its first child.
+pub struct NavGroup {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub children: &'static [(&'static str, &'static str, &'static str)],
+}
+
+impl NavGroup {
+    pub fn href(&self) -> &'static str {
+        self.children[0].1
+    }
+}
+
+/// The admin nav, both rows: drawn by `_admin_nav.html` and `_subtabs.html`.
+/// URLs follow the tree; `admin::moved` sends the old ones here.
+pub const ADMIN_TREE: &[NavGroup] = &[
+    NavGroup {
+        key: "overview",
+        label: "Overview",
+        children: &[
+            ("now", "/admin", "Now"),
+            ("analytics", "/admin/overview/analytics", "Analytics"),
+        ],
+    },
+    NavGroup {
+        key: "investigate",
+        label: "Investigate",
+        children: &[
+            ("lookup", "/admin/investigate/lookup", "Lookup"),
+            ("scans", "/admin/investigate/scans", "Scans"),
+        ],
+    },
+    NavGroup {
+        key: "evidence",
+        label: "Evidence",
+        children: &[
+            ("campaigns", "/admin/evidence/campaigns", "Campaigns"),
+            ("links", "/admin/evidence/links", "Links"),
+            ("canaries", "/admin/evidence/canaries", "Canaries"),
+            ("paths", "/admin/evidence/paths", "New paths"),
+        ],
+    },
+    NavGroup {
+        key: "traps",
+        label: "Traps",
+        children: &[
+            ("mcp", "/admin/traps/mcp", "MCP"),
+            ("llm", "/admin/traps/llm", "LLM"),
+            ("web", "/admin/traps/web", "Web"),
+            ("uploads", "/admin/traps/uploads", "Uploads"),
+        ],
+    },
+    NavGroup {
+        key: "network",
+        label: "Network",
+        children: &[
+            ("members", "/admin/network/members", "Members"),
+            ("access", "/admin/network/access", "Access"),
+            ("ownership", "/admin/network/ownership", "Ownership"),
+            ("credits", "/admin/network/credits", "Credits"),
+        ],
+    },
+    NavGroup {
+        key: "system",
+        label: "System",
+        children: &[
+            ("status", "/admin/system/status", "Status"),
+            ("settings", "/admin/system/settings", "Settings"),
+            ("inbox", "/admin/system/inbox", "Inbox"),
+            ("devices", "/admin/system/devices", "Devices"),
+            ("keys", "/admin/system/keys", "Security keys"),
+            ("export", "/admin/system/export", "Export"),
+        ],
+    },
 ];
 
-pub const DECOYS_TABS: &[(&str, &str, &str)] = &[
-    ("mcp", "/admin/decoys?tab=mcp", "MCP"),
-    ("llm", "/admin/decoys?tab=llm", "LLM"),
-    ("web", "/admin/decoys?tab=web", "Web"),
-];
+/// Network pages that need a cluster; a standalone node shows Members only.
+pub const CLUSTER_ONLY: &[&str] = &["access", "ownership", "credits"];
+
+/// Where a page sits in `ADMIN_TREE`; every admin page sets one.
+pub struct Nav {
+    pub group: &'static str,
+    pub child: &'static str,
+    /// A query (no `?`) the children in `carry` keep, e.g. the decoy range.
+    qs: String,
+    carry: &'static [&'static str],
+}
+
+impl Nav {
+    pub fn new(group: &'static str, child: &'static str) -> Self {
+        debug_assert!(
+            ADMIN_TREE
+                .iter()
+                .any(|g| g.key == group && g.children.iter().any(|c| c.0 == child)),
+            "Nav: no {group}/{child} in ADMIN_TREE"
+        );
+        Self {
+            group,
+            child,
+            qs: String::new(),
+            carry: &[],
+        }
+    }
+
+    /// The children named in `carry` link with `qs` appended.
+    pub fn carrying(mut self, qs: String, carry: &'static [&'static str]) -> Self {
+        self.qs = qs;
+        self.carry = carry;
+        self
+    }
+
+    pub fn current(&self) -> &'static NavGroup {
+        ADMIN_TREE
+            .iter()
+            .find(|g| g.key == self.group)
+            .unwrap_or(&ADMIN_TREE[0])
+    }
+
+    pub fn child_href(&self, key: &str, href: &str) -> String {
+        if self.qs.is_empty() || !self.carry.contains(&key) {
+            href.to_string()
+        } else {
+            format!("{href}?{}", self.qs)
+        }
+    }
+}
 
 /// A value's page under Links. Values are percent-encoded: SSH
 /// fingerprints are base64 (`/`, `+`).
 pub fn link_href(kind: &str, value: &str) -> String {
     format!(
-        "/admin/links/{kind}/{}",
+        "/admin/evidence/links/{kind}/{}",
         crate::admin::public::urlencode(value)
     )
 }
@@ -303,8 +429,8 @@ pub fn pivot_href(kind: &str, value: &str) -> String {
         "ua" if value != crate::store::useragent::NONE => link_href("ua", value),
         "ua" | "path" | "cmd" => format!("/requests?{kind}={v}"),
         "port" | "product" | "os" | "label" => format!("/ips?{kind}={v}"),
-        "sha256" => format!("/admin/uploads?sha256={v}"),
-        "campaign" => format!("/admin/campaigns/{v}"),
+        "sha256" => format!("/admin/traps/uploads?sha256={v}"),
+        "campaign" => format!("/admin/evidence/campaigns/{v}"),
         _ => {
             debug_assert!(false, "pivot_href: unknown kind {kind}");
             format!("/admin/search?q={v}")
@@ -321,18 +447,19 @@ impl crate::store::hostkeys::HostKeyRow {
     }
 }
 
-pub const CLUSTER_TABS: &[(&str, &str, &str)] = &[
-    ("members", "/admin/cluster", "Members"),
-    ("access", "/admin/cluster/access", "Access"),
-    ("ownership", "/admin/cluster/ownership", "Ownership"),
-    ("credits", "/admin/cluster/credits", "Credits"),
-];
-pub const SYSTEM_TABS: &[(&str, &str, &str)] = &[
-    ("status", "/admin/system", "Status"),
-    ("settings", "/admin/system/settings", "Settings"),
-    ("keys", "/admin/system/keys", "Keys"),
-    ("export", "/admin/system/export", "Export"),
-];
+/// A page that moved: 308 to `to`, keeping the query string.
+pub fn moved(to: &str, uri: &axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let loc = match uri.query() {
+        Some(q) => format!("{to}?{q}"),
+        None => to.to_string(),
+    };
+    (
+        axum::http::StatusCode::PERMANENT_REDIRECT,
+        [(axum::http::header::LOCATION, loc)],
+    )
+        .into_response()
+}
 
 #[cfg(test)]
 mod tests {
@@ -342,7 +469,7 @@ mod tests {
     fn pivot_href_encodes_the_value() {
         assert_eq!(
             pivot_href("ua", "Mozilla/5.0 (X11)"),
-            "/admin/links/ua/Mozilla%2F5.0%20%28X11%29"
+            "/admin/evidence/links/ua/Mozilla%2F5.0%20%28X11%29"
         );
         assert_eq!(pivot_href("ua", "(none)"), "/requests?ua=%28none%29");
         assert_eq!(
@@ -357,10 +484,13 @@ mod tests {
         );
         assert_eq!(pivot_href("os", "Linux 5.X"), "/ips?os=Linux%205.X");
         assert_eq!(pivot_href("label", "scanner"), "/ips?label=scanner");
-        assert_eq!(pivot_href("sha256", "ab01"), "/admin/uploads?sha256=ab01");
+        assert_eq!(
+            pivot_href("sha256", "ab01"),
+            "/admin/traps/uploads?sha256=ab01"
+        );
         assert_eq!(
             pivot_href("campaign", "192.0.2.4"),
-            "/admin/campaigns/192.0.2.4"
+            "/admin/evidence/campaigns/192.0.2.4"
         );
     }
 

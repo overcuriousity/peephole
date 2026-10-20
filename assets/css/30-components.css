@@ -7,6 +7,7 @@
 .tile .label { display: block; margin-bottom: 0.25rem; }
 .tile .value { font-size: var(--text-2xl); font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
 .tile .value.brand { color: var(--color-brand); }
+.tile .value.ts { font-size: var(--text-lg); }
 .tile .hint { color: var(--color-fg-muted); font-size: var(--text-xs); margin-top: 0.25rem; }
 
 .table-wrap { border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg-elevated); overflow-x: auto; }
@@ -29,8 +30,17 @@ td.ts { white-space: nowrap; color: var(--color-fg-secondary); font-family: var(
 .badge-cat-interact { background: var(--cat-interact-dim); color: var(--cat-interact); border-color: var(--cat-interact); }
 .badge-cat-bot { background: var(--cat-bot-dim); color: var(--cat-bot); border-color: var(--cat-bot); }
 .badge-cat-postex { background: var(--color-fg-primary); color: var(--color-bg-base); border-color: var(--color-fg-primary); }
-.badge-owasp { background: transparent; color: var(--color-fg-muted); border-color: var(--color-border-strong); font-family: var(--font-mono); }
+.badge-owasp, .badge-reading { background: transparent; color: var(--color-fg-muted); border-color: var(--color-border-strong); font-family: var(--font-mono); }
 .badge-tor { background: var(--color-brand-dim); color: var(--color-brand); }
+.ip-props { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; }
+.badge-share { background: var(--color-bg-active); color: var(--color-fg-primary); border-color: var(--color-border-strong); text-decoration: none; }
+.badge-share[data-shared] { background: var(--color-warning-dim); color: var(--color-warning); border-color: var(--color-warning); }
+.badge-share[data-reading="unscanned"] { background: transparent; color: var(--color-fg-muted); border-style: dashed; }
+.ip-props-line { margin: 0.3rem 0 0.5rem; }
+.ip-props-line .badge { font-size: var(--text-sm); }
+td .ip-props { display: flex; margin-top: 0.2rem; }
+.evidence-caveat { margin-top: -0.25rem; font-weight: 500; color: var(--color-fg-primary); }
+.badge-net { background: transparent; color: var(--color-fg-secondary); border-color: var(--color-border-strong); }
 .badge-agent { background: var(--color-accent-dim); color: var(--color-accent); border-color: var(--color-accent-muted); }
 .badge-unseen { color: var(--color-fg-muted); border: 1px dashed currentColor; }
 .badge-new { background: var(--color-success-dim); color: var(--color-success); }
@@ -124,6 +134,8 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 .intel details .kv { margin-top: 0.5rem; }
 .ip-scans h3 { margin: 1.25rem 0 0.5rem; font-size: var(--text-sm); }
 .ip-scans .card-head + h3 { margin-top: 0; }
+.rollup-facts h3 { margin: 1.25rem 0 0.5rem; }
+.rollup-facts h3:first-child { margin-top: 0; }
 .subnav { display: flex; width: fit-content; max-width: 100%; overflow-x: auto; margin-bottom: 1.25rem; }
 .subnav a { white-space: nowrap; }
 .ip-head .tile .value .sev { font-size: var(--text-lg); vertical-align: middle; }
@@ -174,6 +186,17 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
 /* Second-level tabs under the admin nav. */
 .subnav.subtabs { margin-top: -0.75rem; }
 .subnav.subtabs a { padding: 0.2rem 0.6rem; }
+.subnav.subtabs a[aria-current="page"] { font-weight: 600; }
+/* Phone widths (MIK-711): the six groups are a 3 × 2 grid and the
+   children wrap; nothing scrolls sideways, every target is 44 px tall. */
+@media (max-width: 640px) {
+  .subnav.groups { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; overflow: visible; }
+  .subnav.groups a { display: flex; align-items: center; justify-content: center; min-height: 2.75rem; }
+  .subnav.groups a:nth-child(3n) { border-right: 0; }
+  .subnav.groups a:nth-child(-n+3) { border-bottom: 1px solid var(--color-border); }
+  .subnav.subtabs { flex-wrap: wrap; overflow: visible; }
+  .subnav.subtabs a { display: inline-flex; align-items: center; min-height: 2.75rem; }
+}
 /* Links kinds: identity first, then software, split by a heavier rule. */
 .subnav.kinds { margin-top: -0.5rem; }
 .subnav.kinds a.group-start { border-left: 2px solid var(--color-border-strong); }
@@ -247,6 +270,12 @@ tr.diff td:first-child { box-shadow: inset 3px 0 0 var(--color-warning); }
 .probe-more > summary { cursor: pointer; width: fit-content; color: var(--color-fg-secondary); font-size: var(--text-xs); font-weight: 500; }
 .probe-more > summary:hover { color: var(--color-accent); }
 .probe-more[open] > summary { margin-bottom: 0.5rem; }
+.glossary > summary { cursor: pointer; width: fit-content; color: var(--color-fg-secondary); font-weight: 500; }
+.glossary[open] > summary { margin-bottom: 0.5rem; }
+abbr[title] { text-decoration: underline dotted; cursor: help; }
+a.gloss { color: inherit; text-decoration: underline dotted; }
+@media (max-width: 480px) { .glossary .kv { grid-template-columns: 1fr; } .glossary .kv dd + dt { margin-top: 0.4rem; } }
+.edge-legend { margin-top: 0.75rem; font-size: var(--text-xs); }
 .probe-members { list-style: none; margin: 0; padding: 0; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg-inset); }
 .probe-member { padding: 0.6rem 0.9rem; }
 .probe-member + .probe-member { border-top: 1px solid var(--color-border-subtle); }

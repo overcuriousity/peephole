@@ -2,23 +2,24 @@
 {% block title %}peephole — campaign #{{ c.row.num }}{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "campaigns" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("evidence", "campaigns") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
 <div class="meta">
   {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
+  <span class="campaign-strength{% if c.row.hard_edges == 0 %} soft{% endif %}">{{ self.strength() }} · <a href="/admin/evidence/links">what counts →</a></span>
   <span>{{ c.row.size }} IPs</span>
   <span>key <span class="mono">{{ c.row.key }}</span></span>
   <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>
   <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
   <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
 </div>
-<p class="muted"><a href="/admin/campaigns">← All campaigns</a></p></div></div>
+<p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div></div>
 <div class="stack">
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>
   {% for m in c.members %}<tr>
-    <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a></td>
+    <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a>{% if let Some(p) = props.get(m.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", m.ip) %}{% include "_ip_props.html" %}{% endif %}</td>
     <td>{% let country = m.country %}{% include "_country.html" %}</td>
     <td>{% if let Some(a) = m.asn %}{{ m.asn_org.as_deref().unwrap_or_default() }} <span class="mono muted">AS{{ a }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
     <td class="ts">{{ crate::admin::views::minute(m.first_seen.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(m.last_seen.as_str()) }}</td>
@@ -26,14 +27,14 @@
   </tr>{% endfor %}
   </tbody></table></div>
 </section>
-{% let campaign_key = c.row.key.clone() %}{% include "_campaign_graph.html" %}
+{% let campaign_key = c.row.key.clone() %}{% let small = c.members.len() <= 3 %}{% include "_campaign_graph.html" %}
 <section class="card">
-  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft · <a href="/admin/links">what counts →</a></span></div>
-  <div class="table-wrap"><table class="table"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
+  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft · <a href="/admin/evidence/links">what counts →</a></span></div>
+  <div class="table-wrap"><table class="table stack-narrow edges"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
   {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
-    <td>{{ v.kind_name }}</td>
-    <td>{% if v.hard() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
+    <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
+    <td class="why">{% if v.hard() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
       <ul>
         <li>{{ v.score_rule() }}</li>
         <li>{{ v.agreement_rule() }}</li>
@@ -45,16 +46,17 @@
       </tbody></table>
       <p class="muted">{{ v.rare_rule() }}{% if v.more_shapes() > 0 %} · {{ v.more_shapes() }} more shared, more common shapes not listed{% endif %}</p>
     </details>{% endif %}</td>
-    <td class="ts">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
+    <td class="ts first">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts last">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
+  {% include "_edge_legend.html" %}
 </section>
 <section class="card" data-section="artifacts">
   <div class="card-head"><h2>Artifacts</h2></div>
   <h3>Uploads</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Kind</th><th>File name</th><th>Type</th><th class="num">Size</th><th>SHA-256</th><th>Answered at</th><th>Content</th></tr></thead><tbody>
-  {% for u in uploads %}<tr><td class="mono"><a href="/admin/uploads/{{ u.uid|urlencode }}">{{ u.ts }}</a></td><td class="mono"><a href="/ip/{{ u.ip }}">{{ u.ip }}</a></td><td class="mono">{{ u.kind }}</td><td class="mono">{% if let Some(f) = u.filename %}{{ f }}{% endif %}</td><td class="mono">{{ u.sniffed_type }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="path">{{ u.answered_path }}</td>
-    <td>{% if u.held %}<a class="btn btn-sm" href="/admin/uploads/{{ u.uid|urlencode }}/content.zip">zip</a>{% else %}<span class="muted" title="{{ u.content_state }}">content not held</span>{% endif %}</td></tr>{% endfor %}
+  {% for u in uploads %}<tr><td class="mono"><a href="/admin/traps/uploads/{{ u.uid|urlencode }}">{{ u.ts }}</a></td><td class="mono"><a href="/ip/{{ u.ip }}">{{ u.ip }}</a></td><td class="mono">{{ u.kind }}</td><td class="mono">{% if let Some(f) = u.filename %}{{ f }}{% endif %}</td><td class="mono">{{ u.sniffed_type }}</td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="path">{{ u.answered_path }}</td>
+    <td>{% if u.held %}<a class="btn btn-sm" href="/admin/traps/uploads/{{ u.uid|urlencode }}/content.zip">zip</a>{% else %}<span class="muted" title="{{ u.content_state }}">content not held</span>{% endif %}</td></tr>{% endfor %}
   {% if uploads.is_empty() %}<tr><td colspan="9" class="empty">No file dropped by a member.</td></tr>{% endif %}
   </tbody></table></div>
   <h3>Webshell commands</h3>
@@ -73,7 +75,7 @@
   {% include "_events.html" %}
 </section>
 <section class="card">
-  <div class="card-head"><h2>Shapes</h2></div>
+  <div class="card-head"><h2 title="{{ crate::admin::glossary::help("path-shape") }}">Shapes</h2></div>
   {% for s in self.waves() %}{% if let Some(w) = s.wave %}<p data-wave><span class="badge badge-wave">wave</span> started probing a path no rule knows: <code>{{ s.text }}</code> ({{ w.ips }} IPs in {{ w.minutes() }} min, first seen {{ crate::admin::views::minute(s.first_seen.as_str()) }})</p>{% endif %}{% endfor %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Shape</th><th class="num">Members</th><th class="num">IPs in dataset</th></tr></thead><tbody>
   {% for s in shapes %}<tr><td class="mono">{{ s.text }}</td><td class="num">{{ s.members }}</td><td class="num">{{ s.df }}</td></tr>{% endfor %}
@@ -81,4 +83,5 @@
   </tbody></table></div>
 </section>
 </div>
+{% include "_fingerprint_glossary.html" %}
 {% endblock %}

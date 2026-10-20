@@ -88,11 +88,19 @@ pub struct PromptRow {
 pub struct AiDecoys {
     pub tools: Vec<Named>,
     pub models: Vec<Named>,
+    /// MCP methods: the answer after `decoy:mcp:` (our own names).
+    pub methods: Vec<Named>,
+    /// What `tools` / `models` leave out, summed and said what it holds
+    /// ("3 more, each from a single address").
+    pub tools_rest: Option<Named>,
+    pub models_rest: Option<Named>,
     pub apis: Vec<Named>,
     pub total: i64,
-    /// The largest count in `tools` / `models` (at least 1): bar scales.
+    /// The largest count in `tools` / `models` / `methods` (at least 1):
+    /// bar scales.
     pub tools_max: i64,
     pub models_max: i64,
+    pub methods_max: i64,
 }
 
 /// The session canaries served in the range, and the requests carrying them.
@@ -361,13 +369,13 @@ impl Store {
             "query_db",
             "fetch_url",
         ];
-        let mut q = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
-            "SELECT COALESCE(json_extract(r.decoy_in, '$.tool'), '') AS name, COUNT(*) AS count FROM requests r
+        let mut q = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(format!(
+            "SELECT lower(COALESCE(json_extract(r.decoy_in, '$.tool'), '')), COUNT(*), COUNT(DISTINCT r.ip_id) FROM requests r
              WHERE r.decoy_in IS NOT NULL AND r.answer = 'decoy:mcp:tools/call'{w} GROUP BY 1")));
         if let Some(m) = since {
             q = q.bind(m);
         }
-        let tools = fold_other(
+        let (tools, tools_rest) = fold(
             q.fetch_all(&self.read).await?,
             |n| OURS.contains(&n),
             usize::MAX,
@@ -378,22 +386,16 @@ impl Store {
         if let Some(m) = since {
             q = q.bind(m);
         }
-        let rows = q.fetch_all(&self.read).await?;
-        let shown = |m: &str, ips: i64| ips >= 2 && public_model(m);
-        let models = fold_other(
-            rows.iter()
-                .map(|(m, n, ips)| Named {
-                    name: if shown(m, *ips) {
-                        m.clone()
-                    } else {
-                        String::new()
-                    },
-                    count: *n,
-                })
-                .collect(),
-            |n| !n.is_empty(),
-            10,
-        );
+        let (models, models_rest) = fold(q.fetch_all(&self.read).await?, |_| false, 10);
+        let mut q = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
+            "SELECT substr(r.answer, 11) AS name, COUNT(*) AS count FROM requests r
+             WHERE r.decoy_in IS NOT NULL AND r.answer LIKE 'decoy:mcp:%'{w}
+             GROUP BY 1 ORDER BY 2 DESC, 1"
+        )));
+        if let Some(m) = since {
+            q = q.bind(m);
+        }
+        let methods = q.fetch_all(&self.read).await?;
         let mut q = sqlx::query_as::<_, Named>(sqlx::AssertSqlSafe(format!(
             "SELECT CASE WHEN r.answer LIKE 'decoy:mcp:%' THEN 'mcp' ELSE COALESCE(json_extract(r.decoy_in, '$.api'), 'other') END AS name,
                     COUNT(*) AS count FROM requests r
@@ -407,8 +409,12 @@ impl Store {
         Ok(Some(AiDecoys {
             tools_max: max(&tools),
             models_max: max(&models),
+            methods_max: max(&methods),
             tools,
             models,
+            methods,
+            tools_rest,
+            models_rest,
             apis,
             total,
         }))
@@ -425,32 +431,57 @@ pub fn public_model(m: &str) -> bool {
         })
 }
 
-/// Counts whose name passes `keep`, most first, at most `top`; the rest
-/// summed as "other" (last).
-fn fold_other(rows: Vec<Named>, keep: impl Fn(&str) -> bool, top: usize) -> Vec<Named> {
+/// `(name, requests, IPs)` rows, most requests first: a name shows when
+/// `ours` says so or at least two IPs sent it and it is a
+/// [`public_model`]-style name; at most `top` show. The rest is summed
+/// into one row that says what it holds.
+fn fold(
+    rows: Vec<(String, i64, i64)>,
+    ours: impl Fn(&str) -> bool,
+    top: usize,
+) -> (Vec<Named>, Option<Named>) {
     let mut kept: Vec<Named> = vec![];
-    let mut other = 0;
-    for n in rows {
-        if keep(&n.name) {
-            match kept.iter_mut().find(|k| k.name == n.name) {
-                Some(k) => k.count += n.count,
-                None => kept.push(n),
-            }
+    // Left out: from a single address, an odd name, past the top.
+    let (mut single, mut odd, mut past, mut count) = (0, 0, 0, 0);
+    for (name, n, ips) in rows {
+        if ours(&name) || (ips >= 2 && public_model(&name)) {
+            kept.push(Named { name, count: n });
         } else {
-            other += n.count;
+            if ips < 2 {
+                single += 1;
+            } else {
+                odd += 1;
+            }
+            count += n;
         }
     }
     kept.sort_by(|a, b| b.count.cmp(&a.count).then(a.name.cmp(&b.name)));
     for n in kept.drain(top.min(kept.len())..) {
-        other += n.count;
+        past += 1;
+        count += n.count;
     }
-    if other > 0 {
-        kept.push(Named {
-            name: "other".into(),
-            count: other,
-        });
+    let names = single + odd + past;
+    if names == 0 {
+        return (kept, None);
     }
-    kept
+    let name = if single == names {
+        match names {
+            1 => "1 more, from a single address".to_string(),
+            n => format!("{n} more, each from a single address"),
+        }
+    } else {
+        let parts: Vec<String> = [
+            (single, "from a single address".to_string()),
+            (odd, "not shown by name".to_string()),
+            (past, format!("below the top {top}")),
+        ]
+        .into_iter()
+        .filter(|(k, _)| *k > 0)
+        .map(|(k, why)| format!("{k} {why}"))
+        .collect();
+        format!("{names} more: {}", parts.join(", "))
+    };
+    (kept, Some(Named { name, count }))
 }
 
 /// The last user message of an LLM request body, first 200 characters.
@@ -875,6 +906,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fold_says_what_it_left_out() {
+        let r = |n: &str, c, ips| (n.to_string(), c, ips);
+        let (kept, rest) = fold(
+            vec![
+                r("a", 9, 3),
+                r("b", 5, 2),
+                r("c", 4, 2),
+                r("x y", 3, 5),
+                r("solo", 2, 1),
+            ],
+            |_| false,
+            2,
+        );
+        assert_eq!(
+            kept.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let rest = rest.unwrap();
+        assert_eq!(
+            (rest.name.as_str(), rest.count),
+            (
+                "3 more: 1 from a single address, 1 not shown by name, 1 below the top 2",
+                9
+            )
+        );
+        // Ours show from one address; nothing left out, no row.
+        let (kept, rest) = fold(vec![r("read_file", 1, 1)], |n| n == "read_file", 5);
+        assert_eq!(kept.len(), 1);
+        assert!(rest.is_none());
+    }
+
     #[tokio::test]
     async fn the_public_card_shows_released_aggregates_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -943,22 +1006,64 @@ mod tests {
             "",
         )
         .await;
+        // A foreign tool two addresses called shows by name.
+        for ip in ["8.8.8.8", "8.8.4.4"] {
+            req(
+                &s,
+                ip,
+                "/mcp",
+                "decoy:mcp:tools/call",
+                r#"{"tool":"Steal_Keys"}"#,
+                &[],
+                None,
+                "",
+            )
+            .await;
+        }
+        req(
+            &s,
+            "8.8.8.8",
+            "/mcp",
+            "decoy:mcp:initialize",
+            "{}",
+            &[],
+            None,
+            "",
+        )
+        .await;
         let a = s
             .ai_decoys_as(Range::All, Audience::Admin)
             .await
             .unwrap()
             .unwrap();
+        let pairs = |v: &[Named]| {
+            v.iter()
+                .map(|n| (n.name.clone(), n.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&a.models), [("llama3:70b".to_string(), 2)]);
+        let rest = a.models_rest.as_ref().unwrap();
         assert_eq!(
-            a.models
-                .iter()
-                .map(|n| (n.name.as_str(), n.count))
-                .collect::<Vec<_>>(),
-            [("llama3:70b", 2), ("other", 2)]
+            (rest.name.as_str(), rest.count),
+            ("2 more, each from a single address", 2)
         );
-        assert!(
-            a.tools.iter().any(|n| n.name == "run_command")
-                && a.tools.iter().any(|n| n.name == "other")
+        assert_eq!(
+            pairs(&a.tools),
+            [
+                ("steal_keys".to_string(), 2),
+                ("run_command".to_string(), 1)
+            ]
         );
+        let rest = a.tools_rest.as_ref().unwrap();
+        assert_eq!(
+            (rest.name.as_str(), rest.count),
+            ("1 more, from a single address", 1)
+        );
+        assert_eq!(
+            pairs(&a.methods),
+            [("tools/call".to_string(), 4), ("initialize".to_string(), 1)]
+        );
+        assert_eq!(a.methods_max, 4);
         // Nothing is released yet: the public sees no card.
         assert!(
             s.ai_decoys_as(Range::All, Audience::Public)

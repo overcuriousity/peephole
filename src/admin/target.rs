@@ -38,14 +38,23 @@ pub struct Target {
     pub probes: Vec<crate::admin::probes::GroupView>,
     /// The campaign (key, number) the address is a member of (admin only).
     pub campaign: Option<(String, i64)>,
-    /// The address carries an agent label (admin only).
-    pub agent: bool,
+    /// The property strip: shared reading, Tor, network kind, scanner or
+    /// fleet, agent traces (admin only; MIK-697).
+    pub props: Option<crate::store::evidence::IpProps>,
     /// The verdict over its evidence rows, where it says anything (admin
     /// only; node-local, never public).
     pub evidence: Option<crate::store::evidence::View>,
+    /// The shared reading (admin only; node-local, never public; nothing
+    /// for one operator's address).
+    pub sharing: Option<crate::store::evidence::SharingView>,
 }
 
 impl Target {
+    /// The shared reading's full sentence, for the strip's `title`.
+    pub fn sharing_sentence(&self) -> &str {
+        self.sharing.as_ref().map_or("", |s| s.sentence.as_str())
+    }
+
     /// The Timeline's link to older events, on the IP page only.
     pub fn older_link(&self) -> Option<String> {
         self.paged
@@ -223,19 +232,25 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
-    let (campaign, agent, evidence) = if authed {
+    let (campaign, props, evidence, sharing) = if authed {
         (
             state.store.campaign_of_ip(ip.id).await?,
-            state.store.ip_has_agent_label(ip.id).await?,
+            state
+                .store
+                .ip_props(&[ip.ip.as_str()])
+                .await?
+                .remove(&ip.ip),
             state.store.evidence_view(ip.id, ov.ip.is_tor_exit).await?,
+            state.store.sharing_view(ip.id, ov.ip.is_tor_exit).await?,
         )
     } else {
-        (None, false, None)
+        (None, None, None, None)
     };
     Ok(Some(Target {
         campaign,
-        agent,
+        props,
         evidence,
+        sharing,
         actions,
         probes,
         week_json: serde_json::to_string(&ov.week).unwrap_or_else(|_| "[]".into()),

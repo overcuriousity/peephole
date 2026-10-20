@@ -1,4 +1,4 @@
-//! Cluster › Credits: what this node holds, earned and spent, what every
+//! Market: the credits page; what this node holds, earned and spent, what every
 //! member holds in this node's view, and how the price comes about.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
@@ -18,14 +18,14 @@ use axum::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/cluster/credits";
+const PAGE: &str = "/admin/network/credits";
 /// Rows shown per list.
 const ROWS: usize = 100;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
-        .route("/admin/cluster/credits/send", post(send))
+        .route("/admin/market/send", post(send))
 }
 
 /// When a lot of `day` is gone, seen from `today`.
@@ -95,7 +95,8 @@ struct PriceView {
     /// "Success rates as of 14:00 UTC, next at 15:00."
     weights_as_of: String,
     capacity_per_hour: String,
-    utilization: String,
+    /// Scan capacity used, in %; None: there is no scan capacity.
+    utilization: Option<String>,
     /// What a probe costs here; None: this node does not probe.
     probe: Option<String>,
     /// What resolving a name for another member costs here.
@@ -166,7 +167,7 @@ fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
                     LevelCell {
                         price: match price {
                             Some(_) => show(e as Mc),
-                            None => "–".into(),
+                            None => "—".into(),
                         },
                         basis: match price {
                             Some(p) => format!(
@@ -194,8 +195,11 @@ struct GoodRow {
     label: String,
     /// This node's price; a dash when it does not offer the good.
     price: String,
-    /// "+12 %" over 24 hours, and `up`, `down` or `flat`.
+    /// The move of this node's price over 24 hours: "+12 %", and `up`,
+    /// `down` or `flat`; None when it has no price here.
     change: Option<(String, &'static str)>,
+    /// Without a price here, the move of the members' median: "+36 %".
+    median_change: Option<String>,
     /// Lowest–highest that members announce; empty: nobody does.
     band: String,
     /// Sold and offered by this node, per hour.
@@ -231,15 +235,38 @@ fn charted(p: &credits::history::Point) -> Option<i64> {
     p.own_mc.or(p.median_mc)
 }
 
-/// The move of `points`' price over the last 24 hours, in percent; None
-/// without a price a day back.
-fn change(points: &[credits::history::Point]) -> Option<f64> {
-    let last = points.iter().rev().find(|p| charted(p).is_some())?;
+/// Which price a move is of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Base {
+    /// This node's own price, shown next to it.
+    Own,
+    /// The members' median, for a good this node has no price for.
+    Median,
+}
+
+/// The move of `price` over the last 24 hours, in percent; None without
+/// a price a day back.
+fn moved(
+    points: &[credits::history::Point],
+    price: impl Fn(&credits::history::Point) -> Option<i64>,
+) -> Option<f64> {
+    let last = points.iter().rev().find(|p| price(p).is_some())?;
     let base = points
         .iter()
-        .find(|p| p.hour >= last.hour - 24 && charted(p).is_some())?;
-    let (a, b) = (charted(base)? as f64, charted(last)? as f64);
+        .find(|p| p.hour >= last.hour - 24 && price(p).is_some())?;
+    let (a, b) = (price(base)? as f64, price(last)? as f64);
     (base.hour < last.hour && a > 0.0).then(|| (b - a) / a * 100.0)
+}
+
+/// The price move a good's row shows: this node's when it has a price
+/// now, else the members' median's, so a move never stands beside a dash
+/// without naming its base.
+fn change(points: &[credits::history::Point]) -> Option<(f64, Base)> {
+    if points.last()?.own_mc.is_some() {
+        moved(points, |p| p.own_mc).map(|c| (c, Base::Own))
+    } else {
+        moved(points, |p| p.median_mc).map(|c| (c, Base::Median))
+    }
 }
 
 fn shown_change(pct: f64) -> (String, &'static str) {
@@ -485,7 +512,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             };
             ScannerRow {
                 name: name(&s.node),
-                announced: announced.map_or_else(|| "–".into(), |m| show(m as u64)),
+                announced: announced.map_or_else(|| "—".into(), |m| show(m as u64)),
                 reference: show(s.price_mc as u64),
                 paid: format!("{:.0} / {:.0}", s.paid, s.supply),
                 levels,
@@ -503,7 +530,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .unwrap_or_else(|| p.to_string())
     };
     let price = PriceView {
-        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
+        scan: t.sell_mc.map_or_else(|| "—".into(), |m| show(m as u64)),
         scan_paid: t
             .scanners
             .iter()
@@ -517,7 +544,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         scanners,
         weights_as_of,
         capacity_per_hour: format!("{:.0}", (t.capacity.per_day / 24.0).max(0.0)),
-        utilization: format!("{:.0}", t.capacity.utilization * 100.0),
+        utilization: t.capacity.utilization.map(|u| format!("{:.0}", u * 100.0)),
         probe: t.probe_mc.map(|m| show(m as u64)),
         resolve: show(t.resolve_mc as u64),
         rdns: show(t.rdns_mc as u64),
@@ -562,11 +589,17 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .map(|k| {
             let pts = &by_good[*k];
             let last = pts.last().expect("a key has points");
+            let moves = change(pts);
             GoodRow {
                 key: k.to_string(),
                 label: good_label(k),
                 price: mc(last.own_mc),
-                change: change(pts).map(shown_change),
+                change: moves
+                    .filter(|m| m.1 == Base::Own)
+                    .map(|m| shown_change(m.0)),
+                median_change: moves
+                    .filter(|m| m.1 == Base::Median)
+                    .map(|m| shown_change(m.0).0),
                 band: match (last.lo_mc, last.hi_mc) {
                     (Some(lo), Some(hi)) if lo == hi => show(lo.max(0) as u64),
                     (Some(lo), Some(hi)) => {
@@ -591,7 +624,8 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
     let scan_change = by_good
         .get(credits::price::SCAN)
         .and_then(|p| change(p))
-        .map(shown_change);
+        .filter(|m| m.1 == Base::Own)
+        .map(|m| shown_change(m.0));
     let market_json = serde_json::to_string(
         &by_good
             .into_iter()
@@ -654,7 +688,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .into_iter()
         .map(|r| TradeRow {
             good: good_label(r.good),
-            ask: r.ask_mc.map_or_else(|| "–".into(), show),
+            ask: r.ask_mc.map_or_else(|| "—".into(), show),
             bid: show(r.bid_mc),
             sold: r.tally.sold,
             bought: r.tally.bought,
@@ -778,14 +812,24 @@ mod tests {
             pt(80, Some(100), None),
             pt(100, Some(150), None),
         ];
-        assert_eq!(change(&p), Some(50.0));
+        assert_eq!(change(&p), Some((50.0, Base::Own)));
         assert_eq!(shown_change(50.0), ("+50 %".into(), "up"));
         assert_eq!(shown_change(-20.0), ("-20 %".into(), "down"));
         assert_eq!(shown_change(0.2).1, "flat");
         // The members' median stands in for a good this node does not offer.
         assert_eq!(
             change(&[pt(1, None, Some(200)), pt(2, None, Some(100))]),
-            Some(-50.0)
+            Some((-50.0, Base::Median))
+        );
+        // No price here now: never this node's old move beside a dash.
+        assert_eq!(
+            change(&[pt(1, Some(100), Some(200)), pt(2, None, Some(100))]),
+            Some((-50.0, Base::Median))
+        );
+        // A price here without one a day back: no move, not the median's.
+        assert_eq!(
+            change(&[pt(1, None, Some(200)), pt(2, Some(5), Some(100))]),
+            None
         );
         // One point, or none priced: no move.
         assert_eq!(change(&[pt(1, Some(5), None)]), None);
@@ -805,7 +849,7 @@ mod tests {
         let price = |r: usize, l: usize| cells[r][l].price.as_str();
         assert_eq!(
             (price(0, 3), price(1, 3), price(2, 3)),
-            ("0.04", "0.03", "–")
+            ("0.04", "0.03", "—")
         );
         assert!(cells[0][0].cheapest && !cells[1][0].cheapest);
         assert!(cells[1][3].cheapest && !cells[0][3].cheapest);
@@ -875,7 +919,7 @@ mod tests {
                 }],
                 weights_as_of: "Success rates as of 14:00 UTC, next at 15:00.".into(),
                 capacity_per_hour: "40".into(),
-                utilization: "12".into(),
+                utilization: Some("12".into()),
                 probe: None,
                 resolve: "0.01".into(),
                 rdns: "0.00".into(),
@@ -929,12 +973,20 @@ mod tests {
         assert!(!html.contains("destroyed"));
         assert!(html.contains("node-bravo") && html.contains("30 / 36"));
         assert!(html.contains("<b>0.05</b>"), "cheapest at L1 in bold");
+        // The scanner price column says what it is (MIK-710).
+        assert!(html.contains(">Our price per scan</th>"), "{html}");
+        assert!(
+            html.contains("<p class=\"muted small\">Our price per scan: what this node reckons")
+        );
+        assert!(!html.contains("Reference here"));
+        assert!(html.contains("it pays at most 1.25 times this figure"));
+        assert!(!html.contains("protocol 9"), "no protocol jargon");
         assert!(html.contains(">0.10<"), "L2: 0.05 at half the success rate");
         assert!(html.contains("per delivered result"));
         assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));
         assert!(html.contains("30 paid of 36/h"));
         let mut page = page;
-        page.price.scan = "–".into();
+        page.price.scan = "—".into();
         assert!(page.render().unwrap().contains("not a scanner"));
         page.members[0].qualifies = false;
         page.price.relay = None;
@@ -958,5 +1010,47 @@ mod tests {
         assert!(
             html.contains("<td>node-charlie</td><td>14:05 UTC</td><td class=\"num\">0.12</td>")
         );
+        assert!(html.contains("12<span class=\"of\"> %</span></div><svg class=\"meter\""));
+        assert!(html.contains("40 scans an hour possible"));
+
+        // A node without scan capacity: a dash, no meter, no 100 %, and
+        // no move beside its dashes.
+        let row = |key: &str, price: &str, change, median_change| GoodRow {
+            key: key.into(),
+            label: good_label(key),
+            price: price.into(),
+            change,
+            median_change,
+            band: "0.04–0.06".into(),
+            demand: "0.0".into(),
+            supply: "0.0".into(),
+            cluster_demand: "\u{2014}".into(),
+            cluster_supply: "\u{2014}".into(),
+            spark: "[]".into(),
+        };
+        page.price.utilization = None;
+        page.price.capacity_per_hour = "0".into();
+        page.scan_change = Some(("+36 %".into(), "up"));
+        page.goods = vec![
+            row("scan", "\u{2014}", None, Some("+36 %".into())),
+            row("rdns", "0.01", Some(("+839 %".into(), "up")), None),
+        ];
+        let html = page.render().unwrap();
+        assert!(html.contains("<div class=\"value\">—</div><div class=\"hint\">not a scanner"));
+        assert!(html.contains("no scan capacity here"));
+        assert!(
+            !html.contains("class=\"meter\""),
+            "no meter without capacity"
+        );
+        assert!(!html.contains("<span class=\"of\"> %</span>"));
+        assert!(!html.contains("scans an hour possible"));
+        assert!(!html.contains(">+36 %<"), "no badge beside a dash");
+        assert_eq!(html.matches("class=\"delta-chip\"").count(), 1);
+        // The members' median move names its base; this node's own move
+        // sits next to its price.
+        assert!(html.contains("<span class=\"muted small\">members' median +36 %</span>"));
+        assert!(html.contains(
+            "<td class=\"num\">0.01</td>\n      <td class=\"num\"><span class=\"delta-chip\" data-trend=\"up\">+839 %</span>"
+        ));
     }
 }

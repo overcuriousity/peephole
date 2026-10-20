@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — cluster ownership{% endblock %}
 {% block content %}
-{% let sub = "cluster" %}{% include "_admin_nav.html" %}
-{% let subtab = "ownership" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "ownership") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Ownership</h1><p class="muted">One key claims all your nodes; nodes that keep it manage the others.</p></div></div>
 <div class="stack">
 {% if let Some(k) = shown_key %}
@@ -11,7 +10,7 @@
   <pre class="panel mono break" data-copy>{{ k }}</pre>
   <h3>Next, on each of your other nodes</h3>
   <ol>
-    <li>Open its admin site, Cluster › Ownership, and paste this key under <b>Already have a key?</b> (on the command line: <code>peephole owner claim</code>).</li>
+    <li>Open its admin site, Network › Ownership, and paste this key under <b>Already have a key?</b> (on the command line: <code>peephole owner claim</code>).</li>
     <li>Choose there whether that node also manages the others. Keep the key on as few nodes as you need: a node that keeps it can change all of them.</li>
     <li>Claimed nodes appear under <b>My nodes</b> here within a few minutes.</li>
   </ol>
@@ -95,7 +94,7 @@
   <div class="table-wrap"><table>
     <thead><tr><th>Node</th><th>Roles</th><th>Version</th><th class="num">Credits</th><th>Seen</th></tr></thead>
     <tbody>{% for n in nodes %}<tr>
-      <td><a href="/admin/cluster/node/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span>{% if n.is_self %} <span class="muted small">this node</span>{% endif %}</td>
+      <td><a href="/admin/network/members/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span>{% if n.is_self %} <span class="muted small">this node</span>{% endif %}</td>
       <td>{{ n.roles }}</td><td class="mono">{{ n.version }}</td><td class="num">{{ n.credits }}</td><td>{{ n.seen }}</td>
     </tr>{% endfor %}</tbody>
   </table></div>
@@ -104,8 +103,8 @@
 {% if !others.is_empty() %}
 <section class="card">
   <div class="card-head"><h2>Other members</h2><span class="muted">not claimed with this key</span></div>
-  <p class="muted">Claim it on that node (Cluster › Ownership).</p>
-  <ul>{% for n in others %}<li><a href="/admin/cluster/node/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span></li>{% endfor %}</ul>
+  <p class="muted">Claim it on that node (Network › Ownership).</p>
+  <ul>{% for n in others %}<li><a href="/admin/network/members/{{ n.key }}"><b>{{ n.name }}</b></a> <span class="mono muted">{{ n.short }}</span></li>{% endfor %}</ul>
 </section>
 {% endif %}
 {% endif %}

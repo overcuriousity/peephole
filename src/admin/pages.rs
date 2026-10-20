@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/analytics", get(analytics))
+        .route("/admin/overview/analytics", get(analytics))
         .route("/admin/requests/{id}", get(request_page))
         .route("/admin/requests/{id}/delete", post(request_delete))
         .route("/admin/ips/{addr}/delete", post(ip_delete))
         .route("/admin/requests/bulk-delete", post(bulk_delete_requests))
         .route("/admin/ips/bulk-delete", post(bulk_delete_ips))
-        .route("/admin/inbox", get(inbox))
+        .route("/admin/system/inbox", get(inbox))
         .route("/admin/claims/{id}/delete", post(claim_delete))
 }
 
@@ -133,7 +133,7 @@ impl AnalyticsPage {
     /// A scan level (`level 2`) in the scans history.
     fn level_href(&self, name: &str) -> String {
         format!(
-            "/admin/scans?level={}#history",
+            "/admin/investigate/scans?level={}#history",
             name.trim_start_matches("level ")
         )
     }
@@ -343,7 +343,10 @@ async fn claim_delete(
     if out.deleted + out.hidden == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(redirect_with_notice("/admin/inbox", &deleted_msg(out)))
+    Ok(redirect_with_notice(
+        "/admin/system/inbox",
+        &deleted_msg(out),
+    ))
 }
 
 /// Parsed bulk form: checked row keys, or "everything matching the filter".
@@ -490,7 +493,7 @@ mod delete_notice_tests {
         let value = c.split(';').next().unwrap();
         assert!(!value.contains(' '), "cookie value must be encoded: {c}");
         assert!(c.contains("hid+3+record"), "{c}");
-        let r = redirect_with_error("/admin/cluster", &"é".repeat(2000));
+        let r = redirect_with_error("/admin/network/members", &"é".repeat(2000));
         let c = r.headers()[axum::http::header::SET_COOKIE]
             .to_str()
             .unwrap();
@@ -524,27 +527,32 @@ mod short_strings_tests {
         };
         let cases: [(&str, &[&str], &[&str]); 11] = [
             (
-                "/admin/links",
+                "/admin/evidence/links",
                 &[
                     "mean one operator; JA4, JA4H, HASSH and JA4X the same software; favicon, JARM, page and 404 hashes the same product.",
                     "<option value=\"1\">shared</option>",
+                    // One glossary for every fingerprint (MIK-710).
+                    "<summary>What the fingerprints mean</summary>",
+                    "<dt>JARM</dt><dd class=\"plain\">JARM (Salesforce): how the source",
+                    "<dt>Path shape</dt><dd class=\"plain\">A request path with the parts",
+                    "<th title=\"A hash of what the trap page",
                 ],
                 &["point to one operator", "two or more IPs</option>"],
             ),
             (
-                "/admin/links/canaries",
+                "/admin/evidence/canaries",
                 &[
                     "Credentials served in decoys and their later uses; the period is when they were served.",
                 ],
                 &["the requests that used them again"],
             ),
             (
-                "/admin/uploads",
+                "/admin/traps/uploads",
                 &["Files dropped on the trap, kept by hash; download only as a zip (password"],
                 &["never served, run, shown or unpacked"],
             ),
             (
-                "/admin/decoys",
+                "/admin/traps/mcp",
                 &[
                     "What the fake MCP server and LLM gateway drew out.</p>",
                     "<div class=\"hint\">distinct sessions</div>",
@@ -564,7 +572,7 @@ mod short_strings_tests {
                 &["not an address, network"],
             ),
             (
-                "/admin/lookup",
+                "/admin/investigate/lookup",
                 &[
                     "What the cluster knows about an address and what providers say now.</p>",
                     "placeholder=\"IP, host, URL or a list\"",
@@ -572,12 +580,17 @@ mod short_strings_tests {
                 &["every reachable provider", "placeholder=\"203.0.113.7"],
             ),
             (
-                "/admin/analytics",
-                &["<span class=\"muted\">direct HTTP/1 only</span>"],
+                "/admin/overview/analytics",
+                &[
+                    "<span class=\"muted\">direct HTTP/1 only</span>",
+                    "<h2><a class=\"gloss\" href=\"#glossary\" title=\"JA4 (FoxIO): the TLS ClientHello the source sent us",
+                    "<h2><a class=\"gloss\" href=\"#glossary\" title=\"HASSH-server: a hash of the algorithm lists",
+                    "<summary>What the fingerprints mean</summary>",
+                ],
                 &["not through an HTTP proxy"],
             ),
             (
-                "/admin/scans",
+                "/admin/investigate/scans",
                 &["<h1>Scans</h1></div>"],
                 &["Pace, the live queue"],
             ),
@@ -658,6 +671,7 @@ mod short_strings_tests {
         assert!(!html.contains("ssh2-enum-algos"), "{html}");
 
         let name = |source: &str, agreed: bool| crate::store::probes::NameRow {
+            id: 1,
             name: "host.example".into(),
             source: source.into(),
             first_seen: "2026-10-01 00:00:00".into(),

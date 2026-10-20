@@ -4,10 +4,11 @@
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
-use crate::admin::public::{IntelFact, urlencode};
+use crate::admin::public::{IntelFact, page_props, urlencode};
 use crate::admin::views::Chrome;
-use crate::store::asn::{Rollup, RollupKey};
+use crate::store::asn::{AsnFacts, Rollup, RollupKey};
 use crate::store::browse::{IpFilter, IpSummary};
+use crate::store::evidence::{AsSource, AsType, Catalogue, IpProps};
 use askama::Template;
 use axum::{
     Router,
@@ -15,6 +16,7 @@ use axum::{
     response::Html,
     routing::get,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// IPs listed on the page; the rest are on `/ips?asn=N` (`/ips?net=H`).
@@ -46,12 +48,18 @@ struct AsnPage {
     asn: u32,
     /// `None`: no IP recorded in the network.
     r: Option<Rollup>,
+    facts: AsnFacts,
+    /// The regional registry serving the busiest IP; `None`: not known.
+    registry: Option<&'static str>,
+    /// The AS type and where it comes from; `None`: not classified.
+    kind: Option<String>,
     ips: Vec<IpSummary>,
     /// `_rollup.html`: the network's `/ips` filter.
     base: String,
     /// `_ip_row.html`: no bulk delete here; the bar scale.
     can_delete: bool,
     count_max: i64,
+    props: HashMap<String, IpProps>,
 }
 
 #[derive(Template)]
@@ -66,6 +74,48 @@ struct NetPage {
     base: String,
     can_delete: bool,
     count_max: i64,
+    props: HashMap<String, IpProps>,
+}
+
+/// The regional registry whose RDAP service the built-in IANA bootstrap
+/// file gives for `ip`: a local read, no lookup.
+pub fn registry(ip: &str) -> Option<&'static str> {
+    static BOOT: std::sync::LazyLock<crate::intel::rdap::Bootstrap> =
+        std::sync::LazyLock::new(crate::intel::rdap::Bootstrap::builtin);
+    let base = &BOOT.service_for(&ip.parse().ok()?)?.base;
+    [
+        ("afrinic", "AFRINIC"),
+        ("apnic", "APNIC"),
+        ("arin", "ARIN"),
+        ("lacnic", "LACNIC"),
+        ("ripe", "RIPE NCC"),
+    ]
+    .into_iter()
+    .find(|(k, _)| base.contains(k))
+    .map(|(_, name)| name)
+}
+
+/// The AS type of `asn` as the IP page's evidence reads it, with its
+/// source (docs/detection.md, "AS type").
+pub fn as_kind(asn: i64) -> Option<String> {
+    let cat = Catalogue::current();
+    let c = cat.as_types.get(&asn)?;
+    let kind = match c.kind {
+        AsType::Hosting => "hosting",
+        AsType::Cloud => "cloud",
+        AsType::Scanner => "scanner",
+        AsType::Fixed => "fixed line",
+        AsType::Mobile => "mobile",
+    };
+    let source = match c.source {
+        AsSource::List => "the bundled AS-type list".to_string(),
+        AsSource::X4b => "the X4BNet datacenter list".to_string(),
+        AsSource::Supplement => match &c.reason {
+            Some(r) => format!("our own classification: {r}"),
+            None => "our own classification".to_string(),
+        },
+    };
+    Some(format!("{kind} ({source})"))
 }
 
 /// The network's busiest IPs, when it has any.
@@ -92,8 +142,14 @@ async fn asn(
         ..Default::default()
     };
     let ips = top_ips(&st, &r, f).await?;
+    let props = page_props(&st, true, ips.iter().map(|i| i.ip.as_str())).await?;
+    let facts = st.store.asn_facts(asn.into()).await?;
     render(&AsnPage {
+        props,
         chrome: Chrome::new(true, "ips"),
+        registry: ips.first().and_then(|i| registry(&i.ip)),
+        kind: as_kind(asn.into()),
+        facts,
         count_max: ips.iter().map(|i| i.request_count).max().unwrap_or(0),
         base: format!("asn={asn}"),
         asn,
@@ -134,7 +190,9 @@ async fn net(
         },
         None => vec![],
     };
+    let props = page_props(&st, true, ips.iter().map(|i| i.ip.as_str())).await?;
     render(&NetPage {
+        props,
         chrome: Chrome::new(true, "ips"),
         count_max: ips.iter().map(|i| i.request_count).max().unwrap_or(0),
         base: format!("net={}", urlencode(&handle)),
@@ -166,16 +224,30 @@ mod tests {
         assert_eq!(st, StatusCode::SEE_OTHER);
         assert_eq!(h["location"], "/login");
 
+        sqlx::query(
+            "UPDATE ip_intel SET data_json = json_set(data_json, '$.abuse', 'abuse@example.net')
+             WHERE ip = '203.0.113.1'",
+        )
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
         let (st, _, html) = send(&app, get("/admin/asn/64500"), Body::empty()).await;
         assert_eq!(st, StatusCode::OK);
         for want in [
             "<h1>Example Net <span class=\"mono\">AS64500</span></h1>",
+            "<dt>Abuse contact</dt><dd class=\"plain\"><span class=\"mono\">abuse@example.net</span> <span class=\"muted\">×1</span></dd>",
+            "<dt>Registrant</dt><dd class=\"plain\">Example Registrant <span class=\"muted\">×2</span></dd>",
+            "href=\"/ips?asn=64500&amp;country=DE\">DE</a> <span class=\"muted\">×2</span>",
+            "192.0.2.0 - 192.0.2.255 <span class=\"muted\">×2</span>",
+            "href=\"/admin/net/NET-1\">Example RDAP · <span class=\"mono\">NET-1</span></a>",
+            "<dt>Registry</dt><dd class=\"plain\">APNIC</dd>",
+            "<dt>Network kind</dt><dd class=\"plain\"><span class=\"muted\">not classified</span></dd>",
             "<span class=\"label\">IPs</span><div class=\"value\">2</div>",
             "<span class=\"label\">Requests</span><div class=\"value\">3</div>",
             "href=\"/ips?asn=64500&amp;label=wp\">wp <span class=\"muted\">×2</span>",
             "href=\"/ips?asn=64500&amp;label=env\"",
             "href=\"/ips?asn=64500&amp;port=22\"",
-            "href=\"/admin/campaigns/203.0.113.1\">#7 <span class=\"muted\">×2</span>",
+            "href=\"/admin/evidence/campaigns/203.0.113.1\">#7 <span class=\"muted\">×2</span>",
             "href=\"/ip/203.0.113.1\"",
             "href=\"/ip/203.0.113.2\"",
             "<a href=\"/ips?asn=64500\">All IPs →</a>",
@@ -185,6 +257,28 @@ mod tests {
         assert!(!html.contains("198.51.100.1"), "another network: {html}");
         assert!(!html.contains("port=23"), "a closed port: {html}");
         assert!(!html.contains("bulk-delete"), "{html}");
+        assert_eq!(super::registry("193.0.0.1"), Some("RIPE NCC"));
+        assert_eq!(super::registry("not an ip"), None);
+        let cur = crate::store::evidence::Catalogue::current();
+        let x4b = cur
+            .as_types
+            .iter()
+            .find(|(_, c)| c.source == crate::store::evidence::AsSource::X4b)
+            .map(|(a, _)| *a);
+        if let Some(a) = x4b {
+            assert_eq!(
+                super::as_kind(a).as_deref(),
+                Some("hosting (the X4BNet datacenter list)")
+            );
+        }
+        assert_eq!(super::as_kind(64500), None);
+
+        // Missing data reads "not known", not hidden.
+        let (_, _, other) = send(&app, get("/admin/asn/64501"), Body::empty()).await;
+        assert!(
+            other.contains("<dt>Abuse contact</dt><dd class=\"plain\"><span class=\"muted\">not known</span></dd>"),
+            "{other}"
+        );
 
         // A network with no recorded IP: the page, empty.
         let (st, _, empty) = send(&app, get("/admin/asn/64999"), Body::empty()).await;
@@ -222,7 +316,7 @@ mod tests {
             "<span class=\"label\">Requests</span><div class=\"value\">3</div>",
             "href=\"/ips?net=NET-1&amp;label=wp\">wp <span class=\"muted\">×2</span>",
             "href=\"/ips?net=NET-1&amp;port=22\"",
-            "href=\"/admin/campaigns/203.0.113.1\">#7 <span class=\"muted\">×2</span>",
+            "href=\"/admin/evidence/campaigns/203.0.113.1\">#7 <span class=\"muted\">×2</span>",
             "href=\"/ip/203.0.113.1\"",
             "href=\"/ip/203.0.113.2\"",
             "<a href=\"/ips?net=NET-1\">All IPs →</a>",

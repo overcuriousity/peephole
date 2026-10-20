@@ -1,7 +1,7 @@
 {# Everything the dataset holds on one address (admin::target): the IP page and the lookup result both render it. #}
 {% if !t.intel.is_empty() %}
 <section class="card" id="intel" data-section="intel">
-  <div class="card-head"><h2>Intelligence</h2>{% if t.admin.is_some() %}<a href="/admin/lookup?ip={{ t.ov.ip.ip }}">look up now →</a>{% endif %}</div>
+  <div class="card-head"><h2>Intelligence</h2>{% if t.admin.is_some() %}<a href="/admin/investigate/lookup?ip={{ t.ov.ip.ip }}">look up now →</a>{% endif %}</div>
   {% let signals = t.signals() %}{% include "_signals.html" %}
   <div class="intel-grid">
   {% for c in t.intel %}{% if c.newest.is_some() %}{% let badge = "" %}{% let verb = "checked" %}{% let again = "" %}{% let again_ip = "" %}{% let again_price = String::new() %}{% include "_intel_card.html" %}{% endif %}{% endfor %}
@@ -16,6 +16,7 @@
 {% if t.admin.is_some() && !t.probes.is_empty() %}{% include "_probes.html" %}{% endif %}
 
 {% if let Some(ev) = t.evidence %}{% include "_evidence.html" %}{% endif %}
+{% if let Some(sh) = t.sharing %}{% include "_sharing.html" %}{% endif %}
 
 {% if let Some(adm) = t.admin %}
 <section class="card ip-scans" id="scans" data-section="scans"{% if t.scans_waiting() %} data-scans-src="/admin/api/scan-jobs?ip={{ t.ov.ip.ip|urlencode }}" data-scans-states="{{ t.scan_states() }}"{% endif %}>
@@ -29,8 +30,8 @@
   {% endif %}
   {% if adm.scans.is_empty() %}<p class="muted">{% if adm.jobs.is_empty() %}Never queued for a counter-scan.{% else %}No completed scan yet.{% endif %}</p>{% endif %}
   {% for sc in adm.scans %}
-    <h3 id="scan-{{ sc.s.id }}">Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {% if let Some(os) = sc.s.os_guess %}<a href="{{ crate::admin::views::pivot_href("os", os.as_str()) }}">{{ os }}</a>{% else %}OS unknown{% endif %} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
-      {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/scans/{{ sc.s.id }}">details</a> · <a href="/admin/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
+    <h3 id="scan-{{ sc.s.id }}"><span class="mono">job #{{ sc.s.job_id }} · scan #{{ sc.s.id }}</span> · Level {{ sc.s.level }}{% if sc.s.audit_of.is_some() %} <span class="badge badge-status" data-status="queued">audit{% if let Some(r) = sc.s.audit_result %}: {{ r }}{% endif %}</span>{% endif %} · <span class="mono">{{ sc.s.finished_at.as_deref().unwrap_or("unfinished") }}</span> · {% if let Some(os) = sc.s.os_guess %}<a href="{{ crate::admin::views::pivot_href("os", os.as_str()) }}">{{ os }}</a>{% else %}OS unknown{% endif %} · {{ sc.s.open_ports }} open{% if !sc.serves.is_empty() %} · {{ sc.serves }}{% endif %}{% if !sc.host.is_empty() %} · {{ sc.host }}{% endif %}
+      {% if let Some(n) = sc.s.node %}· <span class="muted">{{ n }}</span> {% endif %}· <a href="/admin/investigate/scans/{{ sc.s.id }}">details</a> · <a href="/admin/investigate/scans/{{ sc.s.id }}/xml">raw XML</a></h3>
     {% let ports = sc.ports %}{% include "_ports.html" %}
   {% endfor %}
 </section>
@@ -45,14 +46,14 @@
 {% if canaries || decoys || !adm.uploads.is_empty() || !adm.webshell.is_empty() %}
 <section class="card" id="drops" data-section="drops">
   <div class="card-head"><h2>Lures</h2></div>
-  {% if canaries %}<p><b>Canaries</b>{% if adm.canary_links.0 > 0 %} · credentials harvested here used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}{% endif %}{% if adm.canary_links.1 > 0 %} · used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}{% endif %} · <a href="/admin/links/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">the reuses →</a></p>{% endif %}
+  {% if canaries %}<p><b>Canaries</b>{% if adm.canary_links.0 > 0 %} · credentials harvested here used by {{ adm.canary_links.0 }} other IP{% if adm.canary_links.0 != 1 %}s{% endif %}{% endif %}{% if adm.canary_links.1 > 0 %} · used credentials harvested by {{ adm.canary_links.1 }} other IP{% if adm.canary_links.1 != 1 %}s{% endif %}{% endif %} · <a href="/admin/evidence/canaries?range=all&amp;ip={{ t.ov.ip.ip }}">the reuses →</a></p>{% endif %}
   {% if decoys %}<p><b>Decoys</b> · MCP sessions {{ adm.decoys.0 }} · tool calls {{ adm.decoys.1 }} · LLM calls {{ adm.decoys.2 }} · <a href="/requests?ip={{ t.ov.ip.ip|urlencode }}&amp;answer=decoy">the decoy requests →</a></p>{% endif %}
   {% let (ups, more_ups) = adm.uploads_shown() %}{% if !ups.is_empty() %}
   <h3>Uploads</h3>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>SHA-256</th><th class="num">Size</th><th>Kind</th><th>Type</th><th></th></tr></thead><tbody>
-  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
+  {% for u in ups %}<tr><td class="mono">{{ u.ts }}</td><td class="mono"><a href="{{ crate::admin::views::pivot_href("sha256", u.hash().as_str()) }}" title="{{ u.hash() }}">{{ u.hash()[..12] }}</a></td><td class="num">{{ crate::admin::views::thousands(u.size) }}</td><td class="mono">{{ u.kind }}</td><td class="mono">{{ u.sniffed_type }}</td><td><a class="btn btn-sm btn-ghost" href="/admin/traps/uploads/{{ u.uid|urlencode }}">upload</a></td></tr>{% endfor %}
   </tbody></table></div>
-  {% if more_ups %}<p><a href="/admin/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
+  {% if more_ups %}<p><a href="/admin/traps/uploads?ip={{ t.ov.ip.ip|urlencode }}">All its uploads →</a></p>{% endif %}
   {% endif %}
   {% let (cmds, more_cmds) = adm.webshell_shown() %}{% if !cmds.is_empty() %}
   <h3>Webshell commands</h3>
@@ -117,9 +118,10 @@
 </section>
 
 {% if let Some(adm) = t.admin %}
+{% include "_fingerprint_glossary.html" %}
 {% if !adm.fingerprints.is_empty() %}
 <section class="card" data-section="fingerprints">
-  <div class="card-head"><h2>Fingerprints</h2></div>
+  <div class="card-head"><h2 title="{{ crate::admin::glossary::help("fp") }}">Browser fingerprints</h2></div>
   {% for f in adm.fingerprints %}
     <p><a class="mono" href="{{ crate::admin::views::link_href("fp", f.hash.as_str()) }}">{{ f.hash }}</a> ×{{ f.count }} — seen from <b>{{ f.other_ips }}</b> other IPs
       {% for v in f.visitor_ids %}<span class="badge badge-label">visitor {{ v }}</span>{% endfor %}</p>

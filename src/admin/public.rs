@@ -7,6 +7,7 @@ use crate::admin::{AdminState, RangeQuery};
 use crate::store::browse::{
     Audience, IpFilter, IpSummary, Page, RequestFilter, RequestListRow, page_num,
 };
+use crate::store::evidence::IpProps;
 use crate::store::inspect::{FpClaimRow, FpSummary, IpIntelRow, PortRow, ScanSummary};
 use crate::store::stats::{MapCounts, Range, Stats, intel_stale};
 use askama::Template;
@@ -17,6 +18,7 @@ use axum::{
     response::{Html, IntoResponse, Json, Response},
     routing::get,
 };
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -335,6 +337,22 @@ struct IpsPage {
     api_providers: Vec<(&'static str, &'static str)>,
     /// Largest request count on this page, for the bar widths.
     count_max: i64,
+    /// The property strip of each address on the page (admin only).
+    props: HashMap<String, IpProps>,
+}
+
+/// The property strips of the addresses on a page, in one query; empty
+/// without a session, so no public page carries one (MIK-697).
+pub(crate) async fn page_props<'a>(
+    state: &AdminState,
+    authed: bool,
+    ips: impl IntoIterator<Item = &'a str>,
+) -> AppResult<HashMap<String, IpProps>> {
+    if !authed {
+        return Ok(HashMap::new());
+    }
+    let ips: Vec<&str> = ips.into_iter().collect();
+    Ok(state.store.ip_props(&ips).await?)
 }
 
 /// Deepest IP-directory page anonymous visitors can open; with a session
@@ -386,6 +404,7 @@ pub(crate) fn public_ip_filter(f: &IpFilter, show_labels: bool) -> IpFilter {
         net: None,
         net_name: None,
         evidence: None,
+        reading: None,
     }
 }
 
@@ -410,6 +429,7 @@ fn ip_pairs(f: &IpFilter) -> Vec<(&'static str, Option<String>)> {
         ("net", f.net.clone()),
         ("net_name", f.net_name.clone()),
         ("evidence", f.evidence.clone()),
+        ("reading", f.reading.clone()),
     ]
 }
 
@@ -434,6 +454,7 @@ fn request_pairs(f: &RequestFilter) -> Vec<(&'static str, Option<String>)> {
         ("ja4", f.ja4.clone()),
         ("ua", f.ua.clone()),
         ("cmd", f.cmd.clone()),
+        ("persona", f.persona.clone()),
         ("method", f.method.clone()),
         ("transport", f.transport.clone()),
         ("answer", f.answer.clone()),
@@ -480,6 +501,19 @@ pub(crate) fn chips(path: &str, pairs: &[(&str, Option<String>)]) -> Vec<Chip> {
         .collect()
 }
 
+/// The reading chip shows the state's label, not its key.
+fn reading_chip(mut chips: Vec<Chip>) -> Vec<Chip> {
+    for c in chips
+        .iter_mut()
+        .filter(|c| c.label == filter_label("reading"))
+    {
+        if let Some(st) = crate::store::evidence::Sharing::from_key(c.value.trim()) {
+            c.value = st.label().to_string();
+        }
+    }
+    chips
+}
+
 /// A query parameter as people read it.
 fn filter_label(k: &str) -> &'static str {
     match k {
@@ -498,6 +532,7 @@ fn filter_label(k: &str) -> &'static str {
         "ja4h" => "JA4H",
         "ua" => "User agent",
         "cmd" => "Webshell command",
+        "persona" => "Persona",
         "method" => "Method",
         "transport" => "Transport",
         "answer" => "Answer",
@@ -514,6 +549,7 @@ fn filter_label(k: &str) -> &'static str {
         "net" => "Network",
         "net_name" => "Network name",
         "evidence" => "Evidence",
+        "reading" => "Address sharing",
         _ => "Filter",
     }
 }
@@ -560,12 +596,14 @@ async fn ips(
         .map(|i| i.request_count)
         .max()
         .unwrap_or(0);
+    let props = page_props(&state, authed, page.items.iter().map(|i| i.ip.as_str())).await?;
     render(&IpsPage {
+        props,
         chrome: Chrome::new(authed, "ips"),
         count_max,
         qs: ip_qs(&f),
         hidden: hidden_fields(ip_pairs(&f)),
-        chips: chips("/ips", &ip_pairs(&f)),
+        chips: reading_chip(chips("/ips", &ip_pairs(&f))),
         f,
         page,
         bulk_total,
@@ -708,6 +746,8 @@ struct RequestsPage {
     /// Cluster member names for the admin-only node filter (empty
     /// standalone or for the public).
     nodes: Vec<String>,
+    /// The property strip of each address on the page.
+    props: HashMap<String, IpProps>,
 }
 
 /// Admin-only: the full request search (timestamps, query strings, bodies,
@@ -726,7 +766,9 @@ async fn requests(
         .into_iter()
         .map(|m| m.name)
         .collect();
+    let props = page_props(&state, true, page.items.iter().map(|r| r.ip.as_str())).await?;
     render(&RequestsPage {
+        props,
         chrome: Chrome::new(true, "requests"),
         chips: chips("/requests", &request_pairs(&f)),
         hidden: hidden_fields(request_pairs(&f)),
@@ -2027,7 +2069,7 @@ show_labels = {show_labels}
             html.contains(r#"href="/requests?path=%2Fwp-login.php">/wp-login.php</a>"#),
             "{html}"
         );
-        let item = "/admin/links/ua/Mozilla%2F5.0%20%28X11%29";
+        let item = "/admin/evidence/links/ua/Mozilla%2F5.0%20%28X11%29";
         assert!(
             html.contains(&format!(r#"href="{item}">Mozilla/5.0 (X11)</a>"#)),
             "{html}"
@@ -2042,9 +2084,14 @@ show_labels = {show_labels}
             "{page}"
         );
         // One IP: listed only with `shared=0`, under its own tab.
-        let (_, index) = get_with(&app, "/admin/links?kind=ua", Some(&cookie)).await;
+        let (_, index) = get_with(&app, "/admin/evidence/links?kind=ua", Some(&cookie)).await;
         assert!(!index.contains(item), "{index}");
-        let (status, index) = get_with(&app, "/admin/links?kind=ua&shared=0", Some(&cookie)).await;
+        let (status, index) = get_with(
+            &app,
+            "/admin/evidence/links?kind=ua&shared=0",
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(
             index.contains(item) && index.contains(" aria-current=\"true\">User agent</a>"),
@@ -2133,10 +2180,14 @@ show_labels = {show_labels}
         .unwrap();
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
-        let (status, html) =
-            get_with(&app, &format!("/admin/links/ja4/{ja4}"), Some(&cookie)).await;
+        let (status, html) = get_with(
+            &app,
+            &format!("/admin/evidence/links/ja4/{ja4}"),
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
-        let badge = r#"href="/admin/campaigns/203.0.113.60">member of campaign #7</a>"#;
+        let badge = r#"href="/admin/evidence/campaigns/203.0.113.60">member of campaign #7</a>"#;
         assert_eq!(html.matches(badge).count(), 1, "{html}");
         assert_eq!(html.matches("member of campaign").count(), 1, "{html}");
         assert!(html.contains("203.0.113.61"), "{html}");
@@ -2218,6 +2269,15 @@ show_labels = {show_labels}
         }
     }
 
+    /// The job that ran scan `scan`.
+    async fn scan_job(st: &AdminState, scan: i64) -> i64 {
+        sqlx::query_scalar("SELECT job_id FROM scans WHERE id = ?")
+            .bind(scan)
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap()
+    }
+
     /// The IP page shows the verdict over the evidence rows and the IP list
     /// filters on them, for admins only, and
     /// nothing on either page claims more than was observed (MIK-586).
@@ -2225,6 +2285,7 @@ show_labels = {show_labels}
     async fn device_evidence_shows_and_filters_for_admins_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
         let (_, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        let job = scan_job(&st, scan).await;
         st.store.recompute_evidence().await.unwrap();
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
@@ -2233,13 +2294,13 @@ show_labels = {show_labels}
         assert!(admin.contains("device evidence only"), "{admin}");
         assert!(
             admin.contains(&format!(
-                "TP-LINK TR-069 remote access answered on 7547 in scan #{scan}"
+                "TP-LINK TR-069 remote access answered on port 7547 in job #{job} · scan #{scan}"
             )),
             "{admin}"
         );
         assert!(admin.contains("AS type not classified"), "{admin}");
         assert!(
-            admin.contains(&format!("href=\"/admin/scans/{scan}\"")),
+            admin.contains(&format!("href=\"/admin/investigate/scans/{scan}\"")),
             "{admin}"
         );
         let (status, public) = get_with(&app, "/ip/203.0.113.47", None).await;
@@ -2262,6 +2323,268 @@ show_labels = {show_labels}
         assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
     }
 
+    /// The IP page shows the shared reading under the device verdict, with
+    /// the doc's sentences, its rows linked to their scan or name, and the
+    /// direction text; the IP list filters on it; admins only (MIK-647).
+    #[tokio::test]
+    async fn the_shared_reading_shows_and_filters_for_admins_only() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        let (cpe_ip, scan) = crate::store::evidence::tests::seed_tr069(&st.store).await;
+        let job = scan_job(&st, scan).await;
+        let now = crate::store::data::now_ts();
+        let named = |ip: &str, name: &str| {
+            let (st, now, ip, name) = (st.clone(), now.clone(), ip.to_string(), name.to_string());
+            async move {
+                let row = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap();
+                st.store
+                    .insert_request(&crate::store::requests::NewRequest {
+                        ip_id: row.id,
+                        method: "GET".into(),
+                        path: "/".into(),
+                        headers_json: "[]".into(),
+                        labels_json: "[]".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                if name.is_empty() {
+                    return 0;
+                }
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen)
+                     VALUES (?, ?, 'rdns', ?, ?) RETURNING id",
+                )
+                .bind(row.id)
+                .bind(&name)
+                .bind(&now)
+                .bind(&now)
+                .fetch_one(&st.store.pool)
+                .await
+                .unwrap()
+            }
+        };
+        let pool_name = named("203.0.113.47", "dynamic-0-0-0-0.pool.telefonica.de").await;
+        let cgn_name = named("203.0.113.48", "0-0-0-0.cgn-wdsl.example.it").await;
+        named("203.0.113.49", "").await;
+        assert!(cpe_ip > 0);
+        st.store.recompute_evidence().await.unwrap();
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let day = &now[..10];
+
+        // Rule 2: the CPE and the pooled-line name, both linked.
+        let (status, page) = get_with(&app, "/ip/203.0.113.47", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(page.contains("id=\"sharing\""), "{page}");
+        assert!(
+            page.contains("one subscriber&#39;s network, on a pooled line"),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!(
+                "TP-LINK TR-069 remote access answered on port 7547 in job #{job} · scan #{scan} \
+                 (level 1, {day} UTC) \
+                 and the operator names this address dynamic-0-0-0-0.pool.telefonica.de \
+                 (reverse DNS looked up {day})"
+            )),
+            "{page}"
+        );
+        assert!(page.contains("not against reassignment."), "{page}");
+        assert!(
+            page.contains(&format!("href=\"#name-{pool_name}\"")),
+            "{page}"
+        );
+        assert!(page.contains(&format!("id=\"name-{pool_name}\"")), "{page}");
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+        // The reading sits under the device verdict.
+        let (ev, sh) = (
+            page.find("id=\"evidence\"").unwrap(),
+            page.find("id=\"sharing\"").unwrap(),
+        );
+        assert!(ev < sh);
+        let sharing = &page[sh..];
+        let sharing = &sharing[..sharing.find("</section>").unwrap()];
+        assert!(
+            sharing.contains(&format!("href=\"/admin/investigate/scans/{scan}\"")),
+            "{sharing}"
+        );
+        // MIK-652: the caveat leads, the badge is a neutral span with no rule
+        // number, the filter is its own link, both days in UTC, the real
+        // lookup word.
+        assert!(sharing.contains("<h2>Address sharing</h2>"), "{sharing}");
+        let (dir, sent) = (
+            sharing
+                .find("It is not a threat or suspicion score.")
+                .unwrap(),
+            sharing.find("not against reassignment.").unwrap(),
+        );
+        assert!(dir < sent, "{sharing}");
+        assert!(
+            sharing.contains("<span class=\"badge badge-reading\""),
+            "{sharing}"
+        );
+        assert!(!sharing.contains("data-status"), "{sharing}");
+        assert!(!sharing.contains("Rule "), "{sharing}");
+        assert!(
+            sharing.contains("href=\"/ips?reading=subscriber-pooled\">Other addresses"),
+            "{sharing}"
+        );
+        assert!(sharing.contains("<th>Kind</th>"), "{sharing}");
+        assert!(sharing.contains("<th>Seen (UTC)</th>"), "{sharing}");
+        assert!(sharing.contains(">rDNS</a>"), "{sharing}");
+
+        // Rule 4: the operator's naming, not verified by behaviour.
+        let (_, page) = get_with(&app, "/ip/203.0.113.48", Some(&cookie)).await;
+        assert!(
+            page.contains("shared pool, by the operator&#39;s naming"),
+            "{page}"
+        );
+        assert!(
+            page.contains("Not verified by behaviour; nothing we hold can verify it."),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!("href=\"#name-{cgn_name}\"")),
+            "{page}"
+        );
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+
+        // Rule 8: insufficient evidence, with the direction text.
+        let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
+        assert!(page.contains("insufficient evidence"), "{page}");
+        assert!(
+            page.contains("An address without a name or a scan result is not thereby single-user"),
+            "{page}"
+        );
+        assert!(
+            page.contains("It is not a threat or suspicion score."),
+            "{page}"
+        );
+
+        // The public page has none of it.
+        let (_, public) = get_with(&app, "/ip/203.0.113.48", None).await;
+        assert!(!public.contains("id=\"sharing\""), "{public}");
+        assert!(!public.contains("shared pool"), "{public}");
+
+        // The list filter, admins only.
+        for (state, ip, not) in [
+            ("subscriber-pooled", "203.0.113.47", "203.0.113.48"),
+            ("shared-pool", "203.0.113.48", "203.0.113.47"),
+            ("insufficient", "203.0.113.49", "203.0.113.48"),
+        ] {
+            let (status, list) =
+                get_with(&app, &format!("/ips?reading={state}"), Some(&cookie)).await;
+            assert_eq!(status, 200);
+            assert!(
+                list.contains(&format!("href=\"/ip/{ip}\"")),
+                "{state}: {list}"
+            );
+            assert!(
+                !list.contains(&format!("href=\"/ip/{not}\"")),
+                "{state}: {list}"
+            );
+        }
+        // The chip names the state, not its key.
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", Some(&cookie)).await;
+        assert!(
+            list.contains("Address sharing: <span class=\"mono\">shared pool, by the operator&#39;s naming</span>"),
+            "{list}"
+        );
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", None).await;
+        assert!(list.contains("href=\"/ip/203.0.113.47\""), "{list}");
+
+        // MIK-697: the property strip on every IP surface, admins only.
+        // The IP header, directly under the address, with the full
+        // sentence as its title.
+        let (_, page) = get_with(&app, "/ip/203.0.113.47", Some(&cookie)).await;
+        let strip = page.find("class=\"ip-props\"").expect("strip");
+        assert!(strip < page.find("class=\"meta\"").unwrap(), "{page}");
+        assert!(strip < page.find("id=\"sharing\"").unwrap(), "{page}");
+        let strip = &page[strip..];
+        let strip = &strip[..strip.find("</span>\n").unwrap()];
+        assert!(
+            strip.contains("data-reading=\"subscriber-pooled\" data-shared"),
+            "{strip}"
+        );
+        assert!(strip.contains("not against reassignment."), "{strip}");
+        // Unscanned: says so, with the scan action.
+        let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
+        // MIK-718: named as the filter names it.
+        assert!(
+            page.contains(">insufficient evidence · not scanned</span>"),
+            "{page}"
+        );
+        assert!(page.contains("href=\"#actions\">scan →</a>"), "{page}");
+        for ip in ["203.0.113.47", "203.0.113.49"] {
+            let (_, public) = get_with(&app, &format!("/ip/{ip}"), None).await;
+            assert!(!public.contains("ip-props"), "{public}");
+            assert!(!public.contains("badge-share"), "{public}");
+        }
+        // The IP list: one strip per row, and the select.
+        let (_, list) = get_with(&app, "/ips", Some(&cookie)).await;
+        assert!(list.contains("<select name=\"reading\">"), "{list}");
+        assert!(
+            list.contains(
+                "<option value=\"shared-pool\">shared pool, by the operator&#39;s naming</option>"
+            ),
+            "{list}"
+        );
+        assert!(list.contains("data-reading=\"shared-pool\""), "{list}");
+        assert!(
+            list.contains("data-reading=\"subscriber-pooled\""),
+            "{list}"
+        );
+        assert!(
+            list.contains("href=\"/ip/203.0.113.49#actions\">scan →</a>"),
+            "{list}"
+        );
+        let (_, list) = get_with(&app, "/ips?reading=shared-pool", Some(&cookie)).await;
+        assert!(
+            list.contains("<option value=\"shared-pool\" selected>"),
+            "{list}"
+        );
+        // MIK-718: grouped one party, shared, not read.
+        let groups: Vec<_> = ["one party", "shared", "not read"]
+            .map(|g| list.find(&format!("<optgroup label=\"{g}\">")).expect(g))
+            .into();
+        assert!(groups.is_sorted(), "{list}");
+        assert!(
+            list.contains("<option value=\"operator\">one operator&#39;s address</option>"),
+            "{list}"
+        );
+        // A queued scan: the strip says so and offers none.
+        st.recorder
+            .enqueue_manual_addr("203.0.113.49", 2)
+            .await
+            .unwrap();
+        let (_, page) = get_with(&app, "/ip/203.0.113.49", Some(&cookie)).await;
+        assert!(page.contains(">scan queued</span>"), "{page}");
+        assert!(!page.contains("scan →</a>"), "{page}");
+        let (_, list) = get_with(&app, "/ips", Some(&cookie)).await;
+        let row = list
+            .split("<tr")
+            .find(|r| r.contains("href=\"/ip/203.0.113.49\""))
+            .expect("row");
+        assert!(row.contains(">scan queued</span>"), "{row}");
+        assert!(!row.contains("scan →</a>"), "{row}");
+        let (_, public) = get_with(&app, "/ips", None).await;
+        assert!(public.contains("href=\"/ip/203.0.113.47\""), "{public}");
+        assert!(!public.contains("ip-props"), "{public}");
+        assert!(!public.contains("name=\"reading\""), "{public}");
+        // Request rows.
+        let (status, reqs) = get_with(&app, "/requests?ip=203.0.113.48", Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert!(reqs.contains("data-reading=\"shared-pool\""), "{reqs}");
+        let (status, _) = get_with(&app, "/requests?ip=203.0.113.48", None).await;
+        assert_ne!(status, 200);
+    }
+
     #[tokio::test]
     async fn the_ip_page_lists_uploads_and_webshell_commands_to_the_admin_only() {
         let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
@@ -2275,7 +2598,10 @@ show_labels = {show_labels}
         let (status, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(html.contains("<h2>Lures</h2>"), "{html}");
-        assert!(html.contains(&format!("/admin/uploads/{uid}\"")), "{html}");
+        assert!(
+            html.contains(&format!("/admin/traps/uploads/{uid}\"")),
+            "{html}"
+        );
         assert!(
             html.contains(r#"href="/requests?cmd=whoami" title="whoami">whoami</a></td>"#),
             "{html}"
@@ -2288,7 +2614,7 @@ show_labels = {show_labels}
         let (status, public) = get_with(&app, "/ip/203.0.113.30", None).await;
         assert_eq!(status, 200);
         assert!(!public.contains("<h2>Lures</h2>"), "{public}");
-        assert!(!public.contains("/admin/uploads/"), "{public}");
+        assert!(!public.contains("/admin/traps/uploads/"), "{public}");
         assert!(!public.contains("whoami"), "{public}");
         // An address with neither: no section.
         let (_, none) = get_with(&app, "/ip/203.0.113.9", Some(&cookie)).await;
@@ -2399,7 +2725,13 @@ show_labels = {show_labels}
         let (status, html) =
             get_with(&app, &format!("/admin/requests/{served}"), Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(html.contains(">Fingerprint</abbr></a></dt>"), "{html}");
+        // MIK-718: the fingerprint names open the glossary.
+        assert!(
+            html.contains("<a class=\"gloss\" href=\"#glossary\">"),
+            "{html}"
+        );
+        assert!(html.contains("id=\"glossary\""), "{html}");
         assert!(html.contains(">fphash</a>"), "{html}");
         assert!(!html.contains("<h2>Fingerprint</h2>"), "{html}");
         let (status, html) =
@@ -2428,13 +2760,17 @@ show_labels = {show_labels}
         let (_, html) = get_with(&app, "/ip/203.0.113.30", Some(&cookie)).await;
         assert_eq!(html.matches("\">upload</a>").count(), IP_DROPS, "{html}");
         assert_eq!(html.matches(">id</a></td>").count(), IP_DROPS, "{html}");
-        assert!(html.contains("/admin/uploads?ip=203.0.113.30\""), "{html}");
+        assert!(
+            html.contains("/admin/traps/uploads?ip=203.0.113.30\""),
+            "{html}"
+        );
         assert!(
             html.contains("/requests?ip=203.0.113.30&amp;answer=webshell\""),
             "{html}"
         );
         // The full list holds this address's uploads only.
-        let (status, list) = get_with(&app, "/admin/uploads?ip=203.0.113.30", Some(&cookie)).await;
+        let (status, list) =
+            get_with(&app, "/admin/traps/uploads?ip=203.0.113.30", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert_eq!(
             list.matches("href=\"/ip/203.0.113.30\">203.0.113.30</a></td>")
@@ -2480,7 +2816,10 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let (status, up) = get_with(&app, &format!("/admin/requests/{up_id}"), Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(up.contains(&format!("/admin/uploads/{uid}\"")), "{up}");
+        assert!(
+            up.contains(&format!("/admin/traps/uploads/{uid}\"")),
+            "{up}"
+        );
         assert!(
             up.contains("bytes · <span class=\"mono\">put</span>"),
             "{up}"
@@ -2495,7 +2834,7 @@ show_labels = {show_labels}
             "{cmd}"
         );
         assert!(cmd.contains("member of campaign #7"), "{cmd}");
-        assert!(!cmd.contains("/admin/uploads/"), "{cmd}");
+        assert!(!cmd.contains("/admin/traps/uploads/"), "{cmd}");
         // Without a session the page is not served at all.
         for id in [up_id, cmd_id] {
             let (status, body) = get_with(&app, &format!("/admin/requests/{id}"), None).await;
@@ -2575,7 +2914,10 @@ show_labels = {show_labels}
         let app = crate::admin::full_router(st.clone());
         let port = r#"href="/ips?port=22""#;
         let product = r#"href="/ips?product=OpenSSH%209.6p1""#;
-        for page in [format!("/admin/scans/{id}"), "/ip/203.0.113.9".into()] {
+        for page in [
+            format!("/admin/investigate/scans/{id}"),
+            "/ip/203.0.113.9".into(),
+        ] {
             let (status, html) = get_with(&app, &page, Some(&cookie)).await;
             assert_eq!(status, 200, "{page}");
             assert!(html.contains(port), "{page}: {html}");
@@ -2594,7 +2936,12 @@ show_labels = {show_labels}
         let (st, _d, id) = scanned_state().await;
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st.clone());
-        let (status, xml) = get_with(&app, &format!("/admin/scans/{id}/xml"), Some(&cookie)).await;
+        let (status, xml) = get_with(
+            &app,
+            &format!("/admin/investigate/scans/{id}/xml"),
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(xml.contains("Hello [[scanner]]"), "{xml}");
         assert!(!xml.contains("198.51.100.5"));
@@ -2799,7 +3146,7 @@ show_labels = {show_labels}
         let (st, _dir) = state(true).await;
         let cookie = admin_cookie(&st).await;
         let app = crate::admin::full_router(st);
-        let (status, _) = get_with(&app, "/admin/decoys", None).await;
+        let (status, _) = get_with(&app, "/admin/traps/mcp", None).await;
         assert_ne!(status, 200, "admin only");
         for (tab, heading) in [
             ("mcp", "Sessions"),
@@ -2807,23 +3154,190 @@ show_labels = {show_labels}
             ("web", "Web decoys"),
         ] {
             let (status, body) =
-                get_with(&app, &format!("/admin/decoys?tab={tab}"), Some(&cookie)).await;
+                get_with(&app, &format!("/admin/traps/{tab}"), Some(&cookie)).await;
             assert_eq!(status, 200, "{tab}");
             assert!(body.contains(heading), "{tab}: {body}");
             assert!(
-                body.contains(r#"href="/admin/decoys" aria-current="true""#),
-                "nav marks Decoys"
+                body.contains(r#"href="/admin/traps/mcp" aria-current="true">Traps</a>"#),
+                "nav marks Traps"
             );
         }
-        let (_, body) = get_with(&app, "/admin/decoys?tab=llm&range=7d", Some(&cookie)).await;
+        let (_, body) = get_with(&app, "/admin/traps/llm?range=7d", Some(&cookie)).await;
         assert!(
-            body.contains("/admin/decoys?tab=mcp&#38;range=7d"),
+            body.contains(r#"href="/admin/traps/mcp?range=7d">MCP</a>"#),
             "tabs keep the range"
         );
         assert!(
-            body.contains("/admin/decoys?tab=llm&amp;range=30d"),
+            body.contains(r#"href="/admin/traps/uploads">Uploads</a>"#),
+            "uploads has no range"
+        );
+        assert!(
+            body.contains("/admin/traps/llm?range=30d"),
             "range keeps the tab"
         );
+    }
+
+    /// Status and `Location` of a GET, redirects not followed.
+    async fn location(app: &axum::Router, path: &str, cookie: Option<&str>) -> (u16, String) {
+        let mut req = axum::http::Request::get(path);
+        if let Some(c) = cookie {
+            req = req.header(axum::http::header::COOKIE, c);
+        }
+        let r = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let loc = r
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .map(|l| l.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (r.status().as_u16(), loc)
+    }
+
+    /// MIK-711 §3: every old admin GET URL answers 308 to its place in the
+    /// tree, query kept, in one hop, and only with a session.
+    #[tokio::test]
+    async fn old_admin_urls_answer_308_to_the_tree() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        let key = "00".repeat(32);
+        let cases: Vec<(String, String)> = [
+            (
+                "/admin/analytics?range=7d",
+                "/admin/overview/analytics?range=7d",
+            ),
+            (
+                "/admin/lookup?ip=192.0.2.1",
+                "/admin/investigate/lookup?ip=192.0.2.1",
+            ),
+            ("/admin/scans", "/admin/investigate/scans"),
+            (
+                "/admin/scans?status=done",
+                "/admin/investigate/scans?status=done",
+            ),
+            ("/admin/scans/7", "/admin/investigate/scans/7"),
+            ("/admin/scans/7/xml", "/admin/investigate/scans/7/xml"),
+            ("/admin/queue", "/admin/investigate/scans"),
+            (
+                "/admin/queue?status=failed",
+                "/admin/investigate/scans?status=failed#history",
+            ),
+            ("/admin/campaigns?q=x", "/admin/evidence/campaigns?q=x"),
+            (
+                "/admin/campaigns/192.0.2.3",
+                "/admin/evidence/campaigns/192.0.2.3",
+            ),
+            ("/admin/links?kind=ssh", "/admin/evidence/links?kind=ssh"),
+            ("/admin/links/ja4/t13d", "/admin/evidence/links/ja4/t13d"),
+            (
+                "/admin/links/canaries?range=all",
+                "/admin/evidence/canaries?range=all",
+            ),
+            (
+                "/admin/links/canaries/served/3",
+                "/admin/evidence/canaries/served/3",
+            ),
+            (
+                "/admin/canaries?range=all&ip=203.0.113.9",
+                "/admin/evidence/canaries?range=all&ip=203.0.113.9",
+            ),
+            ("/admin/fingerprints", "/admin/evidence/links"),
+            ("/admin/paths?since=all", "/admin/evidence/paths?since=all"),
+            ("/admin/decoys", "/admin/traps/mcp"),
+            ("/admin/decoys?tab=mcp", "/admin/traps/mcp"),
+            (
+                "/admin/decoys?tab=llm&range=7d",
+                "/admin/traps/llm?range=7d",
+            ),
+            (
+                "/admin/decoys?range=30d&tab=web",
+                "/admin/traps/web?range=30d",
+            ),
+            ("/admin/uploads?sha256=ab", "/admin/traps/uploads?sha256=ab"),
+            ("/admin/uploads/u1", "/admin/traps/uploads/u1"),
+            (
+                "/admin/uploads/u1/content.zip",
+                "/admin/traps/uploads/u1/content.zip",
+            ),
+            ("/admin/cluster", "/admin/network/members"),
+            ("/admin/cluster/access", "/admin/network/access"),
+            ("/admin/cluster/ownership", "/admin/network/ownership"),
+            ("/admin/cluster/credits?x=1", "/admin/network/credits?x=1"),
+            ("/admin/market", "/admin/network/credits"),
+            ("/admin/system", "/admin/system/status"),
+            ("/admin/inbox", "/admin/system/inbox"),
+            ("/admin/devices", "/admin/system/devices"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .chain([
+            (
+                format!("/admin/cluster/node/{key}"),
+                format!("/admin/network/members/{key}"),
+            ),
+            (
+                format!("/admin/cluster/node/{key}/fork-proof"),
+                format!("/admin/network/members/{key}/fork-proof"),
+            ),
+        ])
+        .collect();
+        for (old, new) in &cases {
+            assert_eq!(
+                location(&app, old, Some(&cookie)).await,
+                (308, new.clone()),
+                "{old}"
+            );
+            assert_eq!(
+                location(&app, old, None).await,
+                (303, "/login".to_string()),
+                "{old} needs a session"
+            );
+        }
+        // Group roots land on their first child.
+        for (root, first) in [
+            ("/admin/overview", "/admin"),
+            ("/admin/investigate", "/admin/investigate/lookup"),
+            ("/admin/evidence", "/admin/evidence/campaigns"),
+            ("/admin/traps", "/admin/traps/mcp"),
+            ("/admin/network", "/admin/network/members"),
+        ] {
+            assert_eq!(
+                location(&app, root, Some(&cookie)).await,
+                (302, first.to_string()),
+                "{root}"
+            );
+        }
+    }
+
+    /// MIK-711: each group's pages mark the group and the child as current.
+    #[tokio::test]
+    async fn each_admin_group_marks_its_group_and_child() {
+        let (st, _dir) = state(true).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st);
+        for (path, group, child) in [
+            ("/admin", "Overview", "Now"),
+            ("/admin/investigate/scans", "Investigate", "Scans"),
+            ("/admin/evidence/canaries", "Evidence", "Canaries"),
+            ("/admin/traps/llm", "Traps", "LLM"),
+            ("/admin/network/members", "Network", "Members"),
+            ("/admin/system/devices", "System", "Devices"),
+        ] {
+            let (status, body) = get_with(&app, path, Some(&cookie)).await;
+            assert_eq!(status, 200, "{path}");
+            assert!(
+                body.contains(&format!(r#" aria-current="true">{group}</a>"#)),
+                "{path}: group {group}"
+            );
+            assert!(
+                body.contains(&format!(r#"aria-label="{group} pages""#))
+                    && body.contains(&format!(r#" aria-current="page">{child}</a>"#)),
+                "{path}: child {child}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3374,8 +3888,8 @@ show_labels = {show_labels}
         let (status, cmd) = get_with(&app, "/requests?cmd=whoami", Some(&cookie)).await;
         assert_eq!(status, 200);
         assert!(cmd.contains("/s.php"), "{cmd}");
-        assert!(ev.contains("/admin/uploads/"), "{ev}");
-        assert!(ev.contains("/admin/scans/"), "{ev}");
+        assert!(ev.contains("/admin/traps/uploads/"), "{ev}");
+        assert!(ev.contains("/admin/investigate/scans/"), "{ev}");
         assert!(ev.contains("192.0.2.99"), "{ev}");
         assert!(ev.contains("<th>Node</th>"), "{ev}");
         // A bad cursor is the first page.

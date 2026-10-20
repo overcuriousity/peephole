@@ -486,7 +486,7 @@ mod tests {
         assert!(
             rows[0]
                 .link_href()
-                .starts_with("/admin/links/http-etag/%22")
+                .starts_with("/admin/evidence/links/http-etag/%22")
         );
         let probe_keys: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM host_keys WHERE probe_id IS NOT NULL")

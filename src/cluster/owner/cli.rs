@@ -173,7 +173,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
             if (unfinished || waiting > 0) && !force {
                 bail!(
                     "{stranded}. Finish the rotation, or retry or give up on those nodes, on \
-                     Cluster › Ownership first. To forget every key kept here anyway: \
+                     Network › Ownership first. To forget every key kept here anyway: \
                      peephole owner forget-key --force"
                 );
             }

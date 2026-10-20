@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — links{% endblock %}
 {% block content %}
-{% let sub = "links" %}{% include "_admin_nav.html" %}
-{% let subtab = "fingerprints" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("evidence", "links") %}{% include "_admin_nav.html" %}
 <nav class="seg subnav subtabs kinds" aria-label="Kind of link">
   {% for (k, href, group_start) in kind_tabs %}<a href="{{ href }}"{% if *group_start %} class="group-start"{% endif %} title="{% if k.identity() %}Identity: points to one operator{% else %}Software: points to the same tool, not the same operator{% endif %}"{% if *k == kind %} aria-current="true"{% endif %}>{{ k.name() }}</a>{% endfor %}
 </nav>
@@ -10,7 +9,7 @@
 <div class="stack">
 {% if let Some(a) = not_found %}<div class="card empty">The old link <span class="mono">{{ a }}</span> no longer matches anything stored.</div>{% endif %}
 <section class="card">
-  <form class="filters" method="get" action="/admin/links">
+  <form class="filters" method="get" action="/admin/evidence/links">
     <input type="hidden" name="kind" value="{{ kind.key() }}">
     <label>Starts with <input name="q" size="16" value="{{ f.q.as_deref().unwrap_or_default() }}"></label>
     <label>Seen on <select name="shared"><option value="1">shared</option><option value="0"{% if !f.shared() %} selected{% endif %}>all</option></select></label>
@@ -21,7 +20,7 @@
     <label>Sort <select name="sort"><option value="ips">IPs</option><option value="sightings"{% if f.sort.as_deref() == Some("sightings") %} selected{% endif %}>sightings</option><option value="recent"{% if f.sort.as_deref() == Some("recent") %} selected{% endif %}>last seen</option></select></label>
     <button class="btn btn-primary" type="submit">Filter</button>
   </form>
-  <div class="table-wrap"><table class="table"><thead><tr><th>{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
+  <div class="table-wrap"><table class="table"><thead><tr><th title="{{ crate::admin::glossary::help(kind.key()) }}">{{ kind.name() }}</th><th class="num">IPs</th><th class="num">Sightings</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
   {% for r in page.items %}<tr>
     <td class="mono hk-fp"><a href="{{ crate::admin::views::link_href(kind.key(), r.value.as_str()) }}">{{ r.value }}</a>{% let value = r.value.as_str() %}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</td>
     <td class="num">{{ r.ips }}</td><td class="num">{{ crate::admin::views::thousands(r.sightings) }}</td>
@@ -32,4 +31,5 @@
   {% include "_pagination.html" %}
 </section>
 </div>
+{% include "_fingerprint_glossary.html" %}
 {% endblock %}

@@ -2,8 +2,7 @@
 {% block title %}peephole — {{ kind_name }}{% endblock %}
 {% block head %}<script src="/assets/js/linkgraph.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "links" %}{% include "_admin_nav.html" %}
-{% let subtab = "fingerprints" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("evidence", "links") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>{{ kind_name }}</h1><p class="mono hk-fp">{{ value }}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</p></div></div>
 {% if !seen() %}
 <div class="card empty">Not seen: nothing with this value is stored.</div>

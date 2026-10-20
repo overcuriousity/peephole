@@ -2,14 +2,14 @@
 {% block title %}peephole — lookup{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
-{% let sub = "lookup" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("investigate", "lookup") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Lookup</h1><p class="muted">What the cluster knows about an address and what providers say now{% if cluster %}; provider answers cost credits{% endif %}.</p></div></div>
 <form class="lookup-bar card" method="post" action="/admin/lookup" data-live>
   <label class="visually-hidden" for="lookup-q">IP address, host name, URL, or a pasted list</label>
   <textarea id="lookup-q" class="mono" name="ip" rows="1" data-enter-submits placeholder="IP, host, URL or a list" required autofocus>{% if let Some(b) = bulk %}{{ b.text }}{% else %}{{ ip }}{% endif %}</textarea>
   <button class="btn btn-primary" type="submit" data-busy="Looking up…">Look up{% if offer.balance.is_some() %} · ≤ <span class="num">{{ offer.total }}</span> credits{% if results.len() > 1 %} each{% endif %}{% endif %}</button>
   {% if let Some(b) = offer.balance %}
-  <a class="balance-chip" href="/admin/cluster/credits" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b></a>
+  <a class="balance-chip" href="/admin/network/credits" title="Credits{% if offer.fleet %} of all your nodes{% endif %}"><span class="label">Balance</span><b class="num">{{ b }}</b></a>
   {% endif %}
   <p class="lookup-hint muted">Enter looks up · Shift+Enter adds a line · free providers answer at once, paid ones are offered below</p>
 </form>
@@ -17,8 +17,8 @@
 <section class="card">
   <div class="card-head"><h2>Stored</h2><span class="muted">{{ b.rows.len() }}{% if b.capped %} (first {{ crate::admin::lookup::BULK_MAX }}){% endif %} · stored data only</span></div>
   <div class="table-wrap"><table class="table" data-bulk><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th><th class="num">Abuse</th><th>Last seen</th><th></th></tr></thead><tbody>
-  {% for r in b.rows %}<tr><td><a class="mono" href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.unseen %} {% include "_unseen.html" %}{% endif %}</td><td>{% let country = r.country.clone() %}{% include "_country.html" %}</td><td>{% if let Some(a) = r.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ r.request_count }}</td><td>{% let sev = r.max_severity %}{% include "_severity.html" %}</td><td class="num">{% if let Some(a) = r.abuse_score %}{{ a }}{% else %}—{% endif %}</td><td class="ts">{{ crate::admin::views::minute(r.last_seen) }}</td><td><a href="{{ crate::admin::views::link_href("ip", r.ip.as_str()) }}">links</a> · <a href="/admin/lookup?ip={{ r.ip }}">look up</a></td></tr>{% endfor %}
-  {% for m in b.missing %}<tr><td class="mono">{{ m }}</td><td colspan="6" class="muted">not stored</td><td><a href="/admin/lookup?ip={{ m }}">look up</a></td></tr>{% endfor %}
+  {% for r in b.rows %}<tr><td><a class="mono" href="/ip/{{ r.ip }}">{{ r.ip }}</a>{% if r.unseen %} {% include "_unseen.html" %}{% endif %}</td><td>{% let country = r.country.clone() %}{% include "_country.html" %}</td><td>{% if let Some(a) = r.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ r.request_count }}</td><td>{% let sev = r.max_severity %}{% include "_severity.html" %}</td><td class="num">{% if let Some(a) = r.abuse_score %}{{ a }}{% else %}—{% endif %}</td><td class="ts">{{ crate::admin::views::minute(r.last_seen) }}</td><td><a href="{{ crate::admin::views::link_href("ip", r.ip.as_str()) }}">links</a> · <a href="/admin/investigate/lookup?ip={{ r.ip }}">look up</a></td></tr>{% endfor %}
+  {% for m in b.missing %}<tr><td class="mono">{{ m }}</td><td colspan="6" class="muted">not stored</td><td><a href="/admin/investigate/lookup?ip={{ m }}">look up</a></td></tr>{% endfor %}
   {% if b.rows.is_empty() && b.missing.is_empty() %}<tr><td colspan="8" class="empty">Nothing stored matches.</td></tr>{% endif %}
   </tbody></table></div>
   {% if !b.unreadable.is_empty() %}<p class="muted">Not an address or network: <span class="mono">{{ b.unreadable.join(", ") }}</span></p>{% endif %}

@@ -21,7 +21,12 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/lookup", get(page).post(lookup))
+        .route("/admin/investigate/lookup", get(page))
+        // The form posts to the old path; its GET moved.
+        .route(
+            "/admin/lookup",
+            get(crate::admin::moved::redirect).post(lookup),
+        )
         .route("/admin/lookup/bulk", axum::routing::post(bulk))
         .route("/admin/lookup/answer", axum::routing::post(answer))
         .route("/admin/lookup/name", axum::routing::post(name))
@@ -1213,12 +1218,17 @@ secure_cookies = false
     async fn the_page_needs_a_session_and_answers_from_local_providers() {
         let (app, cookie, _d) = app().await;
         // Anonymous: not even the form.
-        let (status, _) = send(&app, axum::http::Request::get("/admin/lookup"), "").await;
+        let (status, _) = send(
+            &app,
+            axum::http::Request::get("/admin/investigate/lookup"),
+            "",
+        )
+        .await;
         assert_ne!(status, 200);
 
         let (status, html) = send(
             &app,
-            axum::http::Request::get("/admin/lookup?ip=203.0.113.9")
+            axum::http::Request::get("/admin/investigate/lookup?ip=203.0.113.9")
                 .header("cookie", &cookie)
                 .header("sec-fetch-site", "same-origin"),
             "",
@@ -1238,6 +1248,13 @@ secure_cookies = false
         assert!(html.contains("Tor exit list"), "the exit list answered");
         assert!(html.contains("not listed"));
         assert!(html.contains("in the dataset"));
+        // MIK-697: the recorded address carries its property strip, here
+        // unscanned, with the scan action of the Actions card.
+        assert!(
+            html.contains(">insufficient evidence · not scanned</span>"),
+            "{html}"
+        );
+        assert!(html.contains("href=\"#actions\">scan →</a>"), "{html}");
         // GeoLite2 is not loaded: listed as declined, with the reason.
         assert!(html.contains("MaxMind GeoLite2") && html.contains("not available on this node"));
         assert!(html.contains("no reachable node serves this provider"));

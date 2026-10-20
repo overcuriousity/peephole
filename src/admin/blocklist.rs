@@ -9,6 +9,7 @@
 //! `never_scan` networks, and non-global addresses.
 use crate::admin::AdminState;
 use crate::scan::safety::nets_overlap;
+use crate::store::evidence::Shared;
 use axum::{
     extract::{Query, State},
     http::{StatusCode, header},
@@ -138,6 +139,15 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
     } else {
         BTreeSet::new()
     };
+    // Addresses with a shared reading (rules 2, 4, 5, 6), listed or not:
+    // their entries get a comment line, and their /24 is never collapsed.
+    let shared: BTreeMap<IpAddr, Shared> = state
+        .store
+        .shared_readings(None)
+        .await?
+        .into_iter()
+        .filter_map(|(_, ip, s)| Some((crate::net::canonical(ip.parse().ok()?), s)))
+        .collect();
     let mut safety = state.safety.lock().await;
     safety
         .refresh(&state.cfg, state.recorder.node().map(|n| &**n))
@@ -158,6 +168,10 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
             safety.overlaps(net)
                 || never.iter().any(|n| nets_overlap(n, net))
                 || spared
+                    .range(net.network()..=net.broadcast())
+                    .next()
+                    .is_some()
+                || shared
                     .range(net.network()..=net.broadcast())
                     .next()
                     .is_some()
@@ -188,8 +202,15 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
     out.push_str(&format!(
         "# parameters: hours=1..{MAX_HOURS} min_severity=1..4 networks=1 (collapse /24 and /64 with {NET_MIN_IPS}+ entries)\n"
     ));
+    out.push_str(
+        "# shared: a comment line before an entry the operator's naming calls a pool or a reassigned line; a cost warning (a block hits other people, and such an address changes hands within days or hours), not a verdict; never collapsed by networks=1\n",
+    );
     out.push_str("# documentation: /api\n");
     for e in &entries {
+        if let Some(s) = e.parse::<IpAddr>().ok().and_then(|ip| shared.get(&ip)) {
+            out.push_str(&s.note(e));
+            out.push('\n');
+        }
         out.push_str(e);
         out.push('\n');
     }
@@ -198,7 +219,7 @@ async fn build(state: &AdminState, p: Params) -> anyhow::Result<String> {
 
 /// Addresses, with every /24 (IPv6 /64) holding [`NET_MIN_IPS`] or more
 /// of them replaced by the prefix, unless `spared` says the prefix holds
-/// an excluded address. Sorted, prefixes where their first address would be.
+/// an excluded address or one with a shared reading. Sorted, prefixes where their first address would be.
 pub fn collapse(ips: &[IpAddr], spared: impl Fn(&IpNet) -> bool) -> Vec<String> {
     let mut nets: BTreeMap<IpNet, Vec<IpAddr>> = BTreeMap::new();
     for ip in ips {
@@ -281,7 +302,87 @@ mod tests {
         );
     }
 
+    /// Every address an entry covers, among `of`.
+    fn covered(entries: &[String], of: &[IpAddr]) -> BTreeSet<IpAddr> {
+        of.iter()
+            .copied()
+            .filter(|ip| {
+                entries.iter().any(|e| match e.parse::<IpNet>() {
+                    Ok(n) => n.contains(ip),
+                    Err(_) => e.parse::<IpAddr>().ok() == Some(*ip),
+                })
+            })
+            .collect()
+    }
+
+    /// MIK-646: the skip for /24s holding a shared reading only narrows.
+    /// Every listed address stays listed, and what is covered with the
+    /// skip is a subset of what is covered without it.
+    #[test]
+    fn the_shared_skip_only_narrows() {
+        let ips: Vec<IpAddr> = [
+            "203.0.113.1",
+            "203.0.113.2",
+            "203.0.113.3",
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+            "198.51.100.4",
+            "192.0.2.9",
+            "2001:db8:1::1",
+            "2001:db8:1::2",
+            "2001:db8:1::3",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        // Every address of the /24s and /64s involved, listed or not.
+        let mut universe: Vec<IpAddr> = (0..=255u8)
+            .flat_map(|n| {
+                [
+                    format!("203.0.113.{n}"),
+                    format!("198.51.100.{n}"),
+                    format!("192.0.2.{n}"),
+                    format!("2001:db8:1::{n:x}"),
+                ]
+            })
+            .map(|s| s.parse().unwrap())
+            .collect();
+        universe.sort_unstable();
+        let shared_sets: &[&[&str]] = &[
+            &[],
+            &["203.0.113.2"],
+            &["203.0.113.77", "2001:db8:1::9"],
+            &["198.51.100.4", "192.0.2.9", "2001:db8:1::1"],
+        ];
+        let without = collapse(&ips, |_| false);
+        let all = covered(&without, &universe);
+        for set in shared_sets {
+            let shared: BTreeSet<IpAddr> = set.iter().map(|s| s.parse().unwrap()).collect();
+            let with = collapse(&ips, |net| {
+                shared
+                    .range(net.network()..=net.broadcast())
+                    .next()
+                    .is_some()
+            });
+            let some = covered(&with, &universe);
+            assert!(some.is_subset(&all), "{set:?}: {with:?}");
+            assert!(ips.iter().all(|ip| some.contains(ip)), "{set:?}: {with:?}");
+            for ip in &shared {
+                let net = IpNet::new(*ip, if ip.is_ipv4() { 24 } else { 64 })
+                    .unwrap()
+                    .trunc();
+                assert!(!with.contains(&net.to_string()), "{set:?}: {with:?}");
+            }
+        }
+    }
+
     async fn app() -> (axum::Router, tempfile::TempDir) {
+        app_with(false).await
+    }
+
+    /// `shared`: 203.0.113.10 carries a carrier-NAT name (rule 4).
+    async fn app_with(shared: bool) -> (axum::Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -338,6 +439,23 @@ never_scan = ["198.51.100.0/24"]
                 .await
                 .unwrap();
         }
+        if shared {
+            let ip = store
+                .upsert_ip("203.0.113.10".parse().unwrap())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO ip_names (ip_id, name, source, first_seen, last_seen, agreed)
+                 VALUES (?, '0-0-0-10.cgn-wdsl.example.it', 'ptr', datetime('now'), datetime('now'), 1)",
+            )
+            .bind(ip.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            crate::store::maintenance::recompute_campaigns(&store).await;
+            let shared = store.shared_readings(None).await.unwrap();
+            assert_eq!(shared.len(), 1, "{shared:?}");
+        }
         let state = Arc::new(AdminState::public_only(store, cfg));
         (crate::admin::full_router(state), dir)
     }
@@ -391,6 +509,40 @@ never_scan = ["198.51.100.0/24"]
         assert_eq!(
             entries(&again),
             ["203.0.113.9", "203.0.113.10", "203.0.113.11"]
+        );
+    }
+
+    /// MIK-646: a shared reading adds a `#` line before its entry and
+    /// nothing else: without the `#` lines the feed is what it was, and
+    /// with `networks=1` its /24 is listed address by address.
+    #[tokio::test]
+    async fn a_shared_reading_is_a_comment_line_and_keeps_its_net_split() {
+        let (plain, _d1) = app_with(false).await;
+        let (shared, _d2) = app_with(true).await;
+        for q in ["", "?min_severity=4", "?min_severity=1"] {
+            let path = format!("/api/blocklist{q}");
+            let (_, a) = get(&plain, &path).await;
+            let (_, b) = get(&shared, &path).await;
+            assert_eq!(entries(&a), entries(&b), "{path}");
+        }
+        let (_, text) = get(&shared, "/api/blocklist").await;
+        let note = "# shared 203.0.113.10 rule=4 v=3: shared pool, by the operator's naming; \
+                    not verified by behaviour";
+        assert!(
+            text.contains(&format!("\n{note}\n203.0.113.10\n")),
+            "{text}"
+        );
+        assert_eq!(text.matches("\n# shared 2").count(), 1, "{text}");
+        assert!(
+            !text.contains("cgn-wdsl"),
+            "no operator text in the feed: {text}"
+        );
+        let (_, text) = get(&plain, "/api/blocklist?min_severity=1&networks=1").await;
+        assert_eq!(entries(&text), ["192.0.2.5", "203.0.113.0/24"]);
+        let (_, text) = get(&shared, "/api/blocklist?min_severity=1&networks=1").await;
+        assert_eq!(
+            entries(&text),
+            ["192.0.2.5", "203.0.113.9", "203.0.113.10", "203.0.113.11"]
         );
     }
 }

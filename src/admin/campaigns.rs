@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/campaigns", get(index))
-        .route("/admin/campaigns/{key}", get(campaign))
+        .route("/admin/evidence/campaigns", get(index))
+        .route("/admin/evidence/campaigns/{key}", get(campaign))
 }
 
 fn chrome() -> Chrome {
@@ -196,12 +196,41 @@ struct CampaignPage {
     t: CampaignTimeline,
     /// Agent-driven: a member carries an agent label.
     agent: bool,
+    /// The members' property strips, by address.
+    props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
 }
 
 /// Wave lines on a campaign's page, at most.
 pub const CAMPAIGN_WAVES: usize = 3;
 
 impl CampaignPage {
+    /// What ties the group, for the header line (MIK-689 #3): with no hard
+    /// link, the strongest path similarity it rests on.
+    fn strength(&self) -> String {
+        let (hard, soft) = (self.c.row.hard_edges, self.c.row.soft_edges);
+        if hard > 0 {
+            return format!(
+                "{hard} hard link{}, {soft} soft",
+                if hard == 1 { "" } else { "s" }
+            );
+        }
+        let best = self
+            .edges
+            .iter()
+            .filter(|v| !v.hard())
+            .filter_map(|v| v.e.score)
+            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+        let links = if soft == 1 {
+            "soft link only"
+        } else {
+            "soft links only"
+        };
+        match best {
+            Some(x) => format!("{links}: path similarity {x:.2}"),
+            None => links.to_string(),
+        }
+    }
+
     /// The listed shapes that formed a wave, for the Shapes card.
     fn waves(&self) -> Vec<&CampaignShape> {
         self.shapes
@@ -261,7 +290,11 @@ async fn campaign(
         .campaign_events(&key, None, CAMPAIGN_EVENTS)
         .await?;
     let agent = !st.store.agent_campaigns(Some(&key)).await?.is_empty();
+    let props =
+        crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
+            .await?;
     render(&CampaignPage {
+        props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
         calendar,
@@ -315,24 +348,34 @@ mod tests {
                 body
             }
         };
-        let list = page("/admin/campaigns").await;
+        let list = page("/admin/evidence/campaigns").await;
         assert_eq!(list.matches("badge-agent").count(), 1, "{list}");
         let row = list
             .split("<tr>")
             .find(|r| r.contains("badge-agent"))
             .unwrap();
-        assert!(row.contains("/admin/campaigns/192.0.2.3"), "{row}");
+        assert!(row.contains("/admin/evidence/campaigns/192.0.2.3"), "{row}");
         assert!(
-            page("/admin/campaigns/192.0.2.3")
+            page("/admin/evidence/campaigns/192.0.2.3")
                 .await
                 .contains(">agent-driven</span>")
         );
         assert!(
-            !page("/admin/campaigns/198.51.100.10")
+            !page("/admin/evidence/campaigns/198.51.100.10")
                 .await
                 .contains("badge-agent")
         );
         assert!(page("/ip/192.0.2.1").await.contains(">agent traces</span>"));
+        // MIK-697: each member row carries its property strip; the
+        // header says what ties the group (MIK-689 #3).
+        let camp = page("/admin/evidence/campaigns/192.0.2.3").await;
+        let row = camp
+            .split("<tr>")
+            .find(|r| r.contains("href=\"/ip/192.0.2.1\">192.0.2.1</a>"))
+            .unwrap();
+        assert!(row.contains("class=\"ip-props\""), "{row}");
+        assert!(row.contains(">agent traces</span>"), "{row}");
+        assert!(camp.contains("class=\"campaign-strength"), "{camp}");
         assert!(!page("/ip/192.0.2.2").await.contains("badge-agent"));
     }
 
@@ -362,10 +405,10 @@ mod tests {
         };
 
         let paths = [
-            "/admin/campaigns",
-            "/admin/campaigns?country=DE",
-            "/admin/campaigns/192.0.2.3",
-            "/admin/campaigns/nope",
+            "/admin/evidence/campaigns",
+            "/admin/evidence/campaigns?country=DE",
+            "/admin/evidence/campaigns/192.0.2.3",
+            "/admin/evidence/campaigns/nope",
         ];
         for p in paths {
             let (st, h, _) = send(&app, get(p, false), Body::empty()).await;
@@ -373,7 +416,10 @@ mod tests {
             assert_eq!(h["location"], "/login", "{p}");
         }
         // Read-only: no route takes a POST.
-        for p in ["/admin/campaigns", "/admin/campaigns/192.0.2.3"] {
+        for p in [
+            "/admin/evidence/campaigns",
+            "/admin/evidence/campaigns/192.0.2.3",
+        ] {
             let (st, _, _) = send(
                 &app,
                 Request::post(p)
@@ -385,28 +431,41 @@ mod tests {
             assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "{p}");
         }
 
-        let (st, _, list) = send(&app, get("/admin/campaigns", true), Body::empty()).await;
+        let (st, _, list) = send(&app, get("/admin/evidence/campaigns", true), Body::empty()).await;
         assert_eq!(st, StatusCode::OK);
         for want in [
-            "href=\"/admin/campaigns/192.0.2.3\"",
+            "href=\"/admin/evidence/campaigns/192.0.2.3\"",
             "#1",
-            "href=\"/admin/campaigns/198.51.100.10\"",
+            "href=\"/admin/evidence/campaigns/198.51.100.10\"",
             "Excluded values",
             "SHA256:image",
             "Last recompute",
-            "aria-current=\"true\">Campaigns",
+            "aria-current=\"page\">Campaigns",
+            "<dt>Soft edge</dt><dd class=\"plain\">The two IPs behave alike",
         ] {
             assert!(list.contains(want), "{want} missing:\n{list}");
         }
-        // Short strings (MIK-494): the edge rules live on /admin/links only.
-        assert!(list.contains("recomputed hourly. <a href=\"/admin/links\">What counts →</a>"));
+        // Short strings (MIK-494): the edge rules live on /admin/evidence/links only.
+        assert!(
+            list.contains("recomputed hourly. <a href=\"/admin/evidence/links\">What counts →</a>")
+        );
         assert!(list.contains("· no edge</span>"));
         assert!(!list.contains("not one operator"), "{list}");
-        let (_, _, few) = send(&app, get("/admin/campaigns?min=3", true), Body::empty()).await;
-        assert!(few.contains("/admin/campaigns/192.0.2.3"));
-        assert!(!few.contains("/admin/campaigns/198.51.100.10"));
+        let (_, _, few) = send(
+            &app,
+            get("/admin/evidence/campaigns?min=3", true),
+            Body::empty(),
+        )
+        .await;
+        assert!(few.contains("/admin/evidence/campaigns/192.0.2.3"));
+        assert!(!few.contains("/admin/evidence/campaigns/198.51.100.10"));
 
-        let (st, _, a) = send(&app, get("/admin/campaigns/192.0.2.3", true), Body::empty()).await;
+        let (st, _, a) = send(
+            &app,
+            get("/admin/evidence/campaigns/192.0.2.3", true),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         for want in [
             "Campaign #1",
@@ -415,13 +474,19 @@ mod tests {
             "SHA256:operator",
             // The campaign graph (S4) sits between Members and Evidence.
             "data-focus=\"campaign:192.0.2.3\"",
-            "<i class=\"line soft\"></i>shared paths",
+            "<i class=\"line soft\"></i>soft: shared paths",
+            // The edge legend and the fingerprint glossary (MIK-710).
+            "<dt>Hard edge</dt><dd class=\"plain\">The two IPs share an identity",
+            "on more than 50 IPs is shared infrastructure",
+            "active within 30 days of each other",
+            "join only on 2 soft edges",
+            "<summary>What the fingerprints mean</summary>",
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
         for want in [
-            "<a href=\"/admin/campaigns\">← All campaigns</a>",
-            "soft · <a href=\"/admin/links\">what counts →</a>",
+            "<a href=\"/admin/evidence/campaigns\">← All campaigns</a>",
+            "soft · <a href=\"/admin/evidence/links\">what counts →</a>",
             "<span class=\"muted\">per day, last 26 weeks, UTC</span>",
         ] {
             assert!(a.contains(want), "{want} missing:\n{a}");
@@ -441,7 +506,7 @@ mod tests {
         assert!(at("data-section=\"artifacts\"") < at("data-section=\"timeline\""));
         for want in [
             "<td class=\"path\">/drop.php</td>",
-            "href=\"/admin/uploads?sha256=",
+            "href=\"/admin/traps/uploads?sha256=",
             "<a href=\"/requests?cmd=ls%20-la\">ls -la</a></td><td class=\"num\">3</td><td class=\"num\">2</td>",
             "<a href=\"/requests?cmd=id\">id</a>",
         ] {
@@ -452,7 +517,7 @@ mod tests {
         }
         // The merged Timeline: the calendar and one events table with the
         // member's address on every row, no older pages.
-        let tl = &a[at("data-section=\"timeline\"")..at("<h2>Shapes</h2>")];
+        let tl = &a[at("data-section=\"timeline\"")..at("Shapes</h2>")];
         for want in [
             "data-calendar=",
             "<table class=\"events\">",
@@ -466,7 +531,7 @@ mod tests {
         }
         assert!(!tl.contains("Older →"), "{tl}");
         // The wave line sits in the Shapes card.
-        let shapes = &a[at("<h2>Shapes</h2>")..];
+        let shapes = &a[at("Shapes</h2>")..];
         assert!(
             shapes.contains(
                 "started probing a path no rule knows: <code>/gamma</code> (12 IPs in 60 min, first seen 2026-09-01 10:00)"
@@ -476,7 +541,7 @@ mod tests {
         assert_eq!(shapes.matches("data-wave").count(), 1, "{shapes}");
         let (_, _, b) = send(
             &app,
-            get("/admin/campaigns/198.51.100.10", true),
+            get("/admin/evidence/campaigns/198.51.100.10", true),
             Body::empty(),
         )
         .await;
@@ -489,16 +554,16 @@ mod tests {
         assert!(!b.contains("normalized paths most members"), "{b}");
         let (_, _, d) = send(
             &app,
-            get("/admin/campaigns/198.51.100.30", true),
+            get("/admin/evidence/campaigns/198.51.100.30", true),
             Body::empty(),
         )
         .await;
         assert!(d.contains("JA4/JA4H match"), "{d}");
 
         for p in [
-            "/admin/campaigns/nope",
-            "/admin/campaigns/192.0.2.250",
-            "/admin/campaigns/1'%20OR%201=1",
+            "/admin/evidence/campaigns/nope",
+            "/admin/evidence/campaigns/192.0.2.250",
+            "/admin/evidence/campaigns/1'%20OR%201=1",
         ] {
             let (st, _, _) = send(&app, get(p, true), Body::empty()).await;
             assert_eq!(st, StatusCode::NOT_FOUND, "{p}");
@@ -508,7 +573,7 @@ mod tests {
         // without a session.
         let (_, _, member) = send(&app, get("/ip/192.0.2.1", true), Body::empty()).await;
         assert!(
-            member.contains("href=\"/admin/campaigns/192.0.2.3\">member of campaign #1"),
+            member.contains("href=\"/admin/evidence/campaigns/192.0.2.3\">member of campaign #1"),
             "{member}"
         );
         let (_, _, single) = send(&app, get("/ip/203.0.113.20", true), Body::empty()).await;

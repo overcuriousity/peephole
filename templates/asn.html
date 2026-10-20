@@ -3,7 +3,22 @@
 {% block content %}
 <div class="page-head"><div><h1>{% if let Some(r) = r %}{% if let Some(o) = r.org %}{{ o }} {% endif %}{% endif %}<span class="mono">AS{{ asn }}</span></h1></div></div>
 {% if let Some(r) = r %}
+<div class="stack">
+<section class="card">
+  <h2>Network</h2>
+  <p class="muted">From what this node already holds: the geo lookups and the RDAP answers stored for the network's IPs. A count is the number of IPs the value holds for.</p>
+  <dl class="kv">
+    <dt>Registrant</dt><dd class="plain">{% if facts.orgs.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.orgs %}{% if !loop.first %} · {% endif %}{{ v }} <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
+    <dt>Country</dt><dd class="plain">{% if facts.countries.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.countries %}{% if !loop.first %} · {% endif %}<a href="/ips?asn={{ asn }}&amp;country={{ crate::admin::public::urlencode(v) }}">{{ v }}</a> <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
+    <dt>Registry</dt><dd class="plain">{% if let Some(g) = registry %}{{ g }}{% else %}<span class="muted">not known</span>{% endif %}</dd>
+    <dt>Network kind</dt><dd class="plain">{% if let Some(k) = kind %}{{ k }}{% else %}<span class="muted">not classified</span>{% endif %}</dd>
+    <dt>Abuse contact</dt><dd class="plain">{% if facts.abuse.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.abuse %}{% if !loop.first %} · {% endif %}<span class="mono">{{ v }}</span> <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
+    <dt>Ranges seen</dt><dd{% if facts.ranges.is_empty() %} class="plain"{% endif %}>{% if facts.ranges.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.ranges %}{% if !loop.first %}<br>{% endif %}{{ v }} <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
+    <dt>RDAP networks</dt><dd class="plain">{% if facts.nets.is_empty() %}<span class="muted">not known</span>{% else %}{% for (h, name, n) in facts.nets %}{% if !loop.first %} · {% endif %}<a href="{{ crate::admin::asn::net_href(h) }}">{% if let Some(m) = name %}{{ m }} · {% endif %}<span class="mono">{{ h }}</span></a> <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
+  </dl>
+</section>
 {% include "_rollup.html" %}
+</div>
 {% else %}
 <p class="empty">No IP recorded in AS{{ asn }}.</p>
 {% endif %}

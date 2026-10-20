@@ -123,7 +123,7 @@ and looked up again when the address returns:
 An address is looked up again only when it comes back, after 30 days, then
 45, 67.5, … (`[enrichment] refresh_after_days`). Every result records which
 provider and which node it came from, and every lookup is kept in a history
-(Admin → Export → full lookup history). The results of AbuseIPDB, Shodan
+(Admin → System → Export → full lookup history). The results of AbuseIPDB, Shodan
 and Shodan InternetDB are admin-only: the IP page shows them, and the IP list filters by
 abuse score, provider tag and "looked up / not yet".
 
@@ -151,7 +151,7 @@ intrusive and only ever bought:
 | 5 | the top 1000 ports with nmap's `vuln` scripts, minus those that ask third parties; only bought, never queued automatically |
 
 From level 2 the scan reads the source's SSH host keys, TLS certificates and
-HTTP ETags, so sources that share one show up as linked (Admin → Links).
+HTTP ETags, so sources that share one show up as linked (Admin → Evidence → Links).
 
 The top lists are nmap 7.95's (`--top-ports 100` and `1000`), written out
 as port lists, because nmap's `-p` can only narrow a top list. Levels 1 to
@@ -176,6 +176,7 @@ at the row that produced it:
 | `fleet.canary` | a canary served to another address came back from this one in a header or the request body (never the path or query, which a link can plant on anyone) |
 | `fleet.dense` | 16 or more sources in the address's /24 (IPv4) or /48 (IPv6) |
 | `name.consumer`, `name.scanner` | the reverse or PTR name matches a consumer-line or a scanner pattern |
+| `name.pool`, `name.cgn`, `name.mobile` | the reverse or PTR name matches a pooled-line (`dynamic`, `pool`, `ppp`), carrier-NAT (`cgn`, `cgnat`, `lsn`, `nat` as a label) or mobile (`umts`, `lte`, `gprs`, `3g`/`4g`/`5g`, `mobil`, `mob`, `wap`) pattern; read by the [shared reading](#shared-addresses), not the verdict |
 | `net.hosting` | the ASN is in the X4BNet datacenter ASN list or in our supplement (see [AS type](#as-type)) |
 | `net.eyeball` | never set: no bundled source classifies consumer ISPs |
 
@@ -186,9 +187,11 @@ signature or consumer-name pattern may match the banners or names of the
 for that reason: "Android TV OS 11" and "3Com OfficeConnect wireless
 broadband router" turn up on rented hosting addresses.
 
-A scan or name more than 24 hours older than the address's last request is
-not used: on a dynamic line the address may have passed to the next
-subscriber.
+A scan more than 24 hours older than the address's last request is not
+used: on a dynamic line the address may have passed to the next
+subscriber. A name is used for 30 days: a pool or carrier-NAT name is a
+property of the operator's address plan, not of the subscriber, and holds
+for weeks to months.
 
 The verdict is the first rule that matches:
 
@@ -243,10 +246,70 @@ The rows are derived on each node with the hourly campaign pass. They are
 never replicated, never exported and never in the blocklist: a dynamic
 address can be personal data, and a device banner is cheap to fake for
 whoever wants an address to look like a victim. A forged banner earns at
-most a sentence on the admin page of the node it was shown to.
+most a sentence on the admin page of the node it was shown to. (The one
+reading that leaves the node is the [shared field](#shared-addresses),
+never a row.)
 `peephole store recompute-campaigns` recomputes them too. It prints the
 rows by kind, the verdicts by rule, and the device types and OS guesses
 no signature matched, so the catalogue can grow from data.
+
+#### Shared addresses
+
+A second reading over the same rows says how many parties may share an
+address: a carrier-NAT pool, a mobile pool, a line that is reassigned, one
+subscriber's router. It is not a threat or suspicion score and never a
+number; it changes no severity and no blocklist membership. The reasoning
+behind it, signal by signal, is in
+[Shared addresses](shared-addresses.md). The first rule that matches wins:
+
+| # | When | Reading |
+|---|---|---|
+| 1 | `net.hosting`, `name.scanner`, `fleet.key`, `fleet.canary`, or a Tor exit | one operator's address |
+| 2 | `device.cpe` and `name.pool` | one subscriber's network, on a pooled line |
+| 3 | `device.cpe` | one subscriber's network |
+| 4 | `name.cgn` | shared pool, by the operator's naming |
+| 5 | `name.mobile`, or `net.eyeball` = `mobile` (never set) | shared pool, mobile |
+| 6 | `name.pool` | pooled line |
+| 7 | `name.consumer` | consumer line, sharing not read |
+| 8 | anything else | insufficient evidence |
+
+Rule 1 comes first so that a name planted on rented space reads nothing.
+A consumer router answering (rules 2 and 3) is the one observation that
+contradicts a carrier pool, so it overrides a `cgn` or mobile name; it
+says nothing against reassignment, which is why rule 2 keeps the pooled
+line. Nothing adds up: an address with a `cgn` and a `pool` name reads
+rule 4 with both rows shown. Rule 8 is the default, and an address
+without a name or a scan is not thereby single-user, nor shared.
+
+The admin IP page shows the reading under the device verdict, with each
+row linked to its name or scan and the sentence of what was observed and
+who says so; rule 1 shows nothing. Every reading above rule 1 carries the
+text: "This reading says how many parties may share this address. It is
+not a threat or suspicion score. A shared pool means a block on this
+address hits other people; it does not change what the address sent."
+`/ips?reading=<state>` lists the addresses of one reading.
+
+**At the boundaries.** Rules 2, 4, 5 and 6, the readings that say the
+address is or sits on a pool, also go out with the data, computed by the
+publishing node at publish time from its own rows, never stored and never
+replicated:
+
+- the export's `shared` column (see [the dataset](dataset.md#shared));
+- the blocklist feed: a `#` comment line just before the entry, such as
+  `# shared 192.0.2.1 rule=4 v=3: shared pool, by the operator's naming;
+  not verified by behaviour`, and with `networks=1` a /24 (IPv6: /64)
+  holding such an address anywhere is never collapsed into a prefix; its
+  addresses are listed one by one. Entry lines and membership do not
+  change.
+
+Each value names who makes the claim: the operator's naming, plus a scan
+for rule 2. A value is set only on an agreed name the export lists, so a
+rule-5 reading from a mobile `net.eyeball` row alone stays on the IP page
+and goes out with neither. None says "detected": a carrier-NAT name is the carrier's own
+statement about its address plan, and nothing a honeypot receives can
+verify it. The reading is a cost warning about blocking, not a verdict:
+an address in a mobile pool usually holds a subscriber for a day or less,
+so by the time a block lands the address may belong to someone else.
 
 **Bystanders are spared.**
 
@@ -384,6 +447,6 @@ a list file cannot prove who holds an address tomorrow.
 
 ### Seeing who was refused
 
-Admin → Scans lists every refused scan job with its reason
+Admin → Investigate → Scans lists every refused scan job with its reason
 (`status=refused`), e.g. `verified crawler (177.186.132.66.censys-scanner.com)`;
 the pace card links the last 24 hours' refusals.

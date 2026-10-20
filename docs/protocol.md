@@ -85,7 +85,7 @@ of it.
   still prunes, and `peephole cluster purge` removes a blocked peer's data.
 - **The dataset is persistent.** What a node contributed stays when it
   leaves or is pruned. By default every node keeps the whole history. Each
-  member's page (Cluster › the member) counts the requests, fingerprints, scans and
+  member's page (Network › the member) counts the requests, fingerprints, scans and
   lookups this node holds from it; the dataset export has the records.
 - **Known limitation:** the admission limit (20 new members a day per
   sponsor) is judged by the sponsor's own timestamps. A member key that
@@ -147,7 +147,7 @@ can still belong together: they share an **ownership key**.
 
 - **Create it once** on your first node (`peephole owner new`, or Cluster ›
   Ownership › "Your first node?") and **claim each of your other nodes**
-  with it, on that node (`peephole owner claim`, or Cluster › Ownership ›
+  with it, on that node (`peephole owner claim`, or Network › Ownership ›
   "Already have a key?" there). A node cannot be claimed from another one:
   whoever claims it needs its admin site or shell. The key is shown once;
   `claim` reads it from standard input so it does not end up in the shell
@@ -165,12 +165,12 @@ can still belong together: they share an **ownership key**.
 - From a managing node you can change a sibling's scan workers and
   roles, block, unblock and purge peers there, revoke its
   invites, have it leave the cluster, and release it. Each of your nodes
-  lists the commands it received (Cluster › Ownership).
+  lists the commands it received (Network › Ownership).
 - **Not possible from outside**, also for the owner: creating an invite
   (the invite is a secret and would pass through other members), and
   everything in the config file (addresses, paths, WebAuthn, API keys,
   `never_scan`, nmap arguments).
-- **A leaked key**: rotate it on a managing node (Cluster › Ownership).
+- **A leaked key**: rotate it on a managing node (Network › Ownership).
   Every node of yours that answers takes the new key; for the rest the page
   offers to retry. On a node you cannot reach that way, run
   `peephole owner claim` locally. The new key is stored before the first
@@ -422,7 +422,7 @@ disputed with every answer. The other providers show the newest result.
 ### Accounting
 
 - **Every node counts for itself**, from its own copy of the log. There is no
-  vote and no shared chain; `Cluster › Credits` shows the market as this node
+  vote and no shared chain; `Network › Credits` shows the market as this node
   sees it: each good's price over 7 days beside the spread members announce,
   this node's daily income by source and spending, every member's holdings
   and reported hours up. Prices are kept hourly in `price_history` (local,

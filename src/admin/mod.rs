@@ -13,9 +13,11 @@ pub mod credits;
 pub mod decoys;
 pub mod devices;
 pub mod error;
+pub mod glossary;
 pub mod limit;
 pub mod links;
 pub mod lookup;
+pub mod moved;
 pub mod overview;
 pub mod pages;
 pub mod password;
@@ -199,11 +201,16 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(credits::routes())
         .merge(devices::routes())
         .merge(uploads::routes())
+        .merge(moved::routes())
         .merge(api_v1::routes())
         .fallback(error::not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             limit::enforce,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            market_scope,
         ))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
@@ -212,6 +219,16 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
 /// Public-only router used by early tests; same middleware.
 pub fn router(state: Arc<AdminState>) -> Router {
     full_router(state)
+}
+
+/// Lets the admin nav know whether Market (the credits page) answers.
+async fn market_scope(
+    axum::extract::State(st): axum::extract::State<Arc<AdminState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let market = st.recorder.node().is_some();
+    views::MARKET.scope(market, next.run(req)).await
 }
 
 async fn security_headers(
@@ -497,10 +514,13 @@ mod tests {
         // Reading a page from anywhere is not a write.
         let r = app
             .oneshot(
-                with(axum::http::Request::get("/admin/lookup"), FOREIGN[0])
-                    .header("cookie", &cookie)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
+                with(
+                    axum::http::Request::get("/admin/investigate/lookup"),
+                    FOREIGN[0],
+                )
+                .header("cookie", &cookie)
+                .body(axum::body::Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();

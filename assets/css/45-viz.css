@@ -36,6 +36,7 @@
 .ranked li:last-child { border-bottom: 0; }
 .ranked .databar { grid-column: 1 / -1; }
 .ranked-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ranked-rest .ranked-name { white-space: normal; }
 
 .wanted li { display: grid; grid-template-columns: 1.5rem 1fr auto auto; align-items: center; gap: 0.75rem; padding: 0.45rem 0; border-bottom: 1px solid var(--color-border-subtle); }
 .wanted li:last-child { border-bottom: 0; }
@@ -145,6 +146,7 @@ td .databar { margin-top: 0.3rem; min-width: 4rem; }
 /* ---- Request page --------------------------------------------------- */
 .req-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.75rem 1.25rem; margin: 0; }
 .req-facts div { min-width: 0; }
+.req-facts + .req-facts { margin-top: 0.75rem; }
 .req-facts dt { font-size: var(--text-xs); color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.15rem; }
 .req-facts dd { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .req-line { font-family: var(--font-mono); font-size: var(--text-md); padding: 0.6rem 0.8rem; background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow-wrap: anywhere; margin-bottom: 1rem; }
@@ -189,6 +191,7 @@ tr:hover .copy-btn.subtle, h2:hover .copy-btn.subtle, .copy-btn.subtle:focus-vis
 .link-layout { display: grid; grid-template-columns: minmax(0, 1fr) 18rem; gap: 1rem; margin-bottom: 1rem; }
 @media (max-width: 900px) { .link-layout { grid-template-columns: 1fr; } }
 .link-graph { width: 100%; height: 32rem; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-md); background: var(--color-bg-surface); touch-action: none; overflow: hidden; }
+.link-graph-small { height: 16rem; }
 .link-graph svg { display: block; width: 100%; height: 100%; cursor: grab; }
 .link-graph-nojs { padding: 1rem; }
 .link-controls { margin-bottom: 0.5rem; }
@@ -226,3 +229,39 @@ tr:hover .copy-btn.subtle, h2:hover .copy-btn.subtle, .copy-btn.subtle:focus-vis
 .canary-mark.used { color: var(--color-danger); }
 .canary-mark svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 td.nowrap { white-space: nowrap; }
+/* Wall: campaigns and personas in one card, one sub-section after the other (MIK-696). */
+.mix-split { display: grid; gap: 1.25rem; }
+.mix-part h3 { margin: 0 0 0.5rem; }
+.persona-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(18rem, 100%), 1fr)); gap: 0.75rem 1.5rem; }
+.persona-grid h4 { margin: 0 0 0.25rem; font-size: var(--text-sm); }
+/* A wide table read row by row on a phone: time · IP · sev, then method and path, then labels. */
+@media (max-width: 37.5rem) {
+  .table-wrap.wide table.stack-narrow { width: 100%; min-width: 0; }
+  table.stack-narrow thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.stack-narrow, table.stack-narrow tbody { display: block; }
+  table.stack-narrow tr { display: grid; grid-template-columns: auto 1fr auto; gap: 0.2rem 0.5rem; align-items: baseline; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--color-border-subtle); }
+  table.stack-narrow td { display: block; padding: 0; border: 0; white-space: normal; }
+  table.stack-narrow td.ts { grid-column: 1; grid-row: 1; }
+  table.stack-narrow td.ip { grid-column: 2; grid-row: 1; }
+  table.stack-narrow td.sev { grid-column: 3; grid-row: 1; }
+  table.stack-narrow td.mono { grid-column: 1; grid-row: 2; }
+  .table-wrap.wide table.stack-narrow td.path { grid-column: 2 / -1; grid-row: 2; width: auto; max-width: none; }
+  table.stack-narrow td.labels { grid-column: 1 / -1; }
+  table.stack-narrow td.empty { grid-column: 1 / -1; }
+  /* The severity stripe moves to the row, clear of the cell padding. */
+  table.stack-narrow tr[data-sev] td:first-child { box-shadow: none; }
+  table.stack-narrow tr[data-sev] { box-shadow: inset 3px 0 0 var(--sev-0-fill); }
+  table.stack-narrow tr[data-sev="1"] { box-shadow: inset 3px 0 0 var(--sev-1-fill); }
+  table.stack-narrow tr[data-sev="2"] { box-shadow: inset 3px 0 0 var(--sev-2-fill); }
+  table.stack-narrow tr[data-sev="3"] { box-shadow: inset 3px 0 0 var(--sev-3-fill); }
+  table.stack-narrow tr[data-sev="4"] { box-shadow: inset 3px 0 0 var(--sev-4-fill); }
+  /* Campaign evidence: the pair, kind, why, then first and last. */
+  table.stack-narrow.edges tr { grid-template-columns: auto 1fr; }
+  table.stack-narrow.edges td.ip { grid-column: 1 / -1; grid-row: 1; white-space: normal; }
+  table.stack-narrow.edges td.kind { grid-column: 1 / -1; grid-row: 2; }
+  table.stack-narrow.edges td.why { grid-column: 1 / -1; grid-row: 3; }
+  table.stack-narrow.edges td.first { grid-column: 1; grid-row: 4; }
+  table.stack-narrow.edges td.last { grid-column: 2; grid-row: 4; }
+  table.stack-narrow.edges td.first::before { content: "first "; }
+  table.stack-narrow.edges td.last::before { content: "last "; }
+}

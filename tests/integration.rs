@@ -544,16 +544,16 @@ async fn admin_routes_redirect_without_session() {
     for path in [
         "/admin",
         "/admin/requests/1",
-        "/admin/scans",
-        "/admin/scans/1",
-        "/admin/scans/1/xml",
-        "/admin/links",
-        "/admin/links/canaries",
-        "/admin/links/canaries/served/1",
-        "/admin/links/fp/x",
+        "/admin/investigate/scans",
+        "/admin/investigate/scans/1",
+        "/admin/investigate/scans/1/xml",
+        "/admin/evidence/links",
+        "/admin/evidence/canaries",
+        "/admin/evidence/canaries/served/1",
+        "/admin/evidence/links/fp/x",
         "/admin/api/links/graph?focus=fp:x",
-        "/admin/inbox",
-        "/admin/system",
+        "/admin/system/inbox",
+        "/admin/system/status",
         "/admin/system/settings",
         "/admin/system/export",
         "/admin/export/download?format=csv",
@@ -823,20 +823,26 @@ async fn admin_pages_and_deletes_with_session() {
     let html = get("/admin").await.unwrap().text().await.unwrap();
     assert!(!html.contains("data-queue"), "no queue card on Overview");
     assert!(!html.contains("<h2>Intel</h2>"), "intel lives on System");
-    assert!(html.contains("href=\"/admin/inbox\"") && html.contains("href=\"/admin/scans\""));
+    assert!(
+        html.contains("href=\"/admin/system/status\">System<")
+            && html.contains("href=\"/admin/investigate/lookup\">Investigate<")
+    );
+    // No cluster: no Market tab, and its page is not there.
+    assert!(!html.contains("/admin/network/credits"), "{html}");
+    assert_eq!(get("/admin/network/credits").await.unwrap().status(), 404);
     assert!(html.contains("data-recent"), "recent activity stays");
     assert!(
         html.contains("Needs attention") && html.contains("failed in 24 h"),
         "{html}"
     );
-    let html = get("/admin/scans?status=done")
+    let html = get("/admin/investigate/scans?status=done")
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(html.contains("203.0.113.78") && html.contains("done"));
-    let html = get("/admin/scans?status=nonsense&level=abc")
+    let html = get("/admin/investigate/scans?status=nonsense&level=abc")
         .await
         .unwrap()
         .text()
@@ -893,14 +899,19 @@ async fn admin_pages_and_deletes_with_session() {
         .unwrap();
     assert!(html.contains("tarpit · 200 · held 4 min"), "time held");
 
-    let html = get("/admin/scans").await.unwrap().text().await.unwrap();
+    let html = get("/admin/investigate/scans")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("203.0.113.78"));
     let sid: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE ip_id = ?")
         .bind(ip78.id)
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    let html = get(&format!("/admin/scans/{sid}"))
+    let html = get(&format!("/admin/investigate/scans/{sid}"))
         .await
         .unwrap()
         .text()
@@ -918,7 +929,7 @@ async fn admin_pages_and_deletes_with_session() {
         html.contains("shared with 1 other IP"),
         "host keys on the IP page"
     );
-    let html = get("/admin/analytics?range=all")
+    let html = get("/admin/overview/analytics?range=all")
         .await
         .unwrap()
         .text()
@@ -927,13 +938,26 @@ async fn admin_pages_and_deletes_with_session() {
     assert!(html.contains("SSH servers (HASSH)") && html.contains("Certificate builders (JA4X)"));
     assert!(html.contains("HTTP fingerprints (JA4H)") && html.contains(ja4h));
     assert!(
-        html.contains(&format!("href=\"/admin/links/ja4h/{ja4h}\"")),
+        html.contains(&format!("href=\"/admin/evidence/links/ja4h/{ja4h}\"")),
         "JA4H → item page"
     );
     assert!(
-        html.contains("href=\"/admin/links/hassh/") && html.contains("href=\"/admin/links/ja4x/")
+        html.contains("href=\"/admin/evidence/links/hassh/")
+            && html.contains("href=\"/admin/evidence/links/ja4x/")
     );
-    assert!(html.contains("href=\"/admin/links/canaries?range=all\""));
+    assert!(html.contains("href=\"/admin/evidence/canaries?range=all\""));
+    // No agent traces: what counts as one, instead of an empty table (MIK-696).
+    let traces = html.split("AI agent traces").nth(1).unwrap();
+    let traces = traces.split("</section>").next().unwrap();
+    for want in [
+        "href=\"/requests?label=ai-agent-tooling\"",
+        "href=\"/requests?label=ai-agent-artifact\"",
+        "href=\"/admin/traps/mcp\"",
+        "before v0.20.0",
+    ] {
+        assert!(traces.contains(want), "{want}: {traces}");
+    }
+    assert!(!traces.contains("<table"), "{traces}");
     // Every Analytics row opens a filtered view.
     for want in [
         "href=\"/requests?ua=",
@@ -942,8 +966,8 @@ async fn admin_pages_and_deletes_with_session() {
         "href=\"/requests?answer=",
         "href=\"/ips?port=22%2Ftcp\"",
         "href=\"/ips?os=Linux\"",
-        "href=\"/admin/scans?level=",
-        "href=\"/admin/scans?status=",
+        "href=\"/admin/investigate/scans?level=",
+        "href=\"/admin/investigate/scans?status=",
         "href=\"/ips?nointel=abuseipdb\"",
     ] {
         assert!(html.contains(want), "analytics lacks {want}");
@@ -1028,7 +1052,7 @@ async fn admin_pages_and_deletes_with_session() {
     assert!(!rows.contains("class=\"chip\""), "no filter, no chips");
     // Quick filters are always there and apply in one click.
     assert!(rows.contains("class=\"chip shortcut\" href=\"/requests?answer=tarpit\""));
-    let html = get("/admin/analytics?range=24h")
+    let html = get("/admin/overview/analytics?range=24h")
         .await
         .unwrap()
         .text()
@@ -1045,18 +1069,19 @@ async fn admin_pages_and_deletes_with_session() {
         .text()
         .await
         .unwrap();
-    assert!(html.contains(&format!("href=\"/admin/links/ja4h/{ja4h}\"")));
+    assert!(html.contains(&format!("href=\"/admin/evidence/links/ja4h/{ja4h}\"")));
     let html = get("/ip/203.0.113.78").await.unwrap().text().await.unwrap();
     assert!(
-        html.contains("href=\"/admin/links/fp/CLUSTERHASH\""),
+        html.contains("href=\"/admin/evidence/links/fp/CLUSTERHASH\""),
         "fingerprint → item page"
     );
     assert!(
-        html.contains("href=\"/admin/links/ip/203.0.113.78\""),
+        html.contains("href=\"/admin/evidence/links/ip/203.0.113.78\""),
         "IP link graph"
     );
     assert!(
-        html.contains("href=\"/admin/links/ssh/") && html.contains("href=\"/admin/links/hassh/"),
+        html.contains("href=\"/admin/evidence/links/ssh/")
+            && html.contains("href=\"/admin/evidence/links/hassh/"),
         "host keys → item pages"
     );
     assert!(!html.contains("/admin/fingerprints"));
@@ -1070,16 +1095,23 @@ async fn admin_pages_and_deletes_with_session() {
         html.contains(&format!("/admin/requests/{rid}")),
         "JA4H search"
     );
-    let xml = get(&format!("/admin/scans/{sid}/xml")).await.unwrap();
+    let xml = get(&format!("/admin/investigate/scans/{sid}/xml"))
+        .await
+        .unwrap();
     assert_eq!(
         xml.headers().get("content-type").unwrap(),
         "application/xml"
     );
     assert!(xml.text().await.unwrap().contains("RAWXML"));
 
-    let html = get("/admin/links").await.unwrap().text().await.unwrap();
-    assert!(html.contains("CLUSTERHASH") && html.contains("/admin/links/fp/CLUSTERHASH"));
-    let html = get("/admin/links?kind=ssh&q=ab&shared=0")
+    let html = get("/admin/evidence/links")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("CLUSTERHASH") && html.contains("/admin/evidence/links/fp/CLUSTERHASH"));
+    let html = get("/admin/evidence/links?kind=ssh&q=ab&shared=0")
         .await
         .unwrap()
         .text()
@@ -1087,11 +1119,17 @@ async fn admin_pages_and_deletes_with_session() {
         .unwrap();
     // Kinds are a pill bar: the current one marked, the others keep every
     // filter but "starts with"; the software group is set apart.
-    assert!(html.contains("<a href=\"/admin/links?kind=ssh&#38;shared=0\" title=\"Identity"));
-    assert!(html.contains("<a href=\"/admin/links?kind=ja4&#38;shared=0\" class=\"group-start\""));
+    assert!(
+        html.contains("<a href=\"/admin/evidence/links?kind=ssh&#38;shared=0\" title=\"Identity")
+    );
+    assert!(
+        html.contains(
+            "<a href=\"/admin/evidence/links?kind=ja4&#38;shared=0\" class=\"group-start\""
+        )
+    );
     assert!(html.contains(" aria-current=\"true\">SSH host key</a>"));
     assert!(!html.contains("<select name=\"kind\""));
-    let html = get("/admin/links?kind=ssh")
+    let html = get("/admin/evidence/links?kind=ssh")
         .await
         .unwrap()
         .text()
@@ -1111,22 +1149,25 @@ async fn admin_pages_and_deletes_with_session() {
         "{html}"
     );
     assert!(html.contains("data-link-graph") && html.contains("data-focus=\"ssh:"));
-    let html = get("/admin/links/fp/CLUSTERHASH")
+    let html = get("/admin/evidence/links/fp/CLUSTERHASH")
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(html.contains("203.0.113.77") && html.contains("203.0.113.78"));
-    let html = get("/admin/links/fp/NEVERSEEN")
+    let html = get("/admin/evidence/links/fp/NEVERSEEN")
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(html.contains("Not seen") && !html.contains("data-link-graph"));
-    assert_eq!(get("/admin/links/bogus/x").await.unwrap().status(), 404);
-    let html = get("/admin/links/ip/203.0.113.77")
+    assert_eq!(
+        get("/admin/evidence/links/bogus/x").await.unwrap().status(),
+        404
+    );
+    let html = get("/admin/evidence/links/ip/203.0.113.77")
         .await
         .unwrap()
         .text()
@@ -1137,20 +1178,26 @@ async fn admin_pages_and_deletes_with_session() {
             && html.contains("href=\"/ip/203.0.113.77\"")
     );
     // Old anchors.
-    let r = get("/admin/links?anchor=CLUSTERHASH").await.unwrap();
+    let r = get("/admin/evidence/links?anchor=CLUSTERHASH")
+        .await
+        .unwrap();
     assert!(
-        r.url().path().ends_with("/admin/links/fp/CLUSTERHASH"),
+        r.url()
+            .path()
+            .ends_with("/admin/evidence/links/fp/CLUSTERHASH"),
         "{}",
         r.url()
     );
     let a = peephole::store::hostkeys::anchor("ssh-hostkey", &ssh);
-    let r = get(&format!("/admin/links?anchor={a}")).await.unwrap();
+    let r = get(&format!("/admin/evidence/links?anchor={a}"))
+        .await
+        .unwrap();
     assert!(
-        r.url().path().starts_with("/admin/links/ssh/"),
+        r.url().path().starts_with("/admin/evidence/links/ssh/"),
         "{}",
         r.url()
     );
-    let html = get("/admin/links?anchor=ssh-000000000000")
+    let html = get("/admin/evidence/links?anchor=ssh-000000000000")
         .await
         .unwrap()
         .text()
@@ -1199,11 +1246,17 @@ async fn admin_pages_and_deletes_with_session() {
         "{html}"
     );
     let a = peephole::store::hostkeys::anchor("ssh-hostkey", odd);
-    let r = get(&format!("/admin/links?anchor={a}")).await.unwrap();
+    let r = get(&format!("/admin/evidence/links?anchor={a}"))
+        .await
+        .unwrap();
     assert_eq!(r.url().path(), href, "anchor {a}");
     let j: serde_json::Value = get(&format!(
         "/admin/api/links/graph?focus={}&depth=1",
-        peephole::admin::views::link_href("ssh", odd).replacen("/admin/links/ssh/", "ssh:", 1)
+        peephole::admin::views::link_href("ssh", odd).replacen(
+            "/admin/evidence/links/ssh/",
+            "ssh:",
+            1
+        )
     ))
     .await
     .unwrap()
@@ -1211,8 +1264,17 @@ async fn admin_pages_and_deletes_with_session() {
     .await
     .unwrap();
     assert_eq!(j["nodes"][0]["id"], format!("ssh:{odd}"));
-    let html = get("/admin/inbox").await.unwrap().text().await.unwrap();
+    let html = get("/admin/system/inbox")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("lost@example.org"));
+    assert!(
+        html.contains("aria-current=\"page\">Inbox</a>"),
+        "a System subtab"
+    );
     let html = get("/admin/system/keys")
         .await
         .unwrap()
@@ -1229,16 +1291,16 @@ async fn admin_pages_and_deletes_with_session() {
     assert!(html.contains("/admin/export/download"));
     for html_path in [
         "/admin",
-        "/admin/scans",
+        "/admin/investigate/scans",
         &format!("/admin/requests/{rid}"),
-        &format!("/admin/scans/{sid}"),
-        "/admin/links",
-        "/admin/links/fp/CLUSTERHASH",
-        "/admin/links/canaries",
-        "/admin/analytics",
+        &format!("/admin/investigate/scans/{sid}"),
+        "/admin/evidence/links",
+        "/admin/evidence/links/fp/CLUSTERHASH",
+        "/admin/evidence/canaries",
+        "/admin/overview/analytics",
         "/ip/203.0.113.78",
         "/admin/system/keys",
-        "/admin/system",
+        "/admin/system/status",
         "/admin/system/settings",
     ] {
         let html = get(html_path).await.unwrap().text().await.unwrap();
@@ -1987,7 +2049,7 @@ async fn public_ip_page_shows_aggregates_but_hides_requests_and_admin_data() {
     for marker in [
         // Fingerprints are never public.
         ja4h,
-        "/admin/links",
+        "/admin/evidence/links",
         "HEADER-MARKER",
         "claimant@example.org",
         "FPHASHMARKER",
@@ -2364,7 +2426,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
     let (client, base, state) = enrolled_admin_client_with_state(store.clone(), cfg).await;
 
     let page = client
-        .get(format!("{base}/admin/scans"))
+        .get(format!("{base}/admin/investigate/scans"))
         .send()
         .await
         .unwrap();
@@ -2439,7 +2501,7 @@ async fn scan_pace_is_adjustable_from_the_scans_page() {
         .await
         .unwrap();
     let html = client
-        .get(format!("{base}/admin/scans?status=failed"))
+        .get(format!("{base}/admin/investigate/scans?status=failed"))
         .send()
         .await
         .unwrap()
@@ -2638,7 +2700,7 @@ secure_cookies = false
     let store = Store::connect(&cfg.database_path).await.unwrap();
     let (c, base) = enrolled_admin_client(store, cfg).await;
     let body = c
-        .get(format!("{base}/admin/cluster"))
+        .get(format!("{base}/admin/network/members"))
         .send()
         .await
         .unwrap()
@@ -2908,7 +2970,7 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .unwrap();
     assert!(ip.contains("used by 1 other IP"), "{ip}");
     // Both request rows carry a mark that opens the decoy's canary page.
-    let mark = format!("href=\"/admin/links/canaries/served/{served}\"");
+    let mark = format!("href=\"/admin/evidence/canaries/served/{served}\"");
     assert!(ip.contains(&mark), "served mark");
     let user_ip = admin
         .get(format!("{admin_base}/ip/203.0.113.61"))
@@ -2920,7 +2982,9 @@ async fn request_and_ip_pages_show_canary_reuse() {
         .unwrap();
     assert!(user_ip.contains(&mark), "used mark");
     let decoy = admin
-        .get(format!("{admin_base}/admin/links/canaries/served/{served}"))
+        .get(format!(
+            "{admin_base}/admin/evidence/canaries/served/{served}"
+        ))
         .send()
         .await
         .unwrap();
@@ -2935,7 +2999,9 @@ async fn request_and_ip_pages_show_canary_reuse() {
     // Basic auth on /x got the admin decoy, which serves its own ETag
     // canary (version 3): a page of its own, no reuse on it.
     let own = admin
-        .get(format!("{admin_base}/admin/links/canaries/served/{used}"))
+        .get(format!(
+            "{admin_base}/admin/evidence/canaries/served/{used}"
+        ))
         .send()
         .await
         .unwrap();
@@ -2948,7 +3014,9 @@ async fn request_and_ip_pages_show_canary_reuse() {
         "{own}"
     );
     let none = admin
-        .get(format!("{admin_base}/admin/links/canaries/served/{plain}"))
+        .get(format!(
+            "{admin_base}/admin/evidence/canaries/served/{plain}"
+        ))
         .send()
         .await
         .unwrap();
@@ -2983,7 +3051,7 @@ async fn canaries_page_lists_reuses_and_filters() {
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (admin, admin_base) = enrolled_admin_client(store.clone(), cfg).await;
     let page = admin
-        .get(format!("{admin_base}/admin/links/canaries?range=all"))
+        .get(format!("{admin_base}/admin/evidence/canaries?range=all"))
         .send()
         .await
         .unwrap()
@@ -2995,12 +3063,12 @@ async fn canaries_page_lists_reuses_and_filters() {
         "{page}"
     );
     assert!(
-        page.contains("/admin/links/canary/"),
+        page.contains("/admin/evidence/links/canary/"),
         "reuse rows link to the canary's graph"
     );
     let page = admin
         .get(format!(
-            "{admin_base}/admin/links/canaries?range=all&source=same"
+            "{admin_base}/admin/evidence/canaries?range=all&source=same"
         ))
         .send()
         .await
@@ -3012,7 +3080,7 @@ async fn canaries_page_lists_reuses_and_filters() {
     // An IP the store does not know matches nothing, not everything.
     let page = admin
         .get(format!(
-            "{admin_base}/admin/links/canaries?range=all&ip=198.51.100.250"
+            "{admin_base}/admin/evidence/canaries?range=all&ip=198.51.100.250"
         ))
         .send()
         .await
@@ -3022,20 +3090,23 @@ async fn canaries_page_lists_reuses_and_filters() {
         .unwrap();
     assert!(!page.contains("203.0.113.71"), "{page}");
     let nav = admin
-        .get(format!("{admin_base}/admin"))
+        .get(format!("{admin_base}/admin/evidence/canaries"))
         .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(nav.contains("href=\"/admin/links\">Links<"), "links tab");
+    assert!(
+        nav.contains("href=\"/admin/evidence/links\">Links<"),
+        "links tab"
+    );
     let anon = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     assert_ne!(
-        anon.get(format!("{admin_base}/admin/links/canaries"))
+        anon.get(format!("{admin_base}/admin/evidence/canaries"))
             .send()
             .await
             .unwrap()
@@ -3100,10 +3171,10 @@ async fn a_decoy_renders_the_same_after_adoption() {
     assert_eq!(again.body, body);
 }
 
-/// The admin subnav has seven tabs; Fingerprints and Canaries sit under
-/// Links, intel status under System.
+/// The admin nav has six groups (MIK-711); Canaries sit under Evidence,
+/// intel status under System.
 #[tokio::test]
-async fn admin_nav_groups_pages_under_seven_tabs() {
+async fn admin_nav_groups_pages_under_six_groups() {
     let (_trap, store, dir) = spawn_trap().await;
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (client, base) = enrolled_admin_client(store, cfg).await;
@@ -3134,36 +3205,30 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
     let n = nav(&home);
     for want in [
         ">Overview<",
-        ">Analytics<",
-        ">Lookup<",
-        ">Scans<",
-        ">Links<",
-        ">Inbox<",
-        ">Cluster<",
+        ">Investigate<",
+        ">Evidence<",
+        ">Traps<",
+        ">Network<",
         ">System<",
     ] {
         assert!(n.contains(want), "nav lacks {want}");
     }
-    for gone in [
-        ">Queue<",
-        ">Fingerprints<",
-        ">Canaries<",
-        ">Export<",
-        ">Keys<",
-    ] {
+    // Pages are children now; Credits needs a cluster (MIK-696).
+    assert!(!home.contains(">Credits<"), "standalone has no Credits");
+    for gone in [">Analytics<", ">Links<", ">Inbox<", ">Market<", ">Cluster<"] {
         assert!(!n.contains(gone), "nav still has {gone}");
     }
-    let fp = get("/admin/links").await;
-    assert_eq!(current(&fp).as_deref(), Some("Links"));
+    let fp = get("/admin/evidence/links").await;
+    assert_eq!(current(&fp).as_deref(), Some("Evidence"));
     assert!(
-        fp.contains("aria-label=\"Links pages\""),
+        fp.contains("aria-label=\"Evidence pages\""),
         "named sub-tab nav"
     );
     let css = get("/assets/app.css").await;
     for rule in [".subtabs", ".topbar-search", "a.tile", ".attention-list"] {
         assert!(css.contains(rule), "app.css lacks {rule}");
     }
-    let scans = get("/admin/scans").await;
+    let scans = get("/admin/investigate/scans").await;
     let live = scans
         .split("<table data-queue")
         .nth(1)
@@ -3176,21 +3241,29 @@ async fn admin_nav_groups_pages_under_seven_tabs() {
         "live queue columns: {live}"
     );
     assert!(
-        fp.contains("href=\"/admin/links/canaries\""),
-        "links sub-tabs"
+        fp.contains("href=\"/admin/evidence/canaries\""),
+        "evidence sub-tabs"
     );
     assert_eq!(
-        current(&get("/admin/links/canaries").await).as_deref(),
-        Some("Links")
+        current(&get("/admin/evidence/canaries").await).as_deref(),
+        Some("Evidence")
     );
-    let sys = get("/admin/system").await;
+    let sys = get("/admin/system/status").await;
     assert_eq!(current(&sys).as_deref(), Some("System"));
+    assert!(
+        sys.contains("href=\"/admin/system/inbox\""),
+        "Inbox sub-tab"
+    );
+    assert_eq!(
+        current(&get("/admin/system/inbox").await).as_deref(),
+        Some("System")
+    );
     assert!(sys.contains("Tor exit list") && sys.contains("MaxMind GeoLite2"));
     assert!(sys.contains("built in"), "this binary's rules");
 }
 
-/// Moved admin pages answer 308 to their new place, without a session
-/// (the redirect reveals nothing).
+/// Moved admin pages answer 308 to their new place: the old System pages
+/// without a session, the MIK-711 tree moves only with one.
 #[tokio::test]
 async fn moved_admin_pages_redirect_permanently() {
     let (_trap, store, dir) = spawn_trap().await;
@@ -3202,26 +3275,21 @@ async fn moved_admin_pages_redirect_permanently() {
     for (from, to) in [
         ("/admin/keys", "/admin/system/keys"),
         ("/admin/export", "/admin/system/export"),
-        ("/admin/fingerprints", "/admin/links"),
-        ("/admin/canaries", "/admin/links/canaries"),
-        (
-            "/admin/canaries?range=all&ip=203.0.113.9",
-            "/admin/links/canaries?range=all&ip=203.0.113.9",
-        ),
-        ("/admin/queue", "/admin/scans"),
-        (
-            "/admin/queue?status=failed",
-            "/admin/scans?status=failed#history",
-        ),
-        ("/admin/queue?status=queued", "/admin/scans"),
-        (
-            "/admin/queue?status=failed&level=3&page=2",
-            "/admin/scans?status=failed&level=3&page=2#history",
-        ),
     ] {
         let r = client.get(format!("{base}{from}")).send().await.unwrap();
         assert_eq!(r.status(), 308, "{from}");
         assert_eq!(r.headers()["location"], to, "{from}");
+    }
+    // The MIK-711 moves sit behind the session (table walked in
+    // admin::public tests): anonymous gets the login page, not the map.
+    for from in [
+        "/admin/queue?status=failed",
+        "/admin/cluster",
+        "/admin/decoys?tab=llm",
+    ] {
+        let r = client.get(format!("{base}{from}")).send().await.unwrap();
+        assert_eq!(r.status(), 303, "{from}");
+        assert_eq!(r.headers()["location"], "/login", "{from}");
     }
 }
 
@@ -3265,13 +3333,16 @@ async fn admin_search_sends_each_kind_of_input_to_its_page() {
     };
     for (q, want) in [
         ("203.0.113.5", "/ip/203.0.113.5"),
-        (" 198.51.100.99 ", "/admin/lookup?ip=198.51.100.99"),
+        (
+            " 198.51.100.99 ",
+            "/admin/investigate/lookup?ip=198.51.100.99",
+        ),
         ("203.0.113.0/24", "/ips?q=203.0.113.0%2F24"),
         ("AS64500", "/admin/asn/64500"),
         ("as64500", "/admin/asn/64500"),
         (&format!("#{rid}"), &format!("/admin/requests/{rid}")),
         ("/wp-login.php", "/requests?path=%2Fwp-login.php"),
-        ("FPSEARCH", "/admin/links/fp/FPSEARCH"),
+        ("FPSEARCH", "/admin/evidence/links/fp/FPSEARCH"),
     ] {
         let r = go(q).await;
         let got = format!(
@@ -3284,8 +3355,8 @@ async fn admin_search_sends_each_kind_of_input_to_its_page() {
     }
     let html = go("BOTHKINDS").await.text().await.unwrap();
     assert!(
-        html.contains("href=\"/admin/links/fp/BOTHKINDS\"")
-            && html.contains("href=\"/admin/links/ja4/BOTHKINDS\""),
+        html.contains("href=\"/admin/evidence/links/fp/BOTHKINDS\"")
+            && html.contains("href=\"/admin/evidence/links/ja4/BOTHKINDS\""),
         "a value under two kinds lists both"
     );
     let html = go("zzz-nothing").await.text().await.unwrap();
@@ -3326,7 +3397,7 @@ async fn bulk_lookup_lists_stored_addresses() {
         "/ip/203.0.113.5",
         "/ip/10.9.1.1",
         "/ip/10.9.2.2",
-        "/admin/links/ip/10.9.1.1",
+        "/admin/evidence/links/ip/10.9.1.1",
     ] {
         assert!(rows.contains(want), "bulk lacks {want}");
     }
@@ -3439,24 +3510,26 @@ async fn lookup_box_only_for_admins() {
     assert!(!anon.contains("action=\"/admin/search\""));
 }
 
-/// A standalone node has no Access page and no node pages.
+/// A standalone node has no Access page and no node pages; the nav shows
+/// Network › Members only.
 #[tokio::test]
 async fn standalone_cluster_page_has_no_access() {
     let (_trap, store, dir) = spawn_trap().await;
     let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
     let (client, base) = enrolled_admin_client(store, cfg).await;
     let html = client
-        .get(format!("{base}/admin/cluster"))
+        .get(format!("{base}/admin/network/members"))
         .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(html.contains("Standalone") && !html.contains("/admin/cluster/access"));
+    assert!(html.contains("Standalone") && !html.contains("/admin/network/access"));
+    assert!(!html.contains("/admin/network/ownership") && !html.contains(">Credits<"));
     for p in [
-        "/admin/cluster/access".to_string(),
-        format!("/admin/cluster/node/{}", "00".repeat(32)),
+        "/admin/network/access".to_string(),
+        format!("/admin/network/members/{}", "00".repeat(32)),
     ] {
         let r = client.get(format!("{base}{p}")).send().await.unwrap();
         assert_eq!(r.status(), 404, "{p}");
@@ -3493,11 +3566,13 @@ async fn scans_history_pages_link_back_to_scans() {
     assert_eq!(bad.status(), 400);
     let html = bad.text().await.unwrap();
     assert!(
-        html.contains("href=\"/admin/scans?page=2#history\""),
+        html.contains("href=\"/admin/investigate/scans?page=2#history\""),
         "absolute next link"
     );
     let html = client
-        .get(format!("{base}/admin/scans?status=failed&level=1"))
+        .get(format!(
+            "{base}/admin/investigate/scans?status=failed&level=1"
+        ))
         .send()
         .await
         .unwrap()
@@ -3510,7 +3585,9 @@ async fn scans_history_pages_link_back_to_scans() {
         .and_then(|h| h.rsplit("href=\"").next())
         .unwrap_or_default();
     assert!(
-        html.contains("href=\"/admin/scans?status=failed&#38;level=1&#38;page=2#history\""),
+        html.contains(
+            "href=\"/admin/investigate/scans?status=failed&#38;level=1&#38;page=2#history\""
+        ),
         "filters carried: {next}"
     );
 }

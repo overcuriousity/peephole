@@ -1,10 +1,9 @@
 {% extends "layout.html" %}
 {% block title %}peephole — canaries of #{{ d.row.id }}{% endblock %}
 {% block content %}
-{% let sub = "links" %}{% include "_admin_nav.html" %}
-{% let subtab = "canaries" %}{% let tabs = crate::admin::views::LINKS_TABS %}{% let tabs_label = "Links pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("evidence", "canaries") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Canaries of request #{{ d.row.id }}</h1>
-  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a> · <a href="/admin/links/canaries">all canaries</a></p></div></div>
+  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a> · <a href="/admin/evidence/canaries">all canaries</a></p></div></div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ served.len() }}</div></div>
@@ -14,7 +13,7 @@
 <section class="card">
   <h2>Served</h2>
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">Uses</th><th></th></tr></thead><tbody>
-  {% for c in served %}<tr><td>{{ c.kind }}</td><td class="mono wrap">{{ c.value }}</td><td class="num">{{ c.uses }}</td><td>{% if c.uses > 0 %}<a href="/admin/links/canary/{{ c.hash }}">graph</a>{% endif %}</td></tr>{% endfor %}
+  {% for c in served %}<tr><td>{{ c.kind }}</td><td class="mono wrap">{{ c.value }}</td><td class="num">{{ c.uses }}</td><td>{% if c.uses > 0 %}<a href="/admin/evidence/links/canary/{{ c.hash }}">graph</a>{% endif %}</td></tr>{% endfor %}
   {% if served.is_empty() %}<tr><td colspan="4" class="empty">No canary served.</td></tr>{% endif %}
   </tbody></table></div>
 </section>
