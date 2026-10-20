@@ -85,8 +85,7 @@ pub async fn offers_for(state: &AdminState, ip_id: Option<i64>) -> Vec<ScanOffer
         ),
         None => (vec![], vec![]),
     };
-    let node = state.recorder.node();
-    let table = node.map(|n| n.price_table());
+    let asks = state.recorder.node().map(|n| asks(n));
     (1u8..=5)
         .map(|level| {
             let fresh = scans
@@ -104,9 +103,9 @@ pub async fn offers_for(state: &AdminState, ip_id: Option<i64>) -> Vec<ScanOffer
                     _ => None,
                 })
                 .min_by_key(|s| *s != "running");
-            let price = match &table {
+            let price = match &asks {
                 None => "free".into(),
-                Some(t) => match price_range(&t.scanners, level) {
+                Some(a) => match price_range(a, level) {
                     Some(p) => p.text(),
                     None => String::new(),
                 },
@@ -189,18 +188,57 @@ pub enum NotSold {
     Fresh(String, i64),
     /// No live scanner announces a price.
     NoPrice,
-    /// The scan budget does not cover the floor price.
-    NoBudget,
+    /// The scan budget does not cover the floor price `need_mc`: the
+    /// balance and what of it scans in flight hold.
+    NoBudget {
+        need_mc: u64,
+        balance_mc: u64,
+        committed_mc: u64,
+    },
 }
 
-/// The level-scaled price range over `scanners`; None without any.
-pub fn price_range(scanners: &[crate::credits::price::ScannerPrice], level: u8) -> Option<Price> {
+impl NotSold {
+    /// Why a [`NotSold::NoBudget`] is refused, for the flash and the API
+    /// alike; None for the other reasons.
+    pub fn budget_text(&self) -> Option<String> {
+        let Self::NoBudget {
+            need_mc,
+            balance_mc,
+            committed_mc,
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "it costs at least {} credits; the balance is {} credits, {} of them committed to scans in flight",
+            crate::credits::show(*need_mc),
+            crate::credits::show(*balance_mc),
+            crate::credits::show(*committed_mc)
+        ))
+    }
+}
+
+/// What this node, as arbiter, pays each scanner it counts for a level 1
+/// job now (`credits::jobs::price_for`), not its copy of their prices: a
+/// free-market scanner is paid its ask (MIK-748). A scanner it could not
+/// grant a job is left out.
+pub fn asks(node: &crate::cluster::Node) -> Vec<u32> {
+    node.price_table()
+        .scanners
+        .iter()
+        .filter_map(|s| crate::credits::jobs::price_for(node, &s.node))
+        .collect()
+}
+
+/// The level-scaled price range over the level 1 prices `asks`
+/// ([`asks`]); None without any.
+pub fn price_range(asks: &[u32], level: u8) -> Option<Price> {
     let factor = crate::credits::jobs::level_factor(level as i64) as u64;
-    let min = scanners.iter().map(|s| s.price_mc).min()?;
-    let max = scanners.iter().map(|s| s.price_mc).max()?;
+    let min = asks.iter().min()?;
+    let max = asks.iter().max()?;
     Some(Price {
-        floor_mc: min as u64 * factor,
-        max_mc: max as u64 * factor,
+        floor_mc: *min as u64 * factor,
+        max_mc: *max as u64 * factor,
     })
 }
 
@@ -260,14 +298,18 @@ pub async fn sale(
             max_mc: 0,
         }));
     };
-    let Some(price) = price_range(&node.price_table().scanners, level) else {
+    let Some(price) = price_range(&asks(node), level) else {
         return Ok(Err(NotSold::NoPrice));
     };
     let book = crate::credits::book(node).await?;
     let self_mc = crate::credits::jobs::self_committed(&state.store.pool, &node.id()).await?;
     let left = crate::credits::jobs::budget(&book.ledger, &node.id(), self_mc);
     if (left as u64) < price.floor_mc {
-        return Ok(Err(NotSold::NoBudget));
+        return Ok(Err(NotSold::NoBudget {
+            need_mc: price.floor_mc,
+            balance_mc: book.ledger.balance(&node.id()),
+            committed_mc: self_mc,
+        }));
     }
     Ok(Ok(price))
 }
@@ -404,10 +446,13 @@ async fn buy(
                 "No scan: no live scanner announces a price.",
             ));
         }
-        Err(NotSold::NoBudget) => {
+        Err(n @ NotSold::NoBudget { .. }) => {
             return Ok(redirect_with_error(
                 &back,
-                "No scan: the scan budget does not cover this.",
+                &format!(
+                    "No scan: {}. Nothing was charged.",
+                    n.budget_text().unwrap_or_default()
+                ),
             ));
         }
         Ok(_) => {}
@@ -572,14 +617,8 @@ secure_cookies = false
 
     #[test]
     fn a_price_ranges_from_the_cheapest_to_the_dearest_scanner_level_scaled() {
-        let sp = |price_mc| crate::credits::price::ScannerPrice {
-            node: crate::scan::probe::gate::LOCAL,
-            price_mc,
-            paid: 0.0,
-            supply: 0.0,
-        };
         assert_eq!(price_range(&[], 1), None);
-        let scanners = [sp(320), sp(80), sp(160)];
+        let scanners = [320, 80, 160];
         assert_eq!(
             price_range(&scanners, 1),
             Some(Price {
