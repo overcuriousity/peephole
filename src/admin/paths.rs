@@ -359,17 +359,17 @@ mod tests {
             assert_eq!(all, want, "a shape missing");
         };
 
-        let (pages, counts) = walk("/admin/paths?since=all").await;
+        let (pages, counts) = walk("/admin/evidence/paths?since=all").await;
         check(&pages, (0..460).collect());
         assert_eq!(
             counts,
             [
                 "Showing 200 of 460 shapes · newest first, 200 per page",
-                "rows 201–400 of 460 · <a href=\"/admin/paths?since=all\">← newest</a>",
-                "rows 401–460 of 460 · <a href=\"/admin/paths?since=all\">← newest</a>",
+                "rows 201–400 of 460 · <a href=\"/admin/evidence/paths?since=all\">← newest</a>",
+                "rows 401–460 of 460 · <a href=\"/admin/evidence/paths?since=all\">← newest</a>",
             ]
         );
-        let (day, day_counts) = walk("/admin/paths?since=24h").await;
+        let (day, day_counts) = walk("/admin/evidence/paths?since=24h").await;
         check(&day, (0..260).collect());
         assert_eq!(
             day_counts[0],
@@ -377,17 +377,17 @@ mod tests {
         );
         assert_eq!(
             day_counts[1],
-            "rows 201–260 of 260 · <a href=\"/admin/paths?since=24h\">← newest</a>"
+            "rows 201–260 of 260 · <a href=\"/admin/evidence/paths?since=24h\">← newest</a>"
         );
         assert_ne!(day[1], pages[1], "the window changes page 2");
         // The filter keeps the cursor's window and filter.
-        let (unknown, unknown_counts) = walk("/admin/paths?since=all&unknown=1").await;
+        let (unknown, unknown_counts) = walk("/admin/evidence/paths?since=all&unknown=1").await;
         check(&unknown, (0..460).filter(|i| i % 4 != 0).collect());
         assert_eq!(
             unknown_counts[0],
             "Showing 200 of 345 shapes · newest first, 200 per page"
         );
-        let (week, week_counts) = walk("/admin/paths?since=7d&unknown=1").await;
+        let (week, week_counts) = walk("/admin/evidence/paths?since=7d&unknown=1").await;
         check(&week, (0..260).filter(|i| i % 4 != 0).collect());
         assert_eq!(week_counts, ["Showing 195 of 195 shapes"]);
     }
@@ -401,7 +401,7 @@ mod tests {
                 .header("sec-fetch-site", "same-origin")
                 .header("cookie", &cookie)
         };
-        let (_, _, first) = send(&app, get("/admin/paths?since=all"), Body::empty()).await;
+        let (_, _, first) = send(&app, get("/admin/evidence/paths?since=all"), Body::empty()).await;
         for bad in [
             "x",
             "~",
@@ -413,7 +413,7 @@ mod tests {
         ] {
             let (st, _, page) = send(
                 &app,
-                get(&format!("/admin/paths?since=all&before={bad}")),
+                get(&format!("/admin/evidence/paths?since=all&before={bad}")),
                 Body::empty(),
             )
             .await;
