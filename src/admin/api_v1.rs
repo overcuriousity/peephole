@@ -35,6 +35,10 @@ pub fn routes() -> Router<Arc<AdminState>> {
         .route("/api/v1/jobs/{job_id}", get(job))
         .route("/api/v1/uploads", get(uploads))
         .route("/api/v1/uploads/{sha256}", get(upload_by_hash))
+        .route("/api/v1/ips/{addr}/dossier", get(ip_dossier))
+        .route("/api/v1/asns/{n}/dossier", get(asn_dossier))
+        .route("/api/v1/requests/{id}/dossier", get(request_dossier))
+        .route("/api/v1/campaigns/{key}/dossier", get(campaign_dossier))
         // Unknown API paths answer in the API's error shape, not the HTML 404.
         .route("/api/v1/{*rest}", axum::routing::any(not_found))
 }
@@ -132,7 +136,7 @@ fn bearer(parts: &Parts) -> Option<&str> {
 
 /// A stored timestamp (SQLite `YYYY-MM-DD HH:MM:SS` or RFC 3339, as intel
 /// and scans keep it) as RFC 3339 UTC, which the API speaks.
-fn rfc3339<S: crate::admin::views::Stamp>(ts: S) -> String {
+pub(crate) fn rfc3339<S: crate::admin::views::Stamp>(ts: S) -> String {
     ts.utc()
         .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default()
@@ -159,7 +163,7 @@ fn summary_json(s: &IpSummary) -> Value {
 /// [`summary_json`] of each, with `is_tor_relay` (GH #138): null while no
 /// node has a `tor-relays` result for the address (or reading them failed;
 /// it is information only).
-async fn summaries_json(state: &AdminState, rows: &[IpSummary]) -> Vec<Value> {
+pub(crate) async fn summaries_json(state: &AdminState, rows: &[IpSummary]) -> Vec<Value> {
     let ips: Vec<&str> = rows.iter().map(|s| s.ip.as_str()).collect();
     let relay = state
         .store
@@ -468,85 +472,16 @@ async fn ip_detail(
     State(state): State<Arc<AdminState>>,
     Path(addr): Path<String>,
 ) -> Response {
-    let Ok(addr) = addr.trim().parse::<std::net::IpAddr>() else {
+    if addr.trim().parse::<IpAddr>().is_err() {
         return err(StatusCode::BAD_REQUEST, "invalid", "not an IP address");
-    };
-    let addr = crate::net::canonical(addr).to_string();
+    }
     let run = async {
-        let store = &state.store;
-        let Some(ip) = store.ip_by_addr(&addr).await? else {
+        let Some((ip, ov)) = crate::admin::dossier::ip_row(&state.store, &addr).await? else {
             return anyhow::Ok(None);
         };
-        let Some(ov) = store.ip_overview(ip.id).await? else {
-            return Ok(None);
-        };
-        // Newest stored answer per provider (intel_for_ip is provider-major,
-        // newest first). Tor is not an entry: is_tor comes from the exit list.
-        let mut intel = serde_json::Map::new();
-        for p in crate::intel::KNOWN_PROVIDERS
-            .iter()
-            .filter(|p| p.name != crate::intel::TOR)
-        {
-            intel.insert(p.name.to_string(), Value::Null);
-        }
-        for row in store.intel_for_ip(&ip.ip).await? {
-            let taken = intel.get(&row.provider).is_some_and(|v| !v.is_null());
-            if row.provider == crate::intel::TOR || taken {
-                continue;
-            }
-            intel.insert(
-                row.provider.clone(),
-                json!({
-                    "fetched_at": rfc3339(&row.fetched_at),
-                    "data": serde_json::from_str::<Value>(&row.data_json).unwrap_or(Value::Null),
-                }),
-            );
-        }
-        let scans = store.scans_for_ip(ip.id).await?;
-        let ids: Vec<i64> = scans.iter().map(|s| s.id).collect();
-        let mut ports = store.ports_for_scans(&ids).await?;
-        let scans: Vec<Value> = scans
-            .into_iter()
-            .filter_map(|s| {
-                let ports = ports
-                    .remove(&s.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|p| p.state == "open")
-                    .map(|p| json!({"port": p.port, "service": p.service, "product": p.product}))
-                    .collect::<Vec<_>>();
-                Some(json!({"scanned_at": rfc3339(s.finished_at?), "ports": ports}))
-            })
-            .collect();
-        let names: Vec<Value> = store
-            .names_for_ip(ip.id)
-            .await?
-            .into_iter()
-            .map(|n| json!({"name": n.name, "source": n.source, "agreed": n.agreed}))
-            .collect();
-        let is_tor_relay = intel
-            .get(crate::intel::TOR_RELAYS)
-            .and_then(|v| v.get("data")?.get("relay"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        Ok(Some(json!({
-            "ip": ip.ip,
-            "geo": {"country": ip.country, "asn": ip.asn, "asn_org": ip.asn_org},
-            "is_tor": ip.is_tor_exit,
-            "is_tor_relay": is_tor_relay,
-            "severity": ov.max_severity,
-            "first_seen": rfc3339(ov.ip.first_seen),
-            "last_seen": rfc3339(ov.ip.last_seen),
-            "request_count": ov.request_count,
-            "unseen": ip.unseen,
-            "labels": ov.labels.iter().map(|l| &l.name).collect::<Vec<_>>(),
-            "families": ov.families.iter().map(|f| json!({"name": f.name, "count": f.count})).collect::<Vec<_>>(),
-            "intel": Value::Object(intel),
-            "scans": scans,
-            "names": names,
-            "rank": ov.rank,
-            "neighbours": {"net": ov.net, "other_ips": ov.net_count, "same_asn": ov.asn_count},
-        })))
+        crate::admin::dossier::ip_detail(&state.store, &ip, &ov)
+            .await
+            .map(Some)
     };
     match run.await {
         Ok(Some(detail)) => Json(detail).into_response(),
@@ -557,6 +492,64 @@ async fn ip_detail(
         ),
         Err(e) => internal(e),
     }
+}
+
+/// `GET /api/v1/{ips,asns,requests,campaigns}/{id}/dossier`: the entity's
+/// dossier (`admin::dossier`), 404 when the id names nothing.
+fn dossier_response<T: serde::Serialize>(
+    built: anyhow::Result<Option<crate::admin::dossier::Envelope<T>>>,
+    what: &str,
+) -> Response {
+    match built {
+        Ok(Some(d)) => Json(d).into_response(),
+        Ok(None) => err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format_args!("no such {what}"),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+async fn ip_dossier(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(addr): Path<String>,
+) -> Response {
+    dossier_response(
+        crate::admin::dossier::ip(&state, &addr).await,
+        "address in the dataset",
+    )
+}
+
+async fn asn_dossier(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(n): Path<String>,
+) -> Response {
+    dossier_response(
+        crate::admin::dossier::asn(&state, &n).await,
+        "network in the dataset",
+    )
+}
+
+async fn request_dossier(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(id): Path<String>,
+) -> Response {
+    dossier_response(crate::admin::dossier::request(&state, &id).await, "request")
+}
+
+async fn campaign_dossier(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(key): Path<String>,
+) -> Response {
+    dossier_response(
+        crate::admin::dossier::campaign(&state, &key).await,
+        "campaign",
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -2053,6 +2046,169 @@ mod tests {
             }
         }
     }
+
+    /// The four dossier paths of the campaign fixture's entities (MIK-749).
+    async fn seed_dossiers(state: &AdminState) -> [String; 4] {
+        use crate::store::campaigns::tests::{feed, fixture};
+        feed(&state.store, fixture()).await;
+        state.store.recompute_campaigns(true).await.unwrap();
+        let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        state
+            .store
+            .set_ip_geo(ip.id, Some("DE"), Some(64500), Some("Example Net"))
+            .await
+            .unwrap();
+        let req: i64 = sqlx::query_scalar("SELECT max(id) FROM requests")
+            .fetch_one(&state.store.pool)
+            .await
+            .unwrap();
+        [
+            "/api/v1/ips/192.0.2.1/dossier".into(),
+            "/api/v1/asns/64500/dossier".into(),
+            format!("/api/v1/requests/{req}/dossier"),
+            "/api/v1/campaigns/192.0.2.3/dossier".into(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn dossier_needs_bearer_read() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        let paths = seed_dossiers(&state).await;
+        for path in &paths {
+            // A read token: the dossier.
+            let (st, v) = send(&app, authed("GET", path, &token)).await;
+            assert_eq!(st, 200, "{path}: {v}");
+            assert_eq!(v["dossier_v"], 1, "{path}");
+            // No token, or only the admin cookie: 401.
+            let (st, v) = send(&app, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(
+                (st, &v["error"]["code"]),
+                (StatusCode::UNAUTHORIZED, &"unauthorized".into())
+            );
+            let r = Request::get(path)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(&app, r).await.0, StatusCode::UNAUTHORIZED, "{path}");
+            let (st, _) = send(&app, authed("GET", path, "not-a-token")).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        // A token without the read scope: 403.
+        sqlx::query("UPDATE devices SET scopes = 'act'")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        for path in &paths {
+            let (st, v) = send(&app, authed("GET", path, &token)).await;
+            assert_eq!(
+                (st, &v["error"]["code"]),
+                (StatusCode::FORBIDDEN, &"forbidden".into())
+            );
+        }
+        // Revoked: 401.
+        sqlx::query("UPDATE devices SET scopes = 'read', revoked_at = datetime('now')")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        let (st, _) = send(&app, authed("GET", &paths[0], &token)).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dossier_404() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        seed_dossiers(&state).await;
+        for path in [
+            "/api/v1/ips/203.0.113.77/dossier",
+            "/api/v1/ips/not-an-ip/dossier",
+            "/api/v1/asns/64501/dossier",
+            "/api/v1/asns/AS64500/dossier",
+            "/api/v1/requests/999999/dossier",
+            "/api/v1/requests/x/dossier",
+            "/api/v1/campaigns/192.0.2.1/dossier",
+            "/api/v1/campaigns/nope/dossier",
+            "/api/v1/things/1/dossier",
+        ] {
+            let (st, v) = send(&app, authed("GET", path, &token)).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {v}");
+            assert_eq!(v["error"]["code"], "not_found", "{path}: {v}");
+        }
+    }
+
+    /// The body of `GET /api/v1/ips/{addr}` is the Android app's contract:
+    /// moving its helpers into `dossier` (MIK-749) must not change a byte.
+    #[tokio::test]
+    async fn ip_detail_body_is_byte_for_byte_stable() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        let row = state
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: row.id,
+                method: "GET".into(),
+                path: "/.env".into(),
+                headers_json: "[]".into(),
+                labels_json: r#"["sensitive-path"]"#.into(),
+                severity: 3,
+                ts: Some("2026-01-02 03:04:05".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .set_ip_geo(row.id, Some("DE"), Some(6805), Some("Telefonica Germany"))
+            .await
+            .unwrap();
+        state
+            .store
+            .local()
+            .record_intel(
+                "203.0.113.9",
+                crate::intel::TOR_RELAYS,
+                None,
+                serde_json::json!({"relay": true, "exit": false}),
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "UPDATE ips SET first_seen = '2026-01-02 03:04:05', last_seen = '2026-01-03 04:05:06'",
+            "UPDATE ip_intel SET fetched_at = '2026-01-04T05:06:07Z'",
+            "UPDATE ip_intel_log SET fetched_at = '2026-01-04T05:06:07Z'",
+        ] {
+            sqlx::query(sql).execute(&state.store.pool).await.unwrap();
+        }
+        let r = app
+            .clone()
+            .oneshot(authed("GET", "/api/v1/ips/203.0.113.9", &token))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&b), GOLDEN_IP_DETAIL);
+    }
+
+    /// Captured from the body before the move (MIK-749).
+    const GOLDEN_IP_DETAIL: &str = concat!(
+        r#"{"families":[{"count":1,"name":"exposure"}],"first_seen":"2026-01-02T03:04:05Z","#,
+        r#""geo":{"asn":6805,"asn_org":"Telefonica Germany","country":"DE"},"intel":{"abuse"#,
+        r#"ipdb":null,"maxmind-geolite2":{"data":{"asn":6805,"asn_org":"Telefonica Germany""#,
+        r#","country":"DE"},"fetched_at":"2026-01-04T05:06:07Z"},"rdap":null,"shodan":null,"#,
+        r#""shodan-internetdb":null,"tor-relays":{"data":{"exit":false,"relay":true},"fetch"#,
+        r#"ed_at":"2026-01-04T05:06:07Z"}},"ip":"203.0.113.9","is_tor":false,"is_tor_relay""#,
+        r#":true,"labels":["sensitive-path"],"last_seen":"2026-01-03T04:05:06Z","names":[],"#,
+        r#""neighbours":{"net":"203.0.113.0/24","other_ips":0,"same_asn":0},"rank":1,"reque"#,
+        r#"st_count":1,"scans":[],"severity":3,"unseen":false}"#,
+    );
 
     #[tokio::test]
     async fn ip_detail_is_the_dataset_on_one_address() {

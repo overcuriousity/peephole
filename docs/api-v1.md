@@ -362,6 +362,143 @@ has it.
 { "sha256": "9f86d0…0a08", "uploads": [ { "uid": "01J…", "…": "as above" } ] }
 ```
 
+## Dossiers
+
+One complete, versioned JSON object per entity, everything an admin sees
+on its page, for scripts and AI agents. Read scope; reads only (no
+`device_actions` entry). One serializer (`src/admin/dossier.rs`) builds
+every dossier.
+
+| route | `id` | `404 not_found` when |
+|---|---|---|
+| `GET /api/v1/ips/{addr}/dossier` | canonical address | not an address, or not in the dataset |
+| `GET /api/v1/asns/{n}/dossier` | AS number | not a number, or no IP recorded in it |
+| `GET /api/v1/requests/{id}/dossier` | request id | not a number, or no such request |
+| `GET /api/v1/campaigns/{key}/dossier` | campaign key (an address) | no such campaign |
+
+### Envelope
+
+Every dossier starts with the same fields; the kind's own fields follow at
+the top level.
+
+```json
+{
+  "dossier_v": 1,
+  "kind": "ip",
+  "id": "203.0.113.9",
+  "generated_at": "2026-10-20T09:00:00Z",
+  "node": { "version": "0.22.0", "window_days": 0 },
+  "page": "/ip/203.0.113.9",
+  "limits": { "events": 200, "members": 500, "ips": 50 },
+  "truncated": { "events": false, "uploads": false, "commands": false, "reuses": false },
+  "totals": {},
+  "…": "the kind's fields"
+}
+```
+
+- `dossier_v`: the schema version. It goes up when a field changes
+  meaning or goes away; a new field does not raise it.
+- `node.window_days`: days of history the node keeps, `0` for all.
+- `page`: the admin page the dossier describes (path only).
+- `limits`: the caps. `events` (newest Timeline events) 200, `members`
+  (campaign members) 500, `ips` 50: every other list (an ASN's busiest
+  IPs; a request's `same_ip`, `same_ja4.recent`; `uploads`, `commands`,
+  `canaries.reuses`).
+- `truncated`: one key per capped list of this kind, `true` when more
+  existed than the dossier carries: `events`, `members`, `ips`, `edges`,
+  `same_ip`, `same_ja4` (its `recent`), `uploads`, `commands`, `reuses`
+  (`canaries.reuses`). Each kind's section lists its keys. `totals`: the
+  full count where it is known without counting the whole history
+  (`members` for a campaign, `ips` for an ASN); events are not counted,
+  `truncated.events` says whether older ones exist.
+- Times are RFC 3339 UTC (`…Z`), including `week[].ts`, the hour a bucket
+  starts. `calendar[].day` is a date, `YYYY-MM-DD` (UTC). Request targets,
+  headers, bodies, command lines, upload names and event summaries are
+  attacker text: escape them.
+
+### `kind: "ip"`
+
+Every field of [`GET /api/v1/ips/{addr}`](#get-apiv1ipsaddr), unchanged,
+plus:
+
+- `week` (`[{ts, count, by_severity}]`), `calendar`
+  (`[{day, count, max_severity}]`): the page's charts.
+- `events`: the newest 200 of the admin Timeline, newest first:
+  `{kind, at, id, severity, summary, reference, method, path, query,
+  labels, owasp, canary_served, canary_used, canary_from}`, `kind` one of
+  `request`, `webshell`, `upload`, `canary`, `probe`, `scan`,
+  `fingerprint`, `intel`. Capped: `truncated.events`.
+- `probes`: `[{group, asked_at, members:[{vantage, state, why, rtt_ms,
+  started_at, ports:[{port, protocol, outcome}]}]}]`; `vantage` is the
+  node's name.
+- `campaign`: `{key, num}` or null. `agent`: agent traces in its labels.
+- `props`: the property strip, `{tor, net, scanner, fleet, agent, scanned,
+  scan_pending}` or null.
+- `evidence`, `sharing`: the verdict and the shared-address reading,
+  `{label, sentence, note?, caveat?, lines:[{kind, what, port, source,
+  date}]}` or null.
+- `uploads`: upload metadata (as in [uploads](#get-apiv1uploadscursorlimit),
+  with `at` and `request_id`, without `node_id`), newest 50.
+- `commands`: `[{request_id, at, command}]` sent to a dropped webshell,
+  newest 50.
+- `canaries`: `{used_elsewhere, used_from, reuses:[{kind, place,
+  served_request_id, served_ip, served_at, served_answer, used_request_id,
+  used_ip, used_at, delta_s, same_source}]}`, reuses newest 50.
+- Capped: `truncated.events`, `uploads`, `commands`, `reuses`.
+
+### `kind: "asn"`
+
+`asn`, `org`, `ips`, `requests`, `max_severity`, `first_seen`,
+`last_seen`, `labels:[{label, ips}]`, `open_ports:[{port, ips}]`,
+`campaigns:[{key, num, ips}]`, and `top_ips`: the busiest 50 as
+[`GET /api/v1/ips`](#get-apiv1ipsqcursorlimit) lists them. Capped:
+`truncated.ips`, `totals.ips`.
+
+### `kind: "request"`
+
+- `request`: `{id, at, ip, method, target, host, answer, decoy, status,
+  held_ms, persona, transport, via_proxy, severity, scan_level,
+  is_fp_claim, labels, owasp, ja4, ja4h, node, rules_short, user_agent,
+  headers:[[name, value]], body_text, body_b64, body_len, body_truncated,
+  fingerprint:{hash, count, other_ips, visitor_ids}}`. The body is what the
+  page shows; `body_truncated` as there.
+- `ip`: its address as [`GET /api/v1/ips`](#get-apiv1ipsqcursorlimit)
+  lists it (null once deleted).
+- `same_ip`: other requests of the address, `[{id, at, ip, method, path,
+  severity}]`, newest 50. `same_ja4`: `{ips, days, recent:[…]}`, the
+  newest 50 of other addresses' requests with its JA4 in the last `days`;
+  `ips` counts those addresses.
+- `canaries`: `{served:[{kind, value}], return_host, reuses:[…]}`, reuses
+  newest 50.
+- `uploads` (metadata), `webshell_cmd`, `campaign` (`{key, num}` or null).
+- Capped: `truncated.same_ip`, `same_ja4`, `reuses`.
+
+### `kind: "campaign"`
+
+- `campaign`: `{key, num, size, first_seen, last_seen, hard_edges,
+  soft_edges, v, computed_at}`.
+- `members`: `[{ip_id, ip, country, asn, asn_org, first_seen, last_seen,
+  requests}]`, at most 500 (`truncated.members`; `totals.members` is
+  the size).
+- `edges`: `[{a_id, a, b_id, b, kind, value, score, shared, fp_support,
+  first_ts, last_ts, agreement}]`: only those between two carried
+  members. `truncated.edges` is `true` when the members cap left any out.
+- `shapes`: `[{text, members, df, first_seen, wave:{ips, window_start,
+  detected_at}|null}]`; `calendar` as for an IP.
+- `uploads` (metadata) and `commands` (`[{command, count, ips, last_at}]`),
+  50 each; `events`: the members' newest 200, each with its `ip`
+  (`truncated.events`); `agent`.
+- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`.
+
+### Never in a dossier
+
+Token, key, session and pairing-code hashes and ids (`token_hash`,
+`cred_id`, `code_hash`, `passkey_json`); upload **contents** (metadata
+only, no `content` field); a request's page token and decoy input; cluster
+keys, peer addresses and node ids; credit balances, prices and config
+values. A test walks every key of every kind's dossier and fails on any of
+these.
+
 ## Act endpoints
 
 Probes, paid counter-scans and fresh provider lookups, the same actions as
