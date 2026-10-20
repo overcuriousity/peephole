@@ -119,7 +119,9 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-
 pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 0.75rem 1rem; overflow: auto; font-size: var(--text-xs); max-height: 32rem; white-space: pre-wrap; word-break: break-all; }
 [data-copy] { cursor: copy; }
 [data-copy][data-copied] { border-color: var(--color-accent); }
+[data-copy-dossier][data-copied] { border-color: var(--color-success); color: var(--color-success); }
 .ip-head { align-items: center; }
+.ip-head .meta + p { margin: 0.75rem 0 0; }
 .ip-head h1 { font-family: var(--font-mono); font-size: clamp(var(--text-xl), 6vw, var(--text-3xl)); letter-spacing: 0; overflow-wrap: anywhere; }
 .req-head h1 { font-size: clamp(var(--text-lg), 5.5vw, var(--text-2xl)); }
 .ip-head h1 .badge { font-family: var(--font-sans); vertical-align: middle; }

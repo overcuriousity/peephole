@@ -63,6 +63,38 @@
       }, function () {});
     });
   }
+  // "Copy JSON dossier" links ([data-copy-dossier], MIK-750): one click
+  // copies the page's dossier. A modified click, no clipboard, or any
+  // failure (an expired session answers the login page) opens the link,
+  // which shows the JSON. The ClipboardItem path keeps the click's user
+  // activation across the fetch where writeText after it would lose it.
+  if (navigator.clipboard && window.isSecureContext) {
+    document.querySelectorAll("[data-copy-dossier]").forEach(function (a) {
+      var label = a.textContent;
+      a.addEventListener("click", function (e) {
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault();
+        a.setAttribute("aria-busy", "true");
+        var text = fetch(a.href, { credentials: "same-origin", headers: { Accept: "application/json" } }).then(function (r) {
+          if (!r.ok || !/json/.test(r.headers.get("content-type") || "")) throw new Error("dossier " + r.status);
+          return r.json();
+        }).then(function (d) { return JSON.stringify(d, null, 2); });
+        var copied = window.ClipboardItem && navigator.clipboard.write
+          ? navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(function (t) { return new Blob([t], { type: "text/plain" }); }) })])
+          : text.then(function (t) { return navigator.clipboard.writeText(t); });
+        copied.then(function () {
+          a.removeAttribute("aria-busy");
+          // Hold the width so "Copied" does not shift its neighbours.
+          a.style.minWidth = a.offsetWidth + "px"; a.style.justifyContent = "center";
+          a.setAttribute("data-copied", ""); a.textContent = "Copied";
+          setTimeout(function () {
+            a.removeAttribute("data-copied"); a.textContent = label;
+            a.style.minWidth = ""; a.style.justifyContent = "";
+          }, 1500);
+        }, function () { a.removeAttribute("aria-busy"); location.href = a.href; });
+      });
+    });
+  }
   // One-shot notice the server set after an action; shown once, then cleared.
   [["peephole_flash", "success"], ["peephole_flash_error", "warning"]].forEach(function (f) {
     var fm = document.cookie.match(new RegExp("(?:^|; )" + f[0] + "=([^;]*)"));

@@ -6,6 +6,7 @@
   <div>
     <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h1>
     {% include "_ip_meta.html" %}
+    {% if t.admin.is_some() %}<p>{% let dossier_kind = "ip" %}{% let dossier_id = t.ov.ip.ip.as_str() %}{% include "_dossier_link.html" %}</p>{% endif %}
   </div>
   <div class="tiles">
     <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(t.ov.request_count) }}</div>{% if let Some(a) = t.admin %}{% if a.skipped > 0 %}<div class="hint">+ {{ a.skipped }} not recorded in full</div>{% endif %}{% endif %}</div>

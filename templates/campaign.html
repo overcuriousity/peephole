@@ -13,7 +13,7 @@
   <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
   <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
 </div>
-<p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div></div>
+<p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
 <div class="stack">
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
