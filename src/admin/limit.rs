@@ -81,14 +81,14 @@ impl Bucket {
     }
 }
 
-/// A token bucket per client.
-pub struct RateLimiter {
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+/// A token bucket per client: an address, or a bearer token's device id.
+pub struct RateLimiter<K = IpAddr> {
+    buckets: Mutex<HashMap<K, Bucket>>,
     per_sec: f64,
     burst: f64,
 }
 
-impl RateLimiter {
+impl<K: std::hash::Hash + Eq> RateLimiter<K> {
     pub fn new(per_minute: u32, burst: u32) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
@@ -97,8 +97,14 @@ impl RateLimiter {
         }
     }
 
+    /// Whole seconds until an empty bucket holds a token again (an upper
+    /// bound, for `Retry-After`).
+    pub fn retry_after_secs(&self) -> u64 {
+        (1.0 / self.per_sec).ceil().max(1.0) as u64
+    }
+
     /// Take one token for `client`; `false` when its bucket is empty.
-    pub fn allow(&self, client: IpAddr) -> bool {
+    pub fn allow(&self, client: K) -> bool {
         let now = Instant::now();
         let (per_sec, burst) = (self.per_sec, self.burst);
         let mut map = self.buckets.lock_or_recover();
@@ -146,6 +152,9 @@ impl GlobalLimiter {
 pub struct Limits {
     public: RateLimiter,
     auth: RateLimiter,
+    /// Per `/api/v1` bearer token, keyed by its device id (`[limits]`);
+    /// taken by `api_v1::DeviceAuth` once the token is valid.
+    pub api_key: RateLimiter<String>,
     login: GlobalLimiter,
     /// `trusted_proxies` plus loopback (the local reverse proxy).
     trusted: Vec<IpNet>,
@@ -159,6 +168,7 @@ impl Limits {
         Self {
             public: RateLimiter::new(PUBLIC_PER_MINUTE, PUBLIC_BURST),
             auth: RateLimiter::new(AUTH_PER_MINUTE, AUTH_BURST),
+            api_key: RateLimiter::new(cfg.limits.api_per_minute, cfg.limits.api_burst),
             login: GlobalLimiter::new(LOGIN_PER_MINUTE, LOGIN_BURST),
             trusted,
             warned: AtomicBool::new(false),

@@ -243,7 +243,9 @@ header (v1 or v2), and list the proxy in `trusted_proxies`. A trusted peer
 that connects to `trap_tls_listen` without a PROXY header, or with one that
 names no client (`UNKNOWN`, `LOCAL`), is dropped. In the
 admin site's locations, set `X-Forwarded-For` to the peer address: the
-per-client rate limits key on it and are off without it.
+per-client rate limits key on it and are off without it. Each `/api/v1`
+token also has its own budget, `[limits] api_per_minute` (default 120) and
+`api_burst` (default 30); see [API v1](api-v1.md#rate-limit).
 
 ## Upgrades
 

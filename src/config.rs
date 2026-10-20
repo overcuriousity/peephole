@@ -90,6 +90,9 @@ pub struct Config {
     /// When an unknown path shape counts as an exploit wave.
     #[serde(default)]
     pub waves: WavesConfig,
+    /// Request budgets of the web listener that are configurable.
+    #[serde(default)]
+    pub limits: LimitsConfig,
     /// Where this node pushes new waves; absent: no push, no connection.
     pub notify: Option<NotifyConfig>,
     /// When API providers look an IP up again.
@@ -295,6 +298,45 @@ impl WavesConfig {
         }
         if !(5..=1440).contains(&self.window_minutes) {
             bail!("waves.window_minutes must be between 5 and 1440");
+        }
+        Ok(())
+    }
+}
+
+/// `[limits]`: each `/api/v1` bearer token (paired device or API key) may
+/// make `api_per_minute` requests sustained, `api_burst` at once.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_api_per_minute")]
+    pub api_per_minute: u32,
+    #[serde(default = "default_api_burst")]
+    pub api_burst: u32,
+}
+
+fn default_api_per_minute() -> u32 {
+    120
+}
+
+fn default_api_burst() -> u32 {
+    30
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            api_per_minute: default_api_per_minute(),
+            api_burst: default_api_burst(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(1..=6000).contains(&self.api_per_minute) {
+            bail!("limits.api_per_minute must be between 1 and 6000");
+        }
+        if !(1..=1000).contains(&self.api_burst) {
+            bail!("limits.api_burst must be between 1 and 1000");
         }
         Ok(())
     }
@@ -1055,6 +1097,7 @@ impl Config {
         self.enrichment.check()?;
         self.credits.check()?;
         self.waves.check()?;
+        self.limits.check()?;
         if let Some(n) = &self.notify {
             n.check()?;
         }
@@ -2103,6 +2146,16 @@ data_dir = "/tmp"
         assert!(listener("[waves]\nwindow_minutes = 0\n").is_err());
         let cfg = listener("[waves]\nmin_ips = 25\nwindow_minutes = 30\n").unwrap();
         assert_eq!((cfg.waves.min_ips, cfg.waves.window_minutes), (25, 30));
+    }
+
+    #[test]
+    fn api_limits_default_to_120_a_minute_burst_30() {
+        let cfg = listener("").unwrap();
+        assert_eq!((cfg.limits.api_per_minute, cfg.limits.api_burst), (120, 30));
+        assert!(listener("[limits]\napi_per_minute = 0\n").is_err());
+        assert!(listener("[limits]\napi_burst = 0\n").is_err());
+        let cfg = listener("[limits]\napi_per_minute = 600\napi_burst = 5\n").unwrap();
+        assert_eq!((cfg.limits.api_per_minute, cfg.limits.api_burst), (600, 5));
     }
 
     #[test]
