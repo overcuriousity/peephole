@@ -1,0 +1,4339 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "peephole API",
+    "version": "1",
+    "description": "The machine API of a peephole node (`/api/v1`). Every closed endpoint takes `Authorization: Bearer <token>`: a device token from pairing, or an API key an admin mints on Admin → System → Devices. Scopes: `read` (every GET, `POST /api/v1/lookup`) and `act` (probes, scans, lookups that spend credits, and their jobs); the scope an operation needs is in `x-peephole-scope`. Every non-2xx answer is an `Error`. Prose reference: docs/api-v1.md."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/api/v1/openapi.json": {
+      "get": {
+        "summary": "This document",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "the OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pair": {
+      "post": {
+        "summary": "Redeem a pairing code for a device token",
+        "description": "Anonymous: the single-use pairing code is the credential. Rate-limited per client IP.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairRequest"
+              }
+            }
+          }
+        },
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "the token, shown once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        }
+      }
+    },
+    "/api/v1/ips": {
+      "get": {
+        "summary": "List or search the IPs in the dataset",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an exact IP, a network, or a string prefix; empty lists everything"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "opaque continuation token, the previous page's `next_cursor`"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50
+            },
+            "description": "page size; above 100 it clamps to 100"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "a page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/ips/{addr}": {
+      "get": {
+        "summary": "Everything the dataset holds on one address",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/lookup": {
+      "post": {
+        "summary": "Stored-data lookup of addresses, networks, host names and URLs",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LookupRequest"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/uploads": {
+      "get": {
+        "summary": "Files dropped on the trap, newest first (metadata only)",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "opaque continuation token, the previous page's `next_cursor`"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50
+            },
+            "description": "page size; above 100 it clamps to 100"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "a page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/uploads/{sha256}": {
+      "get": {
+        "summary": "Every upload of one file by its SHA-256",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{64}$"
+            },
+            "description": "SHA-256 in hex"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the uploads",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadsByHash"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/ips/{addr}/dossier": {
+      "get": {
+        "summary": "The IP dossier",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the dossier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpDossier"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/asns/{n}/dossier": {
+      "get": {
+        "summary": "The ASN dossier",
+        "parameters": [
+          {
+            "name": "n",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "AS number"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the dossier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnDossier"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/requests/{id}/dossier": {
+      "get": {
+        "summary": "The request dossier",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "request id"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the dossier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestDossier"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/campaigns/{key}/dossier": {
+      "get": {
+        "summary": "The campaign dossier",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "campaign key (an address)"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the dossier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignDossier"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/ips/{addr}/probe/vantages": {
+      "get": {
+        "summary": "What a probe would ask and cost",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the vantages, cheapest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbeVantages"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Refused"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/probe": {
+      "post": {
+        "summary": "Start a probe",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeRequest"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbeStarted"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Refused"
+          },
+          "429": {
+            "description": "rate limited (`rate_limited`) or over the device's 24-hour spend cap (`spend_cap`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/scan/prices": {
+      "get": {
+        "summary": "Every scan level's price range",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the levels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanPrices"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/Refused"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/scan/quote": {
+      "get": {
+        "summary": "Quote a counter-scan",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "description": "scan level"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the quote, valid 2 minutes, spent once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanQuote"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "422": {
+            "$ref": "#/components/responses/Refused"
+          },
+          "409": {
+            "description": "nothing to buy: `fresh`, `on_its_way`, `no_price`, `no_budget`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/scan": {
+      "post": {
+        "summary": "Buy a counter-scan with a quote",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteBuy"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanStarted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "422": {
+            "$ref": "#/components/responses/Refused"
+          },
+          "409": {
+            "description": "nothing queued or charged: `quote_invalid`, `quote_mismatch`, `price_changed`, `fresh`, `on_its_way`, `no_price`, `no_budget`, `not_queued`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate limited (`rate_limited`) or over the device's 24-hour spend cap (`spend_cap`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/lookup/quote": {
+      "get": {
+        "summary": "Quote a fresh provider lookup",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          },
+          {
+            "name": "providers",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "comma-separated provider names; absent asks all"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the quote, valid 2 minutes, spent once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupQuote"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "409": {
+            "description": "`not_offered` or `no_provider`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/ips/{addr}/lookup": {
+      "post": {
+        "summary": "Buy a fresh provider lookup with a quote",
+        "parameters": [
+          {
+            "name": "addr",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "an IPv4 or IPv6 address"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteBuy"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the answers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupBought"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Invalid"
+          },
+          "409": {
+            "description": "nothing asked or charged: `quote_invalid`, `quote_mismatch`, `price_changed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate limited (`rate_limited`) or over the device's 24-hour spend cap (`spend_cap`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "summary": "A job this device queued",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "the id a probe, scan or lookup returned"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "act"
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A device token or API key (256-bit random, base64url)."
+      }
+    },
+    "responses": {
+      "Invalid": {
+        "description": "`invalid`: malformed body, address, cursor, limit or parameter",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "`unauthorized`: no, expired or revoked token; a dead pairing code",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "`forbidden`: the token lacks the required scope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "`not_found`",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Refused": {
+        "description": "`refused`: the probe gate or scan guard refuses the address (reason in `message`)",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "`rate_limited`: per-IP or per-token limit hit",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            },
+            "description": "seconds"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "`internal`: storage failure; the message is generic",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true,
+            "description": "Some codes carry more fields: `fresh` has `scan_id`, `scanned_at`; `on_its_way` has `status`; `no_budget` has `need_mc`, `balance_mc`, `committed_mc`."
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "IpSummary": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "asn": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "asn_org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_tor": {
+            "type": "boolean"
+          },
+          "is_tor_relay": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request_count": {
+            "type": "integer"
+          },
+          "max_severity": {
+            "type": "integer"
+          },
+          "abuse_score": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unseen": {
+            "type": "boolean",
+            "description": "added for a counter-scan, no traffic recorded; servers before 0.15.0 omit it"
+          }
+        },
+        "required": [
+          "ip",
+          "country",
+          "asn",
+          "asn_org",
+          "is_tor",
+          "is_tor_relay",
+          "first_seen",
+          "last_seen",
+          "request_count",
+          "max_severity",
+          "abuse_score"
+        ]
+      },
+      "IpPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IpSummary"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "Scan": {
+        "type": "object",
+        "properties": {
+          "scanned_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "port": {
+                  "type": "integer"
+                },
+                "service": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "product": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "port",
+                "product",
+                "service"
+              ]
+            }
+          }
+        },
+        "required": [
+          "ports",
+          "scanned_at"
+        ]
+      },
+      "IpDetail": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "geo": {
+            "type": "object",
+            "properties": {
+              "country": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "asn": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "asn_org": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "asn",
+              "asn_org",
+              "country"
+            ]
+          },
+          "is_tor": {
+            "type": "boolean",
+            "description": "Tor exit"
+          },
+          "is_tor_relay": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "severity": {
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request_count": {
+            "type": "integer"
+          },
+          "unseen": {
+            "type": "boolean"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "families": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "count",
+                "name"
+              ]
+            }
+          },
+          "intel": {
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "fetched_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "data": {}
+                  },
+                  "required": [
+                    "data",
+                    "fetched_at"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "newest stored answer per provider, keyed by provider name"
+          },
+          "scans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scan"
+            }
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "agreed": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "agreed",
+                "name",
+                "source"
+              ]
+            }
+          },
+          "rank": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "neighbours": {
+            "type": "object",
+            "properties": {
+              "net": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "other_ips": {
+                "type": "integer"
+              },
+              "same_asn": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "net",
+              "other_ips",
+              "same_asn"
+            ]
+          }
+        },
+        "required": [
+          "families",
+          "first_seen",
+          "geo",
+          "intel",
+          "ip",
+          "is_tor",
+          "is_tor_relay",
+          "labels",
+          "last_seen",
+          "names",
+          "neighbours",
+          "rank",
+          "request_count",
+          "scans",
+          "severity",
+          "unseen"
+        ]
+      },
+      "LookupRequest": {
+        "type": "object",
+        "properties": {
+          "ips": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "description": "addresses or networks"
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "host names or URLs, resolved; up to 10 per request"
+          }
+        },
+        "required": []
+      },
+      "LookupResult": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IpSummary"
+            }
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "unreadable": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "capped": {
+            "type": "boolean"
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "host": {
+                  "type": "string"
+                },
+                "resolve": {
+                  "type": "object",
+                  "properties": {
+                    "note": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "votes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "ip": {
+                            "type": "string"
+                          },
+                          "agreed": {
+                            "type": "boolean"
+                          },
+                          "verdict": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "agreed",
+                          "ip",
+                          "verdict"
+                        ]
+                      }
+                    },
+                    "resolvers": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "node": {
+                            "type": "string"
+                          },
+                          "why": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "node",
+                          "why"
+                        ]
+                      }
+                    },
+                    "also": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "also",
+                    "errors",
+                    "note",
+                    "resolvers",
+                    "votes"
+                  ]
+                },
+                "results": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/IpSummary"
+                  }
+                },
+                "missing": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "error": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "invalid",
+                        "unresolved"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ]
+                }
+              },
+              "required": []
+            }
+          }
+        },
+        "required": [
+          "capped",
+          "missing",
+          "names",
+          "results",
+          "unreadable"
+        ]
+      },
+      "UploadMeta": {
+        "type": "object",
+        "properties": {
+          "uid": {
+            "type": "string"
+          },
+          "request_uid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "put",
+              "wp_plugin",
+              "wp_theme",
+              "wp_media",
+              "script"
+            ]
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sniffed_type": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "answered_path": {
+            "type": "string"
+          },
+          "path_is_prefix": {
+            "type": "boolean"
+          },
+          "content_state": {
+            "type": "string",
+            "enum": [
+              "held",
+              "dropped_rate",
+              "dropped_budget",
+              "dropped_ceiling",
+              "dropped_disk",
+              "dropped_mismatch",
+              "too_big",
+              "not_received"
+            ]
+          }
+        },
+        "required": [
+          "answered_path",
+          "content_state",
+          "filename",
+          "ip",
+          "kind",
+          "node_id",
+          "path_is_prefix",
+          "request_uid",
+          "sha256",
+          "size",
+          "sniffed_type",
+          "truncated",
+          "ts",
+          "uid"
+        ],
+        "description": "Metadata and hash only; no field carries the file's content."
+      },
+      "UploadPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UploadMeta"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "UploadsByHash": {
+        "type": "object",
+        "properties": {
+          "sha256": {
+            "type": "string"
+          },
+          "uploads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UploadMeta"
+            }
+          }
+        },
+        "required": [
+          "sha256",
+          "uploads"
+        ]
+      },
+      "PairRequest": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "required": [
+          "code",
+          "device_name"
+        ]
+      },
+      "PairResponse": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "shown once, in this response only"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "read",
+                "act"
+              ]
+            }
+          },
+          "instance_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "instance_name",
+          "scopes",
+          "token"
+        ]
+      },
+      "ProbeVantages": {
+        "type": "object",
+        "properties": {
+          "vantages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "credits": {
+                  "type": "string",
+                  "description": "credits as a decimal string, e.g. \"1.28\""
+                },
+                "credits_mc": {
+                  "type": "integer",
+                  "description": "millicredits"
+                },
+                "default": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "country",
+                "credits",
+                "credits_mc",
+                "default",
+                "id",
+                "name"
+              ]
+            }
+          }
+        },
+        "required": [
+          "vantages"
+        ]
+      },
+      "ProbeRequest": {
+        "type": "object",
+        "properties": {
+          "vantages": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "node id"
+            }
+          }
+        },
+        "required": []
+      },
+      "ProbeStarted": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "credits": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          },
+          "vantages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "credits_mc": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "country",
+                "credits_mc",
+                "id",
+                "name"
+              ]
+            }
+          }
+        },
+        "required": [
+          "credits",
+          "credits_mc",
+          "job_id",
+          "vantages"
+        ]
+      },
+      "ScanPrices": {
+        "type": "object",
+        "properties": {
+          "levels": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "level": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5
+                },
+                "about": {
+                  "type": "string"
+                },
+                "credits": {
+                  "type": "string",
+                  "description": "credits as a decimal string, e.g. \"1.28\""
+                },
+                "credits_mc": {
+                  "type": "integer",
+                  "description": "millicredits"
+                },
+                "credits_max": {
+                  "type": "string",
+                  "description": "credits as a decimal string, e.g. \"1.28\""
+                },
+                "credits_max_mc": {
+                  "type": "integer",
+                  "description": "millicredits"
+                }
+              },
+              "required": [
+                "about",
+                "credits",
+                "credits_max",
+                "credits_max_mc",
+                "credits_mc",
+                "level"
+              ]
+            }
+          }
+        },
+        "required": [
+          "levels"
+        ]
+      },
+      "ScanQuote": {
+        "type": "object",
+        "properties": {
+          "quote_id": {
+            "type": "string"
+          },
+          "credits": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          },
+          "credits_max": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_max_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "offer": {
+            "type": "object",
+            "properties": {
+              "level": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              },
+              "about": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "about",
+              "level"
+            ]
+          }
+        },
+        "required": [
+          "credits",
+          "credits_max",
+          "credits_max_mc",
+          "credits_mc",
+          "expires_at",
+          "offer",
+          "quote_id"
+        ]
+      },
+      "QuoteBuy": {
+        "type": "object",
+        "properties": {
+          "quote_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "quote_id"
+        ]
+      },
+      "ScanStarted": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "credits": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          }
+        },
+        "required": [
+          "credits",
+          "credits_mc",
+          "job_id"
+        ]
+      },
+      "LookupQuote": {
+        "type": "object",
+        "properties": {
+          "quote_id": {
+            "type": "string"
+          },
+          "credits": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "provider": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "node": {
+                  "type": "string"
+                },
+                "credits": {
+                  "type": "string",
+                  "description": "credits as a decimal string, e.g. \"1.28\""
+                },
+                "credits_mc": {
+                  "type": "integer",
+                  "description": "millicredits"
+                },
+                "own": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "credits",
+                "credits_mc",
+                "label",
+                "node",
+                "own",
+                "provider"
+              ]
+            }
+          }
+        },
+        "required": [
+          "credits",
+          "credits_mc",
+          "expires_at",
+          "providers",
+          "quote_id"
+        ]
+      },
+      "LookupBought": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "credits": {
+            "type": "string",
+            "description": "credits as a decimal string, e.g. \"1.28\""
+          },
+          "credits_mc": {
+            "type": "integer",
+            "description": "millicredits"
+          },
+          "charges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "node": {
+                  "type": "string"
+                },
+                "credits": {
+                  "type": "string",
+                  "description": "credits as a decimal string, e.g. \"1.28\""
+                },
+                "credits_mc": {
+                  "type": "integer",
+                  "description": "millicredits"
+                }
+              },
+              "required": [
+                "credits",
+                "credits_mc",
+                "node"
+              ]
+            }
+          },
+          "intel": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "enum": [
+                    "fresh",
+                    "stored"
+                  ]
+                },
+                "node": {
+                  "type": "string"
+                },
+                "fetched_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "data": {}
+              },
+              "required": [
+                "data",
+                "fetched_at",
+                "node",
+                "source"
+              ]
+            }
+          },
+          "declined": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "provider": {
+                  "type": "string"
+                },
+                "node": {
+                  "type": "string"
+                },
+                "why": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node",
+                "provider",
+                "why"
+              ]
+            }
+          },
+          "kept": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "charges",
+          "credits",
+          "credits_mc",
+          "declined",
+          "intel",
+          "ip",
+          "kept"
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "scan",
+              "lookup",
+              "probe"
+            ]
+          },
+          "ip": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "result": {
+            "description": "scan: the shape of `Scan` or null; lookup: null; probe: `{vantages:[…]}`"
+          }
+        },
+        "required": [
+          "created_at",
+          "ip",
+          "job_id",
+          "kind",
+          "result",
+          "status"
+        ]
+      },
+      "DossierEvent": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "request",
+              "webshell",
+              "upload",
+              "canary",
+              "probe",
+              "scan",
+              "fingerprint",
+              "intel"
+            ]
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "ip": {
+            "type": "string",
+            "description": "campaign dossiers only"
+          },
+          "severity": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owasp": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "canary_served": {
+            "type": "boolean"
+          },
+          "canary_used": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "canary_from": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "at",
+          "id",
+          "severity",
+          "summary",
+          "reference",
+          "method",
+          "path",
+          "query",
+          "labels",
+          "owasp",
+          "canary_served",
+          "canary_used",
+          "canary_from"
+        ]
+      },
+      "DossierUpload": {
+        "type": "object",
+        "properties": {
+          "uid": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "put",
+              "wp_plugin",
+              "wp_theme",
+              "wp_media",
+              "script"
+            ]
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sniffed_type": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "answered_path": {
+            "type": "string"
+          },
+          "path_is_prefix": {
+            "type": "boolean"
+          },
+          "content_state": {
+            "type": "string",
+            "enum": [
+              "held",
+              "dropped_rate",
+              "dropped_budget",
+              "dropped_ceiling",
+              "dropped_disk",
+              "dropped_mismatch",
+              "too_big",
+              "not_received"
+            ]
+          },
+          "request_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "answered_path",
+          "at",
+          "content_state",
+          "filename",
+          "ip",
+          "kind",
+          "path_is_prefix",
+          "request_id",
+          "sha256",
+          "size",
+          "sniffed_type",
+          "truncated",
+          "uid"
+        ],
+        "description": "Upload metadata, without `node_id`; never the content."
+      },
+      "DossierReuse": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "place": {
+            "type": "string"
+          },
+          "served_request_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "served_ip": {
+            "type": "string"
+          },
+          "served_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "served_answer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "used_request_id": {
+            "type": "integer"
+          },
+          "used_ip": {
+            "type": "string"
+          },
+          "used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "delta_s": {
+            "type": "integer"
+          },
+          "same_source": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "delta_s",
+          "kind",
+          "place",
+          "same_source",
+          "served_answer",
+          "served_at",
+          "served_ip",
+          "served_request_id",
+          "used_at",
+          "used_ip",
+          "used_request_id"
+        ]
+      },
+      "IpDossier": {
+        "type": "object",
+        "properties": {
+          "dossier_v": {
+            "type": "integer",
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "const": "ip"
+          },
+          "id": {
+            "type": "string"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "node": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "window_days": {
+                "type": "integer",
+                "description": "days of history kept, 0 for all"
+              }
+            },
+            "required": [
+              "version",
+              "window_days"
+            ],
+            "additionalProperties": false
+          },
+          "page": {
+            "type": "string",
+            "description": "the admin page's path"
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "integer",
+                "const": 200
+              },
+              "members": {
+                "type": "integer",
+                "const": 500
+              },
+              "ips": {
+                "type": "integer",
+                "const": 50
+              }
+            },
+            "required": [
+              "events",
+              "ips",
+              "members"
+            ],
+            "additionalProperties": false
+          },
+          "truncated": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "boolean"
+              },
+              "uploads": {
+                "type": "boolean"
+              },
+              "commands": {
+                "type": "boolean"
+              },
+              "reuses": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "events",
+              "uploads",
+              "commands",
+              "reuses"
+            ],
+            "additionalProperties": false
+          },
+          "totals": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+          },
+          "ip": {
+            "type": "string"
+          },
+          "geo": {
+            "type": "object",
+            "properties": {
+              "country": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "asn": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "asn_org": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "asn",
+              "asn_org",
+              "country"
+            ]
+          },
+          "is_tor": {
+            "type": "boolean",
+            "description": "Tor exit"
+          },
+          "is_tor_relay": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "severity": {
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request_count": {
+            "type": "integer"
+          },
+          "unseen": {
+            "type": "boolean"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "families": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "count",
+                "name"
+              ]
+            }
+          },
+          "intel": {
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "fetched_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "data": {}
+                  },
+                  "required": [
+                    "data",
+                    "fetched_at"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "newest stored answer per provider, keyed by provider name"
+          },
+          "scans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scan"
+            }
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "agreed": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "agreed",
+                "name",
+                "source"
+              ]
+            }
+          },
+          "rank": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "neighbours": {
+            "type": "object",
+            "properties": {
+              "net": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "other_ips": {
+                "type": "integer"
+              },
+              "same_asn": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "net",
+              "other_ips",
+              "same_asn"
+            ]
+          },
+          "week": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ts": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "by_severity": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "minItems": 5,
+                  "maxItems": 5
+                }
+              },
+              "required": [
+                "by_severity",
+                "count",
+                "ts"
+              ]
+            }
+          },
+          "calendar": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "day": {
+                  "type": "string",
+                  "format": "date"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "max_severity": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "count",
+                "day",
+                "max_severity"
+              ]
+            }
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DossierEvent"
+            }
+          },
+          "probes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "group": {
+                  "type": "string"
+                },
+                "asked_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "members": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "vantage": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "why": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "rtt_ms": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "started_at": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "format": "date-time"
+                      },
+                      "ports": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "port": {
+                              "type": "integer"
+                            },
+                            "protocol": {
+                              "type": "string"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "outcome",
+                            "port",
+                            "protocol"
+                          ]
+                        }
+                      }
+                    },
+                    "required": [
+                      "ports",
+                      "rtt_ms",
+                      "started_at",
+                      "state",
+                      "vantage",
+                      "why"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "asked_at",
+                "group",
+                "members"
+              ]
+            }
+          },
+          "campaign": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "num": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "key",
+                  "num"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent": {
+            "type": "boolean"
+          },
+          "props": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "tor": {
+                    "type": "boolean"
+                  },
+                  "net": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "scanner": {
+                    "type": "boolean"
+                  },
+                  "fleet": {
+                    "type": "boolean"
+                  },
+                  "agent": {
+                    "type": "boolean"
+                  },
+                  "scanned": {
+                    "type": "boolean"
+                  },
+                  "scan_pending": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "agent",
+                  "fleet",
+                  "net",
+                  "scan_pending",
+                  "scanned",
+                  "scanner",
+                  "tor"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "sentence": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "caveat": {
+                    "type": "string"
+                  },
+                  "lines": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string"
+                        },
+                        "what": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "date": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "kind",
+                        "port",
+                        "source",
+                        "what"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "label",
+                  "sentence",
+                  "lines"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sharing": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "sentence": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "caveat": {
+                    "type": "string"
+                  },
+                  "lines": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string"
+                        },
+                        "what": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "date": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "kind",
+                        "port",
+                        "source",
+                        "what"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "label",
+                  "sentence",
+                  "lines"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "uploads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DossierUpload"
+            }
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "request_id": {
+                  "type": "integer"
+                },
+                "at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "at",
+                "command",
+                "request_id"
+              ]
+            }
+          },
+          "canaries": {
+            "type": "object",
+            "properties": {
+              "used_elsewhere": {
+                "type": "integer"
+              },
+              "used_from": {
+                "type": "integer"
+              },
+              "reuses": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DossierReuse"
+                }
+              }
+            },
+            "required": [
+              "reuses",
+              "used_elsewhere",
+              "used_from"
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "calendar",
+          "campaign",
+          "canaries",
+          "commands",
+          "dossier_v",
+          "events",
+          "evidence",
+          "families",
+          "first_seen",
+          "generated_at",
+          "geo",
+          "id",
+          "intel",
+          "ip",
+          "is_tor",
+          "is_tor_relay",
+          "kind",
+          "labels",
+          "last_seen",
+          "limits",
+          "names",
+          "neighbours",
+          "node",
+          "page",
+          "probes",
+          "props",
+          "rank",
+          "request_count",
+          "scans",
+          "severity",
+          "sharing",
+          "totals",
+          "truncated",
+          "unseen",
+          "uploads",
+          "week"
+        ],
+        "additionalProperties": false,
+        "description": "Every field of `IpDetail`, unchanged, plus the page's charts, Timeline, probes, verdicts and artifacts."
+      },
+      "AsnDossier": {
+        "type": "object",
+        "properties": {
+          "dossier_v": {
+            "type": "integer",
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "const": "asn"
+          },
+          "id": {
+            "type": "string"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "node": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "window_days": {
+                "type": "integer",
+                "description": "days of history kept, 0 for all"
+              }
+            },
+            "required": [
+              "version",
+              "window_days"
+            ],
+            "additionalProperties": false
+          },
+          "page": {
+            "type": "string",
+            "description": "the admin page's path"
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "integer",
+                "const": 200
+              },
+              "members": {
+                "type": "integer",
+                "const": 500
+              },
+              "ips": {
+                "type": "integer",
+                "const": 50
+              }
+            },
+            "required": [
+              "events",
+              "ips",
+              "members"
+            ],
+            "additionalProperties": false
+          },
+          "truncated": {
+            "type": "object",
+            "properties": {
+              "ips": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ips"
+            ],
+            "additionalProperties": false
+          },
+          "totals": {
+            "type": "object",
+            "properties": {
+              "ips": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "ips"
+            ],
+            "additionalProperties": false
+          },
+          "asn": {
+            "type": "integer"
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ips": {
+            "type": "integer"
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "max_severity": {
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "ips": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "ips",
+                "label"
+              ]
+            }
+          },
+          "open_ports": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "port": {
+                  "type": "integer"
+                },
+                "ips": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "ips",
+                "port"
+              ]
+            }
+          },
+          "campaigns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "num": {
+                  "type": "integer"
+                },
+                "ips": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "ips",
+                "key",
+                "num"
+              ]
+            }
+          },
+          "top_ips": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IpSummary"
+            }
+          }
+        },
+        "required": [
+          "asn",
+          "campaigns",
+          "dossier_v",
+          "first_seen",
+          "generated_at",
+          "id",
+          "ips",
+          "kind",
+          "labels",
+          "last_seen",
+          "limits",
+          "max_severity",
+          "node",
+          "open_ports",
+          "org",
+          "page",
+          "requests",
+          "top_ips",
+          "totals",
+          "truncated"
+        ],
+        "additionalProperties": false,
+        "description": "An AS: its totals and its busiest addresses."
+      },
+      "RequestDossier": {
+        "type": "object",
+        "properties": {
+          "dossier_v": {
+            "type": "integer",
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "const": "request"
+          },
+          "id": {
+            "type": "string"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "node": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "window_days": {
+                "type": "integer",
+                "description": "days of history kept, 0 for all"
+              }
+            },
+            "required": [
+              "version",
+              "window_days"
+            ],
+            "additionalProperties": false
+          },
+          "page": {
+            "type": "string",
+            "description": "the admin page's path"
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "integer",
+                "const": 200
+              },
+              "members": {
+                "type": "integer",
+                "const": 500
+              },
+              "ips": {
+                "type": "integer",
+                "const": 50
+              }
+            },
+            "required": [
+              "events",
+              "ips",
+              "members"
+            ],
+            "additionalProperties": false
+          },
+          "truncated": {
+            "type": "object",
+            "properties": {
+              "same_ip": {
+                "type": "boolean"
+              },
+              "same_ja4": {
+                "type": "boolean"
+              },
+              "reuses": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "same_ip",
+              "same_ja4",
+              "reuses"
+            ],
+            "additionalProperties": false
+          },
+          "totals": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "ip": {
+                "type": "string"
+              },
+              "method": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              },
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "answer": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "decoy": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "held_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "persona": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "transport": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "via_proxy": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "severity": {
+                "type": "integer"
+              },
+              "scan_level": {
+                "type": "integer"
+              },
+              "is_fp_claim": {
+                "type": "boolean"
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "owasp": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "ja4": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ja4h": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "node": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rules_short": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "user_agent": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "headers": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                }
+              },
+              "body_text": {
+                "type": "string"
+              },
+              "body_b64": {
+                "type": "string"
+              },
+              "body_len": {
+                "type": "integer"
+              },
+              "body_truncated": {
+                "type": "boolean"
+              },
+              "fingerprint": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "hash": {
+                        "type": "string"
+                      },
+                      "count": {
+                        "type": "integer"
+                      },
+                      "other_ips": {
+                        "type": "integer"
+                      },
+                      "visitor_ids": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "required": [
+                      "count",
+                      "hash",
+                      "other_ips",
+                      "visitor_ids"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "answer",
+              "at",
+              "body_b64",
+              "body_len",
+              "body_text",
+              "body_truncated",
+              "decoy",
+              "fingerprint",
+              "headers",
+              "held_ms",
+              "host",
+              "id",
+              "ip",
+              "is_fp_claim",
+              "ja4",
+              "ja4h",
+              "labels",
+              "method",
+              "node",
+              "owasp",
+              "persona",
+              "rules_short",
+              "scan_level",
+              "severity",
+              "status",
+              "target",
+              "transport",
+              "user_agent",
+              "via_proxy"
+            ]
+          },
+          "ip": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IpSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "same_ip": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "ip": {
+                  "type": "string"
+                },
+                "method": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at",
+                "id",
+                "ip",
+                "method",
+                "path",
+                "severity"
+              ]
+            }
+          },
+          "same_ja4": {
+            "type": "object",
+            "properties": {
+              "ips": {
+                "type": "integer"
+              },
+              "days": {
+                "type": "integer"
+              },
+              "recent": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "ip": {
+                      "type": "string"
+                    },
+                    "method": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": "string"
+                    },
+                    "severity": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "at",
+                    "id",
+                    "ip",
+                    "method",
+                    "path",
+                    "severity"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "days",
+              "ips",
+              "recent"
+            ]
+          },
+          "canaries": {
+            "type": "object",
+            "properties": {
+              "served": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "value"
+                  ]
+                }
+              },
+              "return_host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reuses": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DossierReuse"
+                }
+              }
+            },
+            "required": [
+              "return_host",
+              "reuses",
+              "served"
+            ]
+          },
+          "uploads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DossierUpload"
+            }
+          },
+          "webshell_cmd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "campaign": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "num": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "key",
+                  "num"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "campaign",
+          "canaries",
+          "dossier_v",
+          "generated_at",
+          "id",
+          "ip",
+          "kind",
+          "limits",
+          "node",
+          "page",
+          "request",
+          "same_ip",
+          "same_ja4",
+          "totals",
+          "truncated",
+          "uploads",
+          "webshell_cmd"
+        ],
+        "additionalProperties": false,
+        "description": "One recorded request. `target`, `headers` and the body are attacker text."
+      },
+      "CampaignDossier": {
+        "type": "object",
+        "properties": {
+          "dossier_v": {
+            "type": "integer",
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "const": "campaign"
+          },
+          "id": {
+            "type": "string"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "node": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "window_days": {
+                "type": "integer",
+                "description": "days of history kept, 0 for all"
+              }
+            },
+            "required": [
+              "version",
+              "window_days"
+            ],
+            "additionalProperties": false
+          },
+          "page": {
+            "type": "string",
+            "description": "the admin page's path"
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "integer",
+                "const": 200
+              },
+              "members": {
+                "type": "integer",
+                "const": 500
+              },
+              "ips": {
+                "type": "integer",
+                "const": 50
+              }
+            },
+            "required": [
+              "events",
+              "ips",
+              "members"
+            ],
+            "additionalProperties": false
+          },
+          "truncated": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "boolean"
+              },
+              "members": {
+                "type": "boolean"
+              },
+              "edges": {
+                "type": "boolean"
+              },
+              "uploads": {
+                "type": "boolean"
+              },
+              "commands": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "events",
+              "members",
+              "edges",
+              "uploads",
+              "commands"
+            ],
+            "additionalProperties": false
+          },
+          "totals": {
+            "type": "object",
+            "properties": {
+              "members": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "members"
+            ],
+            "additionalProperties": false
+          },
+          "campaign": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "num": {
+                "type": "integer"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "first_seen": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "last_seen": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "hard_edges": {
+                "type": "integer"
+              },
+              "soft_edges": {
+                "type": "integer"
+              },
+              "v": {
+                "type": "integer"
+              },
+              "computed_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "computed_at",
+              "first_seen",
+              "hard_edges",
+              "key",
+              "last_seen",
+              "num",
+              "size",
+              "soft_edges",
+              "v"
+            ]
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ip_id": {
+                  "type": "integer"
+                },
+                "ip": {
+                  "type": "string"
+                },
+                "country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "asn": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "asn_org": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "first_seen": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "last_seen": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "requests": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "asn",
+                "asn_org",
+                "country",
+                "first_seen",
+                "ip",
+                "ip_id",
+                "last_seen",
+                "requests"
+              ]
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "a_id": {
+                  "type": "integer"
+                },
+                "a": {
+                  "type": "string"
+                },
+                "b_id": {
+                  "type": "integer"
+                },
+                "b": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                },
+                "score": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "shared": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "fp_support": {
+                  "type": "boolean"
+                },
+                "first_ts": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "last_ts": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "agreement": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "a",
+                "a_id",
+                "agreement",
+                "b",
+                "b_id",
+                "first_ts",
+                "fp_support",
+                "kind",
+                "last_ts",
+                "score",
+                "shared",
+                "value"
+              ]
+            }
+          },
+          "shapes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "members": {
+                  "type": "integer"
+                },
+                "df": {
+                  "type": "integer"
+                },
+                "first_seen": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "wave": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "ips": {
+                          "type": "integer"
+                        },
+                        "window_start": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "detected_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "detected_at",
+                        "ips",
+                        "window_start"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "df",
+                "first_seen",
+                "members",
+                "text",
+                "wave"
+              ]
+            }
+          },
+          "calendar": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "day": {
+                  "type": "string",
+                  "format": "date"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "max_severity": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "count",
+                "day",
+                "max_severity"
+              ]
+            }
+          },
+          "uploads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DossierUpload"
+            }
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "ips": {
+                  "type": "integer"
+                },
+                "last_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "command",
+                "count",
+                "ips",
+                "last_at"
+              ]
+            }
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DossierEvent"
+            }
+          },
+          "agent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "agent",
+          "calendar",
+          "campaign",
+          "commands",
+          "dossier_v",
+          "edges",
+          "events",
+          "generated_at",
+          "id",
+          "kind",
+          "limits",
+          "members",
+          "node",
+          "page",
+          "shapes",
+          "totals",
+          "truncated",
+          "uploads"
+        ],
+        "additionalProperties": false,
+        "description": "A campaign: its members, the edges between carried members, shapes and artifacts."
+      }
+    }
+  }
+}

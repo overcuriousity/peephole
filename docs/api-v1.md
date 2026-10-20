@@ -7,6 +7,10 @@ the admin UI you can reach `/api/v1`.
 All endpoints are JSON. All times are RFC 3339 UTC. Base URL: the node's
 admin origin, e.g. `https://ph.example.net` (the same origin WebAuthn uses).
 
+The machine-readable description is `GET /api/v1/openapi.json` (OpenAPI
+3.1, no token needed; source [`openapi.json`](openapi.json)). Tests keep it
+in step with the routes and the dossier serializer.
+
 ## Authentication
 
 Two separate credential kinds live on this listener, and they never mix:
