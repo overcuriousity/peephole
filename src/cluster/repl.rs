@@ -1792,9 +1792,10 @@ const KEPT_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600)
 /// a newer build sends fields this build drops, so until the upgrade
 /// every one of its records does (MIK-775: 4178 lines in a day).
 fn kept_warning(kind: &str, uid: Option<&str>) {
+    use crate::lock::MutexExt;
     static LAST: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
     debug!(kind, uid, "row does not reproduce its record; payload kept");
-    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let mut last = LAST.lock_or_recover();
     match &mut *last {
         Some((at, n)) if at.elapsed() < KEPT_WARN_EVERY => *n += 1,
         _ => {
