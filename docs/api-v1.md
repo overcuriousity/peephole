@@ -390,7 +390,7 @@ the top level.
   "node": { "version": "0.22.0", "window_days": 0 },
   "page": "/ip/203.0.113.9",
   "limits": { "events": 200, "members": 500, "ips": 50 },
-  "truncated": { "events": false },
+  "truncated": { "events": false, "uploads": false, "commands": false, "reuses": false },
   "totals": {},
   "…": "the kind's fields"
 }
@@ -401,14 +401,20 @@ the top level.
 - `node.window_days`: days of history the node keeps, `0` for all.
 - `page`: the admin page the dossier describes (path only).
 - `limits`: the caps. `events` (newest Timeline events) 200, `members`
-  (campaign members) 500, `ips` (an ASN's busiest IPs, a request's
-  same-IP list, uploads and commands of an address) 50.
-- `truncated`: per capped list of this kind, `true` when more existed than
-  the dossier carries. `totals`: the full count where it is known without
-  counting the whole history (`members` for a campaign, `ips` for an ASN);
-  events are not counted, `truncated.events` says whether older ones exist.
-- Times are RFC 3339 UTC. Request targets, headers, bodies, command lines,
-  upload names and event summaries are attacker text: escape them.
+  (campaign members) 500, `ips` 50: every other list (an ASN's busiest
+  IPs; a request's `same_ip`, `same_ja4.recent`; `uploads`, `commands`,
+  `canaries.reuses`).
+- `truncated`: one key per capped list of this kind, `true` when more
+  existed than the dossier carries: `events`, `members`, `ips`, `edges`,
+  `same_ip`, `same_ja4` (its `recent`), `uploads`, `commands`, `reuses`
+  (`canaries.reuses`). Each kind's section lists its keys. `totals`: the
+  full count where it is known without counting the whole history
+  (`members` for a campaign, `ips` for an ASN); events are not counted,
+  `truncated.events` says whether older ones exist.
+- Times are RFC 3339 UTC (`…Z`), including `week[].ts`, the hour a bucket
+  starts. `calendar[].day` is a date, `YYYY-MM-DD` (UTC). Request targets,
+  headers, bodies, command lines, upload names and event summaries are
+  attacker text: escape them.
 
 ### `kind: "ip"`
 
@@ -438,6 +444,7 @@ plus:
 - `canaries`: `{used_elsewhere, used_from, reuses:[{kind, place,
   served_request_id, served_ip, served_at, served_answer, used_request_id,
   used_ip, used_at, delta_s, same_source}]}`, reuses newest 50.
+- Capped: `truncated.events`, `uploads`, `commands`, `reuses`.
 
 ### `kind: "asn"`
 
@@ -458,9 +465,13 @@ plus:
 - `ip`: its address as [`GET /api/v1/ips`](#get-apiv1ipsqcursorlimit)
   lists it (null once deleted).
 - `same_ip`: other requests of the address, `[{id, at, ip, method, path,
-  severity}]`, newest 50. `same_ja4`: `{ips, days, recent:[…]}`.
-- `canaries`: `{served:[{kind, value}], return_host, reuses:[…]}`.
+  severity}]`, newest 50. `same_ja4`: `{ips, days, recent:[…]}`, the
+  newest 50 of other addresses' requests with its JA4 in the last `days`;
+  `ips` counts those addresses.
+- `canaries`: `{served:[{kind, value}], return_host, reuses:[…]}`, reuses
+  newest 50.
 - `uploads` (metadata), `webshell_cmd`, `campaign` (`{key, num}` or null).
+- Capped: `truncated.same_ip`, `same_ja4`, `reuses`.
 
 ### `kind: "campaign"`
 
@@ -470,12 +481,14 @@ plus:
   requests}]`, at most 500 (`truncated.members`; `totals.members` is
   the size).
 - `edges`: `[{a_id, a, b_id, b, kind, value, score, shared, fp_support,
-  first_ts, last_ts, agreement}]`.
+  first_ts, last_ts, agreement}]`: only those between two carried
+  members. `truncated.edges` is `true` when the members cap left any out.
 - `shapes`: `[{text, members, df, first_seen, wave:{ips, window_start,
   detected_at}|null}]`; `calendar` as for an IP.
 - `uploads` (metadata) and `commands` (`[{command, count, ips, last_at}]`),
   50 each; `events`: the members' newest 200, each with its `ip`
   (`truncated.events`); `agent`.
+- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`.
 
 ### Never in a dossier
 

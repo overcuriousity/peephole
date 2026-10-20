@@ -25,7 +25,8 @@ pub const DOSSIER_V: u32 = 1;
 pub const EVENTS: i64 = crate::store::events::MAX_LIMIT;
 /// Campaign members per dossier.
 pub const MEMBERS: usize = 500;
-/// IPs per dossier (an ASN's busiest; a request's same-IP list).
+/// Every other capped list per dossier: an ASN's busiest IPs, a request's
+/// same-IP and same-JA4 requests, uploads, commands, canary reuses.
 pub const IPS: usize = 50;
 
 /// What every dossier starts with; the kind's own fields follow at the
@@ -79,7 +80,31 @@ pub struct Counts<T> {
     pub members: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ips: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edges: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_ip: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_ja4: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploads: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commands: Option<T>,
+    /// `canaries.reuses`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuses: Option<T>,
 }
+
+/// The first `cap` of `v` (fetched with one more), and whether there were
+/// more.
+fn capped<T>(mut v: Vec<T>, cap: usize) -> (Vec<T>, bool) {
+    let more = v.len() > cap;
+    v.truncate(cap);
+    (v, more)
+}
+
+/// Fetch limit for a list capped at [`IPS`]: one more, to tell.
+const IPS_PLUS: i64 = IPS as i64 + 1;
 
 fn envelope<T>(
     state: &AdminState,
@@ -202,8 +227,11 @@ impl From<&crate::store::uploads::UploadRow> for UploadJson {
     }
 }
 
-fn uploads_json(rows: &[crate::store::uploads::UploadRow]) -> Vec<UploadJson> {
-    rows.iter().map(UploadJson::from).collect()
+/// At most [`IPS`] of `rows` (fetched with one more), and whether there
+/// were more.
+fn uploads_json(rows: Vec<crate::store::uploads::UploadRow>) -> (Vec<UploadJson>, bool) {
+    let (rows, more) = capped(rows, IPS);
+    (rows.iter().map(UploadJson::from).collect(), more)
 }
 
 /// A canary served on one side and used on the other. No value hash and
@@ -241,24 +269,43 @@ impl From<&crate::store::canaries::Reuse> for ReuseJson {
     }
 }
 
-/// Canary reuses listed per dossier, as on the request page.
-const REUSES: i64 = 50;
-
+/// The newest [`IPS`] canary reuses `f` matches, and whether there were
+/// more.
 async fn reuses(
     state: &AdminState,
     f: crate::store::canaries::ReuseFilter,
-) -> Result<Vec<ReuseJson>> {
-    Ok(state
+) -> Result<(Vec<ReuseJson>, bool)> {
+    let rows = state
         .store
         .reuses(&crate::store::canaries::ReuseFilter {
             range: crate::store::stats::Range::All,
-            limit: REUSES,
+            limit: IPS_PLUS,
             ..f
         })
-        .await?
-        .iter()
-        .map(ReuseJson::from)
-        .collect())
+        .await?;
+    let (rows, more) = capped(rows, IPS);
+    Ok((rows.iter().map(ReuseJson::from).collect(), more))
+}
+
+/// A chart bucket: the hour it starts, in RFC 3339.
+#[derive(Debug, Serialize)]
+pub struct BucketJson {
+    pub ts: String,
+    pub count: i64,
+    pub by_severity: [i64; 5],
+}
+
+impl From<&Bucket> for BucketJson {
+    fn from(b: &Bucket) -> Self {
+        Self {
+            // The store keys hours as `YYYY-MM-DDTHH:MM`.
+            ts: chrono::NaiveDateTime::parse_from_str(&b.ts, "%Y-%m-%dT%H:%M")
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_default(),
+            count: b.count,
+            by_severity: b.by_severity,
+        }
+    }
 }
 
 /// The (key, number) of a campaign.
@@ -378,7 +425,8 @@ pub struct IpDossier {
     #[serde(flatten)]
     pub detail: Value,
     /// The page's charts: requests per hour this week, per day this half year.
-    pub week: Vec<Bucket>,
+    pub week: Vec<BucketJson>,
+    /// `day` is a date, `YYYY-MM-DD` (UTC).
     pub calendar: Vec<CalendarDay>,
     /// Newest first, at most [`EVENTS`].
     pub events: Vec<EventJson>,
@@ -390,7 +438,7 @@ pub struct IpDossier {
     pub props: Option<PropsJson>,
     pub evidence: Option<VerdictJson>,
     pub sharing: Option<VerdictJson>,
-    /// Newest first, at most [`IPS`].
+    /// Newest first, at most [`IPS`] each.
     pub uploads: Vec<UploadJson>,
     pub commands: Vec<CommandJson>,
     pub canaries: IpCanaries,
@@ -512,7 +560,7 @@ pub struct IpCanaries {
     /// canary was used here.
     pub used_elsewhere: i64,
     pub used_from: i64,
-    /// Newest first, at most 50.
+    /// Newest first, at most [`IPS`].
     pub reuses: Vec<ReuseJson>,
 }
 
@@ -559,10 +607,9 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
             caveat: None,
             lines: lines_json(&v.lines),
         });
-    let uploads = store.uploads_for_ip(ip.id, IPS as i64).await?;
-    let commands = store
-        .webshell_hits_for_ip(ip.id, IPS as i64)
-        .await?
+    let (uploads, uploads_more) = uploads_json(store.uploads_for_ip(ip.id, IPS_PLUS).await?);
+    let (commands, commands_more) = capped(store.webshell_hits_for_ip(ip.id, IPS_PLUS).await?, IPS);
+    let commands = commands
         .into_iter()
         .map(|w| CommandJson {
             request_id: w.request_id,
@@ -571,7 +618,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
         })
         .collect();
     let (used_elsewhere, used_from) = store.canary_links_for_ip(ip.id).await?;
-    let reuses = reuses(
+    let (reuses, reuses_more) = reuses(
         state,
         crate::store::canaries::ReuseFilter {
             ip_id: Some(ip.id),
@@ -581,7 +628,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
     .await?;
     let body = IpDossier {
         detail,
-        week: ov.week.clone(),
+        week: ov.week.iter().map(BucketJson::from).collect(),
         calendar: ov.calendar.clone(),
         events,
         probes,
@@ -598,7 +645,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
         }),
         evidence,
         sharing,
-        uploads: uploads_json(&uploads),
+        uploads,
         commands,
         canaries: IpCanaries {
             used_elsewhere,
@@ -613,6 +660,9 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
         format!("/ip/{}", ip.ip),
         Counts {
             events: Some(more),
+            uploads: Some(uploads_more),
+            commands: Some(commands_more),
+            reuses: Some(reuses_more),
             ..Default::default()
         },
         Counts::default(),
@@ -724,7 +774,8 @@ pub struct RequestDossier {
     pub request: RequestJson,
     /// Its address as `/api/v1/ips` lists it (null once deleted).
     pub ip: Option<Value>,
-    /// Other requests of the address, newest first, at most [`IPS`].
+    /// Other requests of the address, newest first, at most [`IPS`]; as
+    /// many in `same_ja4.recent` and `canaries.reuses`.
     pub same_ip: Vec<RelatedJson>,
     pub same_ja4: SameJa4,
     pub canaries: RequestCanaries,
@@ -843,13 +894,16 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
             let site = format!("{w}.internal");
             crate::canary::site::return_host(host.as_deref(), &site)
         });
-    let mut same_ip = store.related_by_ip(d.row.ip_id, d.row.id).await?;
-    same_ip.truncate(IPS);
+    let (same_ip, same_ip_more) = capped(
+        store.related_by_ip(d.row.ip_id, d.row.id, IPS_PLUS).await?,
+        IPS,
+    );
     let (same_ja4, ja4_ips) = match &d.row.ja4 {
-        Some(j) => store.related_by_ja4(j, d.row.ip_id).await?,
+        Some(j) => store.related_by_ja4(j, d.row.ip_id, IPS_PLUS).await?,
         None => (vec![], 0),
     };
-    let reuses = reuses(
+    let (same_ja4, same_ja4_more) = capped(same_ja4, IPS);
+    let (reuses, reuses_more) = reuses(
         state,
         crate::store::canaries::ReuseFilter {
             request: Some(id),
@@ -920,7 +974,7 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
             return_host,
             reuses,
         },
-        uploads: uploads_json(&uploads),
+        uploads: uploads.iter().map(UploadJson::from).collect(),
         webshell_cmd,
         campaign,
     };
@@ -929,7 +983,12 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
         "request",
         id.to_string(),
         format!("/admin/requests/{id}"),
-        Counts::default(),
+        Counts {
+            same_ip: Some(same_ip_more),
+            same_ja4: Some(same_ja4_more),
+            reuses: Some(reuses_more),
+            ..Default::default()
+        },
         Counts::default(),
         body,
     )))
@@ -939,18 +998,130 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
 
 #[derive(Debug, Serialize)]
 pub struct CampaignDossier {
-    pub campaign: crate::store::campaigns::CampaignRow,
+    pub campaign: CampaignJson,
     /// At most [`MEMBERS`]; `totals.members` is the campaign's size.
-    pub members: Vec<crate::store::campaigns::Member>,
-    pub edges: Vec<crate::store::campaigns::Edge>,
+    pub members: Vec<MemberJson>,
+    /// Those between two carried members.
+    pub edges: Vec<EdgeJson>,
     pub shapes: Vec<ShapeJson>,
     pub calendar: Vec<CalendarDay>,
+    /// At most [`IPS`] each.
     pub uploads: Vec<UploadJson>,
     pub commands: Vec<CampaignCommandJson>,
     /// The members' newest events, at most [`EVENTS`], each with its `ip`.
     pub events: Vec<EventJson>,
     /// A member carries an agent label.
     pub agent: bool,
+}
+
+/// [`crate::store::campaigns::CampaignRow`], times in RFC 3339.
+#[derive(Debug, Serialize)]
+pub struct CampaignJson {
+    pub key: String,
+    pub num: i64,
+    pub size: i64,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub hard_edges: i64,
+    pub soft_edges: i64,
+    pub v: i64,
+    pub computed_at: String,
+}
+
+impl From<crate::store::campaigns::CampaignRow> for CampaignJson {
+    fn from(r: crate::store::campaigns::CampaignRow) -> Self {
+        Self {
+            first_seen: rfc3339(&r.first_seen),
+            last_seen: rfc3339(&r.last_seen),
+            computed_at: rfc3339(&r.computed_at),
+            key: r.key,
+            num: r.num,
+            size: r.size,
+            hard_edges: r.hard_edges,
+            soft_edges: r.soft_edges,
+            v: r.v,
+        }
+    }
+}
+
+/// [`crate::store::campaigns::Member`], times in RFC 3339.
+#[derive(Debug, Serialize)]
+pub struct MemberJson {
+    pub ip_id: i64,
+    pub ip: String,
+    pub country: Option<String>,
+    pub asn: Option<i64>,
+    pub asn_org: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub requests: i64,
+}
+
+impl From<crate::store::campaigns::Member> for MemberJson {
+    fn from(m: crate::store::campaigns::Member) -> Self {
+        Self {
+            first_seen: rfc3339(&m.first_seen),
+            last_seen: rfc3339(&m.last_seen),
+            ip_id: m.ip_id,
+            ip: m.ip,
+            country: m.country,
+            asn: m.asn,
+            asn_org: m.asn_org,
+            requests: m.requests,
+        }
+    }
+}
+
+/// [`crate::store::campaigns::Edge`], times in RFC 3339.
+#[derive(Debug, Serialize)]
+pub struct EdgeJson {
+    pub a_id: i64,
+    pub a: String,
+    pub b_id: i64,
+    pub b: String,
+    pub kind: String,
+    pub value: String,
+    pub score: Option<f64>,
+    pub shared: Option<i64>,
+    pub fp_support: bool,
+    pub first_ts: String,
+    pub last_ts: String,
+    pub agreement: Option<f64>,
+}
+
+impl From<crate::store::campaigns::Edge> for EdgeJson {
+    fn from(e: crate::store::campaigns::Edge) -> Self {
+        Self {
+            first_ts: rfc3339(&e.first_ts),
+            last_ts: rfc3339(&e.last_ts),
+            a_id: e.a_id,
+            a: e.a,
+            b_id: e.b_id,
+            b: e.b,
+            kind: e.kind,
+            value: e.value,
+            score: e.score,
+            shared: e.shared,
+            fp_support: e.fp_support,
+            agreement: e.agreement,
+        }
+    }
+}
+
+/// The edges between two of `members`, and whether any was left out.
+fn member_edges(
+    edges: Vec<crate::store::campaigns::Edge>,
+    members: &[crate::store::campaigns::Member],
+) -> (Vec<EdgeJson>, bool) {
+    let carried: std::collections::HashSet<i64> = members.iter().map(|m| m.ip_id).collect();
+    let all = edges.len();
+    let kept: Vec<EdgeJson> = edges
+        .into_iter()
+        .filter(|e| carried.contains(&e.a_id) && carried.contains(&e.b_id))
+        .map(EdgeJson::from)
+        .collect();
+    let more = kept.len() < all;
+    (kept, more)
 }
 
 #[derive(Debug, Serialize)]
@@ -989,9 +1160,11 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
     };
     let members_more = c.members.len() > MEMBERS;
     c.members.truncate(MEMBERS);
+    let (edges, edges_more) = member_edges(c.edges, &c.members);
     let page = store.campaign_events(&key, None, EVENTS).await?;
     let (events, events_more) = events_json(&page);
-    let artifacts = crate::admin::campaigns::CAMPAIGN_ARTIFACTS;
+    let (uploads, uploads_more) = uploads_json(store.campaign_uploads(&key, IPS_PLUS).await?);
+    let (commands, commands_more) = capped(store.campaign_commands(&key, IPS_PLUS).await?, IPS);
     let body = CampaignDossier {
         shapes: store
             .campaign_shapes(&key)
@@ -1010,10 +1183,8 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
             })
             .collect(),
         calendar: store.campaign_calendar(&key).await?,
-        uploads: uploads_json(&store.campaign_uploads(&key, artifacts).await?),
-        commands: store
-            .campaign_commands(&key, artifacts)
-            .await?
+        uploads,
+        commands: commands
             .into_iter()
             .map(|c| CampaignCommandJson {
                 command: c.cmd,
@@ -1024,9 +1195,9 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
             .collect(),
         events,
         agent: !store.agent_campaigns(Some(&key)).await?.is_empty(),
-        members: c.members,
-        edges: c.edges,
-        campaign: c.row,
+        members: c.members.into_iter().map(MemberJson::from).collect(),
+        edges,
+        campaign: c.row.into(),
     };
     let size = body.campaign.size;
     Ok(Some(envelope(
@@ -1037,6 +1208,9 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
         Counts {
             events: Some(events_more),
             members: Some(members_more),
+            edges: Some(edges_more),
+            uploads: Some(uploads_more),
+            commands: Some(commands_more),
             ..Default::default()
         },
         Counts {
@@ -1120,7 +1294,10 @@ mod tests {
         assert_eq!(ip["page"], "/ip/192.0.2.1");
         assert_eq!(ip["geo"]["asn"], 64500);
         assert_eq!(ip["campaign"]["key"], "192.0.2.3");
-        assert_eq!(ip["truncated"], json!({"events": false}));
+        assert_eq!(
+            ip["truncated"],
+            json!({"events": false, "uploads": false, "commands": false, "reuses": false})
+        );
         assert!(!ip["events"].as_array().unwrap().is_empty(), "{ip}");
         assert_eq!(ip["uploads"][0]["answered_path"], "/drop.php");
         assert_eq!(ip["commands"][0]["command"], "ls -la");
@@ -1140,13 +1317,18 @@ mod tests {
         assert_eq!(request["request"]["method"], "POST");
         assert_eq!(request["ip"]["ip"], "192.0.2.1");
         assert_eq!(request["campaign"]["key"], "192.0.2.3");
+        assert_eq!(
+            request["truncated"],
+            json!({"same_ip": false, "same_ja4": false, "reuses": false})
+        );
         // The campaign: its members, events with their address.
         assert_eq!(campaign["campaign"]["size"], 3);
         assert_eq!(campaign["members"].as_array().unwrap().len(), 3);
         assert_eq!(campaign["totals"], json!({"members": 3}));
         assert_eq!(
             campaign["truncated"],
-            json!({"events": false, "members": false})
+            json!({"events": false, "members": false, "edges": false,
+                "uploads": false, "commands": false})
         );
         assert!(campaign["events"][0]["ip"].is_string(), "{campaign}");
         assert_eq!(campaign["uploads"][0]["answered_path"], "/drop.php");
@@ -1228,6 +1410,156 @@ mod tests {
         // The values did reach the dossier: the walk is over keys only.
         let d = serde_json::to_string(&request_dossier(&state, req).await).unwrap();
         assert!(d.contains("token_hash") && d.contains("passkey_json blob"));
+    }
+
+    /// Every non-null time in `v`: keys `at`, `ts` and `*_at`, `*_seen`,
+    /// `*_ts`, as (key, value).
+    fn times(v: &Value, out: &mut Vec<(String, Value)>) {
+        match v {
+            Value::Object(m) => {
+                for (k, v) in m {
+                    let time = ["at", "ts"].contains(&k.as_str())
+                        || ["_at", "_seen", "_ts"].iter().any(|s| k.ends_with(s));
+                    if time && !v.is_null() {
+                        out.push((k.clone(), v.clone()));
+                    }
+                    times(v, out);
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|v| times(v, out)),
+            _ => {}
+        }
+    }
+
+    fn assert_rfc3339(d: &Value) -> usize {
+        let mut all = vec![];
+        times(d, &mut all);
+        for (k, v) in &all {
+            let ok = v
+                .as_str()
+                .is_some_and(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok());
+            assert!(ok, "{} dossier: {k} = {v} is not RFC 3339", d["kind"]);
+        }
+        all.len()
+    }
+
+    #[tokio::test]
+    async fn every_time_in_a_dossier_is_rfc3339() {
+        let (state, req, _d) = seeded().await;
+        for d in all_four(&state, req).await {
+            assert!(assert_rfc3339(&d) > 2, "{d}");
+        }
+        let c =
+            serde_json::to_value(campaign(&state, "192.0.2.3").await.unwrap().unwrap()).unwrap();
+        for k in ["first_seen", "last_seen", "computed_at"] {
+            assert!(c["campaign"][k].as_str().unwrap().ends_with('Z'), "{k}");
+        }
+        assert!(
+            c["members"][0]["first_seen"]
+                .as_str()
+                .unwrap()
+                .ends_with('Z')
+        );
+        assert!(c["edges"][0]["first_ts"].as_str().unwrap().ends_with('Z'));
+        // An address active this week has hour buckets.
+        let (state, _cookie, _app, _d) = crate::admin::devices::tests::app().await;
+        let ip = state
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let d =
+            serde_json::to_value(super::ip(&state, "203.0.113.9").await.unwrap().unwrap()).unwrap();
+        let ts = d["week"][0]["ts"].as_str().unwrap();
+        assert!(ts.ends_with(":00:00Z"), "{ts}");
+        assert_rfc3339(&d);
+    }
+
+    #[tokio::test]
+    async fn capped_lists_fetch_one_more_and_say_so() {
+        let (state, _cookie, _app, _d) = crate::admin::devices::tests::app().await;
+        let s = &state.store;
+        let ip = s.upsert_ip("203.0.113.9".parse().unwrap()).await.unwrap();
+        // The newest request and 51 others.
+        let mut newest = 0;
+        for i in 0..52 {
+            newest = s
+                .insert_request(&crate::store::requests::NewRequest {
+                    ip_id: ip.id,
+                    method: "GET".into(),
+                    path: format!("/{i}"),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let d = request_dossier(&state, newest).await;
+        assert_eq!(d.body.same_ip.len(), 50);
+        assert_eq!(d.truncated.same_ip, Some(true));
+        // 50 others exactly: all of them, not truncated.
+        sqlx::query("DELETE FROM requests WHERE path = '/0'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let d = request_dossier(&state, newest).await;
+        assert_eq!(d.body.same_ip.len(), 50);
+        assert_eq!(d.truncated.same_ip, Some(false));
+    }
+
+    fn member(ip_id: i64) -> crate::store::campaigns::Member {
+        crate::store::campaigns::Member {
+            ip_id,
+            ip: format!("192.0.2.{ip_id}"),
+            country: None,
+            asn: None,
+            asn_org: None,
+            first_seen: "2026-01-02 03:04:05".into(),
+            last_seen: "2026-01-02 03:04:05".into(),
+            requests: 1,
+        }
+    }
+
+    fn edge(a_id: i64, b_id: i64) -> crate::store::campaigns::Edge {
+        crate::store::campaigns::Edge {
+            a_id,
+            a: format!("192.0.2.{a_id}"),
+            b_id,
+            b: format!("192.0.2.{b_id}"),
+            kind: "paths".into(),
+            value: String::new(),
+            score: Some(0.9),
+            shared: Some(3),
+            fp_support: false,
+            first_ts: "2026-01-02 03:04:05".into(),
+            last_ts: "2026-01-02 03:04:05".into(),
+            agreement: None,
+        }
+    }
+
+    #[test]
+    fn edges_name_carried_members_only() {
+        let edges = vec![edge(1, 2), edge(2, 3), edge(3, 1)];
+        let (kept, more) = member_edges(edges.clone(), &[member(1), member(2), member(3)]);
+        assert_eq!((kept.len(), more), (3, false));
+        // Member 3 cut off by the cap: its edges go with it.
+        let (kept, more) = member_edges(edges, &[member(1), member(2)]);
+        let pairs: Vec<_> = kept.iter().map(|e| (e.a_id, e.b_id)).collect();
+        assert_eq!((pairs, more), (vec![(1, 2)], true));
+        assert_eq!(kept[0].first_ts, "2026-01-02T03:04:05Z");
     }
 
     #[tokio::test]

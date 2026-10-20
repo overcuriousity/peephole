@@ -185,9 +185,9 @@ async fn request_page(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         .map(|(_, v)| v.clone());
-    let same_ip = st.store.related_by_ip(d.row.ip_id, d.row.id).await?;
+    let same_ip = st.store.related_by_ip(d.row.ip_id, d.row.id, 10).await?;
     let (same_ja4, ja4_ips) = match &d.row.ja4 {
-        Some(j) => st.store.related_by_ja4(j, d.row.ip_id).await?,
+        Some(j) => st.store.related_by_ja4(j, d.row.ip_id, 10).await?,
         None => (vec![], 0),
     };
     let served = d.served_canaries();

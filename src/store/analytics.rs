@@ -484,36 +484,48 @@ impl Store {
         )
     }
 
-    /// Other requests of the same IP, newest first.
-    pub async fn related_by_ip(&self, ip_id: i64, except: i64) -> Result<Vec<RecentRequest>> {
+    /// Other requests of the same IP, newest first, at most `limit`.
+    pub async fn related_by_ip(
+        &self,
+        ip_id: i64,
+        except: i64,
+        limit: i64,
+    ) -> Result<Vec<RecentRequest>> {
         let rows: Vec<RecentTuple> = sqlx::query_as(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
                     i.country, i.is_tor_exit, 0, 0
              FROM requests r JOIN ips i ON r.ip_id = i.id
-             WHERE r.ip_id = ? AND r.id != ? ORDER BY r.ts DESC, r.id DESC LIMIT 10",
+             WHERE r.ip_id = ? AND r.id != ? ORDER BY r.ts DESC, r.id DESC LIMIT ?",
         )
         .bind(ip_id)
         .bind(except)
+        .bind(limit)
         .fetch_all(&self.read)
         .await?;
         Ok(rows.into_iter().map(recent_from).collect())
     }
 
     /// Requests from other IPs with the same JA4 in the last
-    /// [`RELATED_JA4_DAYS`] days (newest first, at most 10), and how many
-    /// distinct other IPs sent one. Bounded by time: JA4 is not indexed.
-    pub async fn related_by_ja4(&self, ja4: &str, ip_id: i64) -> Result<(Vec<RecentRequest>, i64)> {
+    /// [`RELATED_JA4_DAYS`] days (newest first, at most `limit`), and how
+    /// many distinct other IPs sent one. Bounded by time: JA4 is not indexed.
+    pub async fn related_by_ja4(
+        &self,
+        ja4: &str,
+        ip_id: i64,
+        limit: i64,
+    ) -> Result<(Vec<RecentRequest>, i64)> {
         let since = format!("-{RELATED_JA4_DAYS} days");
         let rows: Vec<RecentTuple> = sqlx::query_as(
             "SELECT r.id, r.ts, i.ip, r.method, r.path, r.severity, r.labels_json, r.owasp_json,
                     i.country, i.is_tor_exit, 0, 0
              FROM requests r JOIN ips i ON r.ip_id = i.id
              WHERE r.ts >= datetime('now', ?) AND r.ja4 = ? AND r.ip_id != ?
-             ORDER BY r.ts DESC, r.id DESC LIMIT 10",
+             ORDER BY r.ts DESC, r.id DESC LIMIT ?",
         )
         .bind(&since)
         .bind(ja4)
         .bind(ip_id)
+        .bind(limit)
         .fetch_all(&self.read)
         .await?;
         let ips: i64 = sqlx::query_scalar(
@@ -651,9 +663,9 @@ mod tests {
         let newest = s.requests_after(0, 2).await.unwrap();
         assert_eq!(newest.len(), 2);
         assert_eq!(newest[1].id, max, "newest last, the backlog skipped");
-        let by_ip = s.related_by_ip(1, 1).await.unwrap();
+        let by_ip = s.related_by_ip(1, 1, 10).await.unwrap();
         assert_eq!(by_ip.len(), 1);
-        let (rows, ips) = s.related_by_ja4("t13d_a", 1).await.unwrap();
+        let (rows, ips) = s.related_by_ja4("t13d_a", 1, 10).await.unwrap();
         assert_eq!((rows.len(), ips), (1, 1));
         assert_eq!(rows[0].ip, "198.51.100.2");
     }
