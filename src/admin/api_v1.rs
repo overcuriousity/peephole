@@ -13,34 +13,77 @@ use axum::{
     extract::{FromRequestParts, Path, Query, State},
     http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{MethodFilter, MethodRouter, on},
 };
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::sync::Arc;
 
+/// A route's handler, mounted for the method it is listed under.
+type Mount = fn(MethodFilter) -> MethodRouter<Arc<AdminState>>;
+
+/// Every `/api/v1` route: the single source of [`routes`], and what
+/// `docs/openapi.json` must document, path for path and method for method
+/// (tested).
+pub const ROUTES: &[(&str, &str, Mount)] = &[
+    ("GET", "/api/v1/openapi.json", |m| on(m, openapi)),
+    ("POST", "/api/v1/pair", |m| on(m, pair)),
+    ("GET", "/api/v1/ips", |m| on(m, ips)),
+    ("GET", "/api/v1/ips/{addr}", |m| on(m, ip_detail)),
+    ("POST", "/api/v1/lookup", |m| on(m, lookup)),
+    ("POST", "/api/v1/ips/{addr}/probe", |m| on(m, probe)),
+    ("GET", "/api/v1/ips/{addr}/probe/vantages", |m| {
+        on(m, probe_vantages)
+    }),
+    ("GET", "/api/v1/ips/{addr}/scan/prices", |m| {
+        on(m, scan_prices)
+    }),
+    ("GET", "/api/v1/ips/{addr}/scan/quote", |m| {
+        on(m, scan_quote)
+    }),
+    ("POST", "/api/v1/ips/{addr}/scan", |m| on(m, scan_buy)),
+    ("GET", "/api/v1/ips/{addr}/lookup/quote", |m| {
+        on(m, lookup_quote)
+    }),
+    ("POST", "/api/v1/ips/{addr}/lookup", |m| on(m, lookup_buy)),
+    ("GET", "/api/v1/jobs/{job_id}", |m| on(m, job)),
+    ("GET", "/api/v1/uploads", |m| on(m, uploads)),
+    ("GET", "/api/v1/uploads/{sha256}", |m| on(m, upload_by_hash)),
+    ("GET", "/api/v1/ips/{addr}/dossier", |m| on(m, ip_dossier)),
+    ("GET", "/api/v1/asns/{n}/dossier", |m| on(m, asn_dossier)),
+    ("GET", "/api/v1/requests/{id}/dossier", |m| {
+        on(m, request_dossier)
+    }),
+    ("GET", "/api/v1/campaigns/{key}/dossier", |m| {
+        on(m, campaign_dossier)
+    }),
+];
+
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new()
-        .route("/api/v1/pair", post(pair))
-        .route("/api/v1/ips", get(ips))
-        .route("/api/v1/ips/{addr}", get(ip_detail))
-        .route("/api/v1/lookup", post(lookup))
-        .route("/api/v1/ips/{addr}/probe", post(probe))
-        .route("/api/v1/ips/{addr}/probe/vantages", get(probe_vantages))
-        .route("/api/v1/ips/{addr}/scan/prices", get(scan_prices))
-        .route("/api/v1/ips/{addr}/scan/quote", get(scan_quote))
-        .route("/api/v1/ips/{addr}/scan", post(scan_buy))
-        .route("/api/v1/ips/{addr}/lookup/quote", get(lookup_quote))
-        .route("/api/v1/ips/{addr}/lookup", post(lookup_buy))
-        .route("/api/v1/jobs/{job_id}", get(job))
-        .route("/api/v1/uploads", get(uploads))
-        .route("/api/v1/uploads/{sha256}", get(upload_by_hash))
-        .route("/api/v1/ips/{addr}/dossier", get(ip_dossier))
-        .route("/api/v1/asns/{n}/dossier", get(asn_dossier))
-        .route("/api/v1/requests/{id}/dossier", get(request_dossier))
-        .route("/api/v1/campaigns/{key}/dossier", get(campaign_dossier))
+    ROUTES
+        .iter()
+        .fold(Router::new(), |r, (method, path, mount)| {
+            let filter = match *method {
+                "GET" => MethodFilter::GET,
+                "POST" => MethodFilter::POST,
+                other => unreachable!("ROUTES lists {other}"),
+            };
+            r.route(path, mount(filter))
+        })
         // Unknown API paths answer in the API's error shape, not the HTML 404.
         .route("/api/v1/{*rest}", axum::routing::any(not_found))
+}
+
+/// The OpenAPI 3.1 document of this API. Unauthenticated (MIK-712 Q4): it
+/// holds no address, key or token.
+pub const OPENAPI: &str = include_str!("../../docs/openapi.json");
+
+async fn openapi() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        OPENAPI,
+    )
+        .into_response()
 }
 
 async fn not_found() -> Response {
@@ -3877,5 +3920,154 @@ mod tests {
             (2, 2),
             "free: not audited, as before"
         );
+    }
+
+    fn openapi_doc() -> serde_json::Value {
+        serde_json::from_str(super::OPENAPI).expect("docs/openapi.json parses")
+    }
+
+    /// `/api/v1/ips/{addr}` and `/api/v1/ips/{x}` are the same route.
+    fn normalised(path: &str) -> String {
+        let mut out = String::new();
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => {
+                    in_param = true;
+                    out.push_str("{}");
+                }
+                '}' => in_param = false,
+                _ if in_param => {}
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn openapi_document_is_openapi_3_1() {
+        let doc = openapi_doc();
+        assert!(doc["openapi"].as_str().unwrap().starts_with("3.1"));
+        assert_eq!(doc["info"]["version"], "1");
+    }
+
+    #[test]
+    fn openapi_documents_exactly_the_routes() {
+        use std::collections::BTreeSet;
+        let doc = openapi_doc();
+        let documented: BTreeSet<(String, String)> = doc["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .flat_map(|(path, item)| {
+                item.as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| {
+                        ["get", "put", "post", "delete", "patch", "head", "options"]
+                            .contains(&k.as_str())
+                    })
+                    .map(move |m| (m.to_uppercase(), normalised(path)))
+            })
+            .collect();
+        let routed: BTreeSet<(String, String)> = super::ROUTES
+            .iter()
+            .map(|(m, p, _)| (m.to_string(), normalised(p)))
+            .collect();
+        assert_eq!(
+            super::ROUTES.len(),
+            routed.len(),
+            "ROUTES lists a route twice"
+        );
+        let undocumented: Vec<_> = routed.difference(&documented).collect();
+        let unrouted: Vec<_> = documented.difference(&routed).collect();
+        assert!(
+            undocumented.is_empty(),
+            "not in docs/openapi.json: {undocumented:?}"
+        );
+        assert!(unrouted.is_empty(), "documented, not routed: {unrouted:?}");
+    }
+
+    #[test]
+    fn openapi_closed_routes_need_the_bearer() {
+        let doc = openapi_doc();
+        assert_eq!(
+            doc["components"]["securitySchemes"]["bearer"]["scheme"],
+            "bearer"
+        );
+        let mut open = Vec::new();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if op["security"] == serde_json::json!([]) {
+                    open.push(format!("{} {path}", method.to_uppercase()));
+                } else {
+                    assert_eq!(
+                        op["security"],
+                        serde_json::json!([{"bearer": []}]),
+                        "{method} {path}"
+                    );
+                }
+            }
+        }
+        open.sort();
+        assert_eq!(open, ["GET /api/v1/openapi.json", "POST /api/v1/pair"]);
+    }
+
+    #[test]
+    fn openapi_holds_no_address_key_or_example() {
+        fn walk(v: &serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, v) in m {
+                        assert!(!k.starts_with("example"), "an example in the document");
+                        walk(v);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(walk),
+                serde_json::Value::String(s) => {
+                    assert!(!s.contains("://"), "an address in the document: {s}");
+                }
+                _ => {}
+            }
+        }
+        let doc = openapi_doc();
+        assert_eq!(doc["servers"], serde_json::json!([{"url": "/"}]));
+        walk(&doc);
+    }
+
+    #[tokio::test]
+    async fn openapi_is_served_without_a_token() {
+        let (_state, _cookie, app, _d) = app().await;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&b[..], super::OPENAPI.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn openapi_is_linked_from_the_public_api_page() {
+        let (_state, _cookie, app, _d) = app().await;
+        let r = app
+            .clone()
+            .oneshot(Request::get("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&b);
+        assert!(page.contains(r#"href="/api/v1/openapi.json""#));
     }
 }
