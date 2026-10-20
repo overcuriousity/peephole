@@ -1,4 +1,4 @@
-//! Cluster › Ownership: this node's owner, the nodes that share it, and
+//! Network › Ownership: this node's owner, the nodes that share it, and
 //! the owner commands this node received.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
@@ -18,7 +18,7 @@ use axum::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/cluster/ownership";
+const PAGE: &str = "/admin/network/ownership";
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()

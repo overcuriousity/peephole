@@ -19,7 +19,7 @@ use chrono::{Duration, Utc};
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
-    Router::new().route("/admin/paths", get(index))
+    Router::new().route("/admin/evidence/paths", get(index))
 }
 
 /// Rows on the page.
@@ -77,7 +77,7 @@ struct PathsPage {
 impl PathsPage {
     fn href(since: &str, unknown: bool) -> String {
         format!(
-            "/admin/paths?since={since}{}",
+            "/admin/evidence/paths?since={since}{}",
             if unknown { "&unknown=1" } else { "" }
         )
     }
@@ -212,15 +212,18 @@ mod tests {
             }
         };
 
-        for p in ["/admin/paths", "/admin/paths?since=all&unknown=1"] {
+        for p in [
+            "/admin/evidence/paths",
+            "/admin/evidence/paths?since=all&unknown=1",
+        ] {
             let (st, h, _) = send(&app, get(p, false), Body::empty()).await;
             assert_eq!(st, StatusCode::SEE_OTHER, "{p}");
             assert_eq!(h["location"], "/login", "{p}");
         }
-        let (st, _, page) = send(&app, get("/admin/paths", true), Body::empty()).await;
+        let (st, _, page) = send(&app, get("/admin/evidence/paths", true), Body::empty()).await;
         assert_eq!(st, StatusCode::OK);
         for want in [
-            "aria-current=\"true\">New paths",
+            "aria-current=\"page\">New paths",
             "<th>Rule</th><th>Wave</th><th>Campaigns</th>",
             "aria-current=\"true\">7 days",
         ] {
@@ -229,7 +232,12 @@ mod tests {
         // The nav entry follows Campaigns.
         assert!(page.find(">Campaigns</a>").unwrap() < page.find(">New paths</a>").unwrap());
 
-        let (_, _, all) = send(&app, get("/admin/paths?since=all", true), Body::empty()).await;
+        let (_, _, all) = send(
+            &app,
+            get("/admin/evidence/paths?since=all", true),
+            Body::empty(),
+        )
+        .await;
         let row = |page: &str, text: &str| -> String {
             let at = page
                 .find(&format!("<td class=\"mono\">{text}</td>"))
@@ -239,7 +247,9 @@ mod tests {
         let alpha = row(&all, "/alpha");
         assert!(alpha.contains("badge-wave\">none</span>"), "{alpha}");
         assert!(
-            alpha.contains("<a href=\"/admin/campaigns/192.0.2.3\" title=\"members: 1\">#1</a>"),
+            alpha.contains(
+                "<a href=\"/admin/evidence/campaigns/192.0.2.3\" title=\"members: 1\">#1</a>"
+            ),
             "{alpha}"
         );
         assert!(row(&all, "/beta").contains("<td>known</td>"));
@@ -247,7 +257,7 @@ mod tests {
 
         let (_, _, unknown) = send(
             &app,
-            get("/admin/paths?since=all&unknown=1", true),
+            get("/admin/evidence/paths?since=all&unknown=1", true),
             Body::empty(),
         )
         .await;
@@ -260,7 +270,12 @@ mod tests {
             "{unknown}"
         );
         // The fixture is older than a day.
-        let (_, _, day) = send(&app, get("/admin/paths?since=24h", true), Body::empty()).await;
+        let (_, _, day) = send(
+            &app,
+            get("/admin/evidence/paths?since=24h", true),
+            Body::empty(),
+        )
+        .await;
         assert!(!day.contains("/alpha"), "{day}");
         assert!(day.contains("No new path."), "{day}");
     }
@@ -344,17 +359,17 @@ mod tests {
             assert_eq!(all, want, "a shape missing");
         };
 
-        let (pages, counts) = walk("/admin/paths?since=all").await;
+        let (pages, counts) = walk("/admin/evidence/paths?since=all").await;
         check(&pages, (0..460).collect());
         assert_eq!(
             counts,
             [
                 "Showing 200 of 460 shapes · newest first, 200 per page",
-                "rows 201–400 of 460 · <a href=\"/admin/paths?since=all\">← newest</a>",
-                "rows 401–460 of 460 · <a href=\"/admin/paths?since=all\">← newest</a>",
+                "rows 201–400 of 460 · <a href=\"/admin/evidence/paths?since=all\">← newest</a>",
+                "rows 401–460 of 460 · <a href=\"/admin/evidence/paths?since=all\">← newest</a>",
             ]
         );
-        let (day, day_counts) = walk("/admin/paths?since=24h").await;
+        let (day, day_counts) = walk("/admin/evidence/paths?since=24h").await;
         check(&day, (0..260).collect());
         assert_eq!(
             day_counts[0],
@@ -362,17 +377,17 @@ mod tests {
         );
         assert_eq!(
             day_counts[1],
-            "rows 201–260 of 260 · <a href=\"/admin/paths?since=24h\">← newest</a>"
+            "rows 201–260 of 260 · <a href=\"/admin/evidence/paths?since=24h\">← newest</a>"
         );
         assert_ne!(day[1], pages[1], "the window changes page 2");
         // The filter keeps the cursor's window and filter.
-        let (unknown, unknown_counts) = walk("/admin/paths?since=all&unknown=1").await;
+        let (unknown, unknown_counts) = walk("/admin/evidence/paths?since=all&unknown=1").await;
         check(&unknown, (0..460).filter(|i| i % 4 != 0).collect());
         assert_eq!(
             unknown_counts[0],
             "Showing 200 of 345 shapes · newest first, 200 per page"
         );
-        let (week, week_counts) = walk("/admin/paths?since=7d&unknown=1").await;
+        let (week, week_counts) = walk("/admin/evidence/paths?since=7d&unknown=1").await;
         check(&week, (0..260).filter(|i| i % 4 != 0).collect());
         assert_eq!(week_counts, ["Showing 195 of 195 shapes"]);
     }
@@ -386,7 +401,7 @@ mod tests {
                 .header("sec-fetch-site", "same-origin")
                 .header("cookie", &cookie)
         };
-        let (_, _, first) = send(&app, get("/admin/paths?since=all"), Body::empty()).await;
+        let (_, _, first) = send(&app, get("/admin/evidence/paths?since=all"), Body::empty()).await;
         for bad in [
             "x",
             "~",
@@ -398,7 +413,7 @@ mod tests {
         ] {
             let (st, _, page) = send(
                 &app,
-                get(&format!("/admin/paths?since=all&before={bad}")),
+                get(&format!("/admin/evidence/paths?since=all&before={bad}")),
                 Body::empty(),
             )
             .await;

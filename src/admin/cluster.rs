@@ -21,11 +21,16 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/cluster", get(page))
+        .route("/admin/network/members", get(page))
         .route("/admin/cluster/settings", post(set_own))
-        .route("/admin/cluster/node/{key}", get(node_page).post(node_set))
+        .route("/admin/network/members/{key}", get(node_page))
+        // Its form posts to the old path; its GET moved.
+        .route(
+            "/admin/cluster/node/{key}",
+            get(crate::admin::moved::redirect).post(node_set),
+        )
         .route("/admin/cluster/node/{key}/owner", post(node_owner))
-        .route("/admin/cluster/node/{key}/fork-proof", get(fork_proof))
+        .route("/admin/network/members/{key}/fork-proof", get(fork_proof))
         .route("/admin/cluster/block", post(block))
         .route("/admin/cluster/unblock", post(unblock))
         .route("/admin/cluster/purge", post(purge))
@@ -799,7 +804,7 @@ pub(crate) fn back_to(to: &str, notice: Option<String>, error: Option<String>) -
 
 /// Back to the Members page.
 fn back(notice: Option<String>, error: Option<String>) -> Response {
-    back_to("/admin/cluster", notice, error)
+    back_to("/admin/network/members", notice, error)
 }
 
 #[derive(serde::Deserialize)]
@@ -818,7 +823,7 @@ async fn block(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
-    let to = format!("/admin/cluster/node/{id}");
+    let to = format!("/admin/network/members/{id}");
     if f.subtree.is_some() {
         return Ok(match crate::cluster::block::block_subtree(node, id).await {
             Ok((ids, n)) => back_to(
@@ -855,7 +860,7 @@ async fn unblock(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
-    let to = format!("/admin/cluster/node/{id}");
+    let to = format!("/admin/network/members/{id}");
     Ok(if crate::cluster::block::unblock(node, id).await? {
         back_to(
             &to,
@@ -877,7 +882,7 @@ async fn purge(
     let Ok(id) = NodeId::parse(&f.key) else {
         return Ok(back(None, Some("unknown node".into())));
     };
-    let to = format!("/admin/cluster/node/{id}");
+    let to = format!("/admin/network/members/{id}");
     Ok(match crate::cluster::block::purge(node, id).await {
         Ok(n) => back_to(
             &to,
@@ -1258,7 +1263,7 @@ async fn node_set(
     let Ok(id) = NodeId::parse(&key) else {
         return Err(AppError::NotFound);
     };
-    let to = format!("/admin/cluster/node/{id}");
+    let to = format!("/admin/network/members/{id}");
     // Post/redirect/get: a reload of the page does not send the form again.
     Ok(match (f.changes(), f.base_version, f.counter) {
         (Err(e), _, _) => back_to(&to, None, Some(e)),
@@ -1305,7 +1310,7 @@ async fn node_owner(
     let Ok(id) = NodeId::parse(&key) else {
         return Err(AppError::NotFound);
     };
-    let to = format!("/admin/cluster/node/{id}");
+    let to = format!("/admin/network/members/{id}");
     let peer = f.target.as_deref().and_then(|t| NodeId::parse(t).ok());
     let cmd = match (f.action.as_str(), peer, f.invite) {
         ("block", Some(n), _) => OwnerCmd::Block {
@@ -1344,7 +1349,7 @@ struct PaceForm {
 }
 
 /// Where the scanner pace table lives.
-const SCANNERS: &str = "/admin/scans#scanners";
+const SCANNERS: &str = "/admin/investigate/scans#scanners";
 
 async fn set_pace(
     _u: SessionUser,
@@ -1362,7 +1367,7 @@ async fn set_pace(
             SCANNERS,
             None,
             Some(format!(
-                "Change {}'s pace from its page: /admin/cluster/node/{}",
+                "Change {}'s pace from its page: /admin/network/members/{}",
                 id.short(),
                 f.key
             )),
@@ -1561,19 +1566,25 @@ mod tests {
                 .to_string()
         };
         let r = back(Some("Saved.".into()), None);
-        assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
+        assert_eq!(
+            r.headers()[axum::http::header::LOCATION],
+            "/admin/network/members"
+        );
         assert!(cookie(&r).starts_with("peephole_flash=Saved."));
         let r = back(None, Some("Join failed".into()));
-        assert_eq!(r.headers()[axum::http::header::LOCATION], "/admin/cluster");
+        assert_eq!(
+            r.headers()[axum::http::header::LOCATION],
+            "/admin/network/members"
+        );
         assert!(cookie(&r).starts_with("peephole_flash_error=Join+failed"));
         let r = back_to(
-            "/admin/cluster/access",
+            "/admin/network/access",
             Some("Invite revoked.".into()),
             None,
         );
         assert_eq!(
             r.headers()[axum::http::header::LOCATION],
-            "/admin/cluster/access"
+            "/admin/network/access"
         );
     }
 }

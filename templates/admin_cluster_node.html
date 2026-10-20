@@ -1,8 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
-{% let sub = "cluster" %}{% include "_admin_nav.html" %}
-{% let subtab = "members" %}{% let tabs = crate::admin::views::CLUSTER_TABS %}{% let tabs_label = "Cluster pages" %}{% include "_subtabs.html" %}
+{% let nav = crate::admin::views::Nav::new("network", "members") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div>
   <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
   <div class="meta">{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</div>
@@ -53,7 +52,7 @@
   </table></div>
   <dl class="kv">
     <dt>Earns here</dt><dd>{% if credits.earns %}<span class="badge badge-status" data-status="done">yes</span>{% else %}<span class="badge badge-status" data-status="failed">no</span>{% endif %}{% for r in credits.reasons %} <span class="small">{{ r }}{% if !loop.last %};{% endif %}</span>{% endfor %}</dd>
-    {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}.{% if credits.fork_proof %} <a href="/admin/cluster/node/{{ m.key }}/fork-proof">Download the proof</a>{% endif %} <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
+    {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}.{% if credits.fork_proof %} <a href="/admin/network/members/{{ m.key }}/fork-proof">Download the proof</a>{% endif %} <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
     <dt>Audits, 7 days</dt><dd>{{ credits.counted.0 }} agree · {{ credits.counted.1 }} differ · {{ credits.counted.2 }} inconclusive <span class="muted small">by this node and your other nodes: these count</span>{% if credits.others.0 + credits.others.1 + credits.others.2 > 0 %}<br>{{ credits.others.0 }} agree · {{ credits.others.1 }} differ · {{ credits.others.2 }} inconclusive <span class="muted small">by other members: shown, not counted</span>{% endif %}</dd>
   </dl>
 </section>
@@ -74,9 +73,9 @@
 {% endif %}
 <section class="card"><h2>Settings</h2>
 {% match remote %}
-{% when Remote::Own %}<p>This node's settings: <a href="/admin/system/settings">System › Settings</a>; pace on <a href="/admin/scans#pace">Scans</a>.</p>
+{% when Remote::Own %}<p>This node's settings: <a href="/admin/system/settings">System › Settings</a>; pace on <a href="/admin/investigate/scans#pace">Scans</a>.</p>
 {% when Remote::NotYours %}<p class="muted">Not one of your nodes. Only its owner can change it.</p>
-{% when Remote::NoKey %}<p class="muted">The ownership key is not kept on this node. Manage {{ m.name }} from a node that keeps it (<a href="/admin/cluster/ownership">Ownership</a>).</p>
+{% when Remote::NoKey %}<p class="muted">The ownership key is not kept on this node. Manage {{ m.name }} from a node that keeps it (<a href="/admin/network/ownership">Ownership</a>).</p>
 {% when Remote::Offline %}<p class="muted">Not live{% if m.blocked %} (blocked){% endif %}: its settings were not asked.</p>
 {% when Remote::Silent with (msg) %}<div class="banner banner-warning">{{ msg }}</div>
 {% when Remote::Settings with { status, has, blocked, peers } %}

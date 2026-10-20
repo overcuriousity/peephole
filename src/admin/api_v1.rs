@@ -1964,7 +1964,7 @@ mod tests {
         // A device token is not a session on the admin HTML pages.
         let r = app
             .clone()
-            .oneshot(authed("GET", "/admin/devices", &token))
+            .oneshot(authed("GET", "/admin/system/devices", &token))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::SEE_OTHER);
@@ -2748,7 +2748,7 @@ mod tests {
         let r = app
             .clone()
             .oneshot(
-                Request::get("/admin/devices")
+                Request::get("/admin/system/devices")
                     .header("cookie", &cookie)
                     .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())

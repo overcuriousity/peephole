@@ -143,7 +143,7 @@ pub fn describe(h: &Handout, name: &dyn Fn(&NodeId) -> String) -> String {
     let eff = show(h.effective_mc as u64);
     match h.reason {
         Reason::Cheapest => {
-            let price = h.price_mc.map_or_else(|| "–".into(), |p| show(p as u64));
+            let price = h.price_mc.map_or_else(|| "—".into(), |p| show(p as u64));
             let mut t = format!(
                 "Given to {s} for {eff} per delivered result (price {price}, {:.0} % of the best success rate at L{}).",
                 h.rate * 100.0,

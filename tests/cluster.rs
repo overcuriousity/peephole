@@ -2799,14 +2799,14 @@ secure_cookies = false
 
 /// The Members page and every node page it links to, as one string.
 async fn cluster_pages(admin: &reqwest::Client, base: &str) -> String {
-    let mut all = text(admin, format!("{base}/admin/cluster")).await;
+    let mut all = text(admin, format!("{base}/admin/network/members")).await;
     let keys: Vec<String> = all
-        .split("href=\"/admin/cluster/node/")
+        .split("href=\"/admin/network/members/")
         .skip(1)
         .filter_map(|s| s.split('"').next().map(str::to_string))
         .collect();
     for k in keys {
-        all.push_str(&text(admin, format!("{base}/admin/cluster/node/{k}")).await);
+        all.push_str(&text(admin, format!("{base}/admin/network/members/{k}")).await);
     }
     all
 }
@@ -2879,7 +2879,7 @@ async fn admin_cluster_page_and_private_attribution() {
     ] {
         assert!(page.contains(want), "cluster page lacks {want}");
     }
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     let head = members
         .split("<thead>")
         .nth(1)
@@ -2888,7 +2888,7 @@ async fn admin_cluster_page_and_private_attribution() {
         .next()
         .unwrap();
     assert_eq!(head.matches("<th>").count(), 5, "five columns: {head}");
-    let sys = text(&admin, format!("{base}/admin/system")).await;
+    let sys = text(&admin, format!("{base}/admin/system/status")).await;
     assert!(
         sys.contains("built in")
             && sys.contains(&peephole::classify::Classifier::builtin().fingerprint()[..12])
@@ -2896,13 +2896,13 @@ async fn admin_cluster_page_and_private_attribution() {
     // Unknown and malformed keys are 404.
     for bad in ["zz".to_string(), "00".repeat(32)] {
         let r = admin
-            .get(format!("{base}/admin/cluster/node/{bad}"))
+            .get(format!("{base}/admin/network/members/{bad}"))
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), 404, "{bad}");
     }
-    let scans = text(&admin, format!("{base}/admin/scans")).await;
+    let scans = text(&admin, format!("{base}/admin/investigate/scans")).await;
     assert!(
         scans.contains("id=\"scanners\"") && scans.contains(&b.id.short()),
         "scanner pace on the Scans page"
@@ -2941,7 +2941,7 @@ async fn admin_cluster_page_and_private_attribution() {
         .unwrap();
     assert!(r.text().await.unwrap().contains("peephole1:"));
     // Attribution on admin views.
-    let scans = text(&admin, format!("{base}/admin/scans")).await;
+    let scans = text(&admin, format!("{base}/admin/investigate/scans")).await;
     assert!(
         scans.contains("sensor-bravo") && scans.contains("via sensor-alpha"),
         "scan history names scanner and arbiter"
@@ -2962,7 +2962,7 @@ async fn admin_cluster_page_and_private_attribution() {
         .unwrap();
     assert!(!r.status().is_success(), "revoke route is gone");
     assert!(knows(&na, c.id, true).await);
-    let access = text(&admin, format!("{base}/admin/cluster/access")).await;
+    let access = text(&admin, format!("{base}/admin/network/access")).await;
     assert!(
         access.contains("Leave cluster") && access.contains("Create invite"),
         "access page"
@@ -2975,7 +2975,7 @@ async fn admin_cluster_page_and_private_attribution() {
         .await
         .unwrap();
     assert!(
-        r.url().path().starts_with("/admin/cluster/node/"),
+        r.url().path().starts_with("/admin/network/members/"),
         "back to the node page: {}",
         r.url()
     );
@@ -3009,7 +3009,11 @@ async fn admin_cluster_page_and_private_attribution() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    for path in ["/requests", "/requests?node=sensor-alpha", "/admin/cluster"] {
+    for path in [
+        "/requests",
+        "/requests?node=sensor-alpha",
+        "/admin/network/members",
+    ] {
         let resp = noredir.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 303, "{path} should require a session");
         assert_eq!(resp.headers().get("location").unwrap(), "/login", "{path}");
@@ -3519,7 +3523,7 @@ async fn unservable_history_does_not_make_peers_spin() {
     assert!(rounds <= 15, "{rounds} sync rounds in 3 s next to a window");
     assert!(seqs_of(&nf, o.id.id).await.is_empty() || seqs_of(&nf, o.id.id).await == [1]);
     let (admin, base) = admin_on(&nf).await;
-    let page = text(&admin, format!("{base}/admin/cluster")).await;
+    let page = text(&admin, format!("{base}/admin/network/members")).await;
     assert!(
         page.contains("waiting for a full member"),
         "cluster page lacks the warning"
@@ -3542,7 +3546,7 @@ async fn admin_page_shows_contributions_per_node() {
     ];
     repl::apply_batch(&na, batch).await.unwrap();
     let (admin, base) = admin_on(&na).await;
-    let page = text(&admin, format!("{base}/admin/cluster/node/{}", o.id.id)).await;
+    let page = text(&admin, format!("{base}/admin/network/members/{}", o.id.id)).await;
     let section = page
         .split("<h2>Contributions</h2>")
         .nth(1)
@@ -3554,15 +3558,15 @@ async fn admin_page_shows_contributions_per_node() {
         section.contains(r#"<td class="num">3</td>"#),
         "writer's three requests: {section}"
     );
-    let own = text(&admin, format!("{base}/admin/cluster/node/{}", a.id)).await;
+    let own = text(&admin, format!("{base}/admin/network/members/{}", a.id)).await;
     assert!(
         own.contains("<h2>Contributions</h2>") && own.contains("this node"),
         "{own}"
     );
     // The members table shows each node's share at a glance.
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     let row = members
-        .split(&format!("/admin/cluster/node/{}\"", o.id.id))
+        .split(&format!("/admin/network/members/{}\"", o.id.id))
         .nth(1)
         .expect("writer row")
         .split("</tr>")
@@ -4108,8 +4112,8 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     let nb = boot(ib, &b, &[&a], DEFAULT).await;
     let (admin_a, base_a) = admin_on(&na).await;
     let (admin_b, base_b) = admin_on(&nb).await;
-    let page_a = format!("{base_a}/admin/cluster/ownership");
-    let page_b = format!("{base_b}/admin/cluster/ownership");
+    let page_a = format!("{base_a}/admin/network/ownership");
+    let page_b = format!("{base_b}/admin/network/ownership");
 
     let html = text(&admin_a, page_a.clone()).await;
     assert!(html.contains("Not claimed"), "{html}");
@@ -4117,7 +4121,7 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
 
     // Create: the key is on the answer, and nowhere afterwards.
     let r = admin_a
-        .post(format!("{page_a}/create"))
+        .post(format!("{base_a}/admin/cluster/ownership/create"))
         .send()
         .await
         .unwrap();
@@ -4142,7 +4146,7 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
     // A second create does not replace the owner.
     let before = owner::load(&na.store, a.id).await.unwrap().unwrap().id;
     admin_a
-        .post(format!("{page_a}/create"))
+        .post(format!("{base_a}/admin/cluster/ownership/create"))
         .send()
         .await
         .unwrap();
@@ -4153,14 +4157,14 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
 
     // On b: an invite token is not a key; the real key is adopted, not kept.
     admin_b
-        .post(format!("{page_b}/adopt"))
+        .post(format!("{base_b}/admin/cluster/ownership/adopt"))
         .form(&[("key", "peephole1:abc")])
         .send()
         .await
         .unwrap();
     assert!(owner::load(&nb.store, b.id).await.unwrap().is_none());
     let r = admin_b
-        .post(format!("{page_b}/adopt"))
+        .post(format!("{base_b}/admin/cluster/ownership/adopt"))
         .form(&[("key", key.as_str()), ("keep", "no")])
         .send()
         .await
@@ -4205,20 +4209,20 @@ async fn admin_takes_and_gives_up_ownership_in_the_web_interface() {
 
     // Show key again, forget it, release b.
     let r = admin_a
-        .post(format!("{page_a}/show-key"))
+        .post(format!("{base_a}/admin/cluster/ownership/show-key"))
         .send()
         .await
         .unwrap();
     assert!(r.text().await.unwrap().contains(&key));
     admin_a
-        .post(format!("{page_a}/forget-key"))
+        .post(format!("{base_a}/admin/cluster/ownership/forget-key"))
         .send()
         .await
         .unwrap();
     let html = text(&admin_a, page_a.clone()).await;
     assert!(html.contains("the key is not kept here"), "{html}");
     admin_b
-        .post(format!("{page_b}/release"))
+        .post(format!("{base_b}/admin/cluster/ownership/release"))
         .send()
         .await
         .unwrap();
@@ -4290,9 +4294,9 @@ async fn admin_manages_a_sibling_from_its_page() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let b_page = format!("{base}/admin/cluster/node/{}", b.id);
+    let b_page = format!("{base}/admin/network/members/{}", b.id);
 
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     assert!(members.contains(">yours<"), "b is marked in the table");
     let html = text(&admin, b_page.clone()).await;
     assert!(html.contains("node-bravo") && html.contains(">yours<"));
@@ -4320,11 +4324,11 @@ async fn admin_manages_a_sibling_from_its_page() {
     assert!(html.contains("Web off removes its admin pages.</p>"));
     assert!(!html.contains("reset roles.web") && !html.contains("Invites are created on the node"));
     // c is a member, not a sibling.
-    let c_html = text(&admin, format!("{base}/admin/cluster/node/{}", c.id)).await;
+    let c_html = text(&admin, format!("{base}/admin/network/members/{}", c.id)).await;
     assert!(c_html.contains("Not one of your nodes"), "{c_html}");
 
     let r = admin
-        .post(b_page.clone())
+        .post(format!("{base}/admin/cluster/node/{}", b.id))
         .form(&[
             ("counter", counter_on(&html).as_str()),
             ("base_version", "0"),
@@ -4356,7 +4360,7 @@ async fn admin_manages_a_sibling_from_its_page() {
     // An owner action: b blocks c, and the page then lists it.
     let html = text(&admin, b_page.clone()).await;
     let r = admin
-        .post(format!("{b_page}/owner"))
+        .post(format!("{base}/admin/cluster/node/{}/owner", b.id))
         .form(&[
             ("counter", counter_on(&html)),
             ("action", "block".into()),
@@ -4375,7 +4379,7 @@ async fn admin_manages_a_sibling_from_its_page() {
 
     // A stale form (the counter moved on) changes nothing.
     let r = admin
-        .post(format!("{b_page}/owner"))
+        .post(format!("{base}/admin/cluster/node/{}/owner", b.id))
         .form(&[
             ("counter", "0".to_string()),
             ("action", "unblock".to_string()),
@@ -4464,7 +4468,7 @@ async fn a_node_without_the_key_shows_its_siblings_read_only() {
     })
     .await;
     let (admin, base) = admin_on(&nb).await;
-    let a_page = format!("{base}/admin/cluster/node/{}", a.id);
+    let a_page = format!("{base}/admin/network/members/{}", a.id);
     let html = text(&admin, a_page.clone()).await;
     assert!(html.contains(">yours<"), "{html}");
     assert!(
@@ -4478,7 +4482,7 @@ async fn a_node_without_the_key_shows_its_siblings_read_only() {
     // Posted anyway: nothing is sent, nothing changes.
     for (path, form) in [
         (
-            a_page.clone(),
+            format!("{base}/admin/cluster/node/{}", a.id),
             vec![
                 ("counter", "0"),
                 ("base_version", "0"),
@@ -4487,7 +4491,7 @@ async fn a_node_without_the_key_shows_its_siblings_read_only() {
             ],
         ),
         (
-            format!("{a_page}/owner"),
+            format!("{base}/admin/cluster/node/{}/owner", a.id),
             vec![("counter", "0"), ("action", "leave")],
         ),
     ] {
@@ -4618,7 +4622,7 @@ async fn a_rotation_leaves_out_the_nodes_named() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let page = format!("{base}/admin/cluster/ownership");
+    let page = format!("{base}/admin/network/ownership");
     let html = text(&admin, page.clone()).await;
     assert!(
         html.contains(&format!("name=\"skip\" value=\"{}\"", c.id)),
@@ -4630,7 +4634,7 @@ async fn a_rotation_leaves_out_the_nodes_named() {
     assert!(html.contains("from managing nodes · newest first · UTC"));
     assert!(!html.contains("best for scanners and exposed nodes"));
     let r = admin
-        .post(format!("{page}/rotate"))
+        .post(format!("{base}/admin/cluster/ownership/rotate"))
         .form(&[("skip", c.id.to_string())])
         .send()
         .await
@@ -7046,7 +7050,11 @@ async fn the_lookup_result_of_a_recorded_address_has_the_sections_of_its_ip_page
     .await;
     let (admin, base) = admin_on(&na).await;
 
-    let form = text(&admin, format!("{base}/admin/lookup?ip=198.51.100.77")).await;
+    let form = text(
+        &admin,
+        format!("{base}/admin/investigate/lookup?ip=198.51.100.77"),
+    )
+    .await;
     assert!(
         form.contains("Balance") && form.contains(&peephole::credits::show(share(&[a.id], a.id))),
         "{form}"
@@ -7270,11 +7278,11 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let page = format!("{base}/admin/market");
+    let page = format!("{base}/admin/network/credits");
     let html = text(&admin, page.clone()).await;
     assert!(
-        html.contains("href=\"/admin/market\" aria-current=\"true\">Market</a>"),
-        "the top-level tab is there"
+        html.contains("href=\"/admin/network/credits\" aria-current=\"page\">Credits</a>"),
+        "Credits under Network"
     );
     assert!(
         html.contains(&credits::show(held - cost)),
@@ -7351,7 +7359,7 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
 
     // Sending: half a credit to b.
     let r = admin
-        .post(format!("{page}/send"))
+        .post(format!("{base}/admin/market/send"))
         .form(&[("to", b.id.to_string()), ("amount", "0.5".into())])
         .send()
         .await
@@ -7366,7 +7374,7 @@ async fn the_credits_page_shows_balance_earnings_payments_and_the_price() {
     // More than it holds, and nonsense: nothing moves.
     for amount in ["5000", "abc", "0"] {
         admin
-            .post(format!("{page}/send"))
+            .post(format!("{base}/admin/market/send"))
             .form(&[("to", b.id.to_string()), ("amount", amount.into())])
             .send()
             .await
@@ -7396,7 +7404,7 @@ async fn a_members_page_says_whether_it_earns_here() {
     })
     .await;
     let (admin, base) = admin_on(&na).await;
-    let page = format!("{base}/admin/cluster/node/{}", b.id);
+    let page = format!("{base}/admin/network/members/{}", b.id);
     let html = text(&admin, page.clone()).await;
     assert!(
         html.contains("Credits") && html.contains(&peephole::credits::show(share(&[b.id], b.id))),
@@ -7406,7 +7414,7 @@ async fn a_members_page_says_whether_it_earns_here() {
         html.contains("Earns here") && html.contains(">yes<"),
         "{html}"
     );
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     assert!(!members.contains("not earning here"));
 
     // b showed two histories (marked as the seal check would), proven by
@@ -7438,7 +7446,7 @@ async fn a_members_page_says_whether_it_earns_here() {
         peephole::cluster::rpc::cbor::decode(&proof).unwrap();
     assert_eq!((entry.origin, entry.seq), (a.id, 1));
     assert!(entry.verify(), "as its publisher signed it");
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     assert!(
         members.contains("showed two histories") && !members.contains("not earning here"),
         "an issue of its own: {members}"
@@ -7471,13 +7479,13 @@ async fn a_member_on_another_build_is_not_flagged_while_its_requests_agree() {
         .await
         .unwrap();
     let (admin, base) = admin_on(&na).await;
-    let members = text(&admin, format!("{base}/admin/cluster")).await;
+    let members = text(&admin, format!("{base}/admin/network/members")).await;
     assert!(members.contains("node-bravo"), "{members}");
     assert!(
         !members.contains("not earning here") && !members.contains("other rules"),
         "{members}"
     );
-    let page = text(&admin, format!("{base}/admin/cluster/node/{}", b.id)).await;
+    let page = text(&admin, format!("{base}/admin/network/members/{}", b.id)).await;
     assert!(
         page.contains("Earns here") && page.contains(">yes<"),
         "{page}"
@@ -7514,7 +7522,7 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains(&show(pool / 7)), "earned a day");
     assert!(html.contains("200"), "paid lookups a day");
     assert!(
-        html.contains(&t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64))),
+        html.contains(&t.sell_mc.map_or_else(|| "—".into(), |m| show(m as u64))),
         "this node's scan selling price"
     );
     assert!(html.contains("Forks") && html.contains("Audits"));

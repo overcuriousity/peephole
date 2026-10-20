@@ -31,7 +31,7 @@ pairing form). A missing or wrong scope is `403`.
 
 ### Pairing
 
-Pairing starts on the admin UI (**Admin → Devices → Pair a device**, admin
+Pairing starts on the admin UI (**Admin → System → Devices → Pair a device**, admin
 session required). The admin picks the scopes, the server mints a single-use
 pairing code (192-bit random, base64url) and renders a QR. The code's SHA-256
 is stored with a TTL of 5 minutes; the code itself is never stored and never
@@ -84,7 +84,7 @@ rate-limited per client IP (10/min); on excess it answers `429` with
 
 ### Revocation
 
-Admin → Devices lists every device: name, scopes, who paired it, created,
+Admin → System → Devices lists every device: name, scopes, who paired it, created,
 last seen. **Revoke** marks the device revoked; its token gets `401` on the
 next request. Revocation is final (pair again for a new token).
 
@@ -378,7 +378,7 @@ and as integer millicredits (`*_mc`).
 Every call that queues something writes an audit entry: when, the device
 (id and name), who paired it, the action, the target, the credits and the
 job id. Admins see the newest 50 under **Recent actions** on
-Admin → Devices.
+Admin → System → Devices.
 
 ### Spend cap
 

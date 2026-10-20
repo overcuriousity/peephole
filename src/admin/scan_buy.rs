@@ -376,10 +376,13 @@ async fn buy(
 ) -> AppResult<Response> {
     let form = BuyForm::parse(&body);
     let Ok(ip) = form.ip.trim().parse::<IpAddr>() else {
-        return Ok(redirect_with_error("/admin/lookup", "Not an IP address."));
+        return Ok(redirect_with_error(
+            "/admin/investigate/lookup",
+            "Not an IP address.",
+        ));
     };
     let ip = crate::net::canonical(ip);
-    let lookup = format!("/admin/lookup?ip={ip}");
+    let lookup = format!("/admin/investigate/lookup?ip={ip}");
     let row = match scan_target(&state, ip).await? {
         Ok(row) => row,
         Err(why) => return Ok(redirect_with_error(&lookup, &format!("No scan: {why}."))),
@@ -842,7 +845,7 @@ secure_cookies = false
             assert_eq!(r.status(), 303, "{why}");
             assert_eq!(
                 r.headers()["location"],
-                format!("/admin/lookup?ip={ip}").as_str(),
+                format!("/admin/investigate/lookup?ip={ip}").as_str(),
                 "{why}"
             );
         }

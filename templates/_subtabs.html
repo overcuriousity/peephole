@@ -1,5 +1,6 @@
-<nav class="seg subnav subtabs" aria-label="{{ tabs_label }}">
-  {% for (key, href, label) in tabs %}
-  <a href="{{ href }}"{% if *key == subtab %} aria-current="true"{% endif %}>{{ label }}</a>
+{% let group = nav.current() %}
+<nav class="seg subnav subtabs" aria-label="{{ group.label }} pages">
+  {% for (key, href, label) in group.children %}
+  {% if chrome.market || !crate::admin::views::CLUSTER_ONLY.contains(key) %}<a href="{{ nav.child_href(key, href) }}"{% if *key == nav.child %} aria-current="page"{% endif %}>{{ label }}</a>{% endif %}
   {% endfor %}
 </nav>

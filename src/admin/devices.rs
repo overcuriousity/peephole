@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
-        .route("/admin/devices", get(page))
+        .route("/admin/system/devices", get(page))
         .route("/admin/devices/pair", post(pair))
         .route("/admin/devices/revoke", post(revoke))
 }
@@ -120,12 +120,16 @@ async fn revoke(
     Form(f): Form<RevokeForm>,
 ) -> Response {
     match state.store.revoke_device(&f.id).await {
-        Ok(true) => crate::admin::pages::redirect_with_notice("/admin/devices", "Device revoked."),
-        Ok(false) => crate::admin::pages::redirect_with_error("/admin/devices", "No such device."),
+        Ok(true) => {
+            crate::admin::pages::redirect_with_notice("/admin/system/devices", "Device revoked.")
+        }
+        Ok(false) => {
+            crate::admin::pages::redirect_with_error("/admin/system/devices", "No such device.")
+        }
         Err(e) => {
             tracing::warn!(?e, "could not revoke the device");
             crate::admin::pages::redirect_with_error(
-                "/admin/devices",
+                "/admin/system/devices",
                 "Could not revoke the device.",
             )
         }
@@ -189,13 +193,13 @@ secure_cookies = false
         // Anonymous: redirected to the login page.
         let (st, _, _) = send(
             &app,
-            axum::http::Request::get("/admin/devices"),
+            axum::http::Request::get("/admin/system/devices"),
             Body::empty(),
         )
         .await;
         assert_eq!(st, axum::http::StatusCode::SEE_OTHER);
         let get = || {
-            axum::http::Request::get("/admin/devices")
+            axum::http::Request::get("/admin/system/devices")
                 .header("cookie", &cookie)
                 .header("sec-fetch-site", "same-origin")
         };

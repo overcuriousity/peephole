@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}peephole — devices{% endblock %}
 {% block content %}
-{% let sub = "devices" %}{% include "_admin_nav.html" %}
+{% let nav = crate::admin::views::Nav::new("system", "devices") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Devices</h1><p class="muted">Phones and tools paired with <span class="mono">/api/v1</span>.</p></div></div>
 <div class="stack">
 <section class="card">
@@ -11,7 +11,7 @@
   <div>{{ p.qr|safe }}</div>
   <pre class="mono">{{ p.payload }}</pre>
   <p class="muted">Scopes: <span class="mono">{{ p.scopes }}</span></p>
-  <form method="get" action="/admin/devices"><button class="btn" type="submit">Done</button></form>
+  <form method="get" action="/admin/system/devices"><button class="btn" type="submit">Done</button></form>
   {% else %}
   <form method="post" action="/admin/devices/pair" class="stack">
     <p class="muted"><span class="mono">read</span> is always granted; <span class="mono">act</span> also starts probes and buys counter-scans (spends credits).</p>

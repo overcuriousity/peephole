@@ -18,7 +18,7 @@ use axum::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const PAGE: &str = "/admin/market";
+const PAGE: &str = "/admin/network/credits";
 /// Rows shown per list.
 const ROWS: usize = 100;
 
@@ -26,10 +26,6 @@ pub fn routes() -> Router<Arc<AdminState>> {
     Router::new()
         .route(PAGE, get(page))
         .route("/admin/market/send", post(send))
-        .route(
-            "/admin/cluster/credits",
-            get(|uri: axum::http::Uri| async move { crate::admin::views::moved(PAGE, &uri) }),
-        )
 }
 
 /// When a lot of `day` is gone, seen from `today`.
@@ -171,7 +167,7 @@ fn level_cells(rows: &[LevelInputs]) -> Vec<Vec<LevelCell>> {
                     LevelCell {
                         price: match price {
                             Some(_) => show(e as Mc),
-                            None => "–".into(),
+                            None => "—".into(),
                         },
                         basis: match price {
                             Some(p) => format!(
@@ -516,7 +512,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             };
             ScannerRow {
                 name: name(&s.node),
-                announced: announced.map_or_else(|| "–".into(), |m| show(m as u64)),
+                announced: announced.map_or_else(|| "—".into(), |m| show(m as u64)),
                 reference: show(s.price_mc as u64),
                 paid: format!("{:.0} / {:.0}", s.paid, s.supply),
                 levels,
@@ -534,7 +530,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
             .unwrap_or_else(|| p.to_string())
     };
     let price = PriceView {
-        scan: t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64)),
+        scan: t.sell_mc.map_or_else(|| "—".into(), |m| show(m as u64)),
         scan_paid: t
             .scanners
             .iter()
@@ -692,7 +688,7 @@ async fn page(_u: SessionUser, State(st): State<Arc<AdminState>>) -> AppResult<H
         .into_iter()
         .map(|r| TradeRow {
             good: good_label(r.good),
-            ask: r.ask_mc.map_or_else(|| "–".into(), show),
+            ask: r.ask_mc.map_or_else(|| "—".into(), show),
             bid: show(r.bid_mc),
             sold: r.tally.sold,
             bought: r.tally.bought,
@@ -853,7 +849,7 @@ mod tests {
         let price = |r: usize, l: usize| cells[r][l].price.as_str();
         assert_eq!(
             (price(0, 3), price(1, 3), price(2, 3)),
-            ("0.04", "0.03", "–")
+            ("0.04", "0.03", "—")
         );
         assert!(cells[0][0].cheapest && !cells[1][0].cheapest);
         assert!(cells[1][3].cheapest && !cells[0][3].cheapest);
@@ -990,7 +986,7 @@ mod tests {
         assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));
         assert!(html.contains("30 paid of 36/h"));
         let mut page = page;
-        page.price.scan = "–".into();
+        page.price.scan = "—".into();
         assert!(page.render().unwrap().contains("not a scanner"));
         page.members[0].qualifies = false;
         page.price.relay = None;

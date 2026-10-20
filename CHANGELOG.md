@@ -3,6 +3,33 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [Unreleased]
+
+### Changed
+- The admin nav is six groups with a second row of pages (MIK-711):
+  Overview (Now, Analytics) · Investigate (Lookup, Scans) · Evidence
+  (Campaigns, Links, Canaries, New paths) · Traps (MCP, LLM, Web,
+  Uploads) · Network (Members, Access, Ownership, Credits) · System
+  (Status, Settings, Inbox, Devices, Security keys, Export). URLs follow
+  the tree (`/admin/{group}/{page}`); every old admin page URL answers
+  308 to its new one with the query kept, signed in only. Form actions
+  keep their paths. On a phone the groups are a 3 × 2 grid and the pages
+  wrap; nothing scrolls sideways.
+- Admin UI follow-up to the v0.22.0 UX review (MIK-718): the IP
+  property strip says "scan queued" while a counter-scan is queued or
+  running, and names the unscanned state as the filter does
+  ("insufficient evidence · not scanned"); the `/ips` "Address sharing"
+  select is grouped (one party, shared, not read) and "not read: one
+  operator's address" reads "one operator's address". The ASN page gets
+  the card gap, the h3 spacing and the IP page's First/Last seen tiles
+  with UTC. The fingerprint names on the request and analytics pages
+  link to the glossary and open it. The fake-AI card labels its API
+  line, the market's demand and supply chart shows "no data in this
+  range" when empty and no longer repeats a rounded tick, and the wall's
+  recent requests and the campaign evidence table read row by row on a
+  phone with the severity stripe clear of the text. A missing value
+  reads "—" everywhere in the admin UI.
+
 ## [0.22.1] - 2026-10-20
 
 Hotfix for the counter-scan price check (MIK-748). No database

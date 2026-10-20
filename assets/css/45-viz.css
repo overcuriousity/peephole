@@ -146,6 +146,7 @@ td .databar { margin-top: 0.3rem; min-width: 4rem; }
 /* ---- Request page --------------------------------------------------- */
 .req-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.75rem 1.25rem; margin: 0; }
 .req-facts div { min-width: 0; }
+.req-facts + .req-facts { margin-top: 0.75rem; }
 .req-facts dt { font-size: var(--text-xs); color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.15rem; }
 .req-facts dd { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .req-line { font-family: var(--font-mono); font-size: var(--text-md); padding: 0.6rem 0.8rem; background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow-wrap: anywhere; margin-bottom: 1rem; }
@@ -247,4 +248,20 @@ td.nowrap { white-space: nowrap; }
   .table-wrap.wide table.stack-narrow td.path { grid-column: 2 / -1; grid-row: 2; width: auto; max-width: none; }
   table.stack-narrow td.labels { grid-column: 1 / -1; }
   table.stack-narrow td.empty { grid-column: 1 / -1; }
+  /* The severity stripe moves to the row, clear of the cell padding. */
+  table.stack-narrow tr[data-sev] td:first-child { box-shadow: none; }
+  table.stack-narrow tr[data-sev] { box-shadow: inset 3px 0 0 var(--sev-0-fill); }
+  table.stack-narrow tr[data-sev="1"] { box-shadow: inset 3px 0 0 var(--sev-1-fill); }
+  table.stack-narrow tr[data-sev="2"] { box-shadow: inset 3px 0 0 var(--sev-2-fill); }
+  table.stack-narrow tr[data-sev="3"] { box-shadow: inset 3px 0 0 var(--sev-3-fill); }
+  table.stack-narrow tr[data-sev="4"] { box-shadow: inset 3px 0 0 var(--sev-4-fill); }
+  /* Campaign evidence: the pair, kind, why, then first and last. */
+  table.stack-narrow.edges tr { grid-template-columns: auto 1fr; }
+  table.stack-narrow.edges td.ip { grid-column: 1 / -1; grid-row: 1; white-space: normal; }
+  table.stack-narrow.edges td.kind { grid-column: 1 / -1; grid-row: 2; }
+  table.stack-narrow.edges td.why { grid-column: 1 / -1; grid-row: 3; }
+  table.stack-narrow.edges td.first { grid-column: 1; grid-row: 4; }
+  table.stack-narrow.edges td.last { grid-column: 2; grid-row: 4; }
+  table.stack-narrow.edges td.first::before { content: "first "; }
+  table.stack-narrow.edges td.last::before { content: "last "; }
 }

@@ -125,7 +125,10 @@ async fn search(
         Input::Ip(ip) => Some(if st.store.ip_by_addr(&ip.to_string()).await?.is_some() {
             format!("/ip/{ip}")
         } else {
-            format!("/admin/lookup?ip={}", urlencode(&ip.to_string()))
+            format!(
+                "/admin/investigate/lookup?ip={}",
+                urlencode(&ip.to_string())
+            )
         }),
         Input::Net(n) => Some(format!("/ips?q={}", urlencode(&n.to_string()))),
         Input::Asn(n) => Some(crate::admin::asn::asn_href(n.into())),
@@ -134,12 +137,12 @@ async fn search(
                 found.push(("Request", format!("/admin/requests/{n}")));
             }
             if let Some(key) = st.store.campaign_by_num(n).await? {
-                found.push(("Campaign", format!("/admin/campaigns/{key}")));
+                found.push(("Campaign", format!("/admin/evidence/campaigns/{key}")));
             }
             None
         }
         Input::Campaign(n) => match st.store.campaign_by_num(n).await? {
-            Some(key) => Some(format!("/admin/campaigns/{key}")),
+            Some(key) => Some(format!("/admin/evidence/campaigns/{key}")),
             None => {
                 no_campaign = Some(n);
                 None
@@ -151,7 +154,7 @@ async fn search(
                 .unwrap_or_default();
             let mut conn = st.store.read.acquire().await?;
             if crate::store::uploads::has_upload(&mut conn, &bytes).await? {
-                found.push(("Upload", format!("/admin/uploads?sha256={h}")));
+                found.push(("Upload", format!("/admin/traps/uploads?sha256={h}")));
             }
             drop(conn);
             values(&st, &q, &mut found).await?;
@@ -164,7 +167,7 @@ async fn search(
             values(&st, &q, &mut found).await?;
             found
                 .is_empty()
-                .then(|| format!("/admin/lookup?ip={}", urlencode(&h)))
+                .then(|| format!("/admin/investigate/lookup?ip={}", urlencode(&h)))
         }
         Input::Value(v) => {
             values(&st, &v, &mut found).await?;
@@ -329,11 +332,20 @@ mod tests {
         for (q, want) in [
             (
                 hash.clone(),
-                format!("/admin/uploads?sha256={}", hash.to_lowercase()),
+                format!("/admin/traps/uploads?sha256={}", hash.to_lowercase()),
             ),
-            (format!("C{n}"), "/admin/campaigns/192.0.2.4".into()),
-            (format!("campaign {n}"), "/admin/campaigns/192.0.2.4".into()),
-            (format!("#{n}"), "/admin/campaigns/192.0.2.4".into()),
+            (
+                format!("C{n}"),
+                "/admin/evidence/campaigns/192.0.2.4".into(),
+            ),
+            (
+                format!("campaign {n}"),
+                "/admin/evidence/campaigns/192.0.2.4".into(),
+            ),
+            (
+                format!("#{n}"),
+                "/admin/evidence/campaigns/192.0.2.4".into(),
+            ),
             ("searchlabel".into(), "/ips?label=searchlabel".into()),
         ] {
             let (status, to, _) = go(&app, &cookie, &q).await;
@@ -352,7 +364,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("href=\"/admin/campaigns/192.0.2.3\""),
+            body.contains("href=\"/admin/evidence/campaigns/192.0.2.3\""),
             "{body}"
         );
 
