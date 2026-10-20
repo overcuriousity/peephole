@@ -177,11 +177,14 @@ impl Store {
 
     /// Shapes first seen at or after `since` (all when `None`), newest
     /// first, at most `limit`; with `unknown_only` only those no rule knows.
+    /// `before` is a keyset cursor, the `(first_seen, hash)` of the last row
+    /// of the previous page: only rows after it in this order come back.
     /// The campaigns are left empty: see [`Self::campaigns_of_shapes`].
     pub async fn new_paths(
         &self,
         since: Option<&str>,
         unknown_only: bool,
+        before: Option<(&str, i64)>,
         limit: i64,
     ) -> Result<Vec<PathRow>> {
         let rows: Vec<PathTuple> = sqlx::query_as(
@@ -189,11 +192,14 @@ impl Store {
                     w.ips, w.window_start, w.detected_at
              FROM shapes s LEFT JOIN waves w ON w.shape = s.hash
              WHERE (?1 IS NULL OR s.first_seen >= ?1) AND (?2 = 0 OR s.rule_hits = 0)
+               AND (?4 IS NULL OR s.first_seen < ?4 OR (s.first_seen = ?4 AND s.hash > ?5))
              ORDER BY s.first_seen DESC, s.hash LIMIT ?3",
         )
         .bind(since)
         .bind(unknown_only)
         .bind(limit)
+        .bind(before.map(|b| b.0))
+        .bind(before.map(|b| b.1))
         .fetch_all(&self.read)
         .await?;
         Ok(rows
@@ -211,6 +217,41 @@ impl Store {
                 },
             )
             .collect())
+    }
+
+    /// How many shapes [`Self::new_paths`] would list for `since` and
+    /// `unknown_only` without a limit.
+    pub async fn count_paths(&self, since: Option<&str>, unknown_only: bool) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shapes s
+             WHERE (?1 IS NULL OR s.first_seen >= ?1) AND (?2 = 0 OR s.rule_hits = 0)",
+        )
+        .bind(since)
+        .bind(unknown_only)
+        .fetch_one(&self.read)
+        .await?)
+    }
+
+    /// How many of those shapes come before the keyset cursor `before` in
+    /// [`Self::new_paths`] order, the cursor row included: the rows above
+    /// the page that starts after it.
+    pub async fn count_paths_ahead(
+        &self,
+        since: Option<&str>,
+        unknown_only: bool,
+        before: (&str, i64),
+    ) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shapes s
+             WHERE (?1 IS NULL OR s.first_seen >= ?1) AND (?2 = 0 OR s.rule_hits = 0)
+               AND (s.first_seen > ?3 OR (s.first_seen = ?3 AND s.hash <= ?4))",
+        )
+        .bind(since)
+        .bind(unknown_only)
+        .bind(before.0)
+        .bind(before.1)
+        .fetch_one(&self.read)
+        .await?)
     }
 
     /// The campaigns whose members asked for each of `shapes` (light rows
