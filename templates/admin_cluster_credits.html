@@ -50,9 +50,10 @@
   {% endif %}
   {% if !price.scanners.is_empty() %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Scanner</th><th class="num">Announces</th><th class="num">Reference here</th><th class="num">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
+    <thead><tr><th>Scanner</th><th class="num" title="The price per scan the scanner itself announces, in credits">Announces</th><th class="num" title="This node's own figure for one scan by this scanner, in credits">Our price per scan</th><th class="num" title="Paid scans it ran in the past hour, against 90% of its capacity">Paid / target an hour</th>{% for l in 1..=5 %}<th class="num" title="Credits per delivered result at level {{ l }}">L{{ l }}</th>{% endfor %}</tr></thead>
     <tbody>{% for s in price.scanners %}<tr><td>{{ s.name }}</td><td class="num">{{ s.announced }}</td><td class="num">{{ s.reference }}</td><td class="num">{{ s.paid }}</td>{% for c in s.levels %}<td class="num" title="{{ c.basis }}">{% if c.cheapest %}<b>{{ c.price }}</b>{% else %}{{ c.price }}{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
-  </table></div>{% endif %}
+  </table></div>
+  <p class="muted small">Our price per scan: what this node reckons one scan by that scanner is worth, in credits, from the paid scans other nodes' jobs got from it in the past hour (dearer when it is near capacity, cheaper when it sells nothing). An arbiter pays a scanner below protocol 9 at most 1.25 times this figure.</p>{% endif %}
   {% if !price.offers.is_empty() %}
   <div class="table-wrap"><table>
     <thead><tr><th>Provider served here</th><th class="num">Price (credits)</th><th class="num">Paid lookups a day</th></tr></thead>

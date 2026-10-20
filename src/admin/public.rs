@@ -2683,7 +2683,7 @@ show_labels = {show_labels}
         let (status, html) =
             get_with(&app, &format!("/admin/requests/{served}"), Some(&cookie)).await;
         assert_eq!(status, 200);
-        assert!(html.contains("<dt>Fingerprint</dt>"), "{html}");
+        assert!(html.contains(">Fingerprint</abbr></dt>"), "{html}");
         assert!(html.contains(">fphash</a>"), "{html}");
         assert!(!html.contains("<h2>Fingerprint</h2>"), "{html}");
         let (status, html) =

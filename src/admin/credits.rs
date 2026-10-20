@@ -929,6 +929,12 @@ mod tests {
         assert!(!html.contains("destroyed"));
         assert!(html.contains("node-bravo") && html.contains("30 / 36"));
         assert!(html.contains("<b>0.05</b>"), "cheapest at L1 in bold");
+        // The scanner price column says what it is (MIK-710).
+        assert!(html.contains(">Our price per scan</th>"), "{html}");
+        assert!(
+            html.contains("<p class=\"muted small\">Our price per scan: what this node reckons")
+        );
+        assert!(!html.contains("Reference here"));
         assert!(html.contains(">0.10<"), "L2: 0.05 at half the success rate");
         assert!(html.contains("per delivered result"));
         assert!(html.contains("Success rates as of 14:00 UTC, next at 15:00."));

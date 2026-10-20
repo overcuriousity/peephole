@@ -428,7 +428,7 @@ mod tests {
         assert!(html.contains("/assets/js/linkgraph.js"));
         // The legend's dashed line, and the class linkgraph.js gives a
         // non-identity edge, which the stylesheet dashes.
-        assert!(html.contains(r#"<i class="line soft"></i>shared paths"#));
+        assert!(html.contains(r#"<i class="line soft"></i>soft: shared paths"#));
         let js = include_str!("../../assets/js/linkgraph.js");
         assert!(js.contains(r#""edge" + (e.identity ? "" : " soft")"#));
         let css = include_str!("../../assets/css/45-viz.css");

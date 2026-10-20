@@ -1,0 +1,5 @@
+{#- Every fingerprint the admin pages show, in one line each (admin::glossary). -#}
+<details class="card glossary" data-section="glossary">
+  <summary>What the fingerprints mean</summary>
+  <dl class="kv">{% for (name, line) in crate::admin::glossary::entries() %}<dt>{{ name }}</dt><dd class="plain">{{ line }}</dd>{% endfor %}</dl>
+</details>

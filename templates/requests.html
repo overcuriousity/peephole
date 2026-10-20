@@ -17,8 +17,8 @@
   <label>Method <input name="method" size="7" value="{{ f.method.as_deref().unwrap_or_default() }}"></label>
   <label>Transport <input name="transport" size="7" value="{{ f.transport.as_deref().unwrap_or_default() }}"></label>
   <label>Answer <input name="answer" size="12" value="{{ f.answer.as_deref().unwrap_or_default() }}"></label>
-  <label>JA4 <input name="ja4" size="20" value="{{ f.ja4.as_deref().unwrap_or_default() }}"></label>
-  <label>JA4H <input name="ja4h" size="20" value="{{ f.ja4h.as_deref().unwrap_or_default() }}"></label>
+  <label><abbr title="{{ crate::admin::glossary::help("ja4") }}">JA4</abbr> <input name="ja4" size="20" value="{{ f.ja4.as_deref().unwrap_or_default() }}"></label>
+  <label><abbr title="{{ crate::admin::glossary::help("ja4h") }}">JA4H</abbr> <input name="ja4h" size="20" value="{{ f.ja4h.as_deref().unwrap_or_default() }}"></label>
   {% if !nodes.is_empty() %}<label>Node <select name="node"><option value="">any</option>
     {% for n in nodes %}<option value="{{ n }}"{% if f.node.as_deref() == Some(n.as_str()) %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>{% endif %}
   {# Set by links, not by a field here: kept until removed by its chip. #}
