@@ -635,8 +635,8 @@ mod tests {
         assert_eq!(rows, want, "{details}");
         assert_eq!(details.matches("<td>rare</td>").count(), 8, "{details}");
         for want in [
-            "href=\"/admin/links/ja4/t13d1516h2_x\">t13d1516h2_x</a>",
-            "href=\"/admin/links/ja4h/ge11nn05enus_y\">ge11nn05enus_y</a>",
+            "href=\"/admin/evidence/links/ja4/t13d1516h2_x\">t13d1516h2_x</a>",
+            "href=\"/admin/evidence/links/ja4h/ge11nn05enus_y\">ge11nn05enus_y</a>",
             "(supported)</li>",
             "≥ 0.45",
             "order agreement unknown",
@@ -647,7 +647,7 @@ mod tests {
         assert!(!details.contains("more shared"), "{details}");
         // No pair, and only the rarest EDGE_SHAPES_MAX of 131 listed.
         let b = page("/admin/evidence/campaigns/198.51.100.10").await;
-        assert!(!b.contains("/admin/links/ja4/"), "{b}");
+        assert!(!b.contains("/admin/evidence/links/ja4/"), "{b}");
         assert!(b.contains("≥ 0.60 (unsupported; 0.45 with support)"), "{b}");
         assert!(
             b.contains("31 more shared, more common shapes not listed"),
