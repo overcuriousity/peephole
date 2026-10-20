@@ -3,6 +3,22 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.22.1] - 2026-10-20
+
+Hotfix for the counter-scan price check (MIK-748). No database
+migration, no new setting, no protocol version bump.
+
+### Fixed
+- A counter-scan's firm price and the budget check use the scanner's
+  announced ask, which is what the arbiter pays, not this node's drifted
+  reference copy. A node with enough credits no longer gets "the scan
+  budget does not cover this" (MIK-748).
+- A refusal states the price, the balance and the committed amount, in
+  the admin page and in the `/api/v1` `no_budget` 409.
+- The counter-scan dialog no longer shows `— credits` when the quote
+  fails.
+- `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382).
+
 ## [0.22.0] - 2026-10-20
 
 Admin UI polish (MIK-686): the wall, the navigation, the IP pages and
