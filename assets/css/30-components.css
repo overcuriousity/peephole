@@ -186,6 +186,17 @@ td.check input, th.check input { margin: 0; vertical-align: middle; accent-color
 /* Second-level tabs under the admin nav. */
 .subnav.subtabs { margin-top: -0.75rem; }
 .subnav.subtabs a { padding: 0.2rem 0.6rem; }
+.subnav.subtabs a[aria-current="page"] { font-weight: 600; }
+/* Phone widths (MIK-711): the six groups are a 3 × 2 grid and the
+   children wrap; nothing scrolls sideways, every target is 44 px tall. */
+@media (max-width: 640px) {
+  .subnav.groups { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; overflow: visible; }
+  .subnav.groups a { display: flex; align-items: center; justify-content: center; min-height: 2.75rem; }
+  .subnav.groups a:nth-child(3n) { border-right: 0; }
+  .subnav.groups a:nth-child(-n+3) { border-bottom: 1px solid var(--color-border); }
+  .subnav.subtabs { flex-wrap: wrap; overflow: visible; }
+  .subnav.subtabs a { display: inline-flex; align-items: center; min-height: 2.75rem; }
+}
 /* Links kinds: identity first, then software, split by a heavier rule. */
 .subnav.kinds { margin-top: -0.5rem; }
 .subnav.kinds a.group-start { border-left: 2px solid var(--color-border-strong); }
