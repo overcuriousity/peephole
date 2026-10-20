@@ -12,6 +12,7 @@ pub mod countries;
 pub mod credits;
 pub mod decoys;
 pub mod devices;
+pub mod dossier;
 pub mod error;
 pub mod glossary;
 pub mod limit;
