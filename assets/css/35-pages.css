@@ -125,7 +125,9 @@ a.tile:hover .label { color: var(--color-accent); }
 .delta-chip[data-trend="up"]::before { content: "▲ "; font-size: 0.8em; }
 .delta-chip[data-trend="down"] { background: var(--color-success-dim); color: var(--color-success); }
 .delta-chip[data-trend="down"]::before { content: "▼ "; font-size: 0.8em; }
-.market-goods { margin-bottom: 0.75rem; flex-wrap: wrap; }
+.market-goods { display: flex; width: fit-content; max-width: 100%; overflow-x: auto; margin-bottom: 0.75rem; }
+.market-goods a { white-space: nowrap; }
+.card > h3.section-gap { margin-top: 1.25rem; }
 .market h3 { margin: 1.25rem 0 0.5rem; font-size: var(--text-sm); }
 .market-chart .band { fill: var(--color-accent-dim); stroke: none; }
 .market-chart .line, .market-flow .line { fill: none; stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }

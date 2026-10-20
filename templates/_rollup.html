@@ -4,11 +4,11 @@
   <div class="tile"><span class="label">IPs</span><div class="value">{{ crate::admin::views::thousands(r.ips) }}</div></div>
   <div class="tile"><span class="label">Requests</span><div class="value">{{ crate::admin::views::thousands(r.requests) }}</div></div>
   <div class="tile"><span class="label">Max severity</span><div class="value">{% let sev = r.max_severity %}{% include "_severity.html" %}</div></div>
-  <div class="tile"><span class="label">First seen</span><div class="value ts">{{ crate::admin::views::minute(r.first_seen.as_str()) }}</div></div>
-  <div class="tile"><span class="label">Last seen</span><div class="value ts">{{ crate::admin::views::minute(r.last_seen.as_str()) }}</div></div>
+  <div class="tile"><span class="label">First seen</span><div class="value ts">{% let m = crate::admin::views::minute(r.first_seen.as_str()) %}{% if let Some((d, t)) = m.split_once(' ') %}<span class="nowrap">{{ d }}</span><br><span class="nowrap">{{ t }} UTC</span>{% else %}{{ m }}{% endif %}</div></div>
+  <div class="tile"><span class="label">Last seen</span><div class="value ts">{% let m = crate::admin::views::minute(r.last_seen.as_str()) %}{% if let Some((d, t)) = m.split_once(' ') %}<span class="nowrap">{{ d }}</span><br><span class="nowrap">{{ t }} UTC</span>{% else %}{{ m }}{% endif %}</div></div>
 </div>
 {% if !r.labels.is_empty() || !r.open_ports.is_empty() || !r.campaigns.is_empty() %}
-<section class="card">
+<section class="card rollup-facts">
   {% if !r.labels.is_empty() %}<h3>Labels</h3>
   <div class="chips">{% for (l, n) in r.labels %}<a class="badge badge-label {{ crate::admin::views::label_class(l) }}" href="/ips?{{ base }}&amp;label={{ crate::admin::public::urlencode(l) }}">{{ l }} <span class="muted">×{{ n }}</span></a>{% endfor %}</div>{% endif %}
   {% if !r.open_ports.is_empty() %}<h3>Open ports</h3>

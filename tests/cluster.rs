@@ -7514,7 +7514,7 @@ async fn the_overview_shows_the_clusters_credit_figures() {
     assert!(html.contains(&show(pool / 7)), "earned a day");
     assert!(html.contains("200"), "paid lookups a day");
     assert!(
-        html.contains(&t.sell_mc.map_or_else(|| "–".into(), |m| show(m as u64))),
+        html.contains(&t.sell_mc.map_or_else(|| "—".into(), |m| show(m as u64))),
         "this node's scan selling price"
     );
     assert!(html.contains("Forks") && html.contains("Audits"));

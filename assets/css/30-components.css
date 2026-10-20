@@ -7,6 +7,7 @@
 .tile .label { display: block; margin-bottom: 0.25rem; }
 .tile .value { font-size: var(--text-2xl); font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
 .tile .value.brand { color: var(--color-brand); }
+.tile .value.ts { font-size: var(--text-lg); }
 .tile .hint { color: var(--color-fg-muted); font-size: var(--text-xs); margin-top: 0.25rem; }
 
 .table-wrap { border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg-elevated); overflow-x: auto; }
@@ -133,6 +134,8 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 .intel details .kv { margin-top: 0.5rem; }
 .ip-scans h3 { margin: 1.25rem 0 0.5rem; font-size: var(--text-sm); }
 .ip-scans .card-head + h3 { margin-top: 0; }
+.rollup-facts h3 { margin: 1.25rem 0 0.5rem; }
+.rollup-facts h3:first-child { margin-top: 0; }
 .subnav { display: flex; width: fit-content; max-width: 100%; overflow-x: auto; margin-bottom: 1.25rem; }
 .subnav a { white-space: nowrap; }
 .ip-head .tile .value .sev { font-size: var(--text-lg); vertical-align: middle; }
@@ -259,6 +262,8 @@ tr.diff td:first-child { box-shadow: inset 3px 0 0 var(--color-warning); }
 .glossary > summary { cursor: pointer; width: fit-content; color: var(--color-fg-secondary); font-weight: 500; }
 .glossary[open] > summary { margin-bottom: 0.5rem; }
 abbr[title] { text-decoration: underline dotted; cursor: help; }
+a.gloss { color: inherit; text-decoration: underline dotted; }
+@media (max-width: 480px) { .glossary .kv { grid-template-columns: 1fr; } .glossary .kv dd + dt { margin-top: 0.4rem; } }
 .edge-legend { margin-top: 0.75rem; font-size: var(--text-xs); }
 .probe-members { list-style: none; margin: 0; padding: 0; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg-inset); }
 .probe-member { padding: 0.6rem 0.9rem; }
