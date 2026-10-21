@@ -3,7 +3,19 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
-## [Unreleased]
+## [0.23.1] - 2026-10-21
+
+One database migration, run on start: `0051_api_key_never_used`
+(`user_version` 51). No new setting, no protocol version bump.
+
+### Fixed
+- An API key that was never used reads "never" under Last used on
+  System → Devices instead of its creation time (MIK-782); keys minted
+  before this release that were not used a minute or more after minting
+  read "never" too. The page names the time columns "(UTC)", warns that
+  refreshing the shown-once key page mints another key, and at phone
+  width the device and key tables stack row by row, as the campaign edge
+  detail's nested shapes table keeps its own header and columns.
 
 ## [0.23.0] - 2026-10-20
 
@@ -33,9 +45,10 @@ JSON dossiers, admin API keys and an OpenAPI description of `/api/v1`
   description of `/api/v1`, served without a token and linked from the
   public `/api` page. Tests fail when it and the served routes differ.
 
-## [0.22.2]
+## [0.22.2] - not released
 
-The admin nav regroup, campaign edge detail and the intel query fix
+Never tagged: these changes first shipped in 0.23.0, which also carries
+its migrations 0048 and 0049. The admin nav regroup, campaign edge detail and the intel query fix
 (MIK-775). Two database migrations, run in order on start:
 `0048_campaign_edge_detail` and `0049_requests_ip_id` (`user_version`
 49). No new setting, no protocol version bump.

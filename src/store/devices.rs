@@ -27,7 +27,9 @@ pub struct Device {
     /// Who paired it: the passkey label, "password", or "admin".
     pub paired_by: String,
     pub created_at: String,
-    pub last_seen_at: String,
+    /// None for an API key that was never used; a paired device is seen at
+    /// pairing.
+    pub last_seen_at: Option<String>,
     pub revoked_at: Option<String>,
     /// [`KIND_DEVICE`] (paired by code) or [`KIND_API_KEY`] (minted by an
     /// admin on the Devices page).
@@ -80,7 +82,7 @@ async fn insert_device<'e, E: sqlx::SqliteExecutor<'e>>(
     let token = new_device_token();
     let device = sqlx::query_as::<_, Device>(sqlx::AssertSqlSafe(format!(
         "INSERT INTO devices (id, name, token_hash, scopes, paired_by, created_at, last_seen_at, kind)
-         VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), CASE WHEN ?6 = 'api_key' THEN NULL ELSE datetime('now') END, ?6)
          RETURNING {DEVICE_COLS}"
     )))
     .bind(uuid::Uuid::new_v4().to_string())
@@ -166,7 +168,7 @@ impl Store {
             touch: bool,
         }
         let row = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
-            "SELECT {DEVICE_COLS}, last_seen_at < datetime('now', '-60 seconds') AS touch
+            "SELECT {DEVICE_COLS}, coalesce(last_seen_at < datetime('now', '-60 seconds'), 1) AS touch
              FROM devices WHERE token_hash = ? AND revoked_at IS NULL"
         )))
         .bind(token_hash(token))
@@ -597,6 +599,30 @@ mod tests {
         assert!(s.validate_device_token(&token).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn an_api_key_is_never_used_until_its_first_bearer_request() {
+        let (_d, s) = test_store().await;
+        let (key, token) = s.create_api_key("scraper", "read", "admin").await.unwrap();
+        assert_eq!(key.last_seen_at, None, "minted, not used");
+        // A paired device was seen at pairing.
+        let code = s.mint_pairing_code("read", "admin").await.unwrap();
+        let (paired, _) = s
+            .redeem_pairing_code(&code, "Pixel 8")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(paired.last_seen_at.is_some());
+        // The first use sets it, without waiting out the one-minute throttle.
+        s.validate_device_token(&token).await.unwrap().unwrap();
+        let fresh: Option<i64> = sqlx::query_scalar(
+            "SELECT last_seen_at > datetime('now', '-1 minute') FROM devices WHERE id = ?",
+        )
+        .bind(&key.id)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(fresh, Some(1));
+    }
     #[tokio::test]
     async fn the_pairing_admin_is_named_by_their_session() {
         let (_d, s) = test_store().await;
