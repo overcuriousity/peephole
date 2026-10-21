@@ -497,6 +497,79 @@ with `X-Powered-By: ASP.NET`); the AI decoys' identity leans toward the
 product. Every decoy answers under every persona: a `fortinet` host still
 serves `wp-login.php`, so the personas stay comparable.
 
+### A file dropped on the trap
+
+When a bot uploads a file (a `PUT`, a WordPress plugin, theme or media
+upload, a script form), the trap tells it where the file landed and keeps
+the bytes, once per SHA-256, within the bounds below. To get a webshell's
+exact bytes onto your disk:
+
+1. **Admin → Traps → Uploads** (`/admin/traps/uploads`) lists every
+   upload, newest first: time, IP, kind, the file name the client sent,
+   the type sniffed from the first bytes, size, SHA-256, where it was told
+   it landed (*Answered at*), and *Content*. The IP links to the address
+   page; its uploads are `/admin/traps/uploads?ip=<ip>`. The hash links
+   to every upload of the same content, `/admin/traps/uploads?sha256=<hex>`.
+2. The time opens the upload (`/admin/traps/uploads/{uid}`): the same
+   fields, a link to the request that carried it, and *Content*.
+3. **Download zip** (`zip` in the list) fetches
+   `/admin/traps/uploads/{uid}/content.zip`, saved as `<sha256>.zip`. It
+   holds one entry, `<sha256>.bin`, never the client's file name. The zip
+   password is `infected`. That is a handling convention, as malware is
+   usually shared: it keeps antivirus from quarantining the file and stops
+   a double-click from running it. It is **not** protection (ZipCrypto is
+   weak). Each download is logged with the admin's label, the hash and the
+   uid (`admin: upload content exported`).
+
+```sh
+unzip -P infected <sha256>.zip && sha256sum <sha256>.bin   # must print <sha256>
+```
+
+Handle the `.bin` as live malware: open it in an isolated analysis VM, never
+on the node. Peephole never renders, inlines, unpacks or serves the content
+back, to the admin or on the trap: the zip is the only way out. The
+`/api/v1` upload endpoints and the dataset export carry upload metadata only.
+They never read the stored bytes (`upload_blobs`).
+
+**When the bytes are not there.** If there is no button, *Content* reads
+`content not held` followed by the reason (on the list, hover over it):
+
+| `content_state` | Why |
+|---|---|
+| `held` | Stored; the zip is there. |
+| `dropped_rate` | The source sent more than `uploads.per_source` content-bearing uploads in the hour. |
+| `dropped_budget` | This origin's `uploads.daily_mb` for the UTC day is spent. |
+| `dropped_ceiling` | All stored content has reached `uploads.store_max_mb`. |
+| `dropped_disk` | Free disk would fall below `uploads.min_free_mb`. |
+| `dropped_mismatch` | Replicated bytes did not hash to the signed SHA-256. |
+| `too_big` | Replicated bytes larger than 1 MiB (an origin never sends more). |
+| `not_received` | Another node held it but did not send it here (it already had the hash, or a relay did not have it). |
+
+A node keeps at most the first 1 MiB of one upload. *Size* is the full size
+received; past 1 MiB the upload is marked `truncated` ("the first 1 MiB
+kept"), and the SHA-256 and the zip cover the kept bytes only. The row and
+its metadata are written whatever the state. If the same content is held
+from another upload, the button appears even on a row that says dropped.
+
+The bounds are runtime settings (`peephole settings set KEY VALUE`; the
+System page shows how much is held of the ceiling):
+
+| Key | Default | |
+|---|---|---|
+| `uploads.enabled` | `true` | The upload sink. When off, uploads are recorded as plain requests and nothing answers as a webshell. |
+| `uploads.per_source` | `6` | Content-bearing uploads per source (IPv6 by /64) per hour. |
+| `uploads.daily_mb` | `32` | New content per origin per UTC day, in MiB. |
+| `uploads.store_max_mb` | `1024` | All stored content, in MiB. |
+| `uploads.min_free_mb` | `2048` | No new content below this much free disk, in MiB. |
+
+**What it did next.** The upload page's *Timeline* lists the requests this
+node answered at the path the upload was reported at (or under it, for a
+folder) after the upload, up to the first 500. Their *Answer* is `webshell`:
+the trap replies with a canned answer to a few commands, otherwise an empty
+`200`, and never runs or reads the uploaded file. Each request opens on its
+own page; a `webshell` request shows the command line it sent (from the
+query or a form body), linked to every request that sent the same command.
+
 ## Cluster administration
 
 The installer writes a `[cluster]` section on every node (see
