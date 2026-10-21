@@ -329,6 +329,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let pool = store.pool.clone();
         async move { store::webshell_cmd::backfill(&pool).await }
     });
+    // Rows a build before this one stored without the fields it did not
+    // know, from their kept payloads (MIK-775).
+    background.backfill("kept payloads", "rows completed, payloads dropped", {
+        let pool = store.pool.clone();
+        async move { cluster::repl::resettle_kept(&pool).await }
+    });
     background.backfill("rdap networks", "derived stored intel rows", {
         let pool = store.pool.clone();
         async move { store::rdap_net::backfill(&pool).await }

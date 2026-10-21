@@ -469,6 +469,65 @@ async fn skip_batch(conn: &mut SqliteConnection, ctx: Ctx<'_>, b: &SkipBatchRec)
     Ok(Effect::Applied)
 }
 
+/// Fill the fields a stored row-backed record's row lacks, from the record,
+/// for the row of the record's own origin only: a build that did not know
+/// them stored the row without them (MIK-775). Only fields no derivation
+/// reads, validated as on insert. Does nothing without the row.
+pub async fn refill(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &Record) -> Result<()> {
+    match r {
+        Record::Request(r) => {
+            sqlx::query(
+                "UPDATE requests SET decoy_v = COALESCE(decoy_v, ?),
+                   decoy_site = COALESCE(decoy_site, ?), held_ms = COALESCE(held_ms, ?),
+                   decoy_in = COALESCE(decoy_in, ?), persona = COALESCE(persona, ?)
+                 WHERE uid = ? AND origin IS ?",
+            )
+            .bind(r.decoy_v)
+            .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
+            .bind(r.held_ms.filter(|ms| *ms >= 0))
+            .bind(r.decoy_in.as_deref().filter(|d| d.len() <= 512))
+            .bind(r.persona.as_deref().map(|p| cut(p, 64)))
+            .bind(&r.uid)
+            .bind(ctx.origin_bytes())
+            .execute(&mut *conn)
+            .await?;
+        }
+        Record::SkipBatch(b) => {
+            // Rows pair by order, as `rebuild` reads them.
+            let rowids: Vec<i64> = sqlx::query_scalar(
+                "SELECT s.rowid FROM skipped_requests s
+                   JOIN skipped_batches b ON b.id = s.batch_id
+                 WHERE b.uid = ? AND b.origin IS ? ORDER BY s.rowid",
+            )
+            .bind(&b.uid)
+            .bind(ctx.origin_bytes())
+            .fetch_all(&mut *conn)
+            .await?;
+            if rowids.len() != b.rows.len() {
+                return Ok(());
+            }
+            for (rowid, r) in rowids.into_iter().zip(&b.rows) {
+                sqlx::query(
+                    "UPDATE skipped_requests SET decoy_v = COALESCE(decoy_v, ?),
+                       decoy_site = COALESCE(decoy_site, ?), held_ms = COALESCE(held_ms, ?),
+                       decoy_in = COALESCE(decoy_in, ?), persona = COALESCE(persona, ?)
+                     WHERE rowid = ?",
+                )
+                .bind(r.decoy_v)
+                .bind(r.decoy_site.as_deref().map(|w| cut(w, 64)))
+                .bind(r.held_ms.filter(|ms| *ms >= 0))
+                .bind(r.decoy_in.as_deref().filter(|d| d.len() <= 512))
+                .bind(r.persona.as_deref().map(|p| cut(p, 64)))
+                .bind(rowid)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Store one provider's result for an IP (per origin, newest wins) and
 /// bring the IP's shown facts up to date.
 async fn ip_intel(conn: &mut SqliteConnection, ctx: Ctx<'_>, r: &IpIntelRec) -> Result<Effect> {
@@ -1881,6 +1940,90 @@ mod tests {
         apply(&mut conn, ctx, &b).await.unwrap();
         assert_eq!(
             rebuild(&mut conn, "skip_batch", "b-p").await.unwrap(),
+            Some(b)
+        );
+    }
+
+    /// A build before persona stored the rows without it (MIK-775):
+    /// `refill` completes them from their records, for their own origin
+    /// only, so they rebuild byte for byte again.
+    #[tokio::test]
+    async fn refill_completes_rows_an_older_build_stored_without_later_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let mut conn = s.pool.acquire().await.unwrap();
+        let (a, other) = (NodeId([1; 32]), NodeId([2; 32]));
+        let ctx = Ctx {
+            origin: Some(&a),
+            hlc: 1,
+        };
+        let Record::Request(mut r) = request("u-old", "/") else {
+            unreachable!()
+        };
+        r.persona = Some("gitlab".into());
+        r.held_ms = Some(1500);
+        let rec = Record::Request(r);
+        let b = Record::SkipBatch(crate::cluster::record::SkipBatchRec {
+            uid: "b-old".into(),
+            ip: "198.51.100.9".into(),
+            dropped: 0,
+            rows: vec![
+                crate::cluster::record::SkipRow {
+                    ts_ms: 1_791_000_000_000,
+                    method: "GET".into(),
+                    path: "/".into(),
+                    persona: Some("fortinet".into()),
+                    ..Default::default()
+                },
+                crate::cluster::record::SkipRow {
+                    ts_ms: 1_791_000_000_500,
+                    method: "GET".into(),
+                    path: "/a".into(),
+                    ..Default::default()
+                },
+            ],
+            build: String::new(),
+        });
+        apply(&mut conn, ctx, &rec).await.unwrap();
+        apply(&mut conn, ctx, &b).await.unwrap();
+        for sql in [
+            "UPDATE requests SET persona = NULL, held_ms = NULL",
+            "UPDATE skipped_requests SET persona = NULL",
+        ] {
+            sqlx::query(sql).execute(&mut *conn).await.unwrap();
+        }
+        assert_ne!(
+            rebuild(&mut conn, "request", "u-old").await.unwrap(),
+            Some(rec.clone())
+        );
+
+        let theirs = Ctx {
+            origin: Some(&other),
+            hlc: 1,
+        };
+        for r in [&rec, &b] {
+            refill(&mut conn, theirs, r).await.unwrap();
+        }
+        assert_ne!(
+            rebuild(&mut conn, "request", "u-old").await.unwrap(),
+            Some(rec.clone())
+        );
+        assert_ne!(
+            rebuild(&mut conn, "skip_batch", "b-old").await.unwrap(),
+            Some(b.clone())
+        );
+
+        for r in [&rec, &b] {
+            refill(&mut conn, ctx, r).await.unwrap();
+        }
+        assert_eq!(
+            rebuild(&mut conn, "request", "u-old").await.unwrap(),
+            Some(rec)
+        );
+        assert_eq!(
+            rebuild(&mut conn, "skip_batch", "b-old").await.unwrap(),
             Some(b)
         );
     }

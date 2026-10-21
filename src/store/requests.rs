@@ -749,6 +749,38 @@ mod tests {
         assert_eq!(row.owasp_json, "[]");
     }
 
+    /// The "first request of an IP" lookup the sources filter runs once per
+    /// IP reads one index entry, not every request of the IP, their rows
+    /// and a sort:
+    /// on a node with one IP behind 146k requests it took 1 to 13 s
+    /// (MIK-775).
+    #[tokio::test]
+    async fn the_sources_filter_reads_an_ips_first_request_by_index() {
+        let s = test_store().await;
+        for mode in [1i64, 2] {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(concat!(
+                "EXPLAIN QUERY PLAN SELECT i.ip FROM ips i WHERE ",
+                recorded_by_sql!(1, 2, 3)
+            ))
+            .bind(mode)
+            .bind(vec![0u8; 32])
+            .bind("[]")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+            let text: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+            assert!(
+                text.iter()
+                    .any(|t| t.contains("COVERING INDEX idx_requests_ip_id")),
+                "mode {mode}: {text:?}"
+            );
+            assert!(
+                !text.iter().any(|t| t.contains("TEMP B-TREE")),
+                "mode {mode}: {text:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fp_claim_marks_ip() {
         let s = test_store().await;

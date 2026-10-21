@@ -8,10 +8,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [0.23.0] - 2026-10-20
 
 JSON dossiers, admin API keys and an OpenAPI description of `/api/v1`
-(MIK-712), with the six-group admin nav and campaign edge detail. Two
-database migrations, run in order on start: `0048_campaign_edge_detail`
-and `0049_api_keys` (`user_version` 49). One new setting block,
-`[limits]` `api_per_minute` / `api_burst`. No protocol version bump.
+(MIK-712). One database migration, run on start: `0050_api_keys`
+(`user_version` 50). One new setting block, `[limits]`
+`api_per_minute` / `api_burst`. No protocol version bump.
 
 ### Added
 - JSON dossiers of an IP, an ASN, a request and a campaign at
@@ -33,6 +32,15 @@ and `0049_api_keys` (`user_version` 49). One new setting block,
 - `/api/v1/openapi.json` (MIK-752): a hand-written OpenAPI 3.1
   description of `/api/v1`, served without a token and linked from the
   public `/api` page. Tests fail when it and the served routes differ.
+
+## [0.22.2]
+
+The admin nav regroup, campaign edge detail and the intel query fix
+(MIK-775). Two database migrations, run in order on start:
+`0048_campaign_edge_detail` and `0049_requests_ip_id` (`user_version`
+49). No new setting, no protocol version bump.
+
+### Added
 - Campaign edge detail (MIK-635, MIK-759): a soft edge's row on the
   campaign page opens to the shapes that tied the two IPs, their JA4 /
   JA4H pairs, the agreement and the thresholds.
@@ -67,6 +75,18 @@ and `0049_api_keys` (`user_version` 49). One new setting block,
   ask (MIK-765). The copy was stepped up every selling hour with nothing
   re-anchoring it and reached 5× to 4000× the asks; below protocol 9 it
   steps as before.
+- The intel lookup rounds' candidate query reads an IP's first request
+  from a covering index (`idx_requests_ip_id`, migration 0049) instead
+  of reading all of the IP's requests and sorting them. On hermes it ran
+  about 3 times a minute and took 1 to 13 s; on a copy of that database
+  it takes 12 to 29 ms (MIK-775). The rDNS and probe candidate queries use the
+  same lookup.
+- Rows a node stored from a newer peer's records before its upgrade
+  (without the fields its build did not know, such as `persona`) are
+  completed from the kept payloads once after the upgrade, and the
+  payloads are dropped. The "row does not reproduce its record" warning
+  is logged at most once per 10 minutes, with the count of suppressed
+  ones; each one is at debug (MIK-775).
 
 ## [0.22.1] - 2026-10-20
 
