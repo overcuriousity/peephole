@@ -98,6 +98,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0047_ip_evidence.sql"),
     include_str!("migrations/0048_campaign_edge_detail.sql"),
     include_str!("migrations/0049_requests_ip_id.sql"),
+    include_str!("migrations/0050_api_keys.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -733,6 +734,32 @@ mod tests {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// A node on v0.22.2 is at `user_version` 49 with master's
+    /// `0049_requests_ip_id`. The API-key migration is numbered 0050, so
+    /// opening that database with this build still adds `devices.kind`
+    /// (MIK-788).
+    #[tokio::test]
+    async fn a_v0_22_2_database_gets_the_api_key_migration() {
+        assert!(MIGRATIONS[48].contains("idx_requests_ip_id"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let pool = raw_pool(&path).await;
+            check_application_id(&pool).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..49]).await.unwrap();
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        assert_eq!(s.schema_version().await.unwrap(), 50);
+        let kind: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'kind'",
+        )
+        .fetch_one(&s.read)
+        .await
+        .unwrap();
+        assert_eq!(kind, 1, "devices.kind exists");
     }
 
     /// A database of the first release, holding data, written again by the

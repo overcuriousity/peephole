@@ -12,6 +12,7 @@ pub mod countries;
 pub mod credits;
 pub mod decoys;
 pub mod devices;
+pub mod dossier;
 pub mod error;
 pub mod glossary;
 pub mod limit;
@@ -184,6 +185,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(dossier::routes())
         .merge(paths::routes())
         .merge(asn::routes())
         .merge(decoys::routes())
