@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0050_clears_last_seen_only_for_untouched_api_keys() {
+    async fn migration_0051_clears_last_seen_only_for_untouched_api_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         {
@@ -672,7 +672,7 @@ mod tests {
                 .create_if_missing(true);
             let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
             check_application_id(&pool).await.unwrap();
-            migrate(&pool, &MIGRATIONS[..49]).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..50]).await.unwrap();
             sqlx::query(
                 "INSERT INTO devices (id, name, token_hash, scopes, paired_by, created_at, last_seen_at, kind) VALUES
                  ('unused', 'k1', 'h1', 'read', 'admin', '2026-10-01 00:00:00', '2026-10-01 00:00:00', 'api_key'),
@@ -791,7 +791,7 @@ mod tests {
             pool.close().await;
         }
         let s = Store::connect(&path).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), 50);
+        assert_eq!(s.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
         let kind: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'kind'",
         )
