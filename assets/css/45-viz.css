@@ -234,34 +234,43 @@ td.nowrap { white-space: nowrap; }
 .mix-part h3 { margin: 0 0 0.5rem; }
 .persona-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(18rem, 100%), 1fr)); gap: 0.75rem 1.5rem; }
 .persona-grid h4 { margin: 0 0 0.25rem; font-size: var(--text-sm); }
-/* A wide table read row by row on a phone: time · IP · sev, then method and path, then labels. */
+/* A wide table read row by row on a phone: time · IP · sev, then method and path, then labels.
+   Direct rows only, so a table nested in a cell (the edge detail's shapes) keeps its own layout. */
 @media (max-width: 37.5rem) {
   .table-wrap.wide table.stack-narrow { width: 100%; min-width: 0; }
-  table.stack-narrow thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
-  table.stack-narrow, table.stack-narrow tbody { display: block; }
-  table.stack-narrow tr { display: grid; grid-template-columns: auto 1fr auto; gap: 0.2rem 0.5rem; align-items: baseline; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--color-border-subtle); }
-  table.stack-narrow td { display: block; padding: 0; border: 0; white-space: normal; }
-  table.stack-narrow td.ts { grid-column: 1; grid-row: 1; }
-  table.stack-narrow td.ip { grid-column: 2; grid-row: 1; }
-  table.stack-narrow td.sev { grid-column: 3; grid-row: 1; }
-  table.stack-narrow td.mono { grid-column: 1; grid-row: 2; }
-  .table-wrap.wide table.stack-narrow td.path { grid-column: 2 / -1; grid-row: 2; width: auto; max-width: none; }
-  table.stack-narrow td.labels { grid-column: 1 / -1; }
-  table.stack-narrow td.empty { grid-column: 1 / -1; }
+  table.stack-narrow > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.stack-narrow, table.stack-narrow > tbody { display: block; }
+  table.stack-narrow > tbody > tr { display: grid; grid-template-columns: auto 1fr auto; gap: 0.2rem 0.5rem; align-items: baseline; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--color-border-subtle); }
+  table.stack-narrow > tbody > tr > td { display: block; padding: 0; border: 0; white-space: normal; }
+  table.stack-narrow > tbody > tr > td.ts { grid-column: 1; grid-row: 1; }
+  table.stack-narrow > tbody > tr > td.ip { grid-column: 2; grid-row: 1; }
+  table.stack-narrow > tbody > tr > td.sev { grid-column: 3; grid-row: 1; }
+  table.stack-narrow > tbody > tr > td.mono { grid-column: 1; grid-row: 2; }
+  .table-wrap.wide table.stack-narrow > tbody > tr > td.path { grid-column: 2 / -1; grid-row: 2; width: auto; max-width: none; }
+  table.stack-narrow > tbody > tr > td.labels { grid-column: 1 / -1; }
+  table.stack-narrow > tbody > tr > td.empty { grid-column: 1 / -1; }
   /* The severity stripe moves to the row, clear of the cell padding. */
-  table.stack-narrow tr[data-sev] td:first-child { box-shadow: none; }
-  table.stack-narrow tr[data-sev] { box-shadow: inset 3px 0 0 var(--sev-0-fill); }
-  table.stack-narrow tr[data-sev="1"] { box-shadow: inset 3px 0 0 var(--sev-1-fill); }
-  table.stack-narrow tr[data-sev="2"] { box-shadow: inset 3px 0 0 var(--sev-2-fill); }
-  table.stack-narrow tr[data-sev="3"] { box-shadow: inset 3px 0 0 var(--sev-3-fill); }
-  table.stack-narrow tr[data-sev="4"] { box-shadow: inset 3px 0 0 var(--sev-4-fill); }
+  table.stack-narrow > tbody > tr[data-sev] > td:first-child { box-shadow: none; }
+  table.stack-narrow > tbody > tr[data-sev] { box-shadow: inset 3px 0 0 var(--sev-0-fill); }
+  table.stack-narrow > tbody > tr[data-sev="1"] { box-shadow: inset 3px 0 0 var(--sev-1-fill); }
+  table.stack-narrow > tbody > tr[data-sev="2"] { box-shadow: inset 3px 0 0 var(--sev-2-fill); }
+  table.stack-narrow > tbody > tr[data-sev="3"] { box-shadow: inset 3px 0 0 var(--sev-3-fill); }
+  table.stack-narrow > tbody > tr[data-sev="4"] { box-shadow: inset 3px 0 0 var(--sev-4-fill); }
   /* Campaign evidence: the pair, kind, why, then first and last. */
-  table.stack-narrow.edges tr { grid-template-columns: auto 1fr; }
-  table.stack-narrow.edges td.ip { grid-column: 1 / -1; grid-row: 1; white-space: normal; }
-  table.stack-narrow.edges td.kind { grid-column: 1 / -1; grid-row: 2; }
-  table.stack-narrow.edges td.why { grid-column: 1 / -1; grid-row: 3; }
-  table.stack-narrow.edges td.first { grid-column: 1; grid-row: 4; }
-  table.stack-narrow.edges td.last { grid-column: 2; grid-row: 4; }
-  table.stack-narrow.edges td.first::before { content: "first "; }
-  table.stack-narrow.edges td.last::before { content: "last "; }
+  table.stack-narrow.edges > tbody > tr { grid-template-columns: auto 1fr; }
+  table.stack-narrow.edges > tbody > tr > td.ip { grid-column: 1 / -1; grid-row: 1; white-space: normal; }
+  table.stack-narrow.edges > tbody > tr > td.kind { grid-column: 1 / -1; grid-row: 2; }
+  table.stack-narrow.edges > tbody > tr > td.why { grid-column: 1 / -1; grid-row: 3; }
+  table.stack-narrow.edges > tbody > tr > td.first { grid-column: 1; grid-row: 4; }
+  table.stack-narrow.edges > tbody > tr > td.last { grid-column: 2; grid-row: 4; }
+  table.stack-narrow.edges > tbody > tr > td.first::before { content: "first "; }
+  table.stack-narrow.edges > tbody > tr > td.last::before { content: "last "; }
+  table.stack-narrow.edges > tbody > tr > td.first, table.stack-narrow.edges > tbody > tr > td.last { white-space: nowrap; }
+  /* Devices and API keys: name, then each field on its own labelled line; revoke on the right. */
+  table.stack-narrow.devices > tbody > tr { grid-template-columns: 1fr auto; }
+  table.stack-narrow.devices > tbody > tr > td, table.stack-narrow.devices > tbody > tr > td.ts,
+  table.stack-narrow.devices > tbody > tr > td.mono { grid-column: 1; grid-row: auto; }
+  table.stack-narrow.devices > tbody > tr > td.name { font-weight: 600; }
+  table.stack-narrow.devices > tbody > tr > td.act { grid-column: 2; grid-row: 1 / span 5; align-self: start; }
+  table.stack-narrow.devices > tbody > tr > td[data-label]::before { content: attr(data-label) " "; color: var(--color-fg-muted); font-family: var(--font-sans); }
 }

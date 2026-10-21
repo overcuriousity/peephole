@@ -99,6 +99,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0048_campaign_edge_detail.sql"),
     include_str!("migrations/0049_requests_ip_id.sql"),
     include_str!("migrations/0050_api_keys.sql"),
+    include_str!("migrations/0051_api_key_never_used.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of
@@ -659,6 +660,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t2, 0, "partial migration must not persist");
+    }
+
+    #[tokio::test]
+    async fn migration_0050_clears_last_seen_only_for_untouched_api_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            check_application_id(&pool).await.unwrap();
+            migrate(&pool, &MIGRATIONS[..49]).await.unwrap();
+            sqlx::query(
+                "INSERT INTO devices (id, name, token_hash, scopes, paired_by, created_at, last_seen_at, kind) VALUES
+                 ('unused', 'k1', 'h1', 'read', 'admin', '2026-10-01 00:00:00', '2026-10-01 00:00:00', 'api_key'),
+                 ('used', 'k2', 'h2', 'read', 'admin', '2026-10-01 00:00:00', '2026-10-02 00:00:00', 'api_key'),
+                 ('phone', 'p', 'h3', 'read', 'admin', '2026-10-01 00:00:00', '2026-10-01 00:00:00', 'device')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let s = Store::connect(&path).await.unwrap();
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, last_seen_at FROM devices ORDER BY id")
+                .fetch_all(&s.read)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("phone".into(), Some("2026-10-01 00:00:00".into())),
+                ("unused".into(), None),
+                ("used".into(), Some("2026-10-02 00:00:00".into())),
+            ]
+        );
     }
 
     #[tokio::test]

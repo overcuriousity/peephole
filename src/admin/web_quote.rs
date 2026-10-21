@@ -62,7 +62,7 @@ pub fn buyer(token: &str) -> Device {
         scopes: String::new(),
         paired_by: "admin".into(),
         created_at: String::new(),
-        last_seen_at: String::new(),
+        last_seen_at: None,
         revoked_at: None,
         kind: crate::store::devices::KIND_DEVICE.into(),
     }
