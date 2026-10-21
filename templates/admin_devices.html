@@ -23,13 +23,13 @@
 <section class="card">
   <div class="card-head"><h2>Paired devices</h2></div>
   {% if devices.is_empty() %}<p class="muted">No devices paired yet.</p>{% else %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>Name</th><th>Scopes</th><th>Paired by</th><th>Created</th><th>Last seen</th><th></th></tr></thead>
+  <div class="table-wrap"><table class="stack-narrow devices">
+    <thead><tr><th>Name</th><th>Scopes</th><th>Paired by</th><th>Created (UTC)</th><th>Last seen (UTC)</th><th></th></tr></thead>
     <tbody>{% for d in devices %}
       <tr>
-        <td>{{ d.name }}</td><td class="mono">{{ d.scopes }}</td><td>{{ d.paired_by }}</td>
-        <td class="ts">{{ d.created_at }}</td><td class="ts">{{ d.last_seen_at }}</td>
-        <td>{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
+        <td class="name">{{ d.name }}</td><td class="mono" data-label="scopes">{{ d.scopes }}</td><td data-label="paired by">{{ d.paired_by }}</td>
+        <td class="ts" data-label="created">{{ d.created_at }}</td><td class="ts" data-label="last seen">{% if let Some(t) = d.last_seen_at %}{{ t }}{% else %}<span class="muted">never</span>{% endif %}</td>
+        <td class="act">{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
           <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-dev-{{ loop.index }}">Revoke</button>
           <dialog id="dlg-dev-{{ loop.index }}"><h3>Revoke "{{ d.name }}"?</h3><p class="muted">Its token stops working at once. Pair again for a new one.</p>
             <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
@@ -44,6 +44,7 @@
   {% if let Some(k) = new_key %}
   <p>The key for "{{ k.label }}" (scopes <span class="mono">{{ k.scopes }}</span>). <strong>Shown once:</strong> copy it now; it cannot be shown again.</p>
   <pre class="panel mono break" data-copy>{{ k.token }}</pre>
+  <p class="muted">Refreshing this page creates another key.</p>
   <form method="get" action="/admin/system/devices"><button class="btn" type="submit">Done</button></form>
   {% else %}
   <form method="post" action="/admin/devices/keys" class="stack">
@@ -54,13 +55,13 @@
   </form>
   {% endif %}
   {% if keys.is_empty() %}<p class="muted">No API keys yet.</p>{% else %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>Label</th><th>Scopes</th><th>Created by</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+  <div class="table-wrap"><table class="stack-narrow devices">
+    <thead><tr><th>Label</th><th>Scopes</th><th>Created by</th><th>Created (UTC)</th><th>Last used (UTC)</th><th></th></tr></thead>
     <tbody>{% for d in keys %}
       <tr>
-        <td>{{ d.name }}</td><td class="mono">{{ d.scopes }}</td><td>{{ d.paired_by }}</td>
-        <td class="ts">{{ d.created_at }}</td><td class="ts">{{ d.last_seen_at }}</td>
-        <td>{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
+        <td class="name">{{ d.name }}</td><td class="mono" data-label="scopes">{{ d.scopes }}</td><td data-label="created by">{{ d.paired_by }}</td>
+        <td class="ts" data-label="created">{{ d.created_at }}</td><td class="ts" data-label="last used">{% if let Some(t) = d.last_seen_at %}{{ t }}{% else %}<span class="muted">never</span>{% endif %}</td>
+        <td class="act">{% if d.revoked() %}<span class="badge badge-status" data-status="failed" title="{{ d.revoked_at.as_deref().unwrap_or_default() }}">revoked</span>{% else %}
           <button class="btn btn-sm btn-danger" type="button" data-confirm="dlg-key-{{ loop.index }}">Revoke</button>
           <dialog id="dlg-key-{{ loop.index }}"><h3>Revoke key "{{ d.name }}"?</h3><p class="muted">It stops working at once. Create a new one if still needed.</p>
             <form method="post" action="/admin/devices/revoke" class="actions"><input type="hidden" name="id" value="{{ d.id }}">
