@@ -401,6 +401,7 @@ secure_cookies = false
         let token = shown_key(&html).expect("the page shows the key");
         assert_eq!(token.len(), 43, "256-bit base64url");
         assert!(html.contains("Shown once:"), "{html}");
+        assert!(html.contains("Refreshing this page creates another key."));
         assert!(html.contains("<h1>Devices and API keys</h1>"));
         assert!(logs.contains("api key minted"), "{logs}");
         assert!(!logs.contains(&token), "the token is never logged");
@@ -426,6 +427,10 @@ secure_cookies = false
         let (st, _, html) = send(&app, get(), Body::empty()).await;
         assert_eq!(st, 200);
         assert!(!html.contains(&token), "shown once");
+        assert!(
+            html.contains(r#"<span class="muted">never</span>"#),
+            "not used yet"
+        );
         assert!(shown_key(&html).is_none());
         assert!(html.contains("SIEM enrichment"), "{html}");
         assert!(

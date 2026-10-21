@@ -5,6 +5,18 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+One database migration, run on start: `0050_api_key_never_used`
+(`user_version` 50).
+
+### Fixed
+- An API key that was never used reads "never" under Last used on
+  System → Devices instead of its creation time (MIK-782); keys minted
+  before this release that were not used a minute or more after minting
+  read "never" too. The page names the time columns "(UTC)", warns that
+  refreshing the shown-once key page mints another key, and at phone
+  width the device and key tables stack row by row, as the campaign edge
+  detail's nested shapes table keeps its own header and columns.
+
 ## [0.23.0] - 2026-10-20
 
 JSON dossiers, admin API keys and an OpenAPI description of `/api/v1`
