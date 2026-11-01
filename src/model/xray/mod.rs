@@ -116,12 +116,16 @@ impl Xray {
     }
 }
 
-/// What is left to spend on one source.
+/// The limits of one source: `depth` and `layers` are fixed, `output` is
+/// what is left to decode, and `pieces` is the cap the piece extractor
+/// counts against.
 #[derive(Debug, Clone)]
 pub struct Budget {
     depth: usize,
     output: usize,
     layers: usize,
+    // Read by the piece extractor.
+    #[allow(dead_code)]
     pieces: usize,
 }
 
@@ -133,23 +137,5 @@ impl Default for Budget {
             layers: MAX_LAYERS,
             pieces: MAX_PIECES,
         }
-    }
-}
-
-impl Budget {
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
-
-    pub fn output(&self) -> usize {
-        self.output
-    }
-
-    pub fn layers(&self) -> usize {
-        self.layers
-    }
-
-    pub fn pieces(&self) -> usize {
-        self.pieces
     }
 }
