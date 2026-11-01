@@ -12,7 +12,8 @@
 //! the address, so a noisy scanner cannot fill a chain.
 //!
 //! Derived on each node from its sightings, rebuilt in the campaign pass
-//! ([`rebuild`]), never replicated, never exported.
+//! ([`plan`] in its read snapshot, [`store_plan`] in its write transaction),
+//! never replicated, never exported.
 use super::campaigns::HARD_FANOUT_MAX;
 use super::uploads::{self, TimelineRow, UPLOAD_COLS, UploadRow};
 use crate::trap::decoy::keeps_its_own_answer;
@@ -30,6 +31,13 @@ const UPLOAD: u8 = 1;
 const JOINER_ROLES: &str = "('stager', 'key', 'file')";
 /// The kinds that describe.
 const DESCRIBER_KINDS: &str = "('exploit', 'recipe', 'tag', 'shell-profile')";
+
+/// Most joiners a source may name and still connect them. A body can name
+/// 256 pieces, so 32,640 pairs; no real source names this many, so a source
+/// over it costs no pair. Its joiners stay chains, it just joins none.
+const PAIRED_JOINERS_MAX: usize = 64;
+/// Rows per `INSERT`: well under SQLite's bound variables.
+const INSERT_BATCH: usize = 400;
 
 /// Most uploads of a chain [`follow_ups`] and [`dead_ends`] read, newest
 /// first: each is a query, and a botnet's chain can hold thousands.
@@ -49,7 +57,9 @@ pub struct JoinerSighting {
 /// A chain as [`connect`] finds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChainOut {
-    /// The oldest joiner's hash, as 16 lowercase hex digits.
+    /// The oldest joiner's hash, as 16 lowercase hex digits. It stays as a
+    /// chain grows with newer joiners, but it changes when two chains merge
+    /// or an older sighting arrives: views must not treat it as permanent.
     key: String,
     first_seen: String,
     last_seen: String,
@@ -86,13 +96,15 @@ fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
         addresses.entry(s.piece).or_default().insert(s.ip);
     }
     let mut parent = HashMap::new();
-    // A body names up to 256 pieces, so 32,640 pairs. A joiner on one address
-    // cannot connect, and an address sending the same list again says
-    // nothing new: neither costs a pair.
+    // A joiner on one address cannot connect, and an address sending the
+    // same list again says nothing new: neither costs a pair.
     let mut read: HashSet<(i64, Vec<i64>)> = HashSet::new();
     // The first address of each pair: a second one connects it.
     let mut pairs: HashMap<(i64, i64), i64> = HashMap::new();
     for (ip, joiners) in sources.into_values() {
+        if joiners.len() > PAIRED_JOINERS_MAX {
+            continue;
+        }
         let shared: Vec<i64> = joiners
             .into_iter()
             .filter(|j| addresses[j].len() >= 2)
@@ -188,17 +200,24 @@ async fn joiner_sightings(tx: &mut SqliteConnection) -> Result<Vec<JoinerSightin
         .collect())
 }
 
-/// Replace every chain with what the sightings say now. Runs in the
-/// transaction that rebuilds the campaigns.
-pub async fn rebuild(tx: &mut SqliteConnection) -> Result<()> {
-    let chains = connect(&joiner_sightings(tx).await?);
-    let mut holders: HashMap<(u8, i64), Vec<&str>> = HashMap::new();
-    let mut members: BTreeSet<(&str, i64)> = BTreeSet::new();
-    for c in &chains {
+/// What a pass will store.
+pub struct Plan {
+    chains: Vec<ChainOut>,
+    /// Index into `chains`, and a piece: its joiners and describers.
+    members: Vec<(usize, i64)>,
+}
+
+/// Read the sightings and work out the chains, in memory. Called in the
+/// pass's read snapshot, so the write lock is not held for any of this.
+pub async fn plan(conn: &mut SqliteConnection) -> Result<Plan> {
+    let chains = connect(&joiner_sightings(conn).await?);
+    let mut holders: HashMap<(u8, i64), Vec<usize>> = HashMap::new();
+    let mut members: BTreeSet<(usize, i64)> = BTreeSet::new();
+    for (i, c) in chains.iter().enumerate() {
         for &source in &c.sources {
-            holders.entry(source).or_default().push(&c.key);
+            holders.entry(source).or_default().push(i);
         }
-        members.extend(c.joiners.iter().map(|&j| (c.key.as_str(), j)));
+        members.extend(c.joiners.iter().map(|&j| (i, j)));
     }
     let describers: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT g.piece, g.source_kind, g.source_id
@@ -208,36 +227,57 @@ pub async fn rebuild(tx: &mut SqliteConnection) -> Result<()> {
             WHERE j.source_kind = g.source_kind AND j.source_id = g.source_id
               AND j.role IN {JOINER_ROLES})"
     )))
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     for (piece, kind, id) in describers {
-        for &key in holders.get(&source_of(&kind, id)).into_iter().flatten() {
-            members.insert((key, piece));
+        for &i in holders.get(&source_of(&kind, id)).into_iter().flatten() {
+            members.insert((i, piece));
         }
     }
+    Ok(Plan {
+        chains,
+        members: members.into_iter().collect(),
+    })
+}
+
+/// `n` rows of `row`, for a `VALUES` clause.
+fn values(row: &str, n: usize) -> String {
+    vec![row; n].join(",")
+}
+
+/// Replace every chain with `plan`: only writes, in the transaction that
+/// rebuilds the campaigns.
+pub async fn store_plan(tx: &mut SqliteConnection, plan: &Plan) -> Result<()> {
     for sql in ["DELETE FROM chain_pieces", "DELETE FROM chains"] {
         sqlx::query(sql).execute(&mut *tx).await?;
     }
-    for c in &chains {
-        sqlx::query(
-            "INSERT INTO chains (key, first_seen, last_seen, ips, sources, v)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&c.key)
-        .bind(&c.first_seen)
-        .bind(&c.last_seen)
-        .bind(c.ips)
-        .bind(c.sources.len() as i64)
-        .bind(CHAIN_V)
-        .execute(&mut *tx)
-        .await?;
+    for batch in plan.chains.chunks(INSERT_BATCH) {
+        let sql = format!(
+            "INSERT INTO chains (key, first_seen, last_seen, ips, sources, v) VALUES {}",
+            values("(?,?,?,?,?,?)", batch.len())
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for c in batch {
+            q = q
+                .bind(&c.key)
+                .bind(&c.first_seen)
+                .bind(&c.last_seen)
+                .bind(c.ips)
+                .bind(c.sources.len() as i64)
+                .bind(CHAIN_V);
+        }
+        q.execute(&mut *tx).await?;
     }
-    for (chain, piece) in members {
-        sqlx::query("INSERT INTO chain_pieces (chain, piece) VALUES (?, ?)")
-            .bind(chain)
-            .bind(piece)
-            .execute(&mut *tx)
-            .await?;
+    for batch in plan.members.chunks(INSERT_BATCH) {
+        let sql = format!(
+            "INSERT INTO chain_pieces (chain, piece) VALUES {}",
+            values("(?,?)", batch.len())
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for &(i, piece) in batch {
+            q = q.bind(&plan.chains[i].key).bind(piece);
+        }
+        q.execute(&mut *tx).await?;
     }
     Ok(())
 }
@@ -414,6 +454,23 @@ mod tests {
         assert_eq!(joiners(&c), [[1], [2]]);
     }
 
+    /// `n` joiners named together, by each of two addresses.
+    fn named_together(n: i64) -> Vec<JoinerSighting> {
+        (0..n)
+            .flat_map(|j| [at(j, (REQUEST, 1), 10, T0), at(j, (REQUEST, 2), 11, T0)])
+            .collect()
+    }
+
+    #[test]
+    fn a_source_naming_too_many_joiners_connects_none() {
+        let at_cap = named_together(PAIRED_JOINERS_MAX as i64);
+        assert_eq!(connect(&at_cap).len(), 1, "at the cap");
+        let over = connect(&named_together(PAIRED_JOINERS_MAX as i64 + 1));
+        assert_eq!(over.len(), PAIRED_JOINERS_MAX + 1);
+        // Left out of the pairs only: each still has its sources.
+        assert!(over.iter().all(|c| c.sources.len() == 2 && c.ips == 2));
+    }
+
     #[test]
     fn chain_key_is_its_oldest_joiner() {
         let pair = |a, b, s: i64, ts: &str| {
@@ -503,8 +560,11 @@ mod tests {
     }
 
     async fn run(s: &Store) {
+        let mut c = s.pool.acquire().await.unwrap();
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
         let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
-        rebuild(&mut tx).await.unwrap();
+        store_plan(&mut tx, &p).await.unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -551,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_replaces_the_last_pass_and_stamps_the_version() {
+    async fn a_pass_replaces_the_last_one_and_stamps_the_version() {
         let (s, _d) = store().await;
         let a = sight(&s, STAGER_A, ("request", 1), 10).await;
         run(&s).await;
@@ -568,6 +628,24 @@ mod tests {
         assert_eq!(chains(&s).await.len(), 1);
         assert_eq!(chains(&s).await[0].0, key_of(b));
         assert_eq!(pieces_of(&s, &key_of(a)).await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn store_plan_writes_more_than_a_batch() {
+        let (s, _d) = store().await;
+        let n = INSERT_BATCH as i64 + 1;
+        let rows: Vec<_> = (0..n).map(|j| at(j, (REQUEST, j), j, T0)).collect();
+        let p = Plan {
+            chains: connect(&rows),
+            members: (0..n).map(|j| (j as usize, j)).collect(),
+        };
+        let mut c = s.pool.acquire().await.unwrap();
+        store_plan(&mut c, &p).await.unwrap();
+        store_plan(&mut c, &p).await.unwrap();
+        drop(c);
+        assert_eq!(chains(&s).await.len(), n as usize);
+        let last = key_of(n - 1);
+        assert_eq!(pieces_of(&s, &last).await, [n - 1]);
     }
 
     #[tokio::test]

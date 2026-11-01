@@ -340,6 +340,7 @@ impl Store {
             }
         }
         let input = Input::read(&mut tx).await?;
+        let chains = super::chains::plan(&mut tx).await?;
         tx.rollback().await?;
         let out = compute(&input, p);
         let now = super::data::now_ts();
@@ -448,7 +449,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        super::chains::rebuild(&mut tx).await?;
+        super::chains::store_plan(&mut tx, &chains).await?;
         tx.commit().await?;
         Ok(report)
     }

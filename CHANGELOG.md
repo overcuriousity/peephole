@@ -6,6 +6,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- Attack chains are built in the campaign pass: stagers, SSH keys and
+  uploaded files form one chain only when they appear together in sources
+  from at least two addresses, so one forged body fuses nothing. A file on
+  more than 50 addresses is left out, and a source naming more than 64
+  joiners connects none. The trap's own check whether a dropped file may
+  answer stays per request (`answers_itself`); stored rows are read with
+  `keeps_its_own_answer`, so a chain's follow-ups leave out `/` and the
+  decoy paths.
 - Links lists stagers, SSH key fingerprints, uploaded files (SHA-256),
   shell recipes and exploit tags from the body X-ray, with graph, glossary
   and search. Payload values are shown and copied defanged and are never
