@@ -660,6 +660,135 @@ impl Store {
     }
 }
 
+/// Results one piece may hold.
+pub const MAX_RESULTS: i64 = 32;
+const FAMILY_MAX: usize = 64;
+const TEXT_MAX: usize = 2000;
+
+/// What an admin entered from an external sandbox. Every field is
+/// optional, but not all of them at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewResult {
+    pub sha256: Option<String>,
+    pub family: Option<String>,
+    pub source_url: Option<String>,
+    pub note: Option<String>,
+}
+
+impl NewResult {
+    /// Trimmed, empty fields dropped, the hash in lower case; or why it
+    /// cannot be kept. The URL is text for a person to copy: it is never
+    /// parsed, fetched or resolved.
+    pub fn checked(&self) -> Result<NewResult, String> {
+        fn field(v: &Option<String>, max: usize, name: &str) -> Result<Option<String>, String> {
+            let v = v.as_deref().map(str::trim).filter(|v| !v.is_empty());
+            match v {
+                Some(v) if v.chars().count() > max => {
+                    Err(format!("{name} is over {max} characters"))
+                }
+                Some(v) if v.chars().any(char::is_control) && name != "note" => {
+                    Err(format!("{name} holds a control character"))
+                }
+                v => Ok(v.map(str::to_string)),
+            }
+        }
+        let sha256 = self
+            .sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase);
+        if let Some(h) = &sha256
+            && !(h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            return Err("the SHA-256 is 64 hexadecimal characters".into());
+        }
+        let r = NewResult {
+            sha256,
+            family: field(&self.family, FAMILY_MAX, "family")?,
+            source_url: field(&self.source_url, TEXT_MAX, "sandbox URL")?,
+            note: field(&self.note, TEXT_MAX, "note")?,
+        };
+        if r == NewResult::default() {
+            return Err("enter at least one of SHA-256, family, URL or note".into());
+        }
+        Ok(r)
+    }
+}
+
+/// A stored result.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PieceResult {
+    pub piece: i64,
+    pub id: i64,
+    pub sha256: Option<String>,
+    pub family: Option<String>,
+    pub source_url: Option<String>,
+    pub note: Option<String>,
+    pub added_by: String,
+    pub added_at: String,
+}
+
+impl Store {
+    /// Record a sandbox result on a stager or file that joins a chain (or
+    /// already has results). Node-local: nothing reaches the replicated
+    /// log. Returns the result's id.
+    pub async fn add_piece_result(&self, piece: i64, r: &NewResult, by: &str) -> Result<i64> {
+        let r = r.checked().map_err(anyhow::Error::msg)?;
+        let mut tx = self.pool.begin().await?;
+        let ok: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pieces WHERE hash = ?1 AND kind IN ('stager', 'file')
+                            AND (EXISTS (SELECT 1 FROM chain_pieces WHERE piece = ?1)
+                                 OR EXISTS (SELECT 1 FROM piece_results WHERE piece = ?1)))",
+        )
+        .bind(piece)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !ok {
+            anyhow::bail!("results go on a stager or file that joins a chain");
+        }
+        let (n, next): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) + 1 FROM piece_results WHERE piece = ?",
+        )
+        .bind(piece)
+        .fetch_one(&mut *tx)
+        .await?;
+        if n >= MAX_RESULTS {
+            anyhow::bail!("this piece holds {MAX_RESULTS} results already");
+        }
+        sqlx::query(
+            "INSERT INTO piece_results
+               (piece, id, sha256, family, source_url, note, added_by, added_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        )
+        .bind(piece)
+        .bind(next)
+        .bind(&r.sha256)
+        .bind(&r.family)
+        .bind(&r.source_url)
+        .bind(&r.note)
+        .bind(cut(by, 200))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(next)
+    }
+
+    /// A piece's results, oldest first.
+    pub async fn piece_results(&self, piece: i64) -> Result<Vec<PieceResult>> {
+        Ok(sqlx::query_as(
+            "SELECT piece, id, sha256, family, source_url, note, added_by, added_at
+             FROM piece_results WHERE piece = ? ORDER BY id LIMIT ?",
+        )
+        .bind(piece)
+        .bind(MAX_RESULTS)
+        .fetch_all(&self.read)
+        .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1121,125 @@ mod tests {
         assert!(s.piece(h).await.unwrap().is_some());
         assert!(s.piece_urls(h).await.unwrap().is_empty());
         assert_eq!(count(&s, "pieces").await, 1, "the others are gone");
+    }
+
+    /// The stager of `STAGER` made a chain joiner, as a pass would.
+    async fn joiner(s: &Store) -> i64 {
+        let h = piece_hash("stager", "example.org");
+        sqlx::query("INSERT INTO chains VALUES ('k', 't', 't', 1, 1, 1)")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO chain_pieces VALUES ('k', ?)")
+            .bind(h)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        h
+    }
+
+    fn result(family: &str) -> NewResult {
+        NewResult {
+            family: Some(family.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn sha256_must_be_64_hex() {
+        let (s, _d) = store().await;
+        request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        run(&s).await;
+        let h = joiner(&s).await;
+        let with = |v: &str| NewResult {
+            sha256: Some(v.into()),
+            ..Default::default()
+        };
+        for bad in ["abc", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            assert!(
+                s.add_piece_result(h, &with(bad), "t").await.is_err(),
+                "{bad}"
+            );
+        }
+        // Upper case is kept as lower case, and spaces around it go.
+        let upper = format!(" {} ", "AB".repeat(32));
+        s.add_piece_result(h, &with(&upper), "t").await.unwrap();
+        let got = s.piece_results(h).await.unwrap();
+        assert_eq!(got[0].sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        // Lengths and the empty entry.
+        assert!(result(&"f".repeat(65)).checked().is_err());
+        assert!(result(&"f".repeat(64)).checked().is_ok());
+        let long = |n| NewResult {
+            note: Some("n".repeat(n)),
+            source_url: Some("u".repeat(n)),
+            ..Default::default()
+        };
+        assert!(long(2000).checked().is_ok());
+        assert!(long(2001).checked().is_err());
+        assert!(NewResult::default().checked().is_err());
+        assert!(result("  ").checked().is_err());
+    }
+
+    #[tokio::test]
+    async fn results_go_only_on_a_stager_or_file_that_joins() {
+        let (s, _d) = store().await;
+        request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        run(&s).await;
+        let h = piece_hash("stager", "example.org");
+        // Not in a chain.
+        assert!(s.add_piece_result(h, &result("x"), "t").await.is_err());
+        joiner(&s).await;
+        s.add_piece_result(h, &result("x"), "t").await.unwrap();
+        // A piece that is no stager or file.
+        let other = piece_hash("recipe", "wget-sh");
+        assert!(s.add_piece_result(other, &result("x"), "t").await.is_err());
+        // The cap.
+        for _ in 1..MAX_RESULTS {
+            s.add_piece_result(h, &result("x"), "t").await.unwrap();
+        }
+        assert!(s.add_piece_result(h, &result("x"), "t").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn result_survives_a_recompute_and_an_xray_version_change() {
+        let (s, _d) = store().await;
+        let (a, _) = request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        run(&s).await;
+        let h = joiner(&s).await;
+        let id = s
+            .add_piece_result(h, &result("mirai"), "admin")
+            .await
+            .unwrap();
+        // A new version clears and re-derives every sighting.
+        assert_eq!(backfill_at(&s.pool, XRAY_V + 1).await.unwrap(), 1);
+        refresh(&s).await;
+        let got = s.piece_results(h).await.unwrap();
+        assert_eq!((got.len(), got[0].id), (1, id));
+        // The source goes: the piece stays for its result.
+        s.delete_request(a).await.unwrap();
+        refresh(&s).await;
+        assert!(s.piece(h).await.unwrap().is_some());
+        assert_eq!(s.piece_results(h).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn result_is_not_replicated() {
+        let (s, _d) = store().await;
+        request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        run(&s).await;
+        let h = joiner(&s).await;
+        let before = count(&s, "repl_log").await;
+        s.add_piece_result(h, &result("mirai"), "admin")
+            .await
+            .unwrap();
+        assert_eq!(count(&s, "repl_log").await, before);
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE '%piece_results%'",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, ["piece_results"], "no log table carries it");
     }
 
     #[tokio::test]

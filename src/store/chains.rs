@@ -21,6 +21,7 @@
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, offset};
 use super::campaigns::HARD_FANOUT_MAX;
+use super::pieces::PieceResult;
 use super::uploads::{self, HELD_TEXT, TimelineRow, UPLOAD_COLS, UploadRow};
 use crate::admin::views::link_href;
 use crate::model::defang::defang;
@@ -74,6 +75,8 @@ const SHARED_SOURCES_MAX: i64 = 500;
 const STRIP_ROLES: &str = "('exploit', 'tag', 'recipe', 'stager', 'key', 'file')";
 /// Longest label, in characters: a recipe can be 512 bytes.
 const LABEL_MAX: usize = 160;
+/// Sandbox results one chain shows.
+const CHAIN_RESULTS_MAX: i64 = 64;
 /// Paths an Exploit row lists.
 const ROW_PATHS_MAX: usize = 6;
 
@@ -719,7 +722,12 @@ fn delivery_rows(
 /// The Payload stage: the uploaded text as seen, one row per content, else
 /// a gap that points to where a result is entered. Sandbox results belong
 /// here too: this is the one place that decides the stage.
-fn payload_rows(found: &[Found], uploads: &[UploadRow], here: &Here) -> Vec<StageRow> {
+fn payload_rows(
+    found: &[Found],
+    uploads: &[UploadRow],
+    results: &[PieceResult],
+    here: &Here,
+) -> Vec<StageRow> {
     let mut contents: BTreeMap<Vec<u8>, Vec<&UploadRow>> = BTreeMap::new();
     for u in uploads.iter().filter(|u| u.held_text()) {
         contents.entry(u.sha256.clone()).or_default().push(u);
@@ -754,6 +762,8 @@ fn payload_rows(found: &[Found], uploads: &[UploadRow], here: &Here) -> Vec<Stag
             }
         })
         .collect();
+    let mut rows = rows;
+    rows.extend(results.iter().map(|r| result_row(r, found, here)));
     if !rows.is_empty() {
         return rows;
     }
@@ -768,6 +778,53 @@ fn payload_rows(found: &[Found], uploads: &[UploadRow], here: &Here) -> Vec<Stag
         href: target.and_then(Found::href),
         ..row("No payload seen".into(), detail.into(), Mark::Gap)
     }]
+}
+
+/// An admin's sandbox result, as a row: external, not seen here.
+fn result_row(r: &PieceResult, found: &[Found], here: &Here) -> StageRow {
+    let name = match (&r.family, &r.sha256) {
+        (Some(f), _) => f.clone(),
+        (None, Some(h)) => format!("sha256 {}", h.get(..12).unwrap_or(h)),
+        _ => "sandbox result".to_string(),
+    };
+    let mut detail = String::from("external · sandbox result");
+    if r.family.is_some()
+        && let Some(h) = &r.sha256
+    {
+        detail.push_str(&format!(" · sha256 {}", h.get(..12).unwrap_or(h)));
+    }
+    let on = found.iter().find(|p| p.hash == r.piece);
+    StageRow {
+        piece: Some(r.piece),
+        here: here.pieces.contains(&r.piece),
+        href: on.and_then(Found::href),
+        ..row(label(&name), detail, Mark::External)
+    }
+}
+
+/// The results entered for the stagers and files of a chain, oldest first.
+async fn results_of(conn: &mut SqliteConnection, found: &[Found]) -> Result<Vec<PieceResult>> {
+    let hashes: BTreeSet<i64> = found
+        .iter()
+        .filter(|p| matches!(p.kind.as_str(), "stager" | "file"))
+        .map(|p| p.hash)
+        .collect();
+    if hashes.is_empty() {
+        return Ok(vec![]);
+    }
+    // Integers, so they go in the text.
+    let ids = hashes
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT piece, id, sha256, family, source_url, note, added_by, added_at
+         FROM piece_results WHERE piece IN ({ids}) ORDER BY added_at, piece, id LIMIT ?"
+    )))
+    .bind(CHAIN_RESULTS_MAX)
+    .fetch_all(&mut *conn)
+    .await?)
 }
 
 /// One row per distinct `shown`, in order, with how often it came.
@@ -1021,6 +1078,7 @@ struct Parts<'a> {
     tags: &'a [(i64, i64)],
     uploads: &'a [UploadRow],
     follow: &'a FollowUps,
+    results: &'a [PieceResult],
 }
 
 fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
@@ -1028,7 +1086,7 @@ fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
         ("Exploit", exploit_rows(p.found, p.tags, here)),
         ("Command", command_rows(p.found, here)),
         ("Delivery", delivery_rows(p.key, p.found, p.uploads, here)),
-        ("Payload", payload_rows(p.found, p.uploads, here)),
+        ("Payload", payload_rows(p.found, p.uploads, p.results, here)),
         ("Follow-up", follow_up_rows(p.uploads, p.follow, here)),
     ]
     .map(|(name, rows)| Stage { name, rows });
@@ -1146,6 +1204,7 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
     .await?;
     let uploads = uploads_of(conn, key).await?;
     let follow = gather_follow_ups(conn, &uploads, &found).await?;
+    let results = results_of(conn, &found).await?;
     let stages = stages(
         &Parts {
             key: Some(key),
@@ -1153,6 +1212,7 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
             tags: &tags,
             uploads: &uploads,
             follow: &follow,
+            results: &results,
         },
         here,
     );
@@ -1289,6 +1349,7 @@ async fn unkeyed(
     .fetch_all(&mut *conn)
     .await?;
     let follow = gather_follow_ups(conn, &uploads, &found).await?;
+    let results = results_of(conn, &found).await?;
     let stages = stages(
         &Parts {
             key: None,
@@ -1296,6 +1357,7 @@ async fn unkeyed(
             tags: &tags,
             uploads: &uploads,
             follow: &follow,
+            results: &results,
         },
         here,
     );
@@ -2128,6 +2190,7 @@ mod tests {
                     tags: &[],
                     uploads: &[],
                     follow: &FollowUps::default(),
+                    results: &[],
                 },
                 &Here::default(),
             ),
@@ -2239,6 +2302,43 @@ mod tests {
         let follow = one(&chains[0], "Follow-up");
         assert_eq!(follow.mark, Mark::Gap);
         assert!(follow.detail.contains("never ran here"), "{follow:?}");
+    }
+
+    #[tokio::test]
+    async fn result_fills_payload_for_the_whole_chain() {
+        use crate::store::pieces::NewResult;
+        let (s, _d) = store().await;
+        let (a, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        let (b, _) = sighted(&s, OTHER, "/b", &[STAGER_A]).await;
+        run(&s).await;
+        let h = piece_hash(STAGER_A.0, STAGER_A.1);
+        let new = NewResult {
+            family: Some("Mirai".into()),
+            sha256: Some("ab".repeat(32)),
+            source_url: Some("https://example.org/report".into()),
+            ..Default::default()
+        };
+        s.add_piece_result(h, &new, "admin").await.unwrap();
+        s.add_piece_result(
+            h,
+            &NewResult {
+                sha256: Some("cd".repeat(32)),
+                ..Default::default()
+            },
+            "admin",
+        )
+        .await
+        .unwrap();
+        for id in [a, b] {
+            let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+            let rows = stage(&chains[0], "Payload");
+            assert_eq!(rows.len(), 2, "one row per result: {rows:?}");
+            assert!(rows.iter().all(|r| r.mark == Mark::External));
+            assert_eq!(rows[0].label, "Mirai");
+            assert!(rows[0].detail.contains("external"), "{:?}", rows[0]);
+            assert_eq!(rows[1].label, "sha256 cdcdcdcdcdcd");
+            assert_eq!(rows[0].piece, Some(h));
+        }
     }
 
     #[tokio::test]

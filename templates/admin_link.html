@@ -5,7 +5,8 @@
 {% let nav = crate::admin::views::Nav::new("evidence", "links") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>{{ kind_name }}</h1><p class="mono hk-fp">{{ value }}{% let what = "value" %}{% let subtle = true %}{% include "_copy.html" %}</p></div></div>
 {% if !seen() %}
-<div class="card empty">Not seen: nothing with this value is stored.{% if kind_key == "file" %} <a href="{{ crate::admin::views::uploads_by_hash_href(value.as_str()) }}">Uploads with this hash</a>{% endif %}</div>
+<div class="card empty">Not seen: nothing with this value is stored.{% if !results.is_empty() %} No sighting is left; the sandbox results below are kept.{% endif %}{% if kind_key == "file" %} <a href="{{ crate::admin::views::uploads_by_hash_href(value.as_str()) }}">Uploads with this hash</a>{% endif %}</div>
+{% include "_link_results.html" %}
 {% else %}
 {% include "_chain_strip.html" %}
 <div class="link-layout">
@@ -55,5 +56,6 @@
   </tbody></table></div>
 </section>
 {% endif %}
+{% include "_link_results.html" %}
 {% endif %}
 {% endblock %}
