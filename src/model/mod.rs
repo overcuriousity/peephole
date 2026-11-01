@@ -12,3 +12,4 @@ pub mod nmap_xml;
 pub mod retry;
 pub mod shape;
 pub mod webshell;
+pub mod xray;
