@@ -138,6 +138,7 @@ impl Store {
             // setting is not left readable in the file.
             .pragma("secure_delete", "FAST")
             .foreign_keys(true);
+        first_open(&opts, path).await.context("opening sqlite")?;
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
@@ -187,6 +188,37 @@ impl Store {
     pub fn search_indexed(&self) -> bool {
         self.search_index.load(Ordering::Relaxed)
     }
+}
+
+/// Open one connection outside the pool, whose acquire times out after
+/// 30 s. After an unclean stop SQLite rebuilds its WAL index from the
+/// whole `-wal` file on the first open; with a large log on slow storage
+/// that outlasts the pool's deadline, and every restart starts the rebuild
+/// over. Waits on locks are still bounded by the busy timeout.
+async fn first_open(opts: &SqliteConnectOptions, path: &Path) -> anyhow::Result<()> {
+    use sqlx::{ConnectOptions, Connection};
+    let open = opts.connect();
+    tokio::pin!(open);
+    let started = std::time::Instant::now();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+    tick.tick().await;
+    let conn = loop {
+        tokio::select! {
+            c = &mut open => break c?,
+            _ = tick.tick() => {
+                let mut wal = path.as_os_str().to_owned();
+                wal.push("-wal");
+                let wal_mb = std::fs::metadata(&wal).map(|m| m.len() >> 20).unwrap_or(0);
+                tracing::warn!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    wal_mb,
+                    "still opening the database (SQLite recovers the write-ahead log after an unclean stop)"
+                );
+            }
+        }
+    };
+    conn.close().await?;
+    Ok(())
 }
 
 /// A new (empty) database file gets incremental auto-vacuum, so pages freed
