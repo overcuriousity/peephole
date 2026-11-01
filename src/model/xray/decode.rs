@@ -138,7 +138,7 @@ fn scan(xray: &mut Xray, at: usize, text: &[u8], budget: &mut Budget, queue: &mu
 
 /// Bounded like layers, so a body of many candidates stays small; past the
 /// cap one entry per reason is still kept.
-fn push_opaque(xray: &mut Xray, at: Span, reason: OpaqueReason) {
+pub(super) fn push_opaque(xray: &mut Xray, at: Span, reason: OpaqueReason) {
     if xray.opaque.len() < MAX_LAYERS || !xray.opaque.iter().any(|o| o.reason == reason) {
         xray.opaque.push(Opaque { at, reason });
     }

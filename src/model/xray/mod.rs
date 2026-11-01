@@ -38,7 +38,6 @@ pub enum LayerKind {
     Raw,
     Query,
     Form,
-    Multipart,
     MultipartField,
     Json,
     Xml,

