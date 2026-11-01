@@ -57,6 +57,8 @@ pub const ROUTES: &[(&str, &str, Mount)] = &[
     ("GET", "/api/v1/campaigns/{key}/dossier", |m| {
         on(m, campaign_dossier)
     }),
+    ("GET", "/api/v1/chains", |m| on(m, chains)),
+    ("GET", "/api/v1/chains/{key}", |m| on(m, chain)),
 ];
 
 pub fn routes() -> Router<Arc<AdminState>> {
@@ -611,6 +613,85 @@ async fn campaign_dossier(
         crate::admin::dossier::campaign(&state, &key).await,
         "campaign",
     )
+}
+
+#[derive(serde::Deserialize)]
+struct ChainsQuery {
+    /// 1-based; unreadable means the first.
+    #[serde(default, deserialize_with = "crate::store::browse::lenient_i64")]
+    page: Option<i64>,
+    /// Only the chains of this address.
+    ip: Option<String>,
+    /// Only the chains of this campaign's members.
+    campaign: Option<String>,
+}
+
+/// Chains, newest first, a page of `PAGE_SIZE`. Read scope, as the dossiers.
+async fn chains(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<ChainsQuery>,
+) -> Response {
+    use crate::admin::chains_json::ChainRowJson;
+    use crate::store::chains::ChainFilter;
+    let ip = q.ip.filter(|s| !s.trim().is_empty());
+    let campaign = q.campaign.filter(|s| !s.trim().is_empty());
+    // An address the store does not know matches no chain.
+    let ip_id = match &ip {
+        Some(a) => match state
+            .store
+            .ip_by_addr(&crate::store::browse::canonical_ip(a))
+            .await
+        {
+            Ok(i) => Some(i.map_or(0, |i| i.id)),
+            Err(e) => return internal(e),
+        },
+        None => None,
+    };
+    let page = q.page.unwrap_or(1).clamp(1, i64::from(MAX_PAGE)) as u32;
+    let filter = ChainFilter {
+        ip: ip_id,
+        campaign: campaign.as_deref(),
+    };
+    match state.store.chains_page(page, filter).await {
+        Ok(p) => Json(json!({
+            "items": p.items.iter().map(ChainRowJson::from).collect::<Vec<_>>(),
+            "page": p.page,
+            "has_next": p.has_next,
+        }))
+        .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// One chain by its key (16 hex digits).
+async fn chain(
+    DeviceAuth(_): DeviceAuth,
+    State(state): State<Arc<AdminState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let hash = (key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| u64::from_str_radix(&key, 16).ok())
+        .flatten();
+    let Some(hash) = hash else {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such chain");
+    };
+    let key = key.to_ascii_lowercase();
+    let found = match state
+        .store
+        .chains_of(crate::store::chains::Anchor::Piece(hash as i64))
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let Some(found) = found.into_iter().find(|c| c.key.as_deref() == Some(&key)) else {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such chain");
+    };
+    match crate::admin::chains_json::chains_json(&state.store, &[found]).await {
+        Ok(mut c) => Json(json!({ "chain": c.pop() })).into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2174,6 +2255,104 @@ mod tests {
             .unwrap();
         let (st, _) = send(&app, authed("GET", &paths[0], &token)).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chains_api_needs_a_scope() {
+        let (state, cookie, app, _d) = app().await;
+        let (token, _) = pair(&app, &cookie).await;
+        seed_dossiers(&state).await;
+        let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        let hash = crate::store::pieces::piece_hash("stager", "a.example.org");
+        sqlx::query(
+            "INSERT INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             VALUES (?, 'stager', 'a.example.org', 't', 't', 1, 1)",
+        )
+        .bind(hash)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO piece_sightings
+             SELECT ?, 'request', max(id), ?, 'stager', 'seen', '2026-10-01 00:00:00' FROM requests",
+        )
+        .bind(hash)
+        .bind(ip.id)
+        .execute(&state.store.pool)
+        .await
+        .unwrap();
+        state.store.recompute_campaigns(true).await.unwrap();
+        let key = format!("{:016x}", hash as u64);
+        let paths = [
+            "/api/v1/chains".to_string(),
+            format!("/api/v1/chains/{key}"),
+        ];
+        let (st, list) = send(&app, authed("GET", &paths[0], &token)).await;
+        assert_eq!(st, 200, "{list}");
+        assert_eq!(list["items"][0]["key"], key.as_str(), "{list}");
+        assert_eq!(list["items"][0]["joiner"], "a[.]example[.]org");
+        let (st, one) = send(&app, authed("GET", &paths[1], &token)).await;
+        assert_eq!(st, 200, "{one}");
+        assert_eq!(one["chain"]["key"], key.as_str());
+        // Filters: an address with none, a malformed or unknown key.
+        let (_, v) = send(&app, authed("GET", "/api/v1/chains?ip=192.0.2.250", &token)).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 0, "{v}");
+        let (_, v) = send(&app, authed("GET", "/api/v1/chains?ip=192.0.2.1", &token)).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        for bad in ["nothex", "0000000000000000"] {
+            let (st, _) = send(
+                &app,
+                authed("GET", &format!("/api/v1/chains/{bad}"), &token),
+            )
+            .await;
+            assert_eq!(st, 404, "{bad}");
+        }
+        for path in &paths {
+            // No token, or only the admin cookie: 401.
+            let (st, _) = send(&app, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{path}");
+            let r = Request::get(path)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(&app, r).await.0, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        // A token without the read scope: 403.
+        sqlx::query("UPDATE devices SET scopes = 'act'")
+            .execute(&state.store.pool)
+            .await
+            .unwrap();
+        for path in &paths {
+            let (st, v) = send(&app, authed("GET", path, &token)).await;
+            assert_eq!(
+                (st, &v["error"]["code"]),
+                (StatusCode::FORBIDDEN, &"forbidden".into()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_lists_chains() {
+        let doc = openapi_doc();
+        for path in ["/api/v1/chains", "/api/v1/chains/{key}"] {
+            let op = &doc["paths"][path]["get"];
+            assert_eq!(op["x-peephole-scope"], "read", "{path}");
+            assert_eq!(
+                op["security"],
+                serde_json::json!([{"bearer": []}]),
+                "{path}"
+            );
+        }
+        let s = &doc["components"]["schemas"];
+        for name in ["Chain", "ChainList", "ChainRow", "XraySummary"] {
+            assert!(s[name].is_object(), "{name}");
+        }
+        for dossier in ["IpDossier", "CampaignDossier"] {
+            assert!(s[dossier]["properties"]["chains"].is_object(), "{dossier}");
+        }
+        let r = &s["RequestDossier"]["properties"];
+        assert!(r["chain"].is_object() && r["xray"].is_object() && r["other_chains"].is_object());
     }
 
     /// The pages' "Copy JSON dossier" route (MIK-750): the admin session's,

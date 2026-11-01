@@ -545,6 +545,120 @@
         "x-peephole-scope": "read"
       }
     },
+    "/api/v1/chains": {
+      "get": {
+        "summary": "Attack chains, newest first",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "1-based page; unreadable means the first"
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "only the chains of this address"
+          },
+          {
+            "name": "campaign",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "only the chains of this campaign's members (its key)"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
+    "/api/v1/chains/{key}": {
+      "get": {
+        "summary": "One attack chain",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "the chain's key: 16 hex digits"
+          }
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainOne"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "x-peephole-scope": "read"
+      }
+    },
     "/api/v1/ips/{addr}/probe/vantages": {
       "get": {
         "summary": "What a probe would ask and cost",
@@ -3185,6 +3299,13 @@
               "used_elsewhere",
               "used_from"
             ]
+          },
+          "chains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Chain"
+            },
+            "description": "newest first, at most 32"
           }
         },
         "required": [
@@ -3192,6 +3313,7 @@
           "calendar",
           "campaign",
           "canaries",
+          "chains",
           "commands",
           "dossier_v",
           "events",
@@ -3895,11 +4017,29 @@
                 "type": "null"
               }
             ]
+          },
+          "chain": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Chain"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "other_chains": {
+            "type": "integer",
+            "description": "chains past `chain`"
+          },
+          "xray": {
+            "$ref": "#/components/schemas/XraySummary"
           }
         },
         "required": [
           "campaign",
           "canaries",
+          "chain",
           "dossier_v",
           "generated_at",
           "id",
@@ -3907,6 +4047,7 @@
           "kind",
           "limits",
           "node",
+          "other_chains",
           "page",
           "request",
           "same_ip",
@@ -3914,7 +4055,8 @@
           "totals",
           "truncated",
           "uploads",
-          "webshell_cmd"
+          "webshell_cmd",
+          "xray"
         ],
         "additionalProperties": false,
         "description": "One recorded request. `target`, `headers` and the body are attacker text."
@@ -4309,12 +4451,20 @@
           },
           "agent": {
             "type": "boolean"
+          },
+          "chains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Chain"
+            },
+            "description": "newest first, at most 32"
           }
         },
         "required": [
           "agent",
           "calendar",
           "campaign",
+          "chains",
           "commands",
           "dossier_v",
           "edges",
@@ -4333,6 +4483,409 @@
         ],
         "additionalProperties": false,
         "description": "A campaign: its members, the edges between carried members, shapes and artifacts."
+      },
+      "ChainUrl": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "As the attacker wrote it, for a sandbox. Never a link."
+          },
+          "defanged": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "defanged",
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "ChainRowItem": {
+        "type": "object",
+        "properties": {
+          "piece": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "the piece's hash, 16 lowercase hex digits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "value": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "the piece's text as seen; attacker text, never a link"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "defanged": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChainUrl"
+            },
+            "description": "a stager's URLs, newest first, at most 32"
+          },
+          "label": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "mark": {
+            "type": "string",
+            "enum": [
+              "seen",
+              "claimed",
+              "external",
+              "gap",
+              "dead end"
+            ]
+          },
+          "joiner": {
+            "type": "boolean"
+          },
+          "here": {
+            "type": "boolean"
+          },
+          "page": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "defanged",
+          "detail",
+          "here",
+          "joiner",
+          "kind",
+          "label",
+          "mark",
+          "page",
+          "piece",
+          "urls",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "ChainStage": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "Exploit",
+              "Command",
+              "Delivery",
+              "Payload",
+              "Follow-up"
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChainRowItem"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "rows"
+        ],
+        "additionalProperties": false
+      },
+      "Chain": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "the oldest joiner's hash; null for what has no joiner. It changes when chains merge"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ips": {
+            "type": "integer"
+          },
+          "sources": {
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "more": {
+            "type": "integer",
+            "description": "pieces past the 200 a chain lists"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChainStage"
+            }
+          }
+        },
+        "required": [
+          "first_seen",
+          "ips",
+          "key",
+          "last_seen",
+          "more",
+          "sources",
+          "stages"
+        ],
+        "additionalProperties": false,
+        "description": "An attack chain in five stages. Upload text and key material never appear; a key piece is its fingerprint."
+      },
+      "ChainRow": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "joiner": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "defanged"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "page": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ips": {
+            "type": "integer"
+          },
+          "sources": {
+            "type": "integer"
+          },
+          "exploits": {
+            "type": "integer"
+          },
+          "payload": {
+            "type": "string",
+            "enum": [
+              "seen",
+              "gap"
+            ]
+          }
+        },
+        "required": [
+          "exploits",
+          "first_seen",
+          "ips",
+          "joiner",
+          "key",
+          "last_seen",
+          "page",
+          "payload",
+          "sources"
+        ],
+        "additionalProperties": false
+      },
+      "ChainList": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChainRow"
+            }
+          },
+          "page": {
+            "type": "integer"
+          },
+          "has_next": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "has_next",
+          "items",
+          "page"
+        ],
+        "additionalProperties": false
+      },
+      "ChainOne": {
+        "type": "object",
+        "properties": {
+          "chain": {
+            "$ref": "#/components/schemas/Chain"
+          }
+        },
+        "required": [
+          "chain"
+        ],
+        "additionalProperties": false
+      },
+      "XraySummary": {
+        "type": "object",
+        "properties": {
+          "layers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "parent": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "depth": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "depth",
+                "kind",
+                "parent"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "pieces": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "grade": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                },
+                "defanged": {
+                  "type": "string"
+                },
+                "url": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ChainUrl"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "defanged",
+                "grade",
+                "kind",
+                "role",
+                "url",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "opaque": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "high_entropy",
+                    "unknown_encoding",
+                    "too_deep",
+                    "over_limit"
+                  ]
+                },
+                "layer": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "layer",
+                "reason"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "layers",
+          "opaque",
+          "pieces"
+        ],
+        "additionalProperties": false,
+        "description": "What the X-ray found in a request body: layer kinds, pieces and the ranges it did not open. No layer text."
       }
     }
   }

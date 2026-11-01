@@ -474,6 +474,8 @@ plus:
   served_request_id, served_ip, served_at, served_answer, used_request_id,
   used_ip, used_at, delta_s, same_source}]}`, reuses newest 50.
 - Capped: `truncated.events`, `uploads`, `commands`, `reuses`.
+- `chains`: its attack chains, newest first, at most 32, as
+  [chains](#chains) describe them.
 
 ### `kind: "asn"`
 
@@ -500,6 +502,11 @@ plus:
 - `canaries`: `{served:[{kind, value}], return_host, reuses:[…]}`, reuses
   newest 50.
 - `uploads` (metadata), `webshell_cmd`, `campaign` (`{key, num}` or null).
+- `chain`: the newest [chain](#chains) it belongs to, or its own pieces if
+  it joins none (null when it has none); `other_chains` counts the rest.
+- `xray`: what the X-ray found in its body, without any layer's text:
+  `layers:[{kind, parent, depth}]`, `pieces:[{kind, role, grade, value,
+  defanged, url:{url, defanged}|null}]`, `opaque:[{reason, layer}]`.
 - Capped: `truncated.same_ip`, `same_ja4`, `reuses`.
 
 ### `kind: "campaign"`
@@ -518,6 +525,48 @@ plus:
   50 each; `events`: the members' newest 200, each with its `ip`
   (`truncated.events`); `agent`.
 - Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`.
+- `chains`: the chains its members are in, newest first, at most 32.
+
+### Chains
+
+A chain is an attack in five stages: `Exploit`, `Command`, `Delivery`,
+`Payload`, `Follow-up`.
+
+```json
+{ "key": "1a2b3c4d5e6f7081", "ips": 2, "sources": 3,
+  "first_seen": "2026-10-01T00:00:00Z", "last_seen": "2026-10-02T00:00:00Z",
+  "more": 0,
+  "stages": [ { "name": "Delivery", "rows": [ {
+    "piece": "1a2b3c4d5e6f7081", "kind": "stager",
+    "value": "a.example.org", "defanged": "a[.]example[.]org",
+    "urls": [ { "url": "…", "defanged": "…" } ],
+    "label": "a[.]example[.]org", "detail": "…", "mark": "seen",
+    "joiner": true, "here": false, "page": "/admin/evidence/links/…" } ] } ] }
+```
+
+- `key` is the oldest joiner's hash, or null for what has no joiner. It
+  changes when chains merge, so it is no permanent id.
+- A piece has `value` (the text as seen, for a sandbox) and `defanged`. A
+  stager also lists its `urls` (at most 32), raw and defanged. Neither is
+  ever a link. `mark` is `seen`, `claimed`, `external`, `gap` or
+  `dead end`; `label` and `detail` are defanged. Rows that are not pieces
+  (a request, an upload's name, a gap) have a null `piece`.
+- A chain lists at most 200 pieces; `more` counts those past that.
+- Never here: uploaded bytes or text, a layer's decoded text, key
+  material. A key piece is its public fingerprint.
+
+### `GET /api/v1/chains?page=&ip=&campaign=`
+
+Chains, newest first, 50 a page: `{items:[{key, joiner, page, first_seen,
+last_seen, ips, sources, exploits, payload}], page, has_next}`. `joiner`
+is the name of the chain, defanged; `payload` is `seen` when uploaded text
+backs it, else `gap`. `ip` and `campaign` narrow it as on the admin list
+(an unknown address matches nothing). Read scope.
+
+### `GET /api/v1/chains/{key}`
+
+`{chain}` as above, by its 16 hex digits. `404 not_found` when there is no
+such chain (keys change when chains merge). Read scope.
 
 ### Never in a dossier
 

@@ -6,6 +6,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- Dossiers carry attack chains: request dossiers a `chain` and an `xray`
+  summary (layer kinds, pieces, opaque reasons, no layer text), address and
+  campaign dossiers a `chains` list. New read-scope routes
+  `GET /api/v1/chains` and `GET /api/v1/chains/{key}`. Pieces appear as
+  `value` and `defanged`, a stager's URLs raw and defanged; upload text and
+  key material never do. `dossier_v` stays 1.
 - The chain strip shows an attack in five stages (Exploit, Command, Delivery,
   Payload, Follow-up) on the request, upload, address, campaign and piece
   pages: the same chain from any of them, with "you are here" on a source's
