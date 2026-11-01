@@ -3,6 +3,30 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [0.23.2] - 2026-11-01
+
+No database migration, no new setting, no protocol version bump.
+
+### Security
+- `tokio` 1.54.1 closes RUSTSEC-2026-0386 and `zstd` 0.14.3 closes
+  RUSTSEC-2026-0391.
+
+### Fixed
+- A file dropped with `PUT` no longer takes over a path the trap already
+  answers. One `PUT /` used to turn the landing page into the blank
+  webshell answer for every later visitor, and a `PUT` to a decoy path
+  silenced that decoy. The upload is still recorded. The check sits at
+  the answer, so a node already hit heals with this upgrade: nothing to
+  clean up.
+
+### Changed
+- Dependency updates: `aws-lc-rs` 1.18.2, `sha2` 0.11.1, `uuid` 1.29.0,
+  `zip` 9.1.0, and the CI actions.
+
+### Documentation
+- Operations: "A file dropped on the trap" covers retrieving and
+  verifying an upload.
+
 ## [0.23.1] - 2026-10-21
 
 One database migration, run on start: `0051_api_key_never_used`
