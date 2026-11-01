@@ -51,6 +51,41 @@ a.tile:hover .label { color: var(--color-accent); }
 .signal[data-tone="bad"] .signal-value { color: var(--color-danger); }
 .signal[data-tone="info"] { --tone: var(--color-accent); --tone-dim: var(--color-accent-dim); }
 
+/* ---- Chain strip ---------------------------------------------------- */
+/* The line says how far a row is confirmed, and .chain-mark says it in words:
+   solid seen, dashed claimed, double external, hatched gap, danger dead end.
+   An accent edge is a joiner. Five columns, one stack on a narrow screen. */
+.chain + .chain { margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid var(--color-border-subtle); }
+.chain > summary { cursor: pointer; overflow-wrap: anywhere; }
+.chain-name { font-family: var(--font-mono); font-size: var(--text-sm); }
+.chain-stages { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.6rem; margin-top: 0.6rem; }
+.chain-stage { min-width: 0; }
+.chain-stage h3 { margin: 0 0 0.35rem; font-size: var(--text-xs); font-weight: 500; color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.chain-rows { display: grid; gap: 0.35rem; list-style: none; margin: 0; padding: 0; }
+.chain-more { margin-top: 0.35rem; font-size: var(--text-xs); }
+.chain-more > summary { cursor: pointer; margin-bottom: 0.35rem; }
+.chain-empty { font-size: var(--text-xs); color: var(--color-fg-muted); margin: 0; }
+.chain-row, .chain-key { border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); background: var(--color-bg-inset); }
+.chain-row { padding: 0.35rem 0.5rem; font-size: var(--text-xs); line-height: 1.35; overflow-wrap: anywhere; }
+.chain-label { display: block; font-family: var(--font-mono); color: var(--color-fg-primary); }
+a.chain-label { color: var(--color-accent); }
+.chain-detail { display: block; color: var(--color-fg-muted); }
+.chain-mark { display: block; color: var(--color-fg-secondary); font-weight: 500; }
+.chain-row.claimed, .chain-key.claimed { border-style: dashed; }
+.chain-row.external, .chain-key.external { border-style: double; border-width: 3px; }
+.chain-row.gap, .chain-key.gap { border-color: var(--color-border); background: repeating-linear-gradient(135deg, var(--color-bg-inset) 0 6px, var(--color-bg-hover) 6px 9px); }
+.chain-row.dead-end, .chain-key.dead-end { border-color: var(--color-danger); }
+.chain-row.dead-end .chain-mark { color: var(--color-danger); }
+.chain-row.joiner, .chain-key.joiner { border-left: 3px solid var(--color-accent); }
+.chain-row.here { box-shadow: 0 0 0 2px var(--color-accent-muted); }
+.chain-row.dim { border-color: var(--color-border); }
+.chain-row.dim .chain-label, .chain-row.dim .chain-mark { color: var(--color-fg-muted); }
+.chain-legend { display: flex; flex-wrap: wrap; gap: 0.35rem 0.75rem; margin: 0.6rem 0 0; font-size: var(--text-xs); color: var(--color-fg-muted); }
+.chain-key { display: inline-block; padding: 0 0.4rem; color: var(--color-fg-secondary); }
+@media (max-width: 48rem) {
+  .chain-stages { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ---- Provider cards ------------------------------------------------- */
 /* Columns, not grid rows: a short card does not wait for the tallest. */
 .intel-grid { display: block; columns: 17rem; column-gap: 0.75rem; }

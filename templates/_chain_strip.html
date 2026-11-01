@@ -1,0 +1,34 @@
+{# The chain strip: `strips` (admin::chains::Strips), and nothing at all without a chain. Every value is escaped here, a payload's address is a defanged label, and only links of our own are links. Each mark is also a word. #}
+{% if !strips.chains.is_empty() %}
+<section class="card chain-card" data-section="chains">
+  <div class="card-head"><h2>Attack chain{% if strips.chains.len() > 1 %}s{% endif %}</h2><a href="/admin/evidence/chains">all chains →</a></div>
+  {% for ch in strips.chains %}
+  <details class="chain"{% if loop.first %} open{% endif %}>
+    <summary><span class="chain-name">{{ ch.title() }}</span> <span class="muted">· {{ ch.ips }} IP{% if ch.ips != 1 %}s{% endif %} · {{ crate::admin::views::thousands(ch.sources) }} source{% if ch.sources != 1 %}s{% endif %} · last seen {{ crate::admin::views::minute(ch.last_seen.as_str()) }}</span></summary>
+    <div class="chain-stages">
+      {% for s in ch.stages %}
+      <div class="chain-stage">
+        <h3>{{ s.name }}</h3>
+        {% if s.rows.is_empty() %}<p class="chain-empty">none</p>{% else %}
+        <ul class="chain-rows">
+          {% for r in s.rows %}
+          {% if loop.index0 == crate::admin::chains::STAGE_ROWS %}</ul><details class="chain-more"><summary>{{ s.rows.len() - crate::admin::chains::STAGE_ROWS }} more</summary><ul class="chain-rows">{% endif %}
+          <li class="chain-row {{ r.mark.class() }}{% if r.joiner %} joiner{% endif %}{% if r.here %} here{% endif %}{% if r.dim %} dim{% endif %}">
+            {% if let Some(href) = r.href %}<a class="chain-label" href="{{ href }}">{{ r.label }}</a>{% else %}<span class="chain-label">{{ r.label }}</span>{% endif %}
+            <span class="chain-detail">{{ r.detail }}</span>
+            <span class="chain-mark">{{ r.mark.word() }}{% if r.joiner %} · joiner{% endif %}{% if r.here %} · you are here{% endif %}</span>
+          </li>
+          {% endfor %}
+        </ul>
+        {% if s.rows.len() > crate::admin::chains::STAGE_ROWS %}</details>{% endif %}
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endfor %}
+  {% if let Some(rest) = strips.rest %}<p><a href="{{ rest }}">More chains →</a></p>{% endif %}
+  {% if !strips.elsewhere.is_empty() %}<p class="muted">Its address is in: {% for (title, href) in strips.elsewhere %}{% if !loop.first %}, {% endif %}<a class="mono" href="{{ href }}">{{ title }}</a>{% endfor %}</p>{% endif %}
+  <p class="chain-legend"><span class="chain-key seen">seen</span><span class="chain-key claimed">claimed</span><span class="chain-key external">external</span><span class="chain-key gap">gap</span><span class="chain-key dead-end">dead end</span><span class="chain-key joiner">joiner</span></p>
+</section>
+{% endif %}

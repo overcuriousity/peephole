@@ -3300,7 +3300,7 @@ show_labels = {show_labels}
         for (root, first) in [
             ("/admin/overview", "/admin"),
             ("/admin/investigate", "/admin/investigate/lookup"),
-            ("/admin/evidence", "/admin/evidence/campaigns"),
+            ("/admin/evidence", "/admin/evidence/chains"),
             ("/admin/traps", "/admin/traps/mcp"),
             ("/admin/network", "/admin/network/members"),
         ] {

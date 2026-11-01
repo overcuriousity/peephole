@@ -4,10 +4,12 @@
 //! uses, and the graph's JSON.
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
+use crate::admin::chains::Strips;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::{Chrome, link_href};
 use crate::store::browse::{Page, canonical_ip};
 use crate::store::links::{Focus, LinkFilter, LinkItem, LinkKind, LinkRow};
+use crate::store::pieces::piece_hash;
 use crate::store::stats::Range;
 use askama::Template;
 use axum::{
@@ -150,6 +152,8 @@ struct LinkPage {
     urls: Vec<StagerUrl>,
     /// `ip` pages: the address is stored.
     ip_seen: bool,
+    /// A piece's chain, or the sources sharing it.
+    strips: Strips,
     kinds: Vec<LinkKind>,
     types: Vec<LinkKind>,
     depth: u32,
@@ -192,6 +196,7 @@ async fn item(
     Query(gq): Query<GraphQuery>,
 ) -> AppResult<Html<String>> {
     let mut urls = vec![];
+    let mut strips = Strips::default();
     let (kind_name, value, shown, item, ip_seen) = if kind == "ip" {
         let addr = canonical_ip(&value);
         let seen = st.store.ip_by_addr(&addr).await?.is_some();
@@ -212,6 +217,9 @@ async fn item(
                     sources: u.sources,
                 })
                 .collect();
+        }
+        if let Some(piece) = k.piece_kind() {
+            strips = crate::admin::chains::of_piece(&st, piece_hash(piece, &value)).await?;
         }
         let shown = k.shown(&value);
         (k.name(), value, shown, item, false)
@@ -234,6 +242,7 @@ async fn item(
         item,
         urls,
         ip_seen,
+        strips,
         kinds: LinkKind::ALL.to_vec(),
         types: gq.types(),
         depth: gq.depth(),

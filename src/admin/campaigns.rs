@@ -198,6 +198,8 @@ struct CampaignPage {
     agent: bool,
     /// The members' property strips, by address.
     props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
+    /// Every chain of its members.
+    strips: crate::admin::chains::Strips,
 }
 
 /// Wave lines on a campaign's page, at most.
@@ -293,7 +295,9 @@ async fn campaign(
     let props =
         crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
             .await?;
+    let strips = crate::admin::chains::of_campaign(&st, &key).await?;
     render(&CampaignPage {
+        strips,
         props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
@@ -506,7 +510,7 @@ mod tests {
         assert!(at("data-section=\"artifacts\"") < at("data-section=\"timeline\""));
         for want in [
             "<td class=\"path\">/drop.php</td>",
-            "href=\"/admin/traps/uploads?sha256=",
+            "href=\"/admin/evidence/links/file/",
             "<a href=\"/requests?cmd=ls%20-la\">ls -la</a></td><td class=\"num\">3</td><td class=\"num\">2</td>",
             "<a href=\"/requests?cmd=id\">id</a>",
         ] {

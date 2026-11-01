@@ -318,6 +318,7 @@ pub const ADMIN_TREE: &[NavGroup] = &[
         key: "evidence",
         label: "Evidence",
         children: &[
+            ("chains", "/admin/evidence/chains", "Chains"),
             ("campaigns", "/admin/evidence/campaigns", "Campaigns"),
             ("links", "/admin/evidence/links", "Links"),
             ("canaries", "/admin/evidence/canaries", "Canaries"),

@@ -568,6 +568,12 @@ impl UploadRow {
     pub fn hash(&self) -> String {
         data_encoding::HEXLOWER.encode(&self.sha256)
     }
+
+    /// Held, and text by its first bytes: as far as the metadata can tell,
+    /// without reading the content. [`text_for_xray`] looks at all of it.
+    pub fn held_text(&self) -> bool {
+        self.held && matches!(self.sniffed_type.as_str(), "text" | "php")
+    }
 }
 
 /// A later request to where an upload was told it landed.
@@ -592,6 +598,10 @@ pub(super) const UPLOAD_COLS: &str =
     EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256) AS held,
     (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
     FROM uploads u JOIN ips i ON i.id = u.ip_id";
+
+/// [`UploadRow::held_text`] in SQL, for a query on `uploads u`.
+pub(super) const HELD_TEXT: &str = "u.sniffed_type IN ('text', 'php')
+    AND EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256)";
 
 /// One page of uploads, newest first; with `ip`, only that address's;
 /// with `sha256`, only that content's (an equality on

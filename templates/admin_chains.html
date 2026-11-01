@@ -1,0 +1,17 @@
+{% extends "layout.html" %}
+{% block title %}peephole — chains{% endblock %}
+{% block content %}
+{% let nav = crate::admin::views::Nav::new("evidence", "chains") %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Chains</h1><p class="muted">Stagers, keys and uploaded files that belong together, newest first. Each chain is read from its sightings.</p></div></div>
+<div class="stack">
+<section class="card">
+  {% if let Some(a) = ip %}<div class="card-head"><h2>Of <a class="mono" href="/ip/{{ a }}">{{ a }}</a></h2><a href="/admin/evidence/chains">all chains</a></div>{% endif %}
+  {% if let Some(k) = campaign %}<div class="card-head"><h2>Of campaign <a class="mono" href="{{ crate::admin::views::pivot_href("campaign", k.as_str()) }}">{{ k }}</a></h2><a href="/admin/evidence/chains">all chains</a></div>{% endif %}
+  <div class="table-wrap"><table class="table"><thead><tr><th>Joiner</th><th class="num">IPs</th><th class="num">Sources</th><th class="num">Exploits</th><th>Last seen</th><th>Payload</th></tr></thead><tbody>
+  {% for c in page.items %}<tr><td class="mono break">{% if let Some((name, href)) = c.joiner %}<a href="{{ href }}">{{ name }}</a>{% else %}{{ c.key }}{% endif %}</td><td class="num">{{ crate::admin::views::thousands(c.ips) }}</td><td class="num">{{ crate::admin::views::thousands(c.sources) }}</td><td class="num">{{ crate::admin::views::thousands(c.exploits) }}</td><td class="ts">{{ crate::admin::views::minute(c.last_seen.as_str()) }}</td><td>{{ c.payload.word() }}</td></tr>{% endfor %}
+  {% if page.items.is_empty() %}<tr><td colspan="6" class="empty">No chain yet.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% include "_pagination.html" %}
+</section>
+</div>
+{% endblock %}

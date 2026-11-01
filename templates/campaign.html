@@ -15,6 +15,7 @@
 </div>
 <p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
 <div class="stack">
+{% include "_chain_strip.html" %}
 <section class="card">
   <div class="card-head"><h2>Members</h2></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>

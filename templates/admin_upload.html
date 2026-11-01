@@ -5,6 +5,7 @@
 {% let nav = crate::admin::views::Nav::new("traps", "uploads") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Upload</h1><p class="muted"><a href="/admin/traps/uploads">← Uploads</a></p></div></div>
 <div class="stack">
+{% include "_chain_strip.html" %}
 <section class="card">
   <dl class="kv">
     <dt>Time (UTC)</dt><dd class="mono">{{ u.ts }}</dd>

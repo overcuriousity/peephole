@@ -7,6 +7,7 @@
 {% if !seen() %}
 <div class="card empty">Not seen: nothing with this value is stored.{% if kind_key == "file" %} <a href="{{ crate::admin::views::uploads_by_hash_href(value.as_str()) }}">Uploads with this hash</a>{% endif %}</div>
 {% else %}
+{% include "_chain_strip.html" %}
 <div class="link-layout">
   <section class="card link-graph-card">
     <div class="card-head"><h2>Graph</h2><span class="muted" data-graph-status></span></div>

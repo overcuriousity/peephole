@@ -6,6 +6,14 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- The chain strip shows an attack in five stages (Exploit, Command, Delivery,
+  Payload, Follow-up) on the request, upload, address, campaign and piece
+  pages: the same chain from any of them, with "you are here" on a source's
+  own pieces. Each row says in words whether it was seen, is only claimed, or
+  is a gap or a dead end, and joiners get an accent edge. Exploits group by
+  attacker's tag up to its first dot, uploaded text fills Payload, and an
+  address's strip is admin only. Evidence opens on the new Chains list,
+  newest first, at `/admin/evidence/chains`.
 - Attack chains are built in the campaign pass: stagers, SSH keys and
   uploaded files form one chain only when they appear together in sources
   from at least two addresses, so one forged body fuses nothing. A file on

@@ -171,6 +171,7 @@ struct RequestPage {
     campaign: Option<(String, i64)>,
     /// Its body opened layer by layer, from the stored bytes.
     xv: crate::admin::xray::XrayView,
+    strips: crate::admin::chains::Strips,
 }
 
 async fn request_page(
@@ -233,9 +234,17 @@ async fn request_page(
         },
         Policy::embedded(),
     ));
+    let strips = crate::admin::chains::of_source(
+        &st,
+        crate::store::chains::Anchor::Request(id),
+        d.row.ip_id,
+        &d.ip,
+    )
+    .await?;
     render(&RequestPage {
         chrome: chrome(),
         xv,
+        strips,
         request_target,
         d,
         labels,
