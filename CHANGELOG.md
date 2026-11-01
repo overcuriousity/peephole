@@ -19,7 +19,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
-- The request page shows up to 64 KiB of a body (was 16 KiB).
+- The request page shows up to 64 KiB of a body (was 16 KiB). The dossier and
+  API `body_text` and `body_b64` grow to 64 KiB with it.
 
 ## [0.23.2] - 2026-11-01
 

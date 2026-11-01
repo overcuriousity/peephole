@@ -159,37 +159,6 @@
     });
   }
 
-  // Body panel: text ⇄ hex dump.
-  document.querySelectorAll("[data-hex-toggle]").forEach(function (b) {
-    var pre = document.getElementById(b.getAttribute("data-hex-toggle")), text = pre.getAttribute("data-text"), hex = null, on = false;
-    b.addEventListener("click", function () {
-      on = !on;
-      if (on && hex === null) {
-        // Decode the raw bytes from base64 so binary payloads and CR/LF show
-        // correctly; the data-text attribute is lossy UTF-8 with normalised
-        // newlines. Fall back to the text encoding if base64 is absent.
-        var bytes;
-        var b64 = pre.getAttribute("data-b64");
-        if (b64 != null) {
-          var bin = atob(b64);
-          bytes = new Uint8Array(bin.length);
-          for (var k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
-        } else {
-          bytes = new TextEncoder().encode(text);
-        }
-        var lines = [];
-        for (var i = 0; i < bytes.length; i += 16) {
-          var chunk = Array.prototype.slice.call(bytes, i, i + 16);
-          lines.push(i.toString(16).padStart(8, "0") + "  " + chunk.map(function (x) { return x.toString(16).padStart(2, "0"); }).join(" ").padEnd(48) + "  " +
-            chunk.map(function (x) { return x >= 32 && x < 127 ? String.fromCharCode(x) : "."; }).join(""));
-        }
-        hex = lines.join("\n");
-      }
-      pre.textContent = on ? hex : text;
-      b.textContent = on ? "text" : "hex";
-    });
-  });
-
   // Live scan queue over SSE.
   var qt = document.querySelector("[data-queue]");
   if (qt && window.EventSource) {

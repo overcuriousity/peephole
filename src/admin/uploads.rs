@@ -423,7 +423,17 @@ pub(crate) mod tests {
         typed_upload(&st, "b1", "a.bin", elf, true, "elf").await;
         // Text bytes under a binary type are no text either.
         typed_upload(&st, "b2", "b.bin", b"<?php echo 'MARKTXT';", true, "zip").await;
-        for uid in ["b1", "b2"] {
+        // Text by type, but a control byte keeps it out.
+        typed_upload(
+            &st,
+            "b3",
+            "c.txt",
+            b"hello MARKCTL \x01 world",
+            true,
+            "text",
+        )
+        .await;
+        for uid in ["b1", "b2", "b3"] {
             let req = Request::get(format!("/admin/traps/uploads/{uid}"))
                 .header("cookie", cookie.clone())
                 .header("sec-fetch-site", "same-origin");
@@ -431,7 +441,9 @@ pub(crate) mod tests {
             assert_eq!(status, StatusCode::OK);
             assert!(body.contains(&format!("/admin/traps/uploads/{uid}/content.zip")));
             assert!(!body.contains("id=\"xray\""), "{body}");
-            assert!(!body.contains("MARKELF") && !body.contains("MARKTXT"));
+            assert!(
+                !body.contains("MARKELF") && !body.contains("MARKTXT") && !body.contains("MARKCTL")
+            );
         }
     }
 }

@@ -448,11 +448,7 @@ pub fn xray_view(x: &Xray) -> XrayView {
                 kind: piece_kind(p.kind),
                 role: piece_role(p.role),
                 grade: piece_grade(p.grade),
-                value: if p.kind == PieceKind::Exploit {
-                    clip(p.value.clone())
-                } else {
-                    clip(defang(&p.value))
-                },
+                value: clip(defang(&p.value)),
                 link,
             });
         }

