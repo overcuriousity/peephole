@@ -6,6 +6,9 @@
 //! resolved.
 
 pub mod decode;
+pub mod shell;
+
+pub use shell::{Node, Step};
 
 /// Version of the rules below; results derived by an older version are
 /// derived again.
@@ -78,9 +81,14 @@ pub struct Opaque {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Piece {}
 
-/// Filled in by the recipe matcher.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Recipe {}
+/// What one layer's shell text does, branches kept. `normal` is the tree
+/// with hosts, URLs, file names and numbers replaced by placeholders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipe {
+    pub layer: usize,
+    pub nodes: Vec<Node>,
+    pub normal: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Xray {
@@ -117,15 +125,13 @@ impl Xray {
 }
 
 /// The limits of one source: `depth` and `layers` are fixed, `output` is
-/// what is left to decode, and `pieces` is the cap the piece extractor
-/// counts against.
+/// what is left to decode, and `pieces` is what is left for recipe steps
+/// and, later, the piece extractor.
 #[derive(Debug, Clone)]
 pub struct Budget {
     depth: usize,
     output: usize,
     layers: usize,
-    // Read by the piece extractor.
-    #[allow(dead_code)]
     pieces: usize,
 }
 
