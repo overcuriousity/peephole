@@ -35,6 +35,7 @@ pub mod target;
 pub mod uploads;
 pub mod views;
 pub mod web_quote;
+pub mod xray;
 
 use crate::config::Config;
 use crate::store::Store;

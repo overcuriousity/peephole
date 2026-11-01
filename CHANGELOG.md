@@ -3,6 +3,24 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [Unreleased]
+
+### Added
+- Body X-ray on the request page and on the page of a text upload: the
+  original bytes beside what they hide. It opens base64, gzip, percent and
+  `\x` escapes and hex layer by layer, and shows the pieces found (stagers,
+  keys, exploit tags, webshell profiles) and the shell recipe as steps with
+  branches. Hovering or focusing a highlight marks its counterpart. Private
+  keys are withheld from the text and the hex view, and addresses in pieces
+  and steps are defanged and never links. Nothing found is fetched, run or
+  resolved.
+- Text uploads are parsed statically and shown escaped on admin pages.
+  Binaries are never parsed, and the API, dossiers and export stay
+  metadata-only.
+
+### Changed
+- The request page shows up to 64 KiB of a body (was 16 KiB).
+
 ## [0.23.2] - 2026-11-01
 
 No database migration, no new setting, no protocol version bump.

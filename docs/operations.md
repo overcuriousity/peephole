@@ -526,10 +526,13 @@ unzip -P infected <sha256>.zip && sha256sum <sha256>.bin   # must print <sha256>
 ```
 
 Handle the `.bin` as live malware: open it in an isolated analysis VM, never
-on the node. Peephole never renders, inlines, unpacks or serves the content
-back, to the admin or on the trap: the zip is the only way out. The
-`/api/v1` upload endpoints and the dataset export carry upload metadata only.
-They never read the stored bytes (`upload_blobs`).
+on the node. Text uploads (`sniffed_type` `text` or `php`, and printable) are
+parsed statically and shown escaped on their admin page, as the body X-ray;
+nothing in them is run, fetched or resolved. Binaries are never parsed,
+rendered or unpacked: the zip is their only way out. Nothing is served back on
+the trap. The `/api/v1` upload endpoints, the dossiers and the dataset export
+carry upload metadata only. Only the upload store reads the stored bytes
+(`upload_blobs`).
 
 **When the bytes are not there.** If there is no button, *Content* reads
 `content not held` followed by the reason (on the list, hover over it):

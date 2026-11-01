@@ -696,6 +696,41 @@ pub async fn content_for_export(
     .await?)
 }
 
+/// Most bytes of an upload the admin's X-ray reads.
+pub const XRAY_MAX: usize = 256 * 1024;
+
+/// The held content of a text upload, for the admin page's X-ray: its
+/// `sniffed_type` is `text` or `php`, and what is read (the first
+/// [`XRAY_MAX`] bytes) is printable. Anything else, and content not held,
+/// gives `None`: binaries are never parsed. The bytes go to the page's
+/// parser and the escaped view only, never to the API, export or trap.
+pub async fn text_for_xray(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Option<Vec<u8>>> {
+    if !u.held || !matches!(u.sniffed_type.as_str(), "text" | "php") {
+        return Ok(None);
+    }
+    let content: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT substr(b.content, 1, ?) FROM uploads u JOIN upload_blobs b ON b.sha256 = u.sha256
+         WHERE u.uid = ?",
+    )
+    .bind(XRAY_MAX as i64)
+    .bind(&u.uid)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(content.filter(|c| printable(c, c.len() == XRAY_MAX)))
+}
+
+/// UTF-8 with no control bytes but tab, CR and LF. `cut` allows a character
+/// cut at the end.
+fn printable(b: &[u8], cut: bool) -> bool {
+    let valid = match std::str::from_utf8(b) {
+        Ok(_) => true,
+        Err(e) => cut && e.error_len().is_none(),
+    };
+    valid
+        && b.iter()
+            .all(|&c| c >= 0x20 && c != 0x7f || matches!(c, b'\t' | b'\r' | b'\n'))
+}
+
 /// Test fixture: a `PUT` of `content` to `path` from `ip` (a fixture
 /// address), recorded as a request and its upload. Returns the upload's uid.
 #[cfg(test)]

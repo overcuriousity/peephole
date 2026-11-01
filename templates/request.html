@@ -1,5 +1,6 @@
 {% extends "layout.html" %}
 {% block title %}peephole — request #{{ d.row.id }}{% endblock %}
+{% block head %}<script src="/assets/js/xray.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 <div class="page-head req-head"><div>
   <h1>Request #{{ d.row.id }}</h1>
@@ -44,9 +45,7 @@
     </tbody></table></div></section>{% endif %}
   <section class="card"><h2>Headers <span class="muted">in received order</span></h2>
     <dl class="kv">{% for (k, v) in d.headers %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl></section>
-  <section class="card"><div class="card-head"><h2>Body <span class="muted">{{ crate::admin::views::thousands(d.body_len) }} bytes{% if d.body_truncated %}, showing first 16 KiB{% endif %}</span></h2>
-    <button class="btn btn-sm" type="button" data-hex-toggle="body">hex</button></div>
-    <pre class="panel" id="body" data-text="{{ d.body_text }}" data-b64="{{ d.body_b64 }}">{% if d.body_text.is_empty() %}<span class="muted">(empty)</span>{% else %}{{ d.body_text }}{% endif %}</pre></section>
+  {% let xv_title = "Body" %}{% include "_xray.html" %}
 
   <div class="grid-2">
     <section class="card">

@@ -1,0 +1,26 @@
+<section class="card xray" id="xray">
+  <div class="card-head"><h2>{{ xv_title }} <span class="muted">{{ crate::admin::views::thousands(xv.total) }} bytes{% if xv.raw_cut %}, showing first 64 KiB{% endif %}</span></h2>
+    <button class="btn btn-sm" type="button" data-xray-hex aria-controls="xr-hex">hex</button></div>
+  <div class="xr-grid">
+    <div class="xr-pane">
+      <h3>Original bytes</h3>
+      <pre class="panel xr-raw" id="xr-raw">{% if xv.total == 0 %}<span class="muted">(empty)</span>{% else %}{% let segs = xv.raw %}{% include "_xray_segs.html" %}{% endif %}</pre>
+      <pre class="panel xr-hex" id="xr-hex" data-b64="{{ xv.hex_b64 }}" hidden></pre>
+      <p class="muted small">Private keys are withheld here and in the hex view.</p>
+    </div>
+    <div class="xr-pane">
+      <h3>What it means</h3>
+      {% if xv.is_plain() %}<p class="muted">No encoded layer, piece, recipe or hidden range found.</p>{% endif %}
+      {% for l in xv.layers %}
+      <div class="xr-layer xr-d{{ l.indent() }}">
+        <div class="xr-lh">{% if let Some(k) = l.link %}<span class="xr-ln xr-hl" data-l="{{ k }}" tabindex="0">L{{ l.n }}</span>{% else %}<span class="xr-ln">L{{ l.n }}</span>{% endif %}<b>{{ l.title }}</b>{% if let Some(n) = l.name %} <span class="mono">{{ n }}</span>{% endif %}<span class="muted small">{{ crate::admin::views::thousands(l.bytes) }} bytes</span></div>
+        {% if l.collapsed > 0 %}<p class="muted small">{{ l.collapsed }} padding field{% if l.collapsed != 1 %}s{% endif %} collapsed.</p>{% endif %}
+        {% if !l.segs.is_empty() %}<pre class="panel xr-text">{% let segs = l.segs %}{% include "_xray_segs.html" %}{% if l.cut %}<span class="muted"> … (cut)</span>{% endif %}</pre>{% endif %}
+        {% for o in l.opaque %}<p class="xr-opaque"><span class="xr-hl" data-l="{{ o.link }}" tabindex="0">{{ crate::admin::views::thousands(o.bytes) }} bytes</span> {{ o.why }}</p>{% endfor %}
+        {% if !l.pieces.is_empty() %}<ul class="xr-pieces">{% for p in l.pieces %}<li><span class="xr-hl" data-l="{{ p.link }}" tabindex="0"><span class="badge">{{ p.kind }}</span> <span class="mono">{{ p.value }}</span></span> <span class="muted small">{{ p.role }} · {{ p.grade }}</span></li>{% endfor %}</ul>{% endif %}
+        {% if !l.steps.is_empty() %}<ol class="xr-steps">{% for s in l.steps %}{% if s.branch %}<li class="xr-branch xr-d{{ s.indent() }}">{{ s.label }}</li>{% else %}<li class="xr-step xr-d{{ s.indent() }}"><small>{{ s.label }}</small>{% if let Some(k) = s.link %}<span class="xr-hl mono" data-l="{{ k }}" tabindex="0">{{ s.text }}</span>{% else %}<span class="mono">{{ s.text }}</span>{% endif %}</li>{% endif %}{% endfor %}</ol>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>

