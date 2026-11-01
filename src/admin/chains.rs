@@ -7,7 +7,7 @@ use crate::admin::error::{AppResult, render};
 use crate::admin::public::urlencode;
 use crate::admin::views::Chrome;
 use crate::store::browse::{Page, canonical_ip, lenient_i64, page_num};
-use crate::store::chains::{Anchor, Chain, ChainFilter, ChainRow};
+use crate::store::chains::{Anchor, Chain, ChainFilter, ChainRow, DeadEnd};
 use askama::Template;
 use axum::{
     Router,
@@ -111,7 +111,13 @@ pub struct ChainsQuery {
     /// Only the chains of this campaign's members.
     #[serde(default)]
     campaign: Option<String>,
+    /// `dead-ends`: the paths asked for after an upload, found empty.
+    #[serde(default)]
+    tab: Option<String>,
 }
+
+/// Dead ends the tab lists.
+const DEAD_END_ROWS: i64 = 200;
 
 #[derive(Template)]
 #[template(path = "admin_chains.html")]
@@ -122,6 +128,8 @@ struct ChainsPage {
     qs: String,
     ip: Option<String>,
     campaign: Option<String>,
+    /// The Dead ends tab is open, with these rows.
+    dead_ends: Option<Vec<DeadEnd>>,
 }
 
 async fn index(
@@ -133,6 +141,16 @@ async fn index(
         q.ip.filter(|s| !s.trim().is_empty())
             .map(|s| canonical_ip(&s));
     let campaign = q.campaign.filter(|s| !s.trim().is_empty());
+    if q.tab.as_deref() == Some("dead-ends") {
+        return render(&ChainsPage {
+            chrome: Chrome::new(true, "admin"),
+            page: Page::from_rows(vec![], 1),
+            qs: String::new(),
+            ip: None,
+            campaign: None,
+            dead_ends: Some(st.store.dead_ends_all(DEAD_END_ROWS).await?),
+        });
+    }
     // An address the store does not know matches no row (id 0 is never
     // used), rather than dropping the filter.
     let ip_id = match &ip {
@@ -154,6 +172,7 @@ async fn index(
         qs,
         ip,
         campaign,
+        dead_ends: None,
     })
 }
 
@@ -646,5 +665,41 @@ mod tests {
             html.find("data-section=\"chains\"") < html.find("Time (UTC)"),
             "{html}"
         );
+    }
+
+    #[tokio::test]
+    async fn dead_end_tab_lists_a_404_after_upload() {
+        let (st, cookie, app, _d) = app().await;
+        let ip_id = st.store.upsert_ip(IP.parse().unwrap()).await.unwrap().id;
+        sqlx::query(
+            "INSERT INTO uploads (uid, ts, ip_id, kind, filename, sniffed_type, size, truncated,
+               sha256, answered_path, path_is_prefix, content_state, request_uid)
+             VALUES ('u1', '2026-10-01 00:00:00', ?, 'script', 's.php', 'php', 3, 0,
+               x'00', '/uploads/s.php', 0, 'held', 'r1')",
+        )
+        .bind(ip_id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        for (path, status) in [("/x/s.php", 404), ("/found/s.php", 200)] {
+            st.store
+                .insert_request(&NewRequest {
+                    ip_id,
+                    method: "GET".into(),
+                    path: path.into(),
+                    headers_json: "[]".into(),
+                    labels_json: "[]".into(),
+                    status: Some(status),
+                    ts: Some("2026-10-01 00:00:10".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (status, html) =
+            page(&app, Some(&cookie), "/admin/evidence/chains?tab=dead-ends").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("/x/s[.]php"), "{html}");
+        assert!(!html.contains("/found/"), "{html}");
     }
 }

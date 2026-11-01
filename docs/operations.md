@@ -575,6 +575,14 @@ query or a form body), linked to every request that sent the same command.
 A path the trap answers itself (`/`, a decoy) keeps its own answer: the
 upload is recorded and told it landed, and nothing else changes there.
 
+A file sent to the WP File Manager connector
+(`.../wp-file-manager/lib/php/connector.minimal.php`) is answered at
+`/wp-content/plugins/wp-file-manager/lib/files/<name>`, where the attack tool
+looks for it; other upload scripts answer at `/uploads/<name>`. Requests that
+still found nothing (the same address, a path ending in the file's name, a
+`404`, within 60 seconds after the upload) are listed by path under
+Evidence, Chains, *Dead ends*.
+
 ## Cluster administration
 
 The installer writes a `[cluster]` section on every node (see

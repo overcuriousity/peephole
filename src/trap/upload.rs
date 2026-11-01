@@ -42,6 +42,10 @@ const SCRIPTS: [&str; 13] = [
     "/laravel-filemanager/upload",
 ];
 
+/// The WP File Manager connector, and the folder it writes uploads to.
+const FILE_MANAGER_CONNECTOR: &str = "/wp-file-manager/lib/php/connector.minimal.php";
+const FILE_MANAGER_FILES: &str = "/wp-content/plugins/wp-file-manager/lib/files";
+
 /// What kind of upload a request is (`uploads.kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -368,6 +372,11 @@ pub async fn take(
         Kind::WpPlugin => (format!("/wp-content/plugins/{}/", slug()), true),
         Kind::WpTheme => (format!("/wp-content/themes/{}/", slug()), true),
         Kind::WpMedia => (format!("/wp-content/uploads/{ym}/{}", name()), false),
+        // The file manager's tool asks for the file in the folder the
+        // connector writes to, not in `/uploads/`.
+        Kind::Script if path.ends_with(FILE_MANAGER_CONNECTOR) => {
+            (format!("{FILE_MANAGER_FILES}/{}", name()), false)
+        }
         Kind::Script => (format!("/uploads/{}", name()), false),
     };
     Some(Upload {

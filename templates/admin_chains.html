@@ -4,6 +4,16 @@
 {% let nav = crate::admin::views::Nav::new("evidence", "chains") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Chains</h1><p class="muted">Stagers, keys and uploaded files that belong together, newest first. Each chain is read from its sightings.</p></div></div>
 <div class="stack">
+<nav class="tabs"><a href="/admin/evidence/chains"{% if dead_ends.is_none() %} aria-current="page"{% endif %}>Chains</a> <a href="/admin/evidence/chains?tab=dead-ends"{% if dead_ends.is_some() %} aria-current="page"{% endif %}>Dead ends</a></nav>
+{% if let Some(rows) = dead_ends %}
+<section class="card">
+  <div class="card-head"><h2>Dead ends</h2><span class="muted">Paths the same address asked for within a minute after an upload, and got a 404. Defanged.</span></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Path</th><th class="num">Requests</th><th class="num">IPs</th><th>Last seen</th></tr></thead><tbody>
+  {% for d in rows %}<tr><td class="mono break">{{ d.shown }}</td><td class="num">{{ crate::admin::views::thousands(d.hits) }}</td><td class="num">{{ crate::admin::views::thousands(d.ips) }}</td><td class="ts">{{ crate::admin::views::minute(d.last_seen.as_str()) }}</td></tr>{% endfor %}
+  {% if rows.is_empty() %}<tr><td colspan="4" class="empty">No dead end yet.</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+{% else %}
 <section class="card">
   {% if let Some(a) = ip %}<div class="card-head"><h2>Of <a class="mono" href="/ip/{{ a }}">{{ a }}</a></h2><a href="/admin/evidence/chains">all chains</a></div>{% endif %}
   {% if let Some(k) = campaign %}<div class="card-head"><h2>Of campaign <a class="mono" href="{{ crate::admin::views::pivot_href("campaign", k.as_str()) }}">{{ k }}</a></h2><a href="/admin/evidence/chains">all chains</a></div>{% endif %}
@@ -13,5 +23,6 @@
   </tbody></table></div>
   {% include "_pagination.html" %}
 </section>
+{% endif %}
 </div>
 {% endblock %}

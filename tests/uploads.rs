@@ -744,3 +744,70 @@ async fn a_tarpitted_source_gets_the_file_manager_unchanged_by_uploads() {
     assert_eq!(answers, ["decoy:file-manager", "decoy:file-manager"]);
     assert_eq!(state.tarpit.status().held, 0);
 }
+
+const CONNECTOR: &str = "/wp-content/plugins/wp-file-manager/lib/php/connector.minimal.php";
+const LIB_FILES: &str = "/wp-content/plugins/wp-file-manager/lib/files";
+
+#[tokio::test]
+async fn file_manager_upload_lands_in_lib_files() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let (ct, b) = multipart("upload[]", "a.php", b"<?php system($_GET['c']);");
+    let r = send(&base, "POST", CONNECTOR, "203.0.113.40", Some(&ct), b).await;
+    assert_eq!(r.status(), 200);
+    let want = format!("{LIB_FILES}/a.php");
+    assert_eq!(r.text().await.unwrap(), format!("{want}\n"));
+    let up = uploads(&store).await;
+    assert_eq!(up[0].kind, "script");
+    assert_eq!(up[0].answered_path, want);
+}
+
+#[tokio::test]
+async fn other_script_uploads_stay_in_uploads() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let (ct, b) = multipart("file", "a.php", b"<?php system($_GET['c']);");
+    send(&base, "POST", "/upload.php", "203.0.113.40", Some(&ct), b).await;
+    assert_eq!(uploads(&store).await[0].answered_path, "/uploads/a.php");
+}
+
+#[tokio::test]
+async fn get_of_the_landed_file_answers_as_webshell_and_records_the_command() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let (ct, b) = multipart("upload[]", "a.php", b"<?php system($_GET['c']);");
+    send(&base, "POST", CONNECTOR, "203.0.113.40", Some(&ct), b).await;
+    let path = format!("{LIB_FILES}/a.php?cmd=id");
+    let r = send(&base, "GET", &path, "198.51.100.9", None, vec![]).await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().starts_with("uid=33(www-data)"));
+    let (answer, query): (String, Option<String>) =
+        sqlx::query_as("SELECT answer, query FROM requests WHERE method = 'GET'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(answer, "webshell");
+    assert_eq!(query.as_deref(), Some("cmd=id"));
+}
+
+#[tokio::test]
+async fn file_there_does_not_take_over_a_decoy_path() {
+    let (base, store, _dir, state) = serve(UNGATED, true).await;
+    // A file named `wp-login.php`, landing in lib/files, is not at the
+    // decoy; and a decoy path put in the table still answers as the decoy.
+    let (ct, b) = multipart("upload[]", "wp-login.php", b"<?php system($_GET['c']);");
+    send(&base, "POST", CONNECTOR, "203.0.113.40", Some(&ct), b).await;
+    state.webshells.insert("/wp-login.php", false, "stored");
+    assert_eq!(
+        answer_to(&base, &store, "/wp-login.php").await,
+        "decoy:wp-login"
+    );
+}
+
+#[tokio::test]
+async fn path_traversal_in_the_file_name_stays_inside() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let (ct, b) = multipart("upload[]", "../../../x/evil.php", b"<?php 1;");
+    send(&base, "POST", CONNECTOR, "203.0.113.40", Some(&ct), b).await;
+    assert_eq!(
+        uploads(&store).await[0].answered_path,
+        format!("{LIB_FILES}/evil.php")
+    );
+}
