@@ -5,6 +5,7 @@
 //! (a work queue over an arena), and nothing found is fetched, executed or
 //! resolved.
 
+pub mod container;
 pub mod decode;
 pub mod shell;
 
@@ -40,7 +41,6 @@ pub enum LayerKind {
     Raw,
     Query,
     Form,
-    Multipart,
     MultipartField,
     Json,
     Xml,
@@ -60,6 +60,11 @@ pub struct Layer {
     pub parent: Option<usize>,
     pub from: Option<Span>,
     pub text: Vec<u8>,
+    /// Field or file name this layer's text came from (multipart, form,
+    /// query).
+    pub name: Option<Vec<u8>>,
+    /// Sibling fields folded into this one as random padding.
+    pub collapsed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +81,12 @@ pub struct Opaque {
     pub at: Span,
     pub reason: OpaqueReason,
 }
+
+/// What the parser is told. Defined properly with the rules.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {}
+
+pub use container::{Source, parse};
 
 /// Filled in by the piece extractor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,6 +107,9 @@ pub struct Xray {
     pub pieces: Vec<Piece>,
     pub opaque: Vec<Opaque>,
     pub recipes: Vec<Recipe>,
+    /// The body is read as PHP as a whole (PHP-CGI option injection); the
+    /// body layer is not copied.
+    pub php_body: bool,
 }
 
 impl Xray {
@@ -107,6 +121,8 @@ impl Xray {
                 parent: None,
                 from: None,
                 text: body.to_vec(),
+                name: None,
+                collapsed: 0,
             }],
             ..Xray::default()
         }
@@ -133,6 +149,11 @@ pub struct Budget {
     output: usize,
     layers: usize,
     pieces: usize,
+    /// Hash of every layer's text -> its index, so text that is already
+    /// open is not opened again.
+    seen: std::collections::HashMap<u64, usize>,
+    /// Off for a layer that is kept under a second name.
+    dedupe: bool,
 }
 
 impl Default for Budget {
@@ -142,6 +163,8 @@ impl Default for Budget {
             output: MAX_OUTPUT,
             layers: MAX_LAYERS,
             pieces: MAX_PIECES,
+            seen: std::collections::HashMap::new(),
+            dedupe: true,
         }
     }
 }
