@@ -47,6 +47,7 @@ CREATE TABLE chain_pieces (
   chain TEXT NOT NULL REFERENCES chains(key) ON DELETE CASCADE,
   piece INTEGER NOT NULL, PRIMARY KEY (chain, piece)
 ) WITHOUT ROWID;
+CREATE INDEX idx_chain_pieces_piece ON chain_pieces(piece);
 
 CREATE TABLE piece_results (                 -- written by an admin, node-local
   piece INTEGER NOT NULL, id INTEGER NOT NULL, sha256 TEXT, family TEXT,

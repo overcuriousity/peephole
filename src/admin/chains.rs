@@ -169,6 +169,9 @@ mod tests {
     const IP: &str = "203.0.113.70";
     const OTHER: &str = "203.0.113.71";
     const LINK: &str = "chain-card";
+    /// What the public address page has before its first card, as it did
+    /// before the strip's line in `_target.html`.
+    const GAP_BEFORE_TARGET: &str = "\n  \n\n";
 
     async fn request(st: &AdminState, ip: &str, path: &str) -> (i64, i64) {
         let ip_id = st.store.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
@@ -383,6 +386,29 @@ mod tests {
         let (_, admin) = page(&app, Some(&cookie), &format!("/ip/{IP}")).await;
         assert!(admin.contains("Attack chain"), "{admin}");
         assert!(admin.contains("a[.]example[.]org"), "{admin}");
+    }
+
+    /// `_target.html`'s strip line leaves nothing behind on the public page.
+    #[tokio::test]
+    async fn the_public_page_gains_no_blank_line() {
+        let (st, _cookie, app, _d) = app().await;
+        let (id, ip) = request(&st, IP, "/a").await;
+        let t = "2026-10-01 00:00:00";
+        sight(
+            &st,
+            ("stager", "a.example.org", "stager", "claimed"),
+            id,
+            ip,
+            t,
+        )
+        .await;
+        pass(&st).await;
+        let (_, public) = page(&app, None, &format!("/ip/{IP}")).await;
+        assert!(!public.contains("chain"), "{public}");
+        let open = "<div class=\"stack\">";
+        let after = &public[public.find(open).expect("the target") + open.len()..];
+        let gap = &after[..after.find('<').unwrap()];
+        assert_eq!(gap, GAP_BEFORE_TARGET);
     }
 
     #[tokio::test]

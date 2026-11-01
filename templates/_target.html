@@ -1,5 +1,5 @@
 {# Everything the dataset holds on one address (admin::target): the IP page and the lookup result both render it. #}
-{% if let Some(strips) = t.chains %}{% include "_chain_strip.html" %}{% endif %}
+{% if let Some(strips) = t.chains %}{% include "_chain_strip.html" %}{% endif -%}
 {% if !t.intel.is_empty() %}
 <section class="card" id="intel" data-section="intel">
   <div class="card-head"><h2>Intelligence</h2>{% if t.admin.is_some() %}<a href="/admin/investigate/lookup?ip={{ t.ov.ip.ip }}">look up now →</a>{% endif %}</div>

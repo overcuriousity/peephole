@@ -11,7 +11,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   pages: the same chain from any of them, with "you are here" on a source's
   own pieces. Each row says in words whether it was seen, is only claimed, or
   is a gap or a dead end, and joiners get an accent edge. Exploits group by
-  attacker's tag up to its first dot, uploaded text fills Payload, and an
+  attacker's tag up to its first dot, uploaded text fills Payload, follow-ups
+  are read through the X-ray to the command a webshell received, and an
   address's strip is admin only. Evidence opens on the new Chains list,
   newest first, at `/admin/evidence/chains`.
 - Attack chains are built in the campaign pass: stagers, SSH keys and
@@ -41,6 +42,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
+- The X-ray calls its query layer "Query".
 - The request page shows up to 64 KiB of a body (was 16 KiB). The dossier and
   API `body_text` and `body_b64` grow to 64 KiB with it.
 

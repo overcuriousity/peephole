@@ -25,6 +25,7 @@
       </div>
       {% endfor %}
     </div>
+    {% if ch.more > 0 %}<p class="muted small">{{ crate::admin::views::thousands(ch.more) }} more piece{% if ch.more != 1 %}s{% endif %} not shown.</p>{% endif %}
   </details>
   {% endfor %}
   {% if let Some(rest) = strips.rest %}<p><a href="{{ rest }}">More chains →</a></p>{% endif %}

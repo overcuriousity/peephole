@@ -672,22 +672,45 @@ pub async fn get(conn: &mut SqliteConnection, uid: &str) -> Result<Option<Upload
 /// in the path is no wildcard (A2). Requests in the upload's own second
 /// count if they came after its request.
 pub async fn timeline(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Vec<TimelineRow>> {
-    Ok(sqlx::query_as(
-        "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+    timelines(conn, std::slice::from_ref(u)).await
+}
+
+/// [`timeline`] of each upload in one statement, oldest first, each with
+/// its own [`TIMELINE_MAX`], so one upload's noise cannot crowd out
+/// another's. A request two uploads share comes twice.
+pub async fn timelines(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<Vec<TimelineRow>> {
+    if uploads.is_empty() {
+        return Ok(vec![]);
+    }
+    let one = "SELECT * FROM (
+         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
          FROM requests r JOIN ips i ON i.id = r.ip_id
-         WHERE r.origin IS ?1 AND r.path >= ?2
-           AND (r.path = ?2 OR (?3 AND substr(r.path, 1, length(?2)) = ?2))
-           AND (r.ts > ?4 OR (r.ts = ?4 AND r.id > ?5))
-         ORDER BY r.ts, r.id LIMIT ?6",
-    )
-    .bind(&u.origin)
-    .bind(&u.answered_path)
-    .bind(u.path_is_prefix)
-    .bind(&u.ts)
-    .bind(u.request_id.unwrap_or(i64::MAX))
-    .bind(TIMELINE_MAX)
-    .fetch_all(&mut *conn)
-    .await?)
+         WHERE r.origin IS ? AND r.path >= ?
+           AND (r.path = ? OR (? AND substr(r.path, 1, length(?)) = ?))
+           AND (r.ts > ? OR (r.ts = ? AND r.id > ?))
+         ORDER BY r.ts, r.id LIMIT ?)";
+    let sql = format!(
+        "{} ORDER BY ts, id",
+        vec![one; uploads.len()].join(" UNION ALL ")
+    );
+    let mut q = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+    for u in uploads {
+        q = q
+            .bind(&u.origin)
+            .bind(&u.answered_path)
+            .bind(&u.answered_path)
+            .bind(u.path_is_prefix)
+            .bind(&u.answered_path)
+            .bind(&u.answered_path)
+            .bind(&u.ts)
+            .bind(&u.ts)
+            .bind(u.request_id.unwrap_or(i64::MAX))
+            .bind(TIMELINE_MAX);
+    }
+    Ok(q.fetch_all(&mut *conn).await?)
 }
 
 /// An upload's held content, with its SHA-256, for the admin's encrypted

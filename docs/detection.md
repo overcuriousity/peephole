@@ -426,7 +426,7 @@ this node:
 | Command | Shell recipes and webshell profiles. |
 | Delivery | Stagers, SSH keys and uploaded files. A URL a command only queried never appears. |
 | Payload | Uploaded text, held here and text by its first bytes, as seen. Otherwise a gap: the node never fetches a stager. |
-| Follow-up | What was sent to an uploaded file, tied through the file and never through the address, and dead ends: a 404 for the file's name from the uploader within 60 seconds. With no upload, a gap: the commands never ran here. |
+| Follow-up | What was sent to an uploaded file, tied through the file and never through the address, read through the X-ray: the command that reached the shell's own input when its profile names one, else the recipe. A request holding a private key shows only its recipe, and a request that carried an upload is read without its body. Also dead ends: a 404 for the file's name from the uploader within 60 seconds. With no upload, a gap: the commands never ran here. |
 
 Every row says in words how far it is confirmed, as well as by its border:
 solid for seen, dashed for claimed (attacker's text; a tag is a hint, never a
@@ -435,8 +435,9 @@ a dead end. An accent edge marks a joiner, a piece that ties the chain
 together. A request or upload with no joiner in a chain gets a chain of its
 own pieces, without a key, and links to the chains its address is in. A
 source with nothing a strip shows has no strip. A chain reads its newest 64
-uploads, and a page draws at most 5 strips (32 on a campaign's) with a link
-to the rest.
+uploads, the timelines of the newest 8, and the first 32 follow-ups through
+the X-ray, and shows 200 pieces, joiners first; what is past a cap is counted.
+A page draws at most 5 strips (32 on a campaign's) with a link to the rest.
 
 A campaign's page lists every edge. A soft edge's row opens to the score
 and the threshold it met, the order agreement (−1 to 1), the shared
