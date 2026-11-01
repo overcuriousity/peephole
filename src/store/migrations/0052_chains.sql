@@ -14,6 +14,8 @@ CREATE TABLE pieces (
   ips INTEGER NOT NULL, sources INTEGER NOT NULL
 ) WITHOUT ROWID;
 
+CREATE INDEX idx_pieces_kind_value ON pieces(kind, value);
+
 CREATE TABLE piece_sightings (
   piece INTEGER NOT NULL, source_kind TEXT NOT NULL,   -- 'request' | 'upload'
   source_id INTEGER NOT NULL, ip_id INTEGER NOT NULL,
@@ -53,15 +55,40 @@ CREATE TABLE piece_results (                 -- written by an admin, node-local
 ) WITHOUT ROWID;
 
 -- Every deletion path (admin delete, address delete, retention, a
--- tombstone from the cluster) removes the row, so the row's sightings and
--- URLs go with it here.
+-- tombstone from the cluster) removes the row, so what only that row
+-- sighted goes with it at once: its sightings, the pieces nothing else
+-- sights (unless an operator entered results for them), and the URLs
+-- nothing else named. Counts of what stays follow in
+-- `store::pieces::refresh_counts`.
 CREATE TRIGGER requests_del_sightings AFTER DELETE ON requests BEGIN
-  DELETE FROM piece_sightings WHERE source_kind = 'request' AND source_id = OLD.id;
+  DELETE FROM piece_urls WHERE (piece, url) IN
+    (SELECT piece, url FROM piece_url_sources
+     WHERE source_kind = 'request' AND source_id = OLD.id)
+    AND NOT EXISTS (SELECT 1 FROM piece_url_sources o
+      WHERE o.piece = piece_urls.piece AND o.url = piece_urls.url
+        AND NOT (o.source_kind = 'request' AND o.source_id = OLD.id));
   DELETE FROM piece_url_sources WHERE source_kind = 'request' AND source_id = OLD.id;
+  DELETE FROM pieces WHERE hash IN
+    (SELECT piece FROM piece_sightings WHERE source_kind = 'request' AND source_id = OLD.id)
+    AND NOT EXISTS (SELECT 1 FROM piece_sightings o WHERE o.piece = pieces.hash
+      AND NOT (o.source_kind = 'request' AND o.source_id = OLD.id))
+    AND NOT EXISTS (SELECT 1 FROM piece_results r WHERE r.piece = pieces.hash);
+  DELETE FROM piece_sightings WHERE source_kind = 'request' AND source_id = OLD.id;
 END;
 CREATE TRIGGER uploads_del_sightings AFTER DELETE ON uploads BEGIN
-  DELETE FROM piece_sightings WHERE source_kind = 'upload' AND source_id = OLD.id;
+  DELETE FROM piece_urls WHERE (piece, url) IN
+    (SELECT piece, url FROM piece_url_sources
+     WHERE source_kind = 'upload' AND source_id = OLD.id)
+    AND NOT EXISTS (SELECT 1 FROM piece_url_sources o
+      WHERE o.piece = piece_urls.piece AND o.url = piece_urls.url
+        AND NOT (o.source_kind = 'upload' AND o.source_id = OLD.id));
   DELETE FROM piece_url_sources WHERE source_kind = 'upload' AND source_id = OLD.id;
+  DELETE FROM pieces WHERE hash IN
+    (SELECT piece FROM piece_sightings WHERE source_kind = 'upload' AND source_id = OLD.id)
+    AND NOT EXISTS (SELECT 1 FROM piece_sightings o WHERE o.piece = pieces.hash
+      AND NOT (o.source_kind = 'upload' AND o.source_id = OLD.id))
+    AND NOT EXISTS (SELECT 1 FROM piece_results r WHERE r.piece = pieces.hash);
+  DELETE FROM piece_sightings WHERE source_kind = 'upload' AND source_id = OLD.id;
 END;
 CREATE TRIGGER ips_del_sightings AFTER DELETE ON ips BEGIN
   DELETE FROM piece_sightings WHERE ip_id = OLD.id;
