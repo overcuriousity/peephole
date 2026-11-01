@@ -94,6 +94,7 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
         settle(&mut xray, before, &mut budget);
     }
 
+    xray.php_body = body_is_php;
     let mut i = 0;
     while i < xray.layers.len() {
         let before = xray.layers.len();
@@ -106,9 +107,9 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
         } else {
             read_layer(&mut xray, i, &mut budget);
             settle(&mut xray, before, &mut budget);
-            // Parts that were cut out of layer 0 were scanned as layers;
-            // scanning the whole again would open them twice.
-            if i == 0 && xray.layers.len() == before {
+            // Text already open is not opened twice, so the whole of layer
+            // 0 is scanned too: what sits outside the parts is not missed.
+            if i == 0 {
                 decode::decode_all(&mut xray, 0, &mut budget);
             }
         }
@@ -175,13 +176,29 @@ fn add(
         }
         return None;
     }
+    // Decoded text that is also what `eval` runs is PHP, wherever it is.
+    if kind == LayerKind::Php
+        && let Some(l) = xray.layers.iter_mut().find(|l| {
+            l.text == bytes
+                && matches!(
+                    l.kind,
+                    LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                )
+        })
+    {
+        l.kind = LayerKind::Php;
+        return None;
+    }
     let before = xray.layers.len();
     let at = from.unwrap_or(Span {
         layer: parent,
         start: 0,
         end: xray.layers[parent].text.len(),
     });
+    // A layer kept under its own name is opened even if the text is open.
+    budget.dedupe = name.is_none();
     decode::open(xray, parent, kind, at, bytes, budget, &mut VecDeque::new());
+    budget.dedupe = true;
     if xray.layers.len() == before {
         return None;
     }
@@ -1064,11 +1081,41 @@ mod tests {
         );
         assert!(x.layers.iter().any(|l| l.kind == LayerKind::PhpCgi));
         // The body is read as PHP in place, not copied.
+        assert!(x.php_body);
         assert!(find_layer(&x, LayerKind::Php, b"echo \"hi\";").is_some());
         assert_eq!(
             x.layers.iter().filter(|l| l.kind == LayerKind::Php).count(),
             1
         );
+    }
+
+    #[test]
+    fn php_body_is_marked_without_a_call() {
+        let x = request(
+            Some("%ADd+auto_prepend_file%3dphp://input"),
+            Some(b"system('id');"),
+        );
+        assert!(x.php_body);
+        assert_eq!(x.layers[0].text, b"system('id');");
+        assert!(!request(None, Some(b"system('id');")).php_body);
+    }
+
+    #[test]
+    fn base64_outside_a_php_block_opens() {
+        let blob = data_encoding::BASE64.encode(b"Some hidden payload here");
+        let body = format!("junk {blob} <?php echo 1; ?>");
+        let x = request(None, Some(body.as_bytes()));
+        assert!(has_text(&x, b"Some hidden payload here"));
+    }
+
+    #[test]
+    fn multipart_preamble_is_decoded() {
+        let blob = data_encoding::BASE64.encode(b"Some hidden payload here");
+        let body = format!(
+            "preamble {blob}\r\n--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b--\r\n"
+        );
+        let x = request(None, Some(body.as_bytes()));
+        assert!(has_text(&x, b"Some hidden payload here"));
     }
 
     #[test]

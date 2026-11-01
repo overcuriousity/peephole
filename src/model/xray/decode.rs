@@ -145,6 +145,13 @@ pub(super) fn push_opaque(xray: &mut Xray, at: Span, reason: OpaqueReason) {
 }
 
 /// Add `bytes` as a child of `parent`, if the limits allow.
+fn text_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 pub(super) fn open(
     xray: &mut Xray,
     parent: usize,
@@ -154,6 +161,15 @@ pub(super) fn open(
     budget: &mut Budget,
     queue: &mut VecDeque<usize>,
 ) {
+    let hash = text_hash(&bytes);
+    if budget.dedupe
+        && budget
+            .seen
+            .get(&hash)
+            .is_some_and(|&i| xray.layers.get(i).is_some_and(|l| l.text == bytes))
+    {
+        return;
+    }
     if xray.depth(parent) + 1 > budget.depth {
         return push_opaque(xray, at, OpaqueReason::TooDeep);
     }
@@ -161,6 +177,7 @@ pub(super) fn open(
         return push_opaque(xray, at, OpaqueReason::OverLimit);
     }
     budget.output -= bytes.len();
+    budget.seen.entry(hash).or_insert(xray.layers.len());
     xray.layers.push(Layer {
         kind,
         parent: Some(parent),
@@ -789,10 +806,11 @@ mod tests {
     #[test]
     fn many_candidates_stay_fast() {
         // A megabyte of short tokens: linear, and it stops once full.
-        let token = b64(b"echo tick tock");
         let mut body = Vec::new();
+        let mut n = 0u32;
         while body.len() < 1 << 20 {
-            body.extend_from_slice(&token);
+            n += 1;
+            body.extend_from_slice(&b64(format!("echo tick tock {n}").as_bytes()));
             body.push(b' ');
         }
         let x = run(&body);

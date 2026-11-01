@@ -99,6 +99,9 @@ pub struct Xray {
     pub pieces: Vec<Piece>,
     pub opaque: Vec<Opaque>,
     pub recipes: Vec<Recipe>,
+    /// The body is read as PHP as a whole (PHP-CGI option injection); the
+    /// body layer is not copied.
+    pub php_body: bool,
 }
 
 impl Xray {
@@ -140,6 +143,11 @@ pub struct Budget {
     // Read by the piece extractor.
     #[allow(dead_code)]
     pieces: usize,
+    /// Hash of every layer's text -> its index, so text that is already
+    /// open is not opened again.
+    seen: std::collections::HashMap<u64, usize>,
+    /// Off for a layer that is kept under a second name.
+    dedupe: bool,
 }
 
 impl Default for Budget {
@@ -149,6 +157,8 @@ impl Default for Budget {
             output: MAX_OUTPUT,
             layers: MAX_LAYERS,
             pieces: MAX_PIECES,
+            seen: std::collections::HashMap::new(),
+            dedupe: true,
         }
     }
 }
