@@ -267,6 +267,7 @@ fn span_text(x: &Xray, s: Span) -> String {
 fn layer_title(kind: LayerKind) -> &'static str {
     match kind {
         LayerKind::Raw => "Body",
+        LayerKind::Path => "Request path",
         LayerKind::Query => "Query string",
         LayerKind::Form => "Form field",
         LayerKind::MultipartField => "Multipart field",

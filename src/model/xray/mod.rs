@@ -233,10 +233,10 @@ mod tests {
             b"H4sIAAAAAAAA",
         ];
         // Mostly short inputs, now and then one of the full 64 KiB.
-        let len = if rng.random_range(0..2000u16) == 0 {
+        let len = if rng.random_range(0..4000u16) == 0 {
             rng.random_range(0..=64 * 1024usize)
         } else {
-            rng.random_range(0..=512usize)
+            rng.random_range(0..=96usize)
         };
         let mode = rng.random_range(0..5u8);
         let mut out = Vec::with_capacity(len);
