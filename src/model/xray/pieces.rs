@@ -67,7 +67,7 @@ static PHP_EXEC: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PHP_FETCH: LazyLock<Regex> = LazyLock::new(|| {
     regex(&format!(
-        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|fopen|copy)\s*\("
+        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|copy)\s*\("
     ))
 });
 static PHP_WRITE: LazyLock<Regex> = LazyLock::new(|| {
@@ -75,10 +75,22 @@ static PHP_WRITE: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?is-u){FUNCTION}(?:file_put_contents\s*\(|fopen\s*\([^;]*?,\s*['"][waxc])|\bCURLOPT_FILE\b"#
     ))
 });
+/// `fopen` and what it opens first: a quote, or a variable.
+static PHP_FOPEN: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"(?i-u){FUNCTION}fopen\s*\(\s*(?:['"]\s*(?:https?|ftps?|sftp|tftp|scp)://|\$([A-Za-z0-9_]+))"#
+    ))
+});
 /// A fetch inside `eval` or `assert`: what it fetches is run.
 static PHP_FETCH_RUN: LazyLock<Regex> = LazyLock::new(|| {
     regex(&format!(
         r"(?is-u){FUNCTION}(?:eval|assert)\s*\([^;]*?(?:file_get_contents|curl_exec|stream_get_contents)\s*\("
+    ))
+});
+/// The cURL option that names the URL.
+static PHP_CURL_URL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?is-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*"
     ))
 });
 /// The variable `copy` reads.
@@ -806,6 +818,52 @@ fn trimmed(url: &[u8]) -> &[u8] {
     url
 }
 
+/// Whether the PHP fetches something: `fopen` only when it opens a URL, or
+/// a variable that holds one, as a file manager opens its own files.
+fn php_fetches(text: &[u8]) -> bool {
+    if PHP_FETCH.is_match(text) {
+        return true;
+    }
+    PHP_FOPEN.captures_iter(text).any(|c| match c.get(1) {
+        None => true,
+        Some(var) => {
+            let pattern = format!(
+                r#"(?-u)\${}\s*=\s*['"]\s*(?:https?|ftps?|sftp|tftp|scp)://"#,
+                regex::escape(&String::from_utf8_lossy(var.as_bytes()))
+            );
+            Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
+        }
+    })
+}
+
+/// Whether the layer hands the variable or constant `name` to a fetch.
+fn fetched_by_name(text: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let name = regex::escape(&String::from_utf8_lossy(name));
+    let arg = format!(r"(?:\$this\s*->\s*|\$)?{name}\b");
+    let call = format!(
+        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|fopen|copy)\s*\(\s*{arg}|(?i-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*{arg}"
+    );
+    Regex::new(&call).is_ok_and(|r| r.is_match(text))
+}
+
+/// `define('NAME', '…')`: the constant, when the literal at `start` is its value.
+fn defined_name(text: &[u8], start: usize) -> Option<&[u8]> {
+    static DEFINE: LazyLock<Regex> = LazyLock::new(|| {
+        regex(&format!(
+            r#"(?i-u){FUNCTION}define\s*\(\s*['"]([A-Za-z0-9_]+)['"]\s*,\s*$"#
+        ))
+    });
+    let to = start - 1;
+    let from = to.saturating_sub(MAX_STATEMENT);
+    DEFINE
+        .captures(&text[from..to])
+        .and_then(|c| c.get(1))
+        .map(|m| &text[from + m.start()..from + m.end()])
+}
+
 /// How URLs become pieces.
 struct Urls<'a> {
     policy: &'a Policy,
@@ -892,8 +950,7 @@ impl Urls<'_> {
     /// a shared script's credit link would tie all its users together.
     fn php_saved(&self, xray: &Xray, layer: usize, found: &mut Found) {
         let text = &xray.layers[layer].text;
-        let keeps =
-            PHP_FETCH_RUN.is_match(text) || (PHP_FETCH.is_match(text) && PHP_WRITE.is_match(text));
+        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
         let copied: HashSet<&[u8]> = PHP_COPY_VAR
             .captures_iter(text)
             .filter_map(|c| c.get(1))
@@ -908,8 +965,14 @@ impl Urls<'_> {
             }
             let promoted = match literal_use(text, start) {
                 Literal::Kept => true,
-                Literal::Argument => keeps,
-                Literal::Assigned(name) => keeps || copied.contains(name),
+                Literal::Argument => match defined_name(text, start) {
+                    Some(name) => keeps && fetched_by_name(text, name),
+                    None => keeps,
+                },
+                // A literal only assigned is a fetch's when the fetch uses it.
+                Literal::Assigned(name) => {
+                    copied.contains(name) || (keeps && fetched_by_name(text, name))
+                }
                 Literal::Other => false,
             };
             let at = Span { layer, start, end };
@@ -1356,12 +1419,49 @@ mod tests {
         for php in [
             "drop('https://example.org/x');",
             "drop('a', 'https://example.org/x');",
-            "$u = 'https://example.org/x';",
-            "$this->u = 'https://example.org/x';",
-            "$a['u'] = 'https://example.org/x';",
+            "$u = 'https://example.org/x'; curl_init($u);",
+            "$this->u = 'https://example.org/x'; file_get_contents($this->u);",
+            "define('SRC', 'https://example.org/x'); copy(SRC, 'a');",
         ] {
             assert_eq!(shared_script(php), Role::Stager, "{php}");
         }
+    }
+
+    #[test]
+    fn a_literal_no_fetch_uses_is_not_a_stager() {
+        for php in [
+            "$update_url = 'https://example.org/x';",
+            "$u = 'https://example.org/x'; $v = 1; file_get_contents($v);",
+            "$a['u'] = 'https://example.org/x';",
+            "define('UPDATE_URL', 'https://example.org/x');",
+            "define('UPDATE_URL', 'https://example.org/x'); echo UPDATE_URL;",
+        ] {
+            assert_eq!(shared_script(php), Role::Queried, "{php}");
+        }
+    }
+
+    #[test]
+    fn a_stored_url_that_is_fetched_and_written_is_a_stager() {
+        let x = post(
+            "<?php $u='https://example.org/x'; file_put_contents('x',file_get_contents($u)); ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
+        let x = post("<?php $update_url='https://example.org/x'; file_put_contents('x', 'y'); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    #[test]
+    fn opening_a_local_file_is_no_fetch() {
+        let x = post(
+            "<?php $h = fopen($path, 'w'); fwrite($h, $d); echo 'https://example.org/'; \
+             $c = 'https://example.org/'; ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+        let x = post(
+            "<?php $u = 'https://example.org/x'; $f = fopen($u, 'r'); \
+             file_put_contents('a', fread($f, 9)); ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
     }
 
     #[test]

