@@ -569,6 +569,8 @@ the trap replies with a canned answer to a few commands, otherwise an empty
 `200`, and never runs or reads the uploaded file. Each request opens on its
 own page; a `webshell` request shows the command line it sent (from the
 query or a form body), linked to every request that sent the same command.
+A path the trap answers itself (`/`, a decoy) keeps its own answer: the
+upload is recorded and told it landed, and nothing else changes there.
 
 ## Cluster administration
 

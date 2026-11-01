@@ -985,8 +985,14 @@ async fn trap(
         return decoy_response(d);
     }
     // A request to where a file was told it landed: the webshell's answer,
-    // from the command alone, never from what the upload carried.
+    // from the command alone, never from what the upload carried. Only on a
+    // path the trap has no answer of its own for: one `PUT /` or `PUT /.env`
+    // must not blank the landing page or a decoy for everyone after it.
+    // Checked here, not at the upload: stored uploads load back on start.
     if state.uploads.read_or_recover().enabled
+        && path != "/"
+        && ai.is_none()
+        && decoy::choose(method, path, parts.uri.query(), presented, word).is_none()
         && let Some(uid) = state.webshells.lookup(path)
     {
         let form = (body.whole()
