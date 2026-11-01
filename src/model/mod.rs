@@ -3,6 +3,7 @@
 //! retry schedule and the decoys' fixed tables. No I/O, and nothing here
 //! uses `admin`, `scan` or `trap`, so `store` can use it without them.
 pub mod ai_id;
+pub mod defang;
 pub mod facts;
 pub mod hostkeys;
 pub mod ja4h;

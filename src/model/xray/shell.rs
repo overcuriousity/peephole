@@ -1490,9 +1490,6 @@ fn render(nodes: &[Node], separator: &str, out: &mut String) {
 /// `sh -c`, `eval` and heredocs to a shell. So call this on the layers around
 /// them only, not on `Shell` layers. A layer that fetches, runs or writes
 /// nothing is no recipe, and costs no steps.
-// Nothing outside the tests calls this until the piece extractor does; the
-// allow also keeps what it uses alive.
-#[allow(dead_code)]
 pub(crate) fn read_recipes(xray: &mut Xray, layer: usize, budget: &mut Budget) {
     let mut queue = VecDeque::from([layer]);
     let mut run_output = Vec::new();

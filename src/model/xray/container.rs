@@ -10,12 +10,13 @@ use std::collections::VecDeque;
 use std::sync::LazyLock;
 
 use regex::bytes::Regex;
+use serde::de::IgnoredAny;
 use serde_json::Value;
 
-use super::{Budget, Layer, LayerKind, OpaqueReason, Policy, Span, Xray, decode};
+use super::{Budget, Layer, LayerKind, OpaqueReason, Policy, Span, Xray, decode, pieces, shell};
 
-/// Where the text comes from. `method`, `path` and `sender` are not read
-/// here; the rules above use them.
+/// Where the text comes from. `method`, `path` and `sender` are read by the
+/// piece extractor only.
 pub enum Source<'a> {
     Request {
         method: &'a str,
@@ -65,9 +66,16 @@ static CHR_RUN: LazyLock<Regex> = LazyLock::new(|| {
 static CHR_ONE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i-u)chr\s*\(\s*(0x[0-9a-f]{1,2}|[0-9]{1,3})").expect("static regex")
 });
+/// A word shell text would hold. `x.sh` and `ssh` are not `sh`.
+static SHELL_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?-u)(?:^|[^A-Za-z0-9_.-])(?:wget|curl|tftp|ftpget|scp|busybox|sh|bash|ash|chmod|eval|python[23]?|perl)(?:[^A-Za-z0-9_-]|$)",
+    )
+    .expect("static regex")
+});
 
 /// Parse `source` into its layers.
-pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
+pub fn parse(source: Source<'_>, policy: &Policy) -> Xray {
     let (body, query, name) = match source {
         Source::Request { query, body, .. } => (body.unwrap_or(&[]), query, None),
         Source::Upload { name, text, .. } => (text, None, name),
@@ -104,6 +112,7 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
             decode::decode_all(&mut xray, 0, &mut budget);
             let text = xray.layers[0].text.clone();
             php_calls(&mut xray, 0, &text, &mut budget);
+            settle(&mut xray, before, &mut budget);
         } else {
             read_layer(&mut xray, i, &mut budget);
             settle(&mut xray, before, &mut budget);
@@ -115,7 +124,36 @@ pub fn parse(source: Source<'_>, _policy: &Policy) -> Xray {
         }
         i += 1;
     }
+    read_shell(&mut xray, &mut budget);
+    pieces::extract(&mut xray, &source, policy, &mut budget);
     xray
+}
+
+/// Read the recipes. Every `Shell` layer open by now holds the text of a PHP
+/// shell function. The ones the shell reader opens come after them, and it
+/// reads those itself. Other text is read only with a word of shell in it,
+/// so prose costs no steps and no false limit. A container is read through
+/// its parts: as one text, its syntax only gives false steps.
+fn read_shell(xray: &mut Xray, budget: &mut Budget) {
+    let mut container = vec![false; xray.layers.len()];
+    for layer in &xray.layers {
+        let Some(parent) = layer.parent else { continue };
+        container[parent] |= match layer.kind {
+            LayerKind::Form | LayerKind::MultipartField | LayerKind::Xml => true,
+            // `[ "$a" = x ] && …` opens like JSON and has strings too.
+            LayerKind::Json => {
+                !container[parent]
+                    && serde_json::from_slice::<IgnoredAny>(&xray.layers[parent].text).is_ok()
+            }
+            _ => false,
+        };
+    }
+    for (at, container) in container.into_iter().enumerate() {
+        let layer = &xray.layers[at];
+        if layer.kind == LayerKind::Shell || (!container && SHELL_WORD.is_match(&layer.text)) {
+            shell::read_recipes(xray, at, budget);
+        }
+    }
 }
 
 /// Run the decoders over the layers added since `from`.
@@ -210,8 +248,8 @@ fn add(
 }
 
 /// A named piece of a container.
-struct Field {
-    name: Vec<u8>,
+pub(super) struct Field {
+    pub(super) name: Vec<u8>,
     value: Vec<u8>,
     span: Span,
 }
@@ -240,7 +278,7 @@ fn pct_decode(bytes: &[u8], plus: bool) -> Vec<u8> {
 }
 
 /// `k=v&k=v` as fields, decoded; `layer` is the text's layer.
-fn form_fields(text: &[u8], layer: usize) -> Vec<Field> {
+pub(super) fn form_fields(text: &[u8], layer: usize) -> Vec<Field> {
     let mut fields = Vec::new();
     let mut start = 0;
     for part in text.split(|&b| b == b'&') {
@@ -816,8 +854,11 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
                     kind = Some(LayerKind::Php);
                     break;
                 }
-                // The shell functions' text is read by the shell reader; any
-                // other call ends the chain.
+                "system" | "shell_exec" | "exec" | "passthru" | "popen" | "proc_open" => {
+                    kind = Some(LayerKind::Shell);
+                    break;
+                }
+                // Any other call ends the chain.
                 _ => break,
             };
             let Some((next, k)) = step else {
@@ -934,7 +975,7 @@ mod tests {
                 body,
                 sender: Some("192.0.2.7"),
             },
-            &Policy::default(),
+            Policy::embedded(),
         )
     }
 
@@ -1217,7 +1258,7 @@ mod tests {
                 text: b"<?php exec('id'); ?>",
                 sender: None,
             },
-            &Policy::default(),
+            Policy::embedded(),
         );
         assert_eq!(x.layers[0].name.as_deref(), Some(&b"shell.php"[..]));
         assert!(has_text(&x, b" exec('id'); "));

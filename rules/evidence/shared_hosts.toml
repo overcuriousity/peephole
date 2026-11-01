@@ -1,0 +1,46 @@
+# Hosts for the X-ray's URL pieces (`model::xray::pieces`). Built into the
+# binary like the rest of `rules/`. Names match by suffix on a dot boundary,
+# so `github.com` covers `gist.github.com` and not `notgithub.com`.
+#
+# `shared`: hosts whose users are unrelated, so the host alone says nothing
+# about an operator. A stager on one keeps its full URL without the query.
+#
+# `never`: hosts that tie nothing to an operator, whoever saves what they
+# answer: schema hosts named in documents, the address-echo services and
+# cloud endpoints that recon scripts read. They are recorded as `queried`.
+
+shared = [
+    "pastebin.com",
+    "surge.sh",
+    "github.com",
+    "githubusercontent.com",
+    "transfer.sh",
+    "gist.github.com",
+]
+
+never = [
+    # Schemas
+    "w3.org",
+    "xmlsoap.org",
+    "openxmlformats.org",
+    "schemas.microsoft.com",
+    "schemas.android.com",
+    "purl.org",
+    "xmlns.com",
+    "java.sun.com",
+    "ns.adobe.com",
+    # Address echoes
+    "ifconfig.me",
+    "ifconfig.co",
+    "icanhazip.com",
+    "ipify.org",
+    "ipinfo.io",
+    "ip-api.com",
+    "checkip.amazonaws.com",
+    "checkip.dyndns.org",
+    # Cloud endpoints
+    "management.azure.com",
+    "login.microsoftonline.com",
+    "metadata.google.internal",
+    "metadata.azure.com",
+]

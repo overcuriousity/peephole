@@ -7,8 +7,12 @@
 
 pub mod container;
 pub mod decode;
+pub mod key;
+pub mod pieces;
 pub mod shell;
 
+pub use key::mask_ranges;
+pub use pieces::{Grade, Piece, PieceKind, Policy, Role};
 pub use shell::{Node, Step};
 
 /// Version of the rules below; results derived by an older version are
@@ -30,6 +34,12 @@ pub const MAX_PIECES: usize = 256;
 
 /// Recipe steps per source.
 pub const MAX_STEPS: usize = 256;
+
+/// Longest piece value or URL kept.
+pub const MAX_VALUE: usize = 512;
+
+/// URLs kept per piece.
+pub const MAX_URLS: usize = 32;
 
 /// A byte range of one layer's text (`end` exclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,15 +95,7 @@ pub struct Opaque {
     pub reason: OpaqueReason,
 }
 
-/// What the parser is told. Defined properly with the rules.
-#[derive(Debug, Clone, Default)]
-pub struct Policy {}
-
 pub use container::{Source, parse};
-
-/// Filled in by the piece extractor.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Piece {}
 
 /// What one layer's shell text does, branches kept. `normal` is the tree
 /// with hosts, URLs, file names and numbers replaced by placeholders.
@@ -144,16 +146,13 @@ impl Xray {
 }
 
 /// The limits of one source: `depth` and `layers` are fixed, `output` is
-/// what is left to decode, `pieces` is the cap the piece extractor counts
-/// against, and `steps` is what is left for recipe steps, so a long recipe
-/// cannot starve pieces.
+/// what is left to decode, `pieces` is what is left for pieces, and `steps`
+/// is what is left for recipe steps, so a long recipe cannot starve pieces.
 #[derive(Debug, Clone)]
 pub struct Budget {
     depth: usize,
     output: usize,
     layers: usize,
-    // Read by the piece extractor.
-    #[allow(dead_code)]
     pieces: usize,
     steps: usize,
     /// Hash of every layer's text -> its index, so text that is already
