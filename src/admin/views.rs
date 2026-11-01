@@ -418,9 +418,18 @@ pub fn link_href(kind: &str, value: &str) -> String {
     )
 }
 
+/// The uploads list filtered to one SHA-256. The old `sha256` pivot
+/// target; it keeps working, and the File page links to it.
+pub fn uploads_by_hash_href(sha256: &str) -> String {
+    format!(
+        "/admin/traps/uploads?sha256={}",
+        crate::admin::public::urlencode(sha256)
+    )
+}
+
 /// The list a value pivots to, already filtered to it (MIK-482 table
 /// 5.3): `ua` to its Links page (MIK-504; no header, which links nothing,
-/// to the requests); `path` and `cmd` to the requests; `port`, `product`, `os` and `label` to the IPs; `sha256` (lowercase hex) to the uploads;
+/// to the requests); `path` and `cmd` to the requests; `port`, `product`, `os` and `label` to the IPs; `sha256` (lowercase hex) to its File page (the uploads list, `uploads_by_hash_href`, still takes `?sha256=`);
 /// `campaign` (its key) to its page. The value is urlencoded, so a
 /// template never builds such an `href` by concatenation.
 pub fn pivot_href(kind: &str, value: &str) -> String {
@@ -429,7 +438,7 @@ pub fn pivot_href(kind: &str, value: &str) -> String {
         "ua" if value != crate::store::useragent::NONE => link_href("ua", value),
         "ua" | "path" | "cmd" => format!("/requests?{kind}={v}"),
         "port" | "product" | "os" | "label" => format!("/ips?{kind}={v}"),
-        "sha256" => format!("/admin/traps/uploads?sha256={v}"),
+        "sha256" => link_href("file", value),
         "campaign" => format!("/admin/evidence/campaigns/{v}"),
         _ => {
             debug_assert!(false, "pivot_href: unknown kind {kind}");
@@ -486,6 +495,10 @@ mod tests {
         assert_eq!(pivot_href("label", "scanner"), "/ips?label=scanner");
         assert_eq!(
             pivot_href("sha256", "ab01"),
+            "/admin/evidence/links/file/ab01"
+        );
+        assert_eq!(
+            uploads_by_hash_href("ab01"),
             "/admin/traps/uploads?sha256=ab01"
         );
         assert_eq!(
