@@ -305,6 +305,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let store = store.clone();
         async move {
             let derived = store::shapes::backfill(&store.pool).await;
+            // Pieces before the campaign pass (chains build on them).
+            if let Err(e) = store::pieces::extract(&store.pool).await {
+                warn!(error = %e, "attack-chain pieces: extraction failed");
+            }
             store::maintenance::recompute_campaigns(&store).await;
             derived
         }

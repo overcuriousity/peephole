@@ -55,6 +55,9 @@ pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watc
         }
         if tokio::time::Instant::now() >= next_campaigns {
             next_campaigns = tokio::time::Instant::now() + super::campaigns::RECOMPUTE_EVERY;
+            if let Err(e) = super::pieces::extract(&store.pool).await {
+                tracing::warn!(?e, "attack-chain piece extraction failed");
+            }
             recompute_campaigns(&store).await;
         }
     }

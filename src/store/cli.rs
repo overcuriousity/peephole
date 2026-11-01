@@ -53,6 +53,7 @@ pub async fn run(args: &[String], default_config: &str) -> Result<()> {
 async fn campaigns_eval(store: &Store) -> Result<String> {
     let started = std::time::Instant::now();
     while super::shapes::backfill(&store.pool).await? > 0 {}
+    super::pieces::extract(&store.pool).await?;
     let mut conn = store.pool.acquire().await?;
     let input = super::campaigns::Input::read(&mut conn).await?;
     let read = started.elapsed().as_secs_f64();
