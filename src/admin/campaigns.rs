@@ -211,6 +211,9 @@ struct CampaignPage {
     props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
 }
 
+/// Evidence rows on a campaign's page, at most, the claimed ones last.
+pub const CAMPAIGN_EDGES: usize = 500;
+
 /// Wave lines on a campaign's page, at most.
 pub const CAMPAIGN_WAVES: usize = 3;
 
@@ -247,6 +250,22 @@ impl CampaignPage {
         match best {
             Some(x) => format!("{links}: path similarity {x:.2}"),
             None => links.to_string(),
+        }
+    }
+
+    /// The Evidence rows shown.
+    fn listed(&self) -> &[EdgeView] {
+        &self.edges[..self.edges.len().min(CAMPAIGN_EDGES)]
+    }
+
+    /// The claimed edges for the Evidence head. The stored count holds only
+    /// those inside the campaign, so it says so when more rows are listed.
+    fn claimed_note(&self) -> String {
+        let joiner = self.c.row.joiner_edges;
+        match self.edges.iter().filter(|v| !v.e.merged).count() {
+            0 if joiner == 0 => String::new(),
+            0 => format!(", {joiner} claimed"),
+            n => format!(", {joiner} claimed (merged only; {n} not merged also listed)"),
         }
     }
 
@@ -290,7 +309,7 @@ async fn campaign(
         return Err(AppError::NotFound);
     };
     let mut detail = st.store.campaign_edge_detail(&key).await?;
-    let edges = std::mem::take(&mut c.edges)
+    let mut edges: Vec<EdgeView> = std::mem::take(&mut c.edges)
         .into_iter()
         .map(|e| {
             let d = match e.kind.as_str() {
@@ -300,6 +319,7 @@ async fn campaign(
             EdgeView::new(e, d)
         })
         .collect();
+    edges.sort_by_key(EdgeView::claimed);
     let calendar = st.store.campaign_calendar(&key).await?;
     let shapes = st.store.campaign_shapes(&key).await?;
     let uploads = st.store.campaign_uploads(&key, CAMPAIGN_ARTIFACTS).await?;
@@ -648,7 +668,45 @@ mod tests {
             Body::empty(),
         )
         .await;
-        assert!(page.contains("1 hard, 0 soft ·"), "{page}");
+        let note = "1 hard, 0 soft, 0 claimed (merged only; 1 not merged also listed) ·";
+        assert!(page.contains(note), "{page}");
+    }
+
+    /// The Evidence table stops at its limit, with the hard edge kept.
+    #[tokio::test]
+    async fn the_evidence_table_has_a_limit() {
+        let (state, cookie, app, _d) = app().await;
+        let s = &state.store;
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            feed(
+                s,
+                [Op::Key(
+                    ip,
+                    "ssh-hostkey",
+                    "SHA256:a".into(),
+                    "2026-10-01 00:00:00",
+                )],
+            )
+            .await;
+        }
+        s.recompute_campaigns(true).await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO campaign_edges (a, b, kind, value, fp_support, first_ts, last_ts)
+             SELECT e.a, e.b, 'key', 'SHA256:' || n.i, 0, 't', 't' FROM campaign_edges e, n",
+        )
+        .bind(super::CAMPAIGN_EDGES as i64)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let request = Request::get("/admin/evidence/campaigns/192.0.2.1")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", &cookie);
+        let (_, _, page) = send(&app, request, Body::empty()).await;
+        assert_eq!(page.matches("class=\"edge-hard\"").count(), 1, "{page}");
+        let rows = page.matches("class=\"edge-claimed\"").count();
+        assert_eq!(rows, super::CAMPAIGN_EDGES - 1);
+        assert!(page.contains("First 500 of 501 edges"), "{page}");
     }
 
     /// A campaign tied only by claims says so, and never reads as hard.

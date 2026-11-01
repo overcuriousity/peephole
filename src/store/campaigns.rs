@@ -44,6 +44,9 @@ pub const HARD_FANOUT_MAX: usize = 50;
 /// Soft edges two groups of two or more IPs need between them to merge, and
 /// the addresses in each of two such groups that must name a joiner value.
 pub const K_SOFT_MERGE: usize = 2;
+/// Joiner values considered per IP, its newest first: one body can name 256
+/// fresh values, and each would be an edge.
+pub const MAX_JOINERS_PER_IP: usize = 64;
 /// Fewest shared shapes a pair needs for an order term.
 pub const ORDER_MIN_SHARED: usize = 8;
 /// Fewest untied pairs of shared shapes a pair needs for an order term (8
@@ -67,6 +70,9 @@ const KEY_SIGNATURE: &str = "campaigns.signature";
 /// The last pass's [`Report`] as JSON (`settings`).
 const KEY_REPORT: &str = "campaigns.report";
 const PATHS: &str = "paths";
+/// The [`Excluded`] kind of an IP naming more than [`MAX_JOINERS_PER_IP`]
+/// values; its value says which and how many.
+const JOINER_CAP: &str = "joiner cap";
 /// The edge kinds that join on what a body names: a role in `piece_sightings`
 /// and a `campaign_edges.kind`.
 const JOINERS: [LinkKind; 3] = [LinkKind::Stager, LinkKind::Key, LinkKind::File];
@@ -112,7 +118,8 @@ pub struct Report {
     pub members: usize,
     /// Edges by kind.
     pub edges: BTreeMap<String, usize>,
-    /// Hard values and files on more than [`HARD_FANOUT_MAX`] IPs.
+    /// Hard values and files on more than [`HARD_FANOUT_MAX`] IPs, and IPs
+    /// naming more than [`MAX_JOINERS_PER_IP`] values.
     pub excluded: Vec<Excluded>,
     pub seconds: f64,
     /// When the pass ran (as `requests.ts`); absent in reports written
@@ -170,7 +177,11 @@ impl std::fmt::Display for Report {
             return write!(f, "none");
         }
         for e in &self.excluded {
-            write!(f, "\n  {} {} on {} IPs", e.kind, e.value, e.ips)?;
+            if e.kind == JOINER_CAP {
+                write!(f, "\n  {} {}", e.kind, e.value)?;
+            } else {
+                write!(f, "\n  {} {} on {} IPs", e.kind, e.value, e.ips)?;
+            }
         }
         Ok(())
     }
@@ -289,7 +300,8 @@ pub struct CampaignCommand {
 pub const CAMPAIGN_SHAPES: i64 = 25;
 
 /// An evidence edge; `a`'s IP text sorts before `b`'s. All but a joiner edge
-/// that was not merged have both ends in one campaign.
+/// that was not merged have both ends in one campaign; such an edge's ends
+/// can be in no campaign at all.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
 pub struct Edge {
     pub a_id: i64,
@@ -308,7 +320,7 @@ pub struct Edge {
     pub last_ts: String,
     /// A `paths` edge's order agreement, -1..1, when known.
     pub agreement: Option<f64>,
-    /// Its ends are in one campaign. False for a joiner edge between groups
+    /// Its ends are in one group. False for a joiner edge between groups
     /// that stayed apart.
     pub merged: bool,
 }
@@ -964,7 +976,7 @@ struct Link {
     /// rarest [`EDGE_SHAPES_MAX`]; its shared (JA4, JA4H) pairs.
     shapes: Vec<(i64, i64)>,
     tls: Vec<(String, String)>,
-    /// Its ends ended up in one group; only a joiner link can end apart.
+    /// Its ends are in one group; only a joiner link can end apart.
     merged: bool,
 }
 
@@ -1027,9 +1039,12 @@ type JoinerValues<'a> = BTreeMap<(&'static str, &'a str), BTreeMap<usize, Span>>
 /// value on one address goes. A file on more than [`HARD_FANOUT_MAX`]
 /// addresses goes to `excluded`: it is a public webshell. Stagers and keys
 /// have no such cap: the X-ray's role and shared-host filters decide those.
+/// An address keeps its newest [`MAX_JOINERS_PER_IP`] of what is left, and
+/// one over that goes to `excluded`.
 fn joiner_values<'a>(
     input: &'a Input,
     index: &HashMap<i64, usize>,
+    name: &impl Fn(usize) -> &'a str,
     excluded: &mut Vec<Excluded>,
 ) -> JoinerValues<'a> {
     let mut values = JoinerValues::new();
@@ -1053,82 +1068,275 @@ fn joiner_values<'a>(
         }
         ips.len() >= 2
     });
+    // Newest first, ties by who names it, so no value's name decides.
+    let mut held: BTreeMap<usize, Vec<(&str, _)>> = BTreeMap::new();
+    for (&key, ips) in &values {
+        for (&i, span) in ips {
+            held.entry(i)
+                .or_default()
+                .push((span.1.as_deref().unwrap_or_default(), (key, ips)));
+        }
+    }
+    let mut dropped = vec![];
+    for (i, mut named) in held {
+        if named.len() <= MAX_JOINERS_PER_IP {
+            continue;
+        }
+        named.sort_by(|x, y| y.0.cmp(x.0).then_with(|| x.1.1.keys().cmp(y.1.1.keys())));
+        let over = named.split_off(MAX_JOINERS_PER_IP);
+        excluded.push(Excluded {
+            kind: JOINER_CAP.to_string(),
+            value: format!(
+                "{}: {} values past the newest {MAX_JOINERS_PER_IP}",
+                name(i),
+                over.len()
+            ),
+            ips: 1,
+        });
+        dropped.extend(over.into_iter().map(|(_, (key, _))| (key, i)));
+    }
+    for (key, i) in dropped {
+        if let Some(ips) = values.get_mut(&key) {
+            ips.remove(&i);
+        }
+    }
+    values.retain(|_, ips| ips.len() >= 2);
     values
 }
 
-/// A joiner link from every address to the value's oldest, ties by IP text:
-/// n−1 links, where pairs would be thousands for a botnet's stager.
-fn star(kind: &'static str, value: &str, ips: &BTreeMap<usize, Span>) -> Vec<Link> {
-    let Some((&oldest, oldest_span)) = ips.iter().min_by_key(|&(&i, s)| (s.0.as_deref(), i)) else {
-        return vec![];
-    };
-    ips.iter()
-        .filter(|&(&i, _)| i != oldest)
-        .map(|(&i, s)| {
-            let mut span = s.clone();
-            widen(
-                &mut span,
-                oldest_span.0.as_deref(),
-                oldest_span.1.as_deref(),
-            );
-            Link {
-                a: i.min(oldest),
-                b: i.max(oldest),
-                kind,
-                value: value.to_string(),
-                score: None,
-                shared: None,
-                fp_support: false,
-                agreement: None,
-                first: span.0,
-                last: span.1,
-                shapes: vec![],
-                tls: vec![],
-                merged: true,
-            }
-        })
-        .collect()
+/// The address oldest to name a value of these, ties by IP text.
+fn oldest<'a>(ips: impl Iterator<Item = (usize, &'a Span)>) -> Option<(usize, &'a Span)> {
+    ips.min_by_key(|&(i, s)| (s.0.as_deref(), i))
 }
 
-/// Group the addresses of `values`, value by value, until nothing changes.
-/// An address outside any group joins freely: the group with the most
-/// addresses naming the value, ties by root IP text, or, with no group among
-/// them, the other lone addresses, as a new group. Two groups of two or more merge only when at least `k` addresses in each
-/// name the same value, so one body counts once however many values it names
-/// and however many links they make.
+/// A joiner link between two addresses naming `value`.
+fn joiner_link(
+    (kind, value): (&'static str, &str),
+    x: (usize, &Span),
+    y: (usize, &Span),
+    merged: bool,
+) -> Link {
+    let mut span = x.1.clone();
+    widen(&mut span, y.1.0.as_deref(), y.1.1.as_deref());
+    Link {
+        a: x.0.min(y.0),
+        b: x.0.max(y.0),
+        kind,
+        value: value.to_string(),
+        score: None,
+        shared: None,
+        fp_support: false,
+        agreement: None,
+        first: span.0,
+        last: span.1,
+        shapes: vec![],
+        tls: vec![],
+        merged,
+    }
+}
+
+/// The links of a value, once the groups are final: in each group a star to
+/// its oldest address naming the value, and between groups a link from each
+/// group's star to the oldest one, not merged. An address in no group is one
+/// of its own. n−1 links, where pairs would be thousands for a botnet's
+/// stager, and every member has evidence inside its campaign.
+fn joiner_links(
+    kind: &'static str,
+    value: &str,
+    ips: &BTreeMap<usize, Span>,
+    parent: &mut [usize],
+) -> Vec<Link> {
+    let mut groups: BTreeMap<usize, Vec<(usize, &Span)>> = BTreeMap::new();
+    for (&i, span) in ips {
+        groups.entry(find(parent, i)).or_default().push((i, span));
+    }
+    let mut links = vec![];
+    let mut anchors = vec![];
+    for named in groups.values() {
+        let Some(anchor) = oldest(named.iter().copied()) else {
+            continue;
+        };
+        anchors.push(anchor);
+        links.extend(
+            named
+                .iter()
+                .filter(|m| m.0 != anchor.0)
+                .map(|&m| joiner_link((kind, value), m, anchor, true)),
+        );
+    }
+    if let Some(first) = oldest(anchors.iter().copied()) {
+        links.extend(
+            anchors
+                .iter()
+                .filter(|m| m.0 != first.0)
+                .map(|&m| joiner_link((kind, value), m, first, false)),
+        );
+    }
+    links
+}
+
+/// Value clouds: which of `loose` (each value's addresses outside any group)
+/// belong together, as a component per value. Two values connect when the
+/// addresses naming both number at least `k` and a tenth of the smaller, so a
+/// stager and its key are one cloud, and one or two forged addresses are no
+/// bridge between two large ones.
+fn cloud_of_value(loose: &[Vec<usize>], k: usize) -> Vec<usize> {
+    let mut values_of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (v, ips) in loose.iter().enumerate() {
+        for &i in ips {
+            values_of.entry(i).or_default().push(v);
+        }
+    }
+    let mut both: HashMap<(usize, usize), usize> = HashMap::new();
+    for named in values_of.values() {
+        for (x, &v) in named.iter().enumerate() {
+            for &w in &named[x + 1..] {
+                *both.entry((v, w)).or_default() += 1;
+            }
+        }
+    }
+    let mut parent: Vec<usize> = (0..loose.len()).collect();
+    for ((v, w), n) in both {
+        if n >= k.max(loose[v].len().min(loose[w].len()) / 10) {
+            let (rv, rw) = (find(&mut parent, v), find(&mut parent, w));
+            parent[rv.max(rw)] = rv.min(rw);
+        }
+    }
+    (0..loose.len()).map(|v| find(&mut parent, v)).collect()
+}
+
+/// Where a loose address of a cloud went.
+#[derive(Clone, Copy)]
+struct Home {
+    /// As [`cloud_of_value`] numbers them.
+    cloud: usize,
+    /// The block: the cloud's lowest address.
+    block: usize,
+}
+
+/// The joiner groups, on top of the hard and soft ones. Everything is counted
+/// on the membership as it stood before anything joined, so nothing that
+/// joins lifts a count and the partition does not depend on the values' names
+/// or order.
+///
+/// 1. Each value's loose addresses (in no group) are a cloud;
+///    [`cloud_of_value`] connects clouds.
+/// 2. A loose address in two clouds goes to the larger, ties by the lower
+///    members. It counts for that cloud's values only, so it bridges nothing.
+/// 3. Groups and clouds of two or more are blocks. Two connect when at least
+///    `k` addresses of each name one value, however many values a body
+///    names. Connected blocks merge at once: there is no second round.
+/// 4. A lone address left over joins the merged block with the most members
+///    sharing a value with it, ties by root IP text, and adds to no count.
 fn merge_joiners(values: &JoinerValues, k: usize, parent: &mut [usize], size: &mut [usize]) {
-    loop {
-        let mut changed = false;
-        for ips in values.values() {
-            // Addresses naming the value per group, by root: nodes are in
-            // IP-text order, so a lower root is a lower IP text.
+    let root: Vec<usize> = (0..parent.len()).map(|i| find(parent, i)).collect();
+    let is_loose = |i: usize| size[root[i]] == 1;
+    let loose: Vec<Vec<usize>> = values
+        .values()
+        .map(|ips| ips.keys().copied().filter(|&i| is_loose(i)).collect())
+        .collect();
+    let cloud = cloud_of_value(&loose, k);
+    let mut members: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for (v, ips) in loose.iter().enumerate() {
+        members.entry(cloud[v]).or_default().extend(ips);
+    }
+    let mut clouds_of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (&c, ips) in &members {
+        for &i in ips {
+            clouds_of.entry(i).or_default().push(c);
+        }
+    }
+    let mut owned: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, clouds) in clouds_of {
+        let best = clouds
+            .into_iter()
+            .min_by_key(|c| (std::cmp::Reverse(members[c].len()), &members[c]));
+        if let Some(c) = best {
+            owned.entry(c).or_default().push(i);
+        }
+    }
+    // A cloud left with one address is a lone address.
+    owned.retain(|_, ips| ips.len() >= 2);
+    let mut home: HashMap<usize, Home> = HashMap::new();
+    for (&c, ips) in &owned {
+        for &i in ips {
+            home.insert(
+                i,
+                Home {
+                    cloud: c,
+                    block: ips[0],
+                },
+            );
+        }
+    }
+    let block_naming = |i: usize, v: usize| {
+        if is_loose(i) {
+            home.get(&i)
+                .filter(|h| h.cloud == cloud[v])
+                .map(|h| h.block)
+        } else {
+            Some(root[i])
+        }
+    };
+    let met: Vec<Vec<usize>> = values
+        .values()
+        .enumerate()
+        .map(|(v, ips)| {
             let mut naming: BTreeMap<usize, usize> = BTreeMap::new();
             for &i in ips.keys() {
-                *naming.entry(find(parent, i)).or_default() += 1;
-            }
-            let (lone, groups): (Vec<_>, Vec<_>) =
-                naming.into_iter().partition(|&(r, _)| size[r] == 1);
-            let Some(&(target, _)) = groups
-                .iter()
-                .min_by_key(|&&(r, count)| (std::cmp::Reverse(count), r))
-                .or(lone.first())
-            else {
-                continue;
-            };
-            // The target has the most, so a group with `k` means it has too.
-            // What joins it now cannot lift another group to `k`.
-            let met = groups.iter().filter(|g| g.1 >= k);
-            for &(r, _) in lone.iter().chain(met) {
-                let (ra, rb) = (find(parent, target), find(parent, r));
-                if ra != rb {
-                    union(parent, size, ra, rb);
-                    changed = true;
+                if let Some(b) = block_naming(i, v) {
+                    *naming.entry(b).or_default() += 1;
                 }
             }
+            naming.retain(|_, n| *n >= k);
+            naming.into_keys().collect()
+        })
+        .collect();
+    // The tally of step 4 reads who was in a block before anyone lone joined.
+    let in_block: Vec<bool> = (0..parent.len())
+        .map(|i| !is_loose(i) || home.contains_key(&i))
+        .collect();
+    let lone = |i: usize| !in_block[i];
+    let mut join = |parent: &mut [usize], x: usize, y: usize| {
+        let (rx, ry) = (find(parent, x), find(parent, y));
+        if rx != ry {
+            union(parent, size, rx, ry);
         }
-        if !changed {
-            return;
+    };
+    for ips in owned.values() {
+        for &i in &ips[1..] {
+            join(parent, ips[0], i);
         }
+    }
+    for blocks in &met {
+        for pair in blocks.windows(2) {
+            join(parent, pair[0], pair[1]);
+        }
+    }
+    let mut tally: BTreeMap<usize, BTreeMap<usize, BTreeSet<usize>>> = BTreeMap::new();
+    for ips in values.values() {
+        let alone: Vec<usize> = ips.keys().copied().filter(|&i| lone(i)).collect();
+        if alone.is_empty() {
+            continue;
+        }
+        for &m in ips.keys().filter(|&&m| in_block[m]) {
+            let r = find(parent, m);
+            for &i in &alone {
+                tally.entry(i).or_default().entry(r).or_default().insert(m);
+            }
+        }
+    }
+    let joins: Vec<(usize, usize)> = tally
+        .iter()
+        .filter_map(|(&i, blocks)| {
+            let best = blocks
+                .iter()
+                .min_by_key(|&(r, sharing)| (std::cmp::Reverse(sharing.len()), *r))?;
+            Some((i, *best.0))
+        })
+        .collect();
+    for (i, r) in joins {
+        join(parent, r, i);
     }
 }
 
@@ -1429,17 +1637,16 @@ fn compute(input: &Input, p: &Params) -> Output {
         // Joiners last, so they never count in the guard above. A body can
         // name anything, so unlike a soft link a joiner link stays an edge
         // between groups that stayed apart, marked as not merged.
-        let values = joiner_values(input, &index, &mut excluded);
-        let first_joiner = links.len();
-        for ((kind, value), ips) in &values {
+        let ip_text = |i: usize| nodes[i].0;
+        let values = joiner_values(input, &index, &ip_text, &mut excluded);
+        for ips in values.values() {
             for (&i, span) in ips {
                 widen(&mut active[i], span.0.as_deref(), span.1.as_deref());
             }
-            links.extend(star(kind, value, ips));
         }
         merge_joiners(&values, k, &mut parent, &mut size);
-        for l in &mut links[first_joiner..] {
-            l.merged = find(&mut parent, l.a) == find(&mut parent, l.b);
+        for ((kind, value), ips) in &values {
+            links.extend(joiner_links(kind, value, ips, &mut parent));
         }
         // Soft links between groups that stayed apart are not edges.
         let before = links.len();
@@ -3158,17 +3365,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_merge_repeats_until_nothing_changes() {
-        let mut input = two_groups();
-        hard(&mut input, &G3, "SHA256:three");
-        // "a" sorts first: one address each of G1 and G2 until "b" merges
-        // them, then two of the group, as many as G3 has.
-        name(&mut input, "stager", "a", &[G1[0], G2[0], G3[0], G3[1]]);
-        name(&mut input, "stager", "b", &[G1[0], G1[1], G2[0], G2[1]]);
-        assert_eq!(sizes(&input), [9]);
-    }
-
-    #[test]
     fn a_singleton_joins_the_group_with_most_naming_addresses() {
         let lone = "198.51.100.1";
         let mut input = two_groups();
@@ -3196,42 +3392,267 @@ pub(crate) mod tests {
         assert!(joined.contains(&G1[0].to_string()), "{joined:?}");
     }
 
-    #[test]
-    fn a_joined_singleton_does_not_add_to_the_guard() {
-        // Two fresh addresses lift no group to K but the one they joined.
-        let mut input = two_groups();
-        let ips = [G1[0], G2[0], "198.51.100.1", "198.51.100.2"];
-        name(&mut input, "stager", S, &ips);
-        assert_eq!(sizes(&input), [5, 3]);
+    /// The partition as sets, whatever order groups and members came in.
+    fn partition(input: &Input) -> BTreeSet<BTreeSet<String>> {
+        formed(input, &v2(input))
+            .into_iter()
+            .map(|g| g.into_iter().collect())
+            .collect()
+    }
+
+    fn sets(groups: &[&[&str]]) -> BTreeSet<BTreeSet<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|s| s.to_string()).collect())
+            .collect()
     }
 
     #[test]
-    fn value_order_does_not_change_the_outcome_across_runs() {
-        let build = |rev: bool| {
-            let mut input = two_groups();
-            let mut rows = [
-                ("stager", "a", [G1[0], G2[0], "198.51.100.1"]),
-                ("key", "b", [G1[0], G1[1], "198.51.100.2"]),
-            ];
-            if rev {
-                rows.reverse();
+    fn a_merge_does_not_cascade() {
+        let mut input = two_groups();
+        hard(&mut input, &G3, "SHA256:three");
+        // "b" merges G1 and G2. Together they have two addresses on "a", but
+        // the groups of G1 and G2 had one each, and nothing counts across a
+        // merge.
+        name(&mut input, "stager", "a", &[G1[0], G2[0], G3[0], G3[1]]);
+        name(&mut input, "stager", "b", &[G1[0], G1[1], G2[0], G2[1]]);
+        assert_eq!(sizes(&input), [6, 3]);
+    }
+
+    #[test]
+    fn one_address_on_two_clouds_merges_nothing() {
+        let x = "192.0.2.200";
+        let s_ips = [
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+            "198.51.100.4",
+            "198.51.100.5",
+        ];
+        let t_ips = [
+            "203.0.113.1",
+            "203.0.113.2",
+            "203.0.113.3",
+            "203.0.113.4",
+            "203.0.113.5",
+        ];
+        let mut input = Input::default();
+        name(&mut input, "stager", "s", &s_ips);
+        name(&mut input, "stager", "t", &t_ips);
+        name(&mut input, "stager", "s", &[x]);
+        name(&mut input, "stager", "t", &[x]);
+        let mut with_x = s_ips.to_vec();
+        with_x.push(x);
+        // A tie of six: the cloud holding the lower address, x itself in both.
+        assert_eq!(partition(&input), sets(&[&with_x, &t_ips]));
+    }
+
+    #[test]
+    fn one_group_address_on_two_clouds_merges_nothing() {
+        let s_ips = [
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+            "198.51.100.4",
+            "198.51.100.5",
+        ];
+        let t_ips = [
+            "203.0.113.1",
+            "203.0.113.2",
+            "203.0.113.3",
+            "203.0.113.4",
+            "203.0.113.5",
+        ];
+        let mut input = Input::default();
+        hard(&mut input, &[G1[0], G1[1]], "SHA256:one");
+        name(&mut input, "stager", "s", &s_ips);
+        name(&mut input, "stager", "t", &t_ips);
+        name(&mut input, "stager", "s", &[G1[0]]);
+        name(&mut input, "stager", "t", &[G1[0]]);
+        assert_eq!(partition(&input), sets(&[&[G1[0], G1[1]], &s_ips, &t_ips]));
+    }
+
+    /// Two clouds of 30 sharing `shared` addresses, the shared ones in the
+    /// middle of the list: the first cloud holds the lowest address.
+    fn clouds_of_30(shared: usize) -> (Input, Vec<String>) {
+        let ips = addresses(60 - shared);
+        let mut input = Input::default();
+        name(&mut input, "stager", "s", &strs(&ips[..30]));
+        name(&mut input, "stager", "t", &strs(&ips[30 - shared..]));
+        (input, ips)
+    }
+
+    #[test]
+    fn two_addresses_on_two_large_clouds_merge_nothing() {
+        let (input, ips) = clouds_of_30(2);
+        // 2 of 30 is under a tenth, and the two count for one cloud only.
+        assert_eq!(
+            partition(&input),
+            sets(&[&strs(&ips[..30]), &strs(&ips[30..])])
+        );
+    }
+
+    #[test]
+    fn a_tenth_of_the_smaller_cloud_connects() {
+        let (input, ips) = clouds_of_30(3);
+        assert_eq!(partition(&input), sets(&[&strs(&ips)]));
+    }
+
+    #[test]
+    fn a_stager_and_its_key_form_one_cloud() {
+        // 163 addresses: 100 on each, 37 on both.
+        let ips = addresses(163);
+        let mut input = Input::default();
+        name(&mut input, "stager", S, &strs(&ips[..100]));
+        name(&mut input, "key", "SHA256:k", &strs(&ips[63..]));
+        assert_eq!(partition(&input), sets(&[&strs(&ips)]));
+        assert_eq!(joiner_edges(&input, &v2(&input)).len(), 198);
+    }
+
+    /// Groups of three with `a1 a2 b1` on V and `b2 b3` on `t`, and a lone
+    /// address on both.
+    fn lifted(t: &str) -> Input {
+        let (a, b) = (G1, G2);
+        let mut input = two_groups();
+        name(
+            &mut input,
+            "stager",
+            "v",
+            &[a[0], a[1], b[0], "198.51.100.1"],
+        );
+        name(&mut input, "stager", t, &[b[1], b[2], "198.51.100.1"]);
+        input
+    }
+
+    #[test]
+    fn a_lone_address_does_not_lift_the_count() {
+        let mut b = G2.to_vec();
+        b.push("198.51.100.1");
+        let want = sets(&[&G1, &b]);
+        // "a" sorts before "v", "z" after it.
+        assert_eq!(partition(&lifted("a")), want);
+        assert_eq!(partition(&lifted("z")), want);
+    }
+
+    #[test]
+    fn the_bridge_through_loose_addresses_does_not_merge_b() {
+        let (x, l1, l2) = ("198.51.100.1", "198.51.100.2", "198.51.100.3");
+        let mut input = two_groups();
+        name(&mut input, "stager", "t", &[G2[0], x]);
+        name(&mut input, "stager", "u", &[x, l1, l2]);
+        name(&mut input, "stager", "v", &[G1[0], G1[1], l1, l2]);
+        let mut a = G1.to_vec();
+        a.extend([x, l1, l2]);
+        assert_eq!(partition(&input), sets(&[&a, &G2]));
+    }
+
+    #[test]
+    fn renaming_values_keeps_the_partition() {
+        // xorshift: no dependency, and a failure repeats.
+        fn rng(x: &mut u64) -> usize {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            (*x >> 8) as usize
+        }
+        for seed in 1..=200u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let ips = addresses(24);
+            let mut rows: Vec<(usize, usize, usize)> = vec![];
+            for t in 0..48 {
+                rows.push((rng(&mut x) % 9, rng(&mut x) % ips.len(), t));
             }
-            for (kind, value, ips) in rows {
-                name(&mut input, kind, value, &ips);
+            let mut names: Vec<usize> = (0..9).collect();
+            for i in (1..names.len()).rev() {
+                names.swap(i, rng(&mut x) % (i + 1));
             }
-            if rev {
-                input.joiners.reverse();
-            }
-            input
-        };
-        let (x, y) = (build(false), build(true));
-        assert_eq!(formed(&x, &v2(&x)).len(), formed(&y, &v2(&y)).len());
-        let edges = |i: &Input| {
-            let mut v: Vec<_> = joiner_edges(i, &v2(i)).into_iter().map(|e| e.2).collect();
-            v.sort();
-            v
-        };
-        assert_eq!(edges(&x), edges(&y));
+            let build = |value: &dyn Fn(usize) -> usize, rev: bool| {
+                let mut input = Input::default();
+                hard(&mut input, &strs(&ips[..3]), "SHA256:one");
+                hard(&mut input, &strs(&ips[3..7]), "SHA256:two");
+                let mut rows = rows.clone();
+                if rev {
+                    rows.reverse();
+                }
+                for &(v, i, t) in &rows {
+                    let id = id_of(&mut input, &ips[i]);
+                    let name = format!("v{}", value(v));
+                    input.joiners.push(("stager", name, id, at(t)));
+                }
+                input
+            };
+            let (plain, renamed) = (build(&|v| v, false), build(&|v| names[v], true));
+            assert_eq!(partition(&plain), partition(&renamed), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn every_member_has_evidence_inside_its_campaign() {
+        let lone = "198.51.100.1";
+        let mut input = two_groups();
+        // The oldest is in G1, but the lone address joins G2.
+        name(&mut input, "stager", S, &[G1[0], G2[0], G2[1], lone]);
+        let out = v2(&input);
+        assert_eq!(
+            joiner_edges(&input, &out),
+            [
+                (G1[0].to_string(), G2[0].to_string(), false),
+                (G2[0].to_string(), G2[1].to_string(), true),
+                (G2[0].to_string(), lone.to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cloud_stays_apart_from_one_address_of_a_group() {
+        let (a, b, c) = (G1[0], "198.51.100.1", "198.51.100.2");
+        let mut input = Input::default();
+        hard(&mut input, &[a, G1[1]], "SHA256:one");
+        name(&mut input, "stager", S, &[a, b, c]);
+        let out = v2(&input);
+        // b and c are a cloud of two, and a is one address of its group.
+        assert_eq!(
+            joiner_edges(&input, &out),
+            [
+                (a.to_string(), b.to_string(), false),
+                (b.to_string(), c.to_string(), true),
+            ]
+        );
+        assert_eq!(partition(&input), sets(&[&[a, G1[1]], &[b, c]]));
+    }
+
+    #[test]
+    fn joiners_per_address_stop_at_the_cap() {
+        let (a, b) = ("198.51.100.1", "198.51.100.2");
+        let extra = 6;
+        let mut input = Input::default();
+        for i in 0..MAX_JOINERS_PER_IP + extra {
+            let value = format!("{i:03}.example.org");
+            name_at(&mut input, "stager", &value, &[a, b], i);
+        }
+        let out = v2(&input);
+        assert_eq!(out.edges.len(), MAX_JOINERS_PER_IP);
+        assert!(
+            out.edges.iter().all(|e| e.value.as_str() >= "006"),
+            "the oldest go"
+        );
+        assert_eq!(out.excluded.len(), 2, "one row per address");
+        let row = &out.excluded[0];
+        assert_eq!(row.kind, "joiner cap");
+        assert_eq!(row.value, format!("{a}: 6 values past the newest 64"));
+    }
+
+    #[test]
+    fn a_value_only_a_capped_address_kept_alive_forms_no_edge() {
+        let (a, b) = ("198.51.100.1", "198.51.100.2");
+        let mut input = Input::default();
+        name_at(&mut input, "stager", "old.example.org", &[a, b], 0);
+        for i in 0..MAX_JOINERS_PER_IP {
+            let value = format!("{i:03}.example.org");
+            name_at(&mut input, "stager", &value, &[a, "198.51.100.3"], 10 + i);
+        }
+        let out = v2(&input);
+        assert!(out.edges.iter().all(|e| e.value != "old.example.org"));
     }
 
     #[tokio::test]

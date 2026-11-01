@@ -416,11 +416,13 @@ order count like a JA4 and JA4H match, and an edge's reason then ends in
 "order agrees". Two groups of two or more IPs merge only on two soft edges
 between them, so one look-alike pair no longer chains two campaigns into
 one. Since clustering v3 a stager, SSH key or uploaded file two addresses
-name is a claimed edge: an IP outside any group joins on one, two groups
-merge only when two addresses in each name the same value, and an edge
-between groups that stayed apart is listed as "not merged". Filter by country, ASN, minimum size and
+name is a claimed edge: IPs outside any group form clouds per value, groups
+and clouds merge only when two addresses in each name the same value, an IP
+left alone joins the group sharing most with it, and an edge between groups
+that stayed apart is listed as "not merged". Filter by country, ASN, minimum size and
 period. Below the list are the excluded values (a hard value or a file on more
-than 50 IPs is shared infrastructure, not one operator) and when the last pass ran
+than 50 IPs is shared infrastructure, not one operator; an address counts for its
+newest 64 joiner values, and one naming more is listed here too) and when the last pass ran
 and how long it took. A campaign's page shows its members, every evidence
 edge with the reason, the members' requests per day and the path shapes most
 of them asked for, with how many IPs of the whole dataset asked for each.

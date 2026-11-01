@@ -27,7 +27,7 @@
   {% include "_edge_legend.html" %}
 </section>
 <section class="card">
-  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs · no edge</span></div>
+  <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs, or past an address's newest {{ crate::store::campaigns::MAX_JOINERS_PER_IP }} values · no edge</span></div>
   {% if let Some(r) = report %}
   {% if r.excluded.is_empty() %}<p class="empty">None.</p>{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">IPs</th></tr></thead><tbody>

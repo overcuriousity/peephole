@@ -405,15 +405,31 @@ evidence of one operator:
   someone else's stager or upload a public webshell, so these are claims:
   they run after the hard and soft edges, never count as either, and the
   edge list marks them as claimed. A value on one address forms no edge.
-  Each address links to the oldest address naming the value, so n addresses
-  make n−1 edges. An address outside any group joins freely. Two groups of
-  two or more addresses merge only when at least two addresses in each name
-  the same value. The guard counts addresses, not links, so one body naming
-  a stager and its key counts once. An unmet merge keeps its edge, shown as
-  "not merged" on both campaigns. A file on more than 50 addresses is a
-  public webshell and ties nothing. Stagers and keys have no such cap: a
-  stager is a joiner only when a command fetches from it, and a shared host
-  such as a paste site joins by the full URL, not by the host.
+  Everything is counted on the membership as it stood before anything
+  joined, so the result does not depend on how values are named or ordered:
+
+  1. The addresses of a value that are in no group form a cloud. Two clouds
+     connect when the addresses naming both number at least two and at least
+     a tenth of the smaller cloud, so a stager and its key are one cloud and
+     one or two forged addresses are no bridge.
+  2. An address in two unconnected clouds goes to the larger one, and it
+     counts for that cloud's values only.
+  3. Groups and clouds of two or more addresses merge only when at least two
+     addresses in each name the same value. The guard counts addresses, not
+     links, so one body naming a stager and its key counts once. Merges do
+     not cascade: what two merged groups name together counts for nothing.
+  4. An address left alone joins the group sharing the most members with it
+     and adds to no count.
+
+  In each group, the addresses naming a value link to the oldest of them, and
+  groups that stayed apart get one edge between them, shown as "not merged"
+  on both campaigns. So n addresses make n−1 edges, and every member has
+  evidence inside its campaign. A campaign's `joiner_edges` counts merged
+  edges only. A file on more than 50 addresses is a public webshell and ties
+  nothing. Stagers and keys have no such cap: a stager is a joiner only when
+  a command fetches from it, and a shared host such as a paste site joins by
+  the full URL, not by the host. An address counts for its newest 64 values;
+  one naming more is listed under Excluded values.
 
   An attacker controlling two addresses in each of two groups can still
   merge them. The edge list shows such a merge as claimed, so a person can
