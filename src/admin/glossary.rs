@@ -54,7 +54,7 @@ pub fn kind_help(kind: LinkKind) -> &'static str {
             "The ETag header of a file the source's web server serves, from a counter-scan. A match: the same file, not the same operator."
         }
         LinkKind::Stager => {
-            "The host a command told its target to fetch from and run, read from the stored requests and uploads, shown defanged. A match: the same delivery point, so very likely one operator. Addresses only queried, never fetched by a command, are not listed."
+            "The host a command told its target to fetch from and run, read from the stored requests and uploads, shown defanged. The host is what the attacker's own body claims, not a confirmed delivery. A match: likely the same operator or toolkit. Addresses only queried, never fetched by a command, are not listed."
         }
         LinkKind::Key => {
             "The fingerprint of an SSH public key found in a request or upload. Private keys are never stored. A match: the same key, so one operator or one copied toolkit."

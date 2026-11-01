@@ -40,7 +40,9 @@
   function label(n) {
     if (n.kind === "ip") return n.value;
     if (n.kind === "group") return n.ips + " IPs";
-    return n.kind + " " + short(shownOf(n));
+    var v = shownOf(n);
+    // A piece reads as its start (`hxxps://` alone says nothing).
+    return n.kind + " " + (n.shown != null ? v.slice(0, 24) : short(v));
   }
   function say(t) { if (status) status.textContent = t; }
 

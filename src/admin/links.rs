@@ -200,10 +200,9 @@ async fn item(
         let k = LinkKind::parse(&kind).ok_or(AppError::NotFound)?;
         let item = st.store.link_item(k, &value).await?;
         if k == LinkKind::Stager && item.is_some() {
-            let hash = crate::store::pieces::piece_hash("stager", &value);
             urls = st
                 .store
-                .piece_urls(hash)
+                .stager_urls(&value)
                 .await?
                 .into_iter()
                 .map(|u| StagerUrl {
@@ -438,6 +437,9 @@ mod tests {
             "INSERT INTO pieces VALUES (?1, 'stager', 'example.org:8080', 't', 't', 1, 1)",
             "INSERT INTO piece_sightings VALUES (?1, 'request', 1, ?2, 'stager', 'seen', 't')",
             "INSERT INTO piece_urls VALUES (?1, 'https://example.org:8080/x.sh', 't', 't', 1)",
+            "INSERT INTO piece_url_sources VALUES (?1, 'https://example.org:8080/x.sh', 'request', 1, 't')",
+            "INSERT INTO piece_urls VALUES (?1, 'https://example.org:8080/q', 't', 't', 1)",
+            "INSERT INTO piece_url_sources VALUES (?1, 'https://example.org:8080/q', 'request', 2, 't')",
         ] {
             sqlx::query(q)
                 .bind(hash)
@@ -498,6 +500,8 @@ mod tests {
         assert!(body.contains(r#"data-copy-value="https://example.org:8080/x.sh""#));
         assert_eq!(body.matches("https://example.org:8080/x.sh").count(), 1);
         assert!(!body.contains(r#"href="https://example.org"#));
+        // A URL only a non-stager sighting named is not listed.
+        assert!(!body.contains("8080/q"));
     }
 
     #[test]

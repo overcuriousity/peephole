@@ -576,6 +576,26 @@ impl Store {
         }))
     }
 
+    /// The URLs of a stager that a stager-role sighting named, newest
+    /// first: a URL only queried (or self-hosted) joins nobody.
+    pub async fn stager_urls(&self, value: &str) -> Result<Vec<super::pieces::PieceUrl>> {
+        let hash = super::pieces::piece_hash("stager", value);
+        Ok(sqlx::query_as(
+            "SELECT u.url, u.first_seen, u.last_seen, u.sources FROM piece_urls u
+             WHERE u.piece = ?1 AND EXISTS (
+               SELECT 1 FROM piece_url_sources n
+               JOIN piece_sightings g ON g.piece = n.piece
+                 AND g.source_kind = n.source_kind AND g.source_id = n.source_id
+                 AND g.role = 'stager'
+               WHERE n.piece = u.piece AND n.url = u.url)
+             ORDER BY u.last_seen DESC, u.url LIMIT ?2",
+        )
+        .bind(hash)
+        .bind(crate::model::xray::MAX_URLS as i64)
+        .fetch_all(&self.read)
+        .await?)
+    }
+
     /// The listed kinds (not canaries: their values are internal) that
     /// hold exactly `value`, in [`LinkKind::LIST`] order.
     pub async fn find_value(&self, value: &str) -> Result<Vec<LinkKind>> {

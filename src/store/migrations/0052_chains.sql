@@ -14,6 +14,8 @@ CREATE TABLE pieces (
   ips INTEGER NOT NULL, sources INTEGER NOT NULL
 ) WITHOUT ROWID;
 
+CREATE INDEX idx_pieces_kind_value ON pieces(kind, value);
+
 CREATE TABLE piece_sightings (
   piece INTEGER NOT NULL, source_kind TEXT NOT NULL,   -- 'request' | 'upload'
   source_id INTEGER NOT NULL, ip_id INTEGER NOT NULL,
