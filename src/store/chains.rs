@@ -28,7 +28,7 @@ const REQUEST: u8 = 0;
 const UPLOAD: u8 = 1;
 
 /// The roles that join, for a `role IN` clause.
-const JOINER_ROLES: &str = "('stager', 'key', 'file')";
+pub(super) const JOINER_ROLES: &str = "('stager', 'key', 'file')";
 /// The kinds that describe.
 const DESCRIBER_KINDS: &str = "('exploit', 'recipe', 'tag', 'shell-profile')";
 

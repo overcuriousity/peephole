@@ -1,11 +1,11 @@
 {#- A campaign's graph: its members and the evidence linking them, drawn by
     linkgraph.js from /admin/api/links/graph?focus=campaign:<key>. Needs
-    `campaign_key`, `chrome` and `small` (3 members or fewer: a shorter canvas); paths edges (soft) are drawn dashed. -#}
+    `campaign_key`, `chrome` and `small` (3 members or fewer: a shorter canvas); paths edges (soft) and joiner edges (claimed) are drawn dashed. -#}
 <script src="/assets/js/linkgraph.js?v={{ chrome.stamp }}" defer></script>
 <section class="card link-graph-card">
   <div class="card-head"><h2>Graph</h2><span class="muted" data-graph-status></span></div>
-  <div class="link-graph{% if small %} link-graph-small{% endif %}" data-link-graph data-focus="campaign:{{ campaign_key }}" data-center="ip:{{ campaign_key }}" data-kinds='{"ssh":"SSH key","tls":"TLS certificate","fp":"fingerprint","canary":"canary","paths":"shared paths"}' role="group" aria-label="Campaign {{ campaign_key }}: its member IPs and the evidence linking them">
+  <div class="link-graph{% if small %} link-graph-small{% endif %}" data-link-graph data-focus="campaign:{{ campaign_key }}" data-center="ip:{{ campaign_key }}" data-kinds='{"ssh":"SSH key","tls":"TLS certificate","fp":"fingerprint","canary":"canary","paths":"shared paths","stager":"stager","key":"key","file":"file"}' role="group" aria-label="Campaign {{ campaign_key }}: its member IPs and the evidence linking them">
     <p class="muted link-graph-nojs">The graph needs JavaScript; the members are listed above and the evidence below.</p>
   </div>
-  <div class="legend link-legend"><span><i class="swatch ip"></i>member IP</span><span title="Hard edge: a shared identity, no time window"><i class="line"></i>hard: shared key, certificate, fingerprint or canary</span><span title="Soft edge: similar behaviour, time-windowed"><i class="line soft"></i>soft: shared paths</span></div>
+  <div class="legend link-legend"><span><i class="swatch ip"></i>member IP</span><span title="Hard edge: a shared identity, no time window"><i class="line"></i>hard: shared key, certificate, fingerprint or canary</span><span title="Soft edge: similar behaviour, time-windowed. Claimed edge: both name one value, which anyone can do"><i class="line soft"></i>soft: shared paths; claimed: a stager, key or file</span></div>
 </section>

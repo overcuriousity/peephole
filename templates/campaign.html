@@ -29,12 +29,12 @@
 </section>
 {% let campaign_key = c.row.key.clone() %}{% let small = c.members.len() <= 3 %}{% include "_campaign_graph.html" %}
 <section class="card">
-  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft · <a href="/admin/evidence/links">what counts →</a></span></div>
+  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft{% if c.row.joiner_edges > 0 %}, {{ c.row.joiner_edges }} claimed{% endif %} · <a href="/admin/evidence/links">what counts →</a></span></div>
   <div class="table-wrap"><table class="table stack-narrow edges"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
-  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
+  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else if v.claimed() %}claimed{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
-    <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
-    <td class="why">{% if v.hard() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
+    <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}{% if v.claimed() %} <span class="muted" title="{{ crate::admin::glossary::help("joiner") }}">claimed</span>{% endif %}</td>
+    <td class="why">{% if v.hard() || v.claimed() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% if !v.e.merged %} <span class="badge" title="These IPs are in separate campaigns: a merge needs {{ crate::store::campaigns::K_SOFT_MERGE }} addresses in each naming the value.">not merged</span>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
       <ul>
         <li>{{ v.score_rule() }}</li>
         <li>{{ v.agreement_rule() }}</li>

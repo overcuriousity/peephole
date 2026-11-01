@@ -505,13 +505,16 @@ plus:
 ### `kind: "campaign"`
 
 - `campaign`: `{key, num, size, first_seen, last_seen, hard_edges,
-  soft_edges, v, computed_at}`.
+  soft_edges, joiner_edges, v, computed_at}`. `joiner_edges` counts the
+  claimed `stager`, `key` and `file` edges, apart from `hard_edges`.
 - `members`: `[{ip_id, ip, country, asn, asn_org, first_seen, last_seen,
   requests}]`, at most 500 (`truncated.members`; `totals.members` is
   the size).
 - `edges`: `[{a_id, a, b_id, b, kind, value, score, shared, fp_support,
   first_ts, last_ts, agreement}]`: only those between two carried
   members. `truncated.edges` is `true` when the members cap left any out.
+  The `value` of a `stager` or `file` edge is defanged. A claimed edge to
+  another campaign is not listed.
 - `shapes`: `[{text, members, df, first_seen, wave:{ips, window_start,
   detected_at}|null}]`; `calendar` as for an IP.
 - `uploads` (metadata) and `commands` (`[{command, count, ips, last_at}]`),

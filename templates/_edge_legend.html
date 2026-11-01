@@ -1,5 +1,6 @@
-{#- What a hard and a soft campaign edge are; from store::campaigns and docs/operations.md, "Campaigns". -#}
+{#- What a hard, a soft and a claimed campaign edge are; from store::campaigns and docs/operations.md, "Campaigns". -#}
 <dl class="kv edge-legend">
   <dt>Hard edge</dt><dd class="plain">The two IPs share an identity: an SSH host key, a TLS certificate, a browser fingerprint or a reused canary. No time window. A value on more than {{ crate::store::campaigns::HARD_FANOUT_MAX }} IPs is shared infrastructure and forms no edge.</dd>
   <dt>Soft edge</dt><dd class="plain">The two IPs behave alike: near-identical sets of path shapes, rare shapes weighing most, at least {{ crate::store::campaigns::MIN_SHARED_RARE }} rare ones shared, active within {{ crate::store::campaigns::WINDOW_DAYS }} days of each other. A shared JA4 and JA4H, or the same order of first requests, only lowers the bar. Two groups of two or more IPs join only on {{ crate::store::campaigns::K_SOFT_MERGE }} soft edges.</dd>
+  <dt>Claimed edge</dt><dd class="plain">{{ crate::admin::glossary::help("joiner") }}</dd>
 </dl>

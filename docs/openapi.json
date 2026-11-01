@@ -4047,6 +4047,9 @@
               "soft_edges": {
                 "type": "integer"
               },
+              "joiner_edges": {
+                "type": "integer"
+              },
               "v": {
                 "type": "integer"
               },
@@ -4059,6 +4062,7 @@
               "computed_at",
               "first_seen",
               "hard_edges",
+              "joiner_edges",
               "key",
               "last_seen",
               "num",

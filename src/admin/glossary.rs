@@ -7,6 +7,9 @@ use crate::store::links::LinkKind;
 /// The key of a path shape, beside the [`LinkKind`] keys; the campaign
 /// edge kind `paths` reads the same.
 pub const PATH_SHAPE: &str = "path-shape";
+/// The key of a claimed campaign edge (kinds `stager`, `key`, `file`), whose
+/// Links value has a line of its own.
+pub const JOINER: &str = "joiner";
 
 /// The line of a [`LinkKind`].
 pub fn kind_help(kind: LinkKind) -> &'static str {
@@ -73,11 +76,14 @@ pub fn kind_help(kind: LinkKind) -> &'static str {
 
 const PATH_SHAPE_HELP: &str = "A request path with the parts that vary per target or run (ids, hashes, random names) replaced by placeholders. Matching sets of rare shapes: the same target list or tool; campaigns join IPs on them as soft edges.";
 
-/// The line of `key`: a [`LinkKind`] key, [`PATH_SHAPE`] or `paths`; `""`
-/// for anything else.
+const JOINER_HELP: &str = "Two IPs naming one stager, SSH key or uploaded file. Anyone can name someone else's stager or upload a public webshell, so it is a claim, not proof of one operator. An IP outside any group joins on it; two groups of two or more IPs merge only when 2 addresses in each name the same value, and otherwise the edge is listed as not merged. An attacker with two addresses in each group can still merge them.";
+
+/// The line of `key`: a [`LinkKind`] key, [`PATH_SHAPE`], `paths` or
+/// [`JOINER`]; `""` for anything else.
 pub fn help(key: &str) -> &'static str {
     match key {
         PATH_SHAPE | "paths" => PATH_SHAPE_HELP,
+        JOINER => JOINER_HELP,
         _ => LinkKind::parse(key).map(kind_help).unwrap_or_default(),
     }
 }
@@ -90,12 +96,15 @@ pub fn host_help(kind: &str) -> &'static str {
 }
 
 /// The visible list: `(name, line)` of every listed fingerprint, then the
-/// path shape.
+/// path shape and the claimed edge.
 pub fn entries() -> Vec<(&'static str, &'static str)> {
     LinkKind::LIST
         .into_iter()
         .map(|k| (k.name(), kind_help(k)))
-        .chain([("Path shape", PATH_SHAPE_HELP)])
+        .chain([
+            ("Path shape", PATH_SHAPE_HELP),
+            ("Claimed edge", JOINER_HELP),
+        ])
         .collect()
 }
 
@@ -115,7 +124,7 @@ mod tests {
         assert_eq!(help("nope"), "");
         assert_eq!(host_help(crate::model::hostkeys::HASSH), help("hassh"));
         assert_eq!(host_help("ssh2-enum-algos"), "");
-        assert_eq!(entries().len(), LinkKind::LIST.len() + 1);
+        assert_eq!(entries().len(), LinkKind::LIST.len() + 2);
     }
 
     #[test]
@@ -130,5 +139,14 @@ mod tests {
         for n in ["Stager", "Key", "File", "Recipe", "Exploit tag"] {
             assert!(names.contains(&n), "{n}");
         }
+    }
+
+    #[test]
+    fn a_claimed_edge_says_what_it_does_not_prove() {
+        let h = help(JOINER);
+        assert!(h.contains("not proof") && h.contains("not merged"), "{h}");
+        let k = crate::store::campaigns::K_SOFT_MERGE;
+        assert!(h.contains(&format!("merge only when {k} addresses")), "{h}");
+        assert!(entries().iter().any(|e| e == &("Claimed edge", h)));
     }
 }

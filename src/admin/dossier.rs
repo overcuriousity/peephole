@@ -1053,6 +1053,7 @@ pub struct CampaignJson {
     pub last_seen: String,
     pub hard_edges: i64,
     pub soft_edges: i64,
+    pub joiner_edges: i64,
     pub v: i64,
     pub computed_at: String,
 }
@@ -1068,6 +1069,7 @@ impl From<crate::store::campaigns::CampaignRow> for CampaignJson {
             size: r.size,
             hard_edges: r.hard_edges,
             soft_edges: r.soft_edges,
+            joiner_edges: r.joiner_edges,
             v: r.v,
         }
     }
@@ -1120,6 +1122,9 @@ pub struct EdgeJson {
 
 impl From<crate::store::campaigns::Edge> for EdgeJson {
     fn from(e: crate::store::campaigns::Edge) -> Self {
+        // A joiner's value came from a payload.
+        let value = crate::store::links::LinkKind::parse(&e.kind)
+            .map_or_else(|| e.value.clone(), |k| k.shown(&e.value));
         Self {
             first_ts: rfc3339(&e.first_ts),
             last_ts: rfc3339(&e.last_ts),
@@ -1128,7 +1133,7 @@ impl From<crate::store::campaigns::Edge> for EdgeJson {
             b_id: e.b_id,
             b: e.b,
             kind: e.kind,
-            value: e.value,
+            value,
             score: e.score,
             shared: e.shared,
             fp_support: e.fp_support,
@@ -1137,12 +1142,14 @@ impl From<crate::store::campaigns::Edge> for EdgeJson {
     }
 }
 
-/// The edges between two of `members`, and whether any was left out.
+/// The edges between two of `members`, and whether any was left out. An edge
+/// to another campaign was not merged and is not one of these.
 fn member_edges(
     edges: Vec<crate::store::campaigns::Edge>,
     members: &[crate::store::campaigns::Member],
 ) -> (Vec<EdgeJson>, bool) {
     let carried: std::collections::HashSet<i64> = members.iter().map(|m| m.ip_id).collect();
+    let edges: Vec<_> = edges.into_iter().filter(|e| e.merged).collect();
     let all = edges.len();
     let kept: Vec<EdgeJson> = edges
         .into_iter()
@@ -1576,6 +1583,7 @@ mod tests {
             first_ts: "2026-01-02 03:04:05".into(),
             last_ts: "2026-01-02 03:04:05".into(),
             agreement: None,
+            merged: true,
         }
     }
 
@@ -1589,6 +1597,25 @@ mod tests {
         let pairs: Vec<_> = kept.iter().map(|e| (e.a_id, e.b_id)).collect();
         assert_eq!((pairs, more), (vec![(1, 2)], true));
         assert_eq!(kept[0].first_ts, "2026-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn an_unmerged_edge_is_no_member_edge() {
+        let mut other = edge(1, 9);
+        other.merged = false;
+        let (kept, more) = member_edges(vec![edge(1, 2), other], &[member(1), member(2)]);
+        assert_eq!((kept.len(), more), (1, false));
+    }
+
+    #[test]
+    fn a_joiner_edge_value_is_defanged() {
+        let mut e = edge(1, 2);
+        e.kind = "stager".into();
+        e.value = "https://pastebin.com/raw/abc".into();
+        assert_eq!(
+            EdgeJson::from(e).value,
+            crate::model::defang::defang("https://pastebin.com/raw/abc")
+        );
     }
 
     #[tokio::test]

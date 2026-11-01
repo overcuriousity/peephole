@@ -9,6 +9,7 @@ use crate::store::browse::{CALENDAR_DAYS, CalendarDay, canonical_ip};
 use crate::store::campaigns::{
     Campaign, CampaignCommand, CampaignFilter, CampaignListItem, CampaignShape, DF_RARE, Edge,
     EdgeDetail, HARD_FANOUT_MAX, MIN_SHARED_RARE, ORDER_AGREE, PATHS_T, PATHS_T_SUPPORTED, Report,
+    is_joiner,
 };
 use crate::store::events::EventPage;
 use crate::store::links::LinkKind;
@@ -73,7 +74,8 @@ pub struct EdgeView {
     pub kind_name: &'static str,
     /// Why the two are tied, in words.
     pub reason: String,
-    /// The shared value and its Links page (hard kinds).
+    /// The shared value as shown (a joiner's is defanged) and its Links
+    /// page (hard and joiner kinds).
     pub value: Option<(String, String)>,
     /// What tied a `paths` edge, as the pass stored it.
     pub detail: EdgeDetail,
@@ -96,11 +98,13 @@ impl EdgeView {
                 }
             ),
             "canary" => "canary served here, used there".into(),
+            "file" => "both sent this file".into(),
+            k if is_joiner(k) => format!("both name this {}", kind_name.to_lowercase()),
             _ => format!("shared {}", kind_name.to_lowercase()),
         };
         let value = kind
             .filter(|_| !e.value.is_empty())
-            .map(|k| (e.value.clone(), link_href(k.key(), &e.value)));
+            .map(|k| (k.shown(&e.value), link_href(k.key(), &e.value)));
         Self {
             e,
             kind_name,
@@ -174,9 +178,16 @@ impl EdgeView {
             .collect()
     }
 
-    /// Paths edges are soft; the rest point to one operator.
+    /// Paths edges are soft and joiner edges claimed; the rest point to one
+    /// operator.
     pub fn hard(&self) -> bool {
-        self.e.kind != "paths"
+        self.e.kind != "paths" && !self.claimed()
+    }
+
+    /// A joiner edge: a body or an upload names the value, which proves
+    /// nothing about who sent it.
+    pub fn claimed(&self) -> bool {
+        is_joiner(&self.e.kind)
     }
 }
 
@@ -205,25 +216,33 @@ pub const CAMPAIGN_WAVES: usize = 3;
 
 impl CampaignPage {
     /// What ties the group, for the header line (MIK-689 #3): with no hard
-    /// link, the strongest path similarity it rests on.
+    /// link, the strongest path similarity it rests on. Claimed links never
+    /// read as hard.
     fn strength(&self) -> String {
-        let (hard, soft) = (self.c.row.hard_edges, self.c.row.soft_edges);
+        let row = &self.c.row;
+        let (hard, soft, joiner) = (row.hard_edges, row.soft_edges, row.joiner_edges);
         if hard > 0 {
+            let claimed = if joiner > 0 {
+                format!(", {joiner} claimed")
+            } else {
+                String::new()
+            };
             return format!(
-                "{hard} hard link{}, {soft} soft",
+                "{hard} hard link{}, {soft} soft{claimed}",
                 if hard == 1 { "" } else { "s" }
             );
         }
         let best = self
             .edges
             .iter()
-            .filter(|v| !v.hard())
             .filter_map(|v| v.e.score)
             .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
-        let links = if soft == 1 {
-            "soft link only"
-        } else {
-            "soft links only"
+        let links = match (soft, joiner) {
+            (1, 0) => "soft link only",
+            (_, 0) => "soft links only",
+            (0, 1) => "claimed link only",
+            (0, _) => "claimed links only",
+            _ => "soft and claimed links only",
         };
         match best {
             Some(x) => format!("{links}: path similarity {x:.2}"),
@@ -315,7 +334,7 @@ async fn campaign(
 #[cfg(test)]
 mod tests {
     use crate::admin::devices::tests::{app, send};
-    use crate::store::campaigns::tests::{feed, fixture, seed_artifacts, tls_fixture};
+    use crate::store::campaigns::tests::{Op, feed, fixture, seed_artifacts, sighted, tls_fixture};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
 
@@ -506,7 +525,7 @@ mod tests {
         assert!(at("data-section=\"artifacts\"") < at("data-section=\"timeline\""));
         for want in [
             "<td class=\"path\">/drop.php</td>",
-            "href=\"/admin/traps/uploads?sha256=",
+            "href=\"/admin/evidence/links/file/",
             "<a href=\"/requests?cmd=ls%20-la\">ls -la</a></td><td class=\"num\">3</td><td class=\"num\">2</td>",
             "<a href=\"/requests?cmd=id\">id</a>",
         ] {
@@ -580,6 +599,84 @@ mod tests {
         assert!(!single.contains("member of campaign"));
         let (_, _, public) = send(&app, get("/ip/192.0.2.1", false), Body::empty()).await;
         assert!(!public.contains("member of campaign"));
+    }
+
+    /// A joiner edge reads as claimed, its value defanged, and one that
+    /// merged nothing reads "not merged" on both campaigns.
+    #[tokio::test]
+    async fn joiner_edges_show_as_claimed() {
+        let (state, cookie, app, _d) = app().await;
+        let s = &state.store;
+        let url = "https://pastebin.com/raw/abc";
+        let (a, b) = ("192.0.2.1", "192.0.2.2");
+        for (ip, key, ts) in [
+            (a, "SHA256:a", "2026-10-01 00:00:00"),
+            ("192.0.2.3", "SHA256:a", "2026-10-01 00:00:01"),
+            (b, "SHA256:b", "2026-10-01 00:00:02"),
+            ("192.0.2.4", "SHA256:b", "2026-10-01 00:00:03"),
+        ] {
+            feed(s, [Op::Key(ip, "ssh-hostkey", key.into(), ts)]).await;
+        }
+        sighted(s, "stager", "stager", url, a, "2026-10-01 00:00:00").await;
+        sighted(s, "stager", "stager", url, b, "2026-10-01 00:00:02").await;
+        s.recompute_campaigns(true).await.unwrap();
+        let get = |path: String| {
+            Request::get(path)
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+        };
+        for key in [a, b] {
+            let (st, _, page) = send(
+                &app,
+                get(format!("/admin/evidence/campaigns/{key}")),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(page.contains("class=\"edge-claimed\""), "{page}");
+            assert!(page.contains(">not merged</span>"), "{page}");
+            assert!(page.contains(">claimed</span>"), "{page}");
+            assert!(page.contains("both name this stager"), "{page}");
+            assert!(page.contains("pastebin[.]com"), "{page}");
+            assert!(!page.contains("https://pastebin"), "{page}");
+            assert!(page.contains("<dt>Claimed edge</dt>"), "{page}");
+        }
+        // The two stayed apart, so neither has a claimed edge of its own.
+        let (_, _, page) = send(
+            &app,
+            get(format!("/admin/evidence/campaigns/{a}")),
+            Body::empty(),
+        )
+        .await;
+        assert!(page.contains("1 hard, 0 soft ·"), "{page}");
+    }
+
+    /// A campaign tied only by claims says so, and never reads as hard.
+    #[tokio::test]
+    async fn a_claimed_campaign_reads_as_claimed() {
+        let (state, cookie, app, _d) = app().await;
+        let s = &state.store;
+        for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+            sighted(s, "key", "key", "SHA256:k", ip, "2026-10-01 00:00:00").await;
+        }
+        s.recompute_campaigns(true).await.unwrap();
+        let get = |path: &str| {
+            Request::get(path)
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+        };
+        let (_, _, page) = send(
+            &app,
+            get("/admin/evidence/campaigns/192.0.2.1"),
+            Body::empty(),
+        )
+        .await;
+        assert!(page.contains("claimed links only ·"), "{page}");
+        assert!(page.contains("0 hard, 0 soft, 2 claimed ·"), "{page}");
+        assert!(page.contains(">SHA256:k</a>"), "{page}");
+        assert!(!page.contains(">not merged</span>"), "{page}");
+        let (_, _, list) = send(&app, get("/admin/evidence/campaigns"), Body::empty()).await;
+        assert!(list.contains("Claimed edges</th>"), "{list}");
     }
 
     /// MIK-635: a soft edge's row expands to what tied it, the same shapes

@@ -400,6 +400,24 @@ evidence of one operator:
   50 addresses each, active within 30 days of each other). A shared JA4
   and JA4H pair, or the shapes asked for in the same order, lowers the
   score needed to 0.45. JA4 and JA4H never tie two addresses on their own.
+- **Claimed edges**, one value two addresses name: a stager, an SSH key or
+  an uploaded file, read from this node's own sightings. Anyone can name
+  someone else's stager or upload a public webshell, so these are claims:
+  they run after the hard and soft edges, never count as either, and the
+  edge list marks them as claimed. A value on one address forms no edge.
+  Each address links to the oldest address naming the value, so n addresses
+  make n−1 edges. An address outside any group joins freely. Two groups of
+  two or more addresses merge only when at least two addresses in each name
+  the same value. The guard counts addresses, not links, so one body naming
+  a stager and its key counts once. An unmet merge keeps its edge, shown as
+  "not merged" on both campaigns. A file on more than 50 addresses is a
+  public webshell and ties nothing. Stagers and keys have no such cap: a
+  stager is a joiner only when a command fetches from it, and a shared host
+  such as a paste site joins by the full URL, not by the host.
+
+  An attacker controlling two addresses in each of two groups can still
+  merge them. The edge list shows such a merge as claimed, so a person can
+  see why.
 
 User agent, JA4 alone, JA4H alone, HASSH, JA4X, JARM, favicon and the
 HTTP body, 404 and ETag hashes do not feed campaigns: they identify the
@@ -410,8 +428,8 @@ The Links page also lists what the body X-ray finds, read from this node's
 own sightings and not replicated: stagers (only those a command fetches from,
 not addresses it merely queries), SSH key fingerprints and uploaded files (by
 SHA-256) as identity kinds, and shell recipes and exploit tags as software
-kinds. They do not feed campaigns yet. Values from payloads are shown and
-copied defanged and are never links. A stager's page lists its URLs, each
+kinds. Stagers, keys and files feed campaigns as claimed edges; recipes and
+exploit tags do not. Values from payloads are shown and copied defanged and are never links. A stager's page lists its URLs, each
 with a "Copy for sandbox" button that puts the raw URL on the clipboard for
 an external sandbox; the node never fetches it.
 

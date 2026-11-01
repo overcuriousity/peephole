@@ -884,7 +884,9 @@ impl Store {
     /// A campaign's member IPs (the anchor at hop 0, the rest at hop 1,
     /// by IP text, up to [`GRAPH_MAX`]) and one edge per `campaign_edges`
     /// row between them, up to [`GRAPH_EDGE_MAX`]: identity edges first,
-    /// then `paths` edges by similarity. `paths` edges are the soft ones.
+    /// then joiner edges, then `paths` edges by similarity. `paths` and
+    /// joiner edges draw as soft: a joiner's value is only claimed, and is
+    /// shown defanged.
     async fn campaign_graph(&self, key: &str) -> Result<LinkGraph> {
         let mut g = LinkGraph::default();
         let ips: Vec<String> = sqlx::query_scalar(
@@ -923,7 +925,8 @@ impl Store {
              JOIN campaign_members m ON m.ip_id = e.a
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
              WHERE m.campaign_key = ?
-             ORDER BY e.kind = 'paths', e.score DESC, ia.ip, ib.ip, e.kind, e.value",
+             ORDER BY e.kind = 'paths', e.kind IN ('stager', 'key', 'file'), e.score DESC,
+                      ia.ip, ib.ip, e.kind, e.value",
         )
         .bind(key)
         .fetch_all(&self.read)
@@ -951,12 +954,12 @@ impl Store {
                 }
                 l
             } else {
-                value
+                LinkKind::parse(&kind).map_or(value.clone(), |k| k.shown(&value))
             };
             g.edges.push(GraphEdge {
                 a,
                 b,
-                identity: kind != "paths",
+                identity: kind != "paths" && !crate::store::campaigns::is_joiner(&kind),
                 kind,
                 label: Some(label),
             });
@@ -1712,6 +1715,28 @@ mod tests {
                 .is_empty()
         );
     }
+    /// Joiner edges in a campaign's graph: dashed, after the identity edges,
+    /// and their value defanged.
+    #[tokio::test]
+    async fn campaign_graph_draws_joiner_edges_as_claimed() {
+        use crate::store::campaigns::tests::sighted;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        let url = "https://pastebin.com/raw/abc";
+        for ip in ["203.0.113.1", "203.0.113.2"] {
+            sighted(&s, "stager", "stager", url, ip, "2026-10-01 00:00:00").await;
+        }
+        s.recompute_campaigns(true).await.unwrap();
+        let f = Focus::Campaign("203.0.113.1".into());
+        let g = s.link_graph(&f, 1, &[], false).await.unwrap();
+        assert_eq!(g.edges.len(), 1);
+        let e = &g.edges[0];
+        assert_eq!(e.kind, "stager");
+        assert!(!e.identity);
+        let shown = LinkKind::Stager.shown(url);
+        assert_eq!(e.label.as_deref(), Some(shown.as_str()));
+    }
+
     #[tokio::test]
     async fn a_campaign_graph_stops_at_graph_max() {
         let (s, ids) = seeded().await;
@@ -1747,7 +1772,7 @@ mod tests {
         let (last_a, last_b) = (nth_last_ip(&g, 1), nth_last_ip(&g, 2));
         sqlx::query(
             "INSERT INTO campaign_edges
-             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't', NULL
+             SELECT x.ip_id, y.ip_id, 'paths', '', 0.5, 3, 0, 't', 't', NULL, 1
              FROM campaign_members x JOIN campaign_members y ON x.ip_id < y.ip_id
              LIMIT 3000",
         )
@@ -1757,7 +1782,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO campaign_edges VALUES
              ((SELECT id FROM ips WHERE ip = ?), (SELECT id FROM ips WHERE ip = ?),
-              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't', NULL)",
+              'ssh', 'SHA256:last', NULL, NULL, 0, 't', 't', NULL, 1)",
         )
         .bind(&last_a)
         .bind(&last_b)

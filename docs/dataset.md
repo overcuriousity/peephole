@@ -142,13 +142,17 @@ per `ip` first (`DISTINCT ON`, `group_by(...).first()`).
 | `campaign` | string? | The campaign `key` of the address when the export ran; null when the address is in no campaign |
 
 A campaign is a group of addresses tied by evidence: a shared SSH host key,
-TLS certificate, browser fingerprint or canary, or a similar set of
-normalized paths. The column is derived, not recorded: every node
-recomputes campaigns from the replicated rows about once an hour, so it is
-node-local in timing (a node that has not caught up yet, or not recomputed
-yet, can still miss a new member). It is stable in identity: the key is the
-IP text of the campaign's oldest member, the same on every node, and
-survives recomputes as long as that member stays in it. The key is not a
+TLS certificate, browser fingerprint or canary, a similar set of normalized
+paths, or a stager, SSH key or uploaded file several addresses name (a
+claim, guarded so one forged body merges nothing). The column is derived,
+not recorded: every node recomputes campaigns from the replicated rows about
+once an hour, so it is node-local in timing (a node that has not caught up
+yet, or not recomputed yet, can still miss a new member). The claimed edges
+are read from what each node's X-ray found in the rows it holds, so a node
+that has not read a body yet, or does not hold it, can differ until it has.
+It is stable in identity: the key is the IP text of the campaign's oldest
+member, the same on every node holding the same rows, and survives
+recomputes as long as that member stays in it. The key is not a
 row of the export; join on it, not on the `#N` the admin pages show, which
 is a display rank. A new clustering version can split a campaign, and the
 split-off parts get new keys: join across exports made by the same version.
