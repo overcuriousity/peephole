@@ -7,7 +7,8 @@
 #
 # `never`: hosts that tie nothing to an operator, whoever saves what they
 # answer: schema hosts named in documents, the address-echo services and
-# cloud endpoints that recon scripts read. They are recorded as `queried`.
+# cloud endpoints that recon scripts read, public installers, and the
+# placeholders of copied proofs of concept. They are recorded as `queried`.
 
 shared = [
     "pastebin.com",
@@ -43,4 +44,12 @@ never = [
     "login.microsoftonline.com",
     "metadata.google.internal",
     "metadata.azure.com",
+    # Public installers
+    "get.docker.com",
+    # Placeholders of copied proofs of concept
+    "x.x.x.x",
+    "1.2.3.4",
+    "example.com",
+    "attacker.com",
+    "evil.com",
 ]

