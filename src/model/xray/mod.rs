@@ -28,6 +28,9 @@ pub const MAX_LAYERS: usize = 128;
 /// Pieces per source.
 pub const MAX_PIECES: usize = 256;
 
+/// Recipe steps per source.
+pub const MAX_STEPS: usize = 256;
+
 /// A byte range of one layer's text (`end` exclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -141,14 +144,18 @@ impl Xray {
 }
 
 /// The limits of one source: `depth` and `layers` are fixed, `output` is
-/// what is left to decode, and `pieces` is what is left for recipe steps
-/// and, later, the piece extractor.
+/// what is left to decode, `pieces` is the cap the piece extractor counts
+/// against, and `steps` is what is left for recipe steps, so a long recipe
+/// cannot starve pieces.
 #[derive(Debug, Clone)]
 pub struct Budget {
     depth: usize,
     output: usize,
     layers: usize,
+    // Read by the piece extractor.
+    #[allow(dead_code)]
     pieces: usize,
+    steps: usize,
     /// Hash of every layer's text -> its index, so text that is already
     /// open is not opened again.
     seen: std::collections::HashMap<u64, usize>,
@@ -163,6 +170,7 @@ impl Default for Budget {
             output: MAX_OUTPUT,
             layers: MAX_LAYERS,
             pieces: MAX_PIECES,
+            steps: MAX_STEPS,
             seen: std::collections::HashMap::new(),
             dedupe: true,
         }

