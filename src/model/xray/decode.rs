@@ -66,9 +66,6 @@ enum Found {
 
 /// Open every layer reachable from `layer`, spending `budget`. Children are
 /// appended to `xray.layers` and queued; nothing recurses.
-// Nothing outside the tests calls this until the piece extractor does; the
-// allow also keeps what it uses alive.
-#[allow(dead_code)]
 pub(crate) fn decode_all(xray: &mut Xray, layer: usize, budget: &mut Budget) {
     let mut queue = VecDeque::from([layer]);
     while let Some(at) = queue.pop_front() {
@@ -148,7 +145,7 @@ fn push_opaque(xray: &mut Xray, at: Span, reason: OpaqueReason) {
 }
 
 /// Add `bytes` as a child of `parent`, if the limits allow.
-fn open(
+pub(super) fn open(
     xray: &mut Xray,
     parent: usize,
     kind: LayerKind,
@@ -169,6 +166,8 @@ fn open(
         parent: Some(parent),
         from: Some(at),
         text: bytes,
+        name: None,
+        collapsed: 0,
     });
     queue.push_back(xray.layers.len() - 1);
 }
@@ -199,11 +198,37 @@ fn read_limited(reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
 }
 
 /// Raw deflate (PHP `gzinflate`), at most `limit` bytes of output.
-#[allow(dead_code)]
 pub(crate) fn inflate_raw(bytes: &[u8], limit: usize) -> Option<Vec<u8>> {
     let (mut out, _) = read_limited(flate2::read::DeflateDecoder::new(bytes), limit);
     out.truncate(limit);
     (!out.is_empty()).then_some(out)
+}
+
+/// Zlib (PHP `gzuncompress`), at most `limit` bytes of output.
+pub(super) fn inflate_zlib(bytes: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let (mut out, _) = read_limited(flate2::read::ZlibDecoder::new(bytes), limit);
+    out.truncate(limit);
+    (!out.is_empty()).then_some(out)
+}
+
+/// Base64 as PHP's `base64_decode` reads it: line breaks and padding cut,
+/// trailing bits ignored.
+pub(super) fn base64_lenient(run: &[u8]) -> Option<Vec<u8>> {
+    let clean: Vec<u8> = run
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .take_while(|&b| b != b'=')
+        .collect();
+    if clean.len() % 4 == 1 {
+        return None;
+    }
+    BASE64_LENIENT.decode(&clean).ok()
+}
+
+/// Hex digits to bytes (PHP `hex2bin`).
+pub(super) fn hex_bytes(run: &[u8]) -> Option<Vec<u8>> {
+    HEXLOWER_PERMISSIVE.decode(run).ok()
 }
 
 /// Decompress `text`, the text of `parent`. True when it was a stream:
@@ -240,7 +265,7 @@ fn open_compressed(
     true
 }
 
-fn printable_enough(bytes: &[u8]) -> bool {
+pub(super) fn printable_enough(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
@@ -259,7 +284,7 @@ fn has_marker(bytes: &[u8]) -> bool {
 }
 
 /// Decoded bytes worth a layer: mostly printable, or a known container.
-fn worth_opening(bytes: &[u8]) -> bool {
+pub(super) fn worth_opening(bytes: &[u8]) -> bool {
     printable_enough(bytes) || has_marker(bytes)
 }
 

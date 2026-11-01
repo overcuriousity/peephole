@@ -5,6 +5,7 @@
 //! (a work queue over an arena), and nothing found is fetched, executed or
 //! resolved.
 
+pub mod container;
 pub mod decode;
 
 /// Version of the rules below; results derived by an older version are
@@ -57,6 +58,11 @@ pub struct Layer {
     pub parent: Option<usize>,
     pub from: Option<Span>,
     pub text: Vec<u8>,
+    /// Field or file name this layer's text came from (multipart, form,
+    /// query).
+    pub name: Option<Vec<u8>>,
+    /// Sibling fields folded into this one as random padding.
+    pub collapsed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,12 @@ pub struct Opaque {
     pub at: Span,
     pub reason: OpaqueReason,
 }
+
+/// What the parser is told. Defined properly with the rules.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {}
+
+pub use container::{Source, parse};
 
 /// Filled in by the piece extractor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +111,8 @@ impl Xray {
                 parent: None,
                 from: None,
                 text: body.to_vec(),
+                name: None,
+                collapsed: 0,
             }],
             ..Xray::default()
         }
