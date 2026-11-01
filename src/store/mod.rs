@@ -6,6 +6,7 @@ pub mod blocklist;
 pub mod browse;
 pub mod campaigns;
 pub mod canaries;
+pub mod chains;
 pub mod cli;
 pub mod data;
 pub mod decoys;

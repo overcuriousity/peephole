@@ -9,8 +9,10 @@
 //! goes by IP text, never by a node's row ids, so nodes holding the same
 //! rows compute the same campaigns.
 use super::Store;
+use super::chains::CHAIN_V;
 use super::links::{LinkKind, all_sightings};
 use crate::model::shape::SHAPE_V;
+use crate::model::xray::XRAY_V;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
@@ -446,6 +448,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        super::chains::rebuild(&mut tx).await?;
         tx.commit().await?;
         Ok(report)
     }
@@ -749,9 +752,23 @@ async fn signature(conn: &mut sqlx::SqliteConnection) -> Result<String> {
     .bind(SHAPE_V)
     .fetch_one(&mut *conn)
     .await?;
+    let (sightings, newest): (i64, Option<String>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(ts) FROM piece_sightings")
+            .fetch_one(&mut *conn)
+            .await?;
     Ok(format!(
-        "v{CAMPAIGN_V} s{SHAPE_V} {} {} {} {} {} {} {} {} {} {}",
-        n.0, n.1, n.2, n.3, n.4, n.5, n.6, n.7, n.8, n.9
+        "v{CAMPAIGN_V} s{SHAPE_V} x{XRAY_V} c{CHAIN_V} {} {} {} {} {} {} {} {} {} {} {sightings} {}",
+        n.0,
+        n.1,
+        n.2,
+        n.3,
+        n.4,
+        n.5,
+        n.6,
+        n.7,
+        n.8,
+        n.9,
+        newest.unwrap_or_default()
     ))
 }
 
@@ -2381,6 +2398,65 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!s.recompute_campaigns(false).await.unwrap().unchanged);
+    }
+
+    async fn sight(s: &Store, value: &str, ts: &str) {
+        let hash = crate::store::pieces::piece_hash("stager", value);
+        sqlx::query(
+            "INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             VALUES (?, 'stager', ?, ?, ?, 1, 1)",
+        )
+        .bind(hash)
+        .bind(value)
+        .bind(ts)
+        .bind(ts)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO piece_sightings VALUES (?, 'request', 1, 1, 'stager', 'claimed', ?)",
+        )
+        .bind(hash)
+        .bind(ts)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn chain_count(s: &Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chains")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pass_rebuilds_the_chains_when_sightings_change() {
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        s.recompute_campaigns(false).await.unwrap();
+        assert!(s.recompute_campaigns(false).await.unwrap().unchanged);
+        assert_eq!(chain_count(&s).await, 0);
+        sight(&s, "a.example.org", "2026-10-01 00:00:00").await;
+        assert!(!s.recompute_campaigns(false).await.unwrap().unchanged);
+        assert_eq!(chain_count(&s).await, 1);
+        assert!(s.recompute_campaigns(false).await.unwrap().unchanged);
+        // As many sightings as before, but a newer one.
+        sqlx::query("DELETE FROM piece_sightings")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sight(&s, "b.example.org", "2026-10-02 00:00:00").await;
+        assert!(!s.recompute_campaigns(false).await.unwrap().unchanged);
+    }
+
+    #[tokio::test]
+    async fn signature_names_the_xray_and_chain_versions() {
+        let (s, _d) = store().await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        let sig = signature(&mut conn).await.unwrap();
+        let want = format!("v{CAMPAIGN_V} s{SHAPE_V} x{XRAY_V} c{CHAIN_V} ");
+        assert!(sig.starts_with(&want), "{sig}");
     }
 
     #[tokio::test]

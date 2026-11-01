@@ -137,6 +137,66 @@ pub fn choose(
     None
 }
 
+/// Whether the trap answers this request itself, so that a file dropped at
+/// its path does not take it over: the landing page, or a decoy for what
+/// this request presented. `p` and `word` as for [`choose`].
+pub fn answers_itself(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    p: Presented,
+    word: &str,
+) -> bool {
+    path == "/" || choose(method, path, query, p, word).is_some()
+}
+
+/// Each [`Presented`] that can change an answer, on its own: the trap can
+/// find them together, but no rule of [`choose`] asks for two. The trap
+/// looks for a cookie canary under `/wp-admin`, a body canary on a wp-login
+/// POST and a Basic one anywhere (`trap::credentials`).
+const EVERY: [Presented; 4] = [
+    Presented {
+        basic: false,
+        cookie: false,
+        body: false,
+    },
+    Presented {
+        basic: true,
+        cookie: false,
+        body: false,
+    },
+    Presented {
+        basic: false,
+        cookie: true,
+        body: false,
+    },
+    Presented {
+        basic: false,
+        cookie: false,
+        body: true,
+    },
+];
+
+/// Whether the trap has an answer of its own for this path, whoever asks:
+/// [`answers_itself`] under each thing the trap can find presented. For
+/// rows read later, which keep neither the presentation nor, for most, the
+/// site word: the answer here is about the path, so the trap itself, which
+/// knows both, asks [`answers_itself`], and a dropped file at
+/// `/wp-admin/x.php` keeps answering a request with no canary cookie. The
+/// `admin` page does not count: a Basic canary opens it on any path, which
+/// says something of the request and nothing of the path.
+pub fn keeps_its_own_answer(method: &str, path: &str, query: Option<&str>) -> bool {
+    // Any repository is taken for the node's: the word is not in the row.
+    let word = path
+        .strip_prefix("/git/")
+        .and_then(|r| r.split_once(".git/"))
+        .map_or("", |(w, _)| w);
+    path == "/"
+        || EVERY
+            .into_iter()
+            .any(|p| choose(method, path, query, p, word).is_some_and(|name| name != "admin"))
+}
+
 /// The decoy `name` as version `inp.v` renders it (None: unknown).
 pub fn render(inp: &Input, name: &str) -> Option<Decoy> {
     if inp.v >= 2 {
@@ -788,6 +848,111 @@ mod tests {
         let pack = format!("{repo}/git-upload-pack");
         assert_eq!(choose("POST", &pack, None, basic, n), Some("git-pack"));
         assert_eq!(choose("POST", &pack, None, none(), n), None);
+    }
+
+    #[test]
+    fn a_path_keeps_its_answer_under_any_presentation() {
+        let n = crate::canary::site::word(Some(&NODE));
+        let refs = format!("/git/{n}.git/info/refs");
+        let pack = format!("/git/{n}.git/git-upload-pack");
+        let svc = Some("service=git-upload-pack");
+        let page = Some("page=wp_file_manager");
+        for (m, p, q) in [
+            ("GET", "/", None),
+            ("POST", "/", None),
+            ("PUT", "/", None),
+            // No presentation needed.
+            ("GET", "/.env", None),
+            ("HEAD", "/api/.env", None),
+            ("GET", "/.git/config", None),
+            ("GET", "/.git/HEAD", None),
+            ("GET", "/blog/wp-login.php", None),
+            ("POST", "/wp-login.php", None),
+            ("GET", "/phpinfo.php", None),
+            ("GET", "/elfinder.html", None),
+            ("GET", "/wp-admin/admin.php", page),
+            ("GET", refs.as_str(), svc),
+            // A cookie canary.
+            ("GET", "/wp-admin", None),
+            ("GET", "/wp-admin/", None),
+            ("HEAD", "/wp-admin/x.php", None),
+            // A Basic canary.
+            ("POST", pack.as_str(), None),
+            // The site word is the node's: any repository is one.
+            ("GET", "/git/other.git/info/refs", svc),
+            ("POST", "/git/other.git/git-upload-pack", None),
+        ] {
+            assert!(keeps_its_own_answer(m, p, q), "{m} {p} {q:?}");
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_answer_of_its_own_is_the_files() {
+        // `Presented::basic` answers any path with the admin page: that
+        // says something of the request, nothing of the path.
+        let n = crate::canary::site::word(Some(&NODE));
+        assert_eq!(choose("GET", "/up/a.php", None, EVERY[1], n), Some("admin"));
+        for (m, p, q) in [
+            ("GET", "/up/a.php", None),
+            ("POST", "/up/a.php", Some("cmd=id")),
+            ("POST", "/.env", None),
+            ("PUT", "/.env", None),
+            ("PUT", "/wp-admin/x.php", None),
+            ("DELETE", "/wp-login.php", None),
+            ("GET", "/git/other.git/info/refs", None),
+            ("GET", "/git/.git/config.php", None),
+            ("POST", "/git/a.git/b.git/git-upload-pack", None),
+        ] {
+            assert!(!keeps_its_own_answer(m, p, q), "{m} {p} {q:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_trap_answers_is_also_kept() {
+        let n = crate::canary::site::word(Some(&NODE));
+        let refs = format!("/git/{n}.git/info/refs");
+        let pack = format!("/git/{n}.git/git-upload-pack");
+        for (m, p) in [
+            ("GET", "/"),
+            ("GET", "/.env"),
+            ("POST", "/wp-login.php"),
+            ("GET", "/wp-admin/x.php"),
+            ("GET", refs.as_str()),
+            ("POST", pack.as_str()),
+        ] {
+            for presented in EVERY {
+                let q = Some("service=git-upload-pack");
+                if answers_itself(m, p, q, presented, n) {
+                    assert!(keeps_its_own_answer(m, p, q), "{m} {p} {presented:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_trap_decides_by_what_this_request_presented() {
+        let n = crate::canary::site::word(Some(&NODE));
+        let pack = format!("/git/{n}.git/git-upload-pack");
+        // As before the check moved here: a dropped file answers unless
+        // this request's own presentation gets a decoy.
+        for (m, p, unlocks) in [
+            ("GET", "/wp-admin/x.php", EVERY[2]),
+            ("POST", pack.as_str(), EVERY[1]),
+            ("GET", "/up/a.php", EVERY[1]),
+        ] {
+            assert!(!answers_itself(m, p, None, EVERY[0], n), "{m} {p}");
+            assert!(answers_itself(m, p, None, unlocks, n), "{m} {p}");
+        }
+        assert!(answers_itself("GET", "/", None, EVERY[0], n));
+        assert!(answers_itself("GET", "/.env", None, EVERY[0], n));
+        // A word that is not this node's is no route here.
+        assert!(!answers_itself(
+            "GET",
+            "/git/other.git/info/refs",
+            Some("service=git-upload-pack"),
+            EVERY[0],
+            n
+        ));
     }
 
     #[test]
