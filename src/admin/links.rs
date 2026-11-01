@@ -146,6 +146,8 @@ struct LinkPage {
     /// Graph focus, as the API names it.
     focus: String,
     item: Option<LinkItem>,
+    /// A stager's URLs, newest first.
+    urls: Vec<StagerUrl>,
     /// `ip` pages: the address is stored.
     ip_seen: bool,
     kinds: Vec<LinkKind>,
@@ -155,6 +157,15 @@ struct LinkPage {
     kinds_json: String,
     /// Keys of the identity kinds.
     identity_json: String,
+}
+
+/// A URL a stager came from: shown defanged, and held raw only by the
+/// "Copy for sandbox" button, which is never a link.
+struct StagerUrl {
+    shown: String,
+    raw: String,
+    last_seen: String,
+    sources: i64,
 }
 
 impl LinkPage {
@@ -180,14 +191,31 @@ async fn item(
     Path((kind, value)): Path<(String, String)>,
     Query(gq): Query<GraphQuery>,
 ) -> AppResult<Html<String>> {
-    let (kind_name, value, item, ip_seen) = if kind == "ip" {
+    let mut urls = vec![];
+    let (kind_name, value, shown, item, ip_seen) = if kind == "ip" {
         let addr = canonical_ip(&value);
         let seen = st.store.ip_by_addr(&addr).await?.is_some();
-        ("IP", addr, None, seen)
+        ("IP", addr.clone(), addr, None, seen)
     } else {
         let k = LinkKind::parse(&kind).ok_or(AppError::NotFound)?;
         let item = st.store.link_item(k, &value).await?;
-        (k.name(), value, item, false)
+        if k == LinkKind::Stager && item.is_some() {
+            let hash = crate::store::pieces::piece_hash("stager", &value);
+            urls = st
+                .store
+                .piece_urls(hash)
+                .await?
+                .into_iter()
+                .map(|u| StagerUrl {
+                    shown: crate::model::defang::defang(&u.url),
+                    raw: u.url,
+                    last_seen: u.last_seen,
+                    sources: u.sources,
+                })
+                .collect();
+        }
+        let shown = k.shown(&value);
+        (k.name(), value, shown, item, false)
     };
     let kinds_json = serde_json::to_string(
         &LinkKind::ALL
@@ -203,8 +231,9 @@ async fn item(
         focus: format!("{kind}:{value}"),
         kind_key: kind,
         kind_name,
-        value,
+        value: shown,
         item,
+        urls,
         ip_seen,
         kinds: LinkKind::ALL.to_vec(),
         types: gq.types(),
@@ -390,6 +419,111 @@ async fn decoy_canaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::devices::tests::{app, send};
+    use axum::body::Body;
+    use axum::http::Request;
+
+    const RAW: &str = "https://example.org:8080/x.sh";
+
+    /// A stager piece on one address, with the URL it came from.
+    async fn seed(st: &AdminState) -> i64 {
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.7".parse().unwrap())
+            .await
+            .unwrap()
+            .id;
+        let hash = crate::store::pieces::piece_hash("stager", "example.org:8080");
+        for q in [
+            "INSERT INTO pieces VALUES (?1, 'stager', 'example.org:8080', 't', 't', 1, 1)",
+            "INSERT INTO piece_sightings VALUES (?1, 'request', 1, ?2, 'stager', 'seen', 't')",
+            "INSERT INTO piece_urls VALUES (?1, 'https://example.org:8080/x.sh', 't', 't', 1)",
+        ] {
+            sqlx::query(q)
+                .bind(hash)
+                .bind(ip)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+        }
+        hash
+    }
+
+    async fn page(cookie: &str, app: &axum::Router, uri: &str) -> (StatusCode, String) {
+        let (status, _, body) = send(
+            app,
+            Request::get(uri).header("cookie", cookie),
+            Body::empty(),
+        )
+        .await;
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn piece_page_shows_defanged_value() {
+        let (st, cookie, app, _d) = app().await;
+        seed(&st).await;
+        let (status, body) = page(
+            &cookie,
+            &app,
+            "/admin/evidence/links/stager/example.org%3A8080",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("example[.]org"));
+        assert!(!body.contains(">example.org:8080<"));
+        // The value is never a link; `hxxps://` is how the URL reads.
+        assert!(body.contains("hxxps://example[.]org:8080/x[.]sh"), "{body}");
+        assert!(!body.contains("<a href=\"https://example.org"));
+        assert!(!body.contains("<a href=\"hxxp"));
+        // The list shows it defanged too.
+        let (_, list) = page(&cookie, &app, "/admin/evidence/links?kind=stager&shared=0").await;
+        assert!(list.contains("example[.]org"), "{list}");
+        assert!(!list.contains(">example.org:8080<"));
+    }
+
+    #[tokio::test]
+    async fn stager_page_lists_urls_with_copy_for_sandbox() {
+        let (st, cookie, app, _d) = app().await;
+        seed(&st).await;
+        let (_, body) = page(
+            &cookie,
+            &app,
+            "/admin/evidence/links/stager/example.org%3A8080",
+        )
+        .await;
+        assert!(body.contains("Copy for sandbox"));
+        // The raw URL only as the button's text to copy, not as a link or
+        // visible text.
+        assert!(body.contains(r#"data-copy-value="https://example.org:8080/x.sh""#));
+        assert_eq!(body.matches("https://example.org:8080/x.sh").count(), 1);
+        assert!(!body.contains(r#"href="https://example.org"#));
+    }
+
+    #[test]
+    fn sha256_pivot_redirects_to_file_page() {
+        let h = "ab".repeat(32);
+        assert_eq!(
+            crate::admin::views::pivot_href("sha256", &h),
+            format!("/admin/evidence/links/file/{h}")
+        );
+        // The old address still names the uploads list.
+        assert_eq!(
+            crate::admin::views::uploads_by_hash_href(&h),
+            format!("/admin/traps/uploads?sha256={h}")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_file_page_without_a_piece_links_to_the_uploads() {
+        let (_st, cookie, app, _d) = app().await;
+        let h = "ab".repeat(32);
+        let (status, body) = page(&cookie, &app, &format!("/admin/evidence/links/file/{h}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&format!("/admin/traps/uploads?sha256={h}")));
+        let (status, _) = page(&cookie, &app, &format!("/admin/traps/uploads?sha256={h}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
     #[derive(Template)]
     #[template(

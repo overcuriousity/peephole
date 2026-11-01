@@ -53,6 +53,21 @@ pub fn kind_help(kind: LinkKind) -> &'static str {
         LinkKind::HttpEtag => {
             "The ETag header of a file the source's web server serves, from a counter-scan. A match: the same file, not the same operator."
         }
+        LinkKind::Stager => {
+            "The host a command told its target to fetch from and run, read from the stored requests and uploads, shown defanged. A match: the same delivery point, so very likely one operator. Addresses only queried, never fetched by a command, are not listed."
+        }
+        LinkKind::Key => {
+            "The fingerprint of an SSH public key found in a request or upload. Private keys are never stored. A match: the same key, so one operator or one copied toolkit."
+        }
+        LinkKind::File => {
+            "SHA-256 of a file the trap received. A match: the same file, so one operator or one shared toolkit."
+        }
+        LinkKind::Recipe => {
+            "The shape of a command the X-ray read (its steps, not its arguments). A match: the same command pattern, i.e. the same tooling, not the same operator."
+        }
+        LinkKind::ExploitTag => {
+            "A tag the attacker's own request carried, shown defanged. A match: the same exploit kit or script, not necessarily the same operator."
+        }
     }
 }
 
@@ -101,5 +116,19 @@ mod tests {
         assert_eq!(host_help(crate::model::hostkeys::HASSH), help("hassh"));
         assert_eq!(host_help("ssh2-enum-algos"), "");
         assert_eq!(entries().len(), LinkKind::LIST.len() + 1);
+    }
+
+    #[test]
+    fn every_kind_has_a_glossary_line() {
+        for k in LinkKind::ALL {
+            assert!(kind_help(k).len() > 40, "{k:?}");
+        }
+        for k in ["stager", "key", "file", "recipe", "exploit-tag"] {
+            assert!(!help(k).is_empty(), "{k}");
+        }
+        let names: Vec<_> = entries().iter().map(|e| e.0).collect();
+        for n in ["Stager", "Key", "File", "Recipe", "Exploit tag"] {
+            assert!(names.contains(&n), "{n}");
+        }
     }
 }

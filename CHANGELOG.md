@@ -6,6 +6,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- Links lists stagers, SSH key fingerprints, uploaded files (SHA-256),
+  shell recipes and exploit tags from the body X-ray, with graph, glossary
+  and search. Payload values are shown and copied defanged and are never
+  links; a stager's page lists its URLs with a "Copy for sandbox" button.
+  The SHA-256 pivots now open the File page; the old uploads address still
+  works.
 - Body X-ray on the request page and on the page of a text upload: the
   original bytes beside what they hide. It opens base64, gzip, percent and
   `\x` escapes and hex layer by layer, and shows the pieces found (stagers,

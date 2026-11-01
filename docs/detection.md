@@ -406,6 +406,15 @@ HTTP body, 404 and ETag hashes do not feed campaigns: they identify the
 software or the product, which many unrelated operators share, not the
 operator. They stay pivots on the Links page.
 
+The Links page also lists what the body X-ray finds, read from this node's
+own sightings and not replicated: stagers (only those a command fetches from,
+not addresses it merely queries), SSH key fingerprints and uploaded files (by
+SHA-256) as identity kinds, and shell recipes and exploit tags as software
+kinds. They do not feed campaigns yet. Values from payloads are shown and
+copied defanged and are never links. A stager's page lists its URLs, each
+with a "Copy for sandbox" button that puts the raw URL on the clipboard for
+an external sandbox; the node never fetches it.
+
 A campaign's page lists every edge. A soft edge's row opens to the score
 and the threshold it met, the order agreement (−1 to 1), the shared
 (JA4, JA4H) pairs and the shared shapes with how many addresses asked for

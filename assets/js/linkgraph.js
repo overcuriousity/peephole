@@ -33,11 +33,14 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
+  // Pieces come from payloads: the API sends them defanged as `shown`; the
+  // plain value only builds the page address.
+  function shownOf(n) { return n.shown != null ? n.shown : n.value; }
   function short(v) { return String(v).replace(/^SHA256:/, "").slice(0, 8); }
   function label(n) {
     if (n.kind === "ip") return n.value;
     if (n.kind === "group") return n.ips + " IPs";
-    return n.kind + " " + short(n.value);
+    return n.kind + " " + short(shownOf(n));
   }
   function say(t) { if (status) status.textContent = t; }
 
@@ -205,7 +208,7 @@
       else if (n.kind === "group") el("circle", { r: 13 }, n.el);
       else el("rect", { x: -7, y: -7, width: 14, height: 14, rx: 3 }, n.el);
       el("text", { x: n.kind === "group" ? 17 : 11, y: 4 }, n.el).textContent = label(n);
-      el("title", {}, n.el).textContent = (n.kind === "group" ? n.ips + " IPs with " + (kinds[n.of] || n.of) : (kinds[n.kind] || "IP")) + " " + n.value;
+      el("title", {}, n.el).textContent = (n.kind === "group" ? n.ips + " IPs with " + (kinds[n.of] || n.of) : (kinds[n.kind] || "IP")) + " " + shownOf(n);
       n.el.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
       n.el.addEventListener("mouseenter", function () { light(n, true); });
       n.el.addEventListener("mouseleave", function () { light(n, false); });
@@ -253,7 +256,7 @@
     selected = n; n.el.classList.add("selected");
     if (!panel) return;
     var name = n.kind === "group" ? n.ips + " IPs with this " + (kinds[n.of] || n.of) : (kinds[n.kind] || "IP");
-    var rows = [["Value", n.value]];
+    var rows = [["Value", shownOf(n)]];
     if (n.ips != null && n.kind !== "group") rows.push(["IPs", n.ips]);
     if (n.sightings != null) rows.push([n.kind === "ip" ? "Requests" : "Sightings", n.sightings]);
     if (n.last_seen) rows.push(["Last seen", n.last_seen]);

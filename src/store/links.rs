@@ -27,18 +27,25 @@ pub enum LinkKind {
     Http404,
     HttpEtag,
     Ua,
+    Stager,
+    Key,
+    File,
+    Recipe,
+    #[serde(rename = "exploit-tag")]
+    ExploitTag,
 }
 
 use LinkKind::*;
 
 impl LinkKind {
-    pub const ALL: [LinkKind; 14] = [
-        Fp, Ssh, Tls, Canary, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404,
-        HttpEtag,
+    pub const ALL: [LinkKind; 19] = [
+        Fp, Ssh, Tls, Canary, Stager, Key, File, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm,
+        HttpBody, Http404, HttpEtag, Recipe, ExploitTag,
     ];
     /// The kinds the index lists (canaries have their own tab).
-    pub const LIST: [LinkKind; 13] = [
-        Fp, Ssh, Tls, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm, HttpBody, Http404, HttpEtag,
+    pub const LIST: [LinkKind; 18] = [
+        Fp, Ssh, Tls, Stager, Key, File, Ja4, Ja4h, Ua, Hassh, Ja4x, Favicon, Jarm, HttpBody,
+        Http404, HttpEtag, Recipe, ExploitTag,
     ];
     pub const IDENTITY: [LinkKind; 4] = [Fp, Ssh, Tls, Canary];
 
@@ -63,6 +70,11 @@ impl LinkKind {
             HttpBody => "http-body",
             Http404 => "http-404",
             HttpEtag => "http-etag",
+            Stager => "stager",
+            Key => "key",
+            File => "file",
+            Recipe => "recipe",
+            ExploitTag => "exploit-tag",
         }
     }
 
@@ -82,12 +94,39 @@ impl LinkKind {
             HttpBody => "Page body",
             Http404 => "404 page",
             HttpEtag => "HTTP ETag",
+            Stager => "Stager",
+            Key => "Key",
+            File => "File",
+            Recipe => "Recipe",
+            ExploitTag => "Exploit tag",
         }
     }
 
     /// Ties sources to one operator, not only to the same software.
     pub fn identity(self) -> bool {
-        matches!(self, Fp | Ssh | Tls | Canary)
+        matches!(self, Fp | Ssh | Tls | Canary | Stager | Key | File)
+    }
+
+    /// Its `pieces.kind` for the kinds read from the X-ray's pieces
+    /// ([`super::pieces`]).
+    pub fn piece_kind(self) -> Option<&'static str> {
+        match self {
+            Stager => Some("stager"),
+            Key => Some("key"),
+            File => Some("file"),
+            Recipe => Some("recipe"),
+            ExploitTag => Some("tag"),
+            _ => None,
+        }
+    }
+
+    /// `value` as pages show and copy it: a piece's text came from a
+    /// payload, so it is defanged. A key is a fingerprint, safe as it is.
+    pub fn shown(self, value: &str) -> String {
+        match self {
+            Stager | File | Recipe | ExploitTag => crate::model::defang::defang(value),
+            _ => value.to_string(),
+        }
     }
 
     /// Recorded by a node (requests); host keys come from scans instead.
@@ -131,6 +170,11 @@ impl LinkKind {
             Http404 => &HTTP_404_LEGS,
             HttpEtag => &HTTP_ETAG_LEGS,
             Canary => &CANARY_LEGS,
+            Stager => &STAGER_LEGS,
+            Key => &KEY_LEGS,
+            File => &FILE_LEGS,
+            Recipe => &RECIPE_LEGS,
+            ExploitTag => &TAG_LEGS,
         }
     }
 }
@@ -174,6 +218,15 @@ const HTTP_BODY_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-body'")];
 const HTTP_404_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-404'")];
 const HTTP_ETAG_LEGS: [Leg; 1] = [Leg::host_key("h.kind = 'http-etag'")];
 
+// The X-ray's pieces (`store::pieces`), node-local. A stager is joinable
+// only in the role `stager`: a queried or self-hosted address names nobody.
+// The kind literals are `pieces::kind_str`'s (checked by a test).
+const STAGER_LEGS: [Leg; 1] = [Leg::piece("p.kind = 'stager' AND g.role = 'stager'")];
+const KEY_LEGS: [Leg; 1] = [Leg::piece("p.kind = 'key'")];
+const FILE_LEGS: [Leg; 1] = [Leg::piece("p.kind = 'file'")];
+const RECIPE_LEGS: [Leg; 1] = [Leg::piece("p.kind = 'recipe'")];
+const TAG_LEGS: [Leg; 1] = [Leg::piece("p.kind = 'tag'")];
+
 /// One source of sightings.
 struct Leg {
     from: &'static str,
@@ -205,6 +258,19 @@ impl Leg {
             ts,
             origin,
             cond: "",
+        }
+    }
+
+    /// `piece_sightings` of one kind of piece; the value is the piece's.
+    const fn piece(cond: &'static str) -> Leg {
+        Leg {
+            from: "piece_sightings g JOIN pieces p ON p.hash = g.piece",
+            text: "p.value",
+            col: "p.value",
+            ip: "g.ip_id",
+            ts: "g.ts",
+            origin: "NULL",
+            cond,
         }
     }
 
@@ -620,6 +686,11 @@ impl Focus {
     }
 }
 
+/// [`LinkKind::shown`], when it differs from the value.
+fn shown_of(k: LinkKind, v: &str) -> Option<String> {
+    Some(k.shown(v)).filter(|s| s != v)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphNode {
     pub id: String,
@@ -627,6 +698,9 @@ pub struct GraphNode {
     pub kind: String,
     /// The address, the item's value, or (group) the collapsed item's value.
     pub value: String,
+    /// The value as shown, when that is not the value (a piece, defanged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shown: Option<String>,
     /// Hops from the focus.
     pub hop: u32,
     pub identity: bool,
@@ -733,6 +807,7 @@ impl Store {
                                     id: gid.clone(),
                                     kind: "group".into(),
                                     value: v.clone(),
+                                    shown: shown_of(*k, v),
                                     hop,
                                     identity: k.identity(),
                                     ips: Some(ips),
@@ -883,6 +958,7 @@ impl Store {
                     id: f.id(),
                     kind: "ip".into(),
                     value: ip,
+                    shown: None,
                     hop,
                     identity: true,
                     ips: None,
@@ -913,6 +989,7 @@ impl Store {
                     id: f.id(),
                     kind: k.key().into(),
                     value: v.clone(),
+                    shown: shown_of(*k, v),
                     hop,
                     identity: k.identity(),
                     ips: Some(ips),
@@ -1698,10 +1775,205 @@ mod tests {
         .unwrap();
     }
 
+    /// A piece sighted from a request on `ip` (the stored shape of
+    /// `store::pieces`).
+    async fn piece(s: &Store, kind: &str, value: &str, role: &str, ip: i64, src: i64) {
+        let hash = crate::store::pieces::piece_hash(kind, value);
+        sqlx::query(
+            "INSERT OR IGNORE INTO pieces VALUES (?, ?, ?, '2026-10-01 00:00:00',
+             '2026-10-02 00:00:00', 0, 0)",
+        )
+        .bind(hash)
+        .bind(kind)
+        .bind(value)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO piece_sightings VALUES (?, 'request', ?, ?, ?, 'seen',
+             '2026-10-02 00:00:00')",
+        )
+        .bind(hash)
+        .bind(src)
+        .bind(ip)
+        .bind(role)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    const STAGER_V: &str = "example.org:8080/x.sh";
+
+    #[test]
+    fn stager_is_an_identity_kind() {
+        for k in [LinkKind::Stager, LinkKind::Key, LinkKind::File] {
+            assert!(k.identity(), "{k:?}");
+            assert!(!k.by_node());
+            assert_eq!(k.host_kind(), None);
+            assert!(LinkKind::LIST.contains(&k));
+            assert_eq!(LinkKind::parse(k.key()), Some(k));
+        }
+        assert_eq!(LinkKind::Stager.key(), "stager");
+        // The campaigns do not read them yet.
+        assert!(!LinkKind::IDENTITY.contains(&LinkKind::Stager));
+        // Identity kinds stay together in the list.
+        let at = |k| LinkKind::LIST.iter().position(|x| *x == k).unwrap();
+        assert_eq!(at(LinkKind::Key), at(LinkKind::Stager) + 1);
+        assert_eq!(at(LinkKind::File), at(LinkKind::Key) + 1);
+    }
+
+    #[test]
+    fn recipe_and_tag_are_software_kinds() {
+        for (k, key) in [
+            (LinkKind::Recipe, "recipe"),
+            (LinkKind::ExploitTag, "exploit-tag"),
+        ] {
+            assert!(!k.identity());
+            assert!(!k.by_node());
+            assert_eq!(k.host_kind(), None);
+            assert_eq!(k.key(), key);
+            assert_eq!(LinkKind::parse(key), Some(k));
+            assert!(LinkKind::LIST.contains(&k));
+        }
+        assert_eq!(
+            serde_json::to_string(&LinkKind::ExploitTag).unwrap(),
+            "\"exploit-tag\""
+        );
+    }
+
+    #[tokio::test]
+    async fn link_item_reads_sightings() {
+        let (s, ids) = seeded().await;
+        piece(&s, "stager", STAGER_V, "stager", ids[0], 1).await;
+        piece(&s, "stager", STAGER_V, "stager", ids[1], 2).await;
+        // Queried, not delivered: joins nobody.
+        piece(&s, "stager", "example.org/q", "queried", ids[0], 1).await;
+        piece(&s, "key", "SHA256:abc", "key", ids[0], 1).await;
+        piece(&s, "file", "ab01", "file", ids[2], 3).await;
+        piece(&s, "recipe", "wget-sh", "recipe", ids[0], 1).await;
+        piece(&s, "recipe", "wget-sh", "recipe", ids[1], 2).await;
+        piece(&s, "tag", "cve-x", "tag", ids[3], 4).await;
+        // A kind of piece no link kind reads.
+        piece(&s, "exploit", "shape", "exploit", ids[0], 1).await;
+
+        let it = s
+            .link_item(LinkKind::Stager, STAGER_V)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((it.ips, it.sightings), (2, 2));
+        assert_eq!(it.first_seen.as_deref(), Some("2026-10-02 00:00:00"));
+        assert!(it.nodes.is_empty());
+        let mut ips: Vec<&str> = it.ip_rows.iter().map(|r| r.ip.as_str()).collect();
+        ips.sort();
+        assert_eq!(ips, ["203.0.113.1", "203.0.113.2"]);
+        assert!(
+            s.link_item(LinkKind::Stager, "example.org/q")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A value is read under its own kind only.
+        assert!(
+            s.link_item(LinkKind::Key, STAGER_V)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for (k, v) in [
+            (LinkKind::Key, "SHA256:abc"),
+            (LinkKind::File, "ab01"),
+            (LinkKind::Recipe, "wget-sh"),
+            (LinkKind::ExploitTag, "cve-x"),
+        ] {
+            assert!(s.link_item(k, v).await.unwrap().is_some(), "{k:?}");
+        }
+        assert!(
+            s.link_item(LinkKind::ExploitTag, "shape")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let list = s
+            .links_list(&LinkFilter {
+                kind: Some("stager".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(values(&list), [STAGER_V]);
+        let list = s
+            .links_list(&LinkFilter {
+                kind: Some("recipe".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(values(&list), ["wget-sh"]);
+        assert_eq!(s.find_value("ab01").await.unwrap(), [LinkKind::File]);
+        assert_eq!(s.find_value("cve-x").await.unwrap(), [LinkKind::ExploitTag]);
+    }
+
+    #[tokio::test]
+    async fn graph_includes_piece_kinds() {
+        let (s, ids) = seeded().await;
+        piece(&s, "stager", STAGER_V, "stager", ids[0], 1).await;
+        piece(&s, "stager", STAGER_V, "stager", ids[1], 2).await;
+        piece(&s, "recipe", "wget-sh", "recipe", ids[1], 2).await;
+        let g = s
+            .link_graph(
+                &Focus::Item(LinkKind::Stager, STAGER_V.into()),
+                2,
+                &[LinkKind::Recipe],
+                false,
+            )
+            .await
+            .unwrap();
+        let id = |k: &str, v: &str| format!("{k}:{v}");
+        let ids_in: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            ids_in.contains(&id("stager", STAGER_V).as_str()),
+            "{ids_in:?}"
+        );
+        assert!(ids_in.contains(&"ip:203.0.113.1"));
+        assert!(
+            ids_in.contains(&id("recipe", "wget-sh").as_str()),
+            "{ids_in:?}"
+        );
+        let n = g.nodes.iter().find(|n| n.kind == "stager").unwrap();
+        assert!(n.identity);
+        assert_eq!((n.ips, n.sightings), (Some(2), Some(2)));
+        let r = g.nodes.iter().find(|n| n.kind == "recipe").unwrap();
+        assert!(!r.identity);
+        assert_eq!(
+            Focus::parse("exploit-tag:cve-x"),
+            Some(Focus::Item(LinkKind::ExploitTag, "cve-x".into()))
+        );
+    }
+
+    #[test]
+    fn piece_kinds_name_the_pieces_they_read() {
+        for k in LinkKind::ALL {
+            match k.piece_kind() {
+                Some(p) => assert!(
+                    k.legs()[0].cond.contains(&format!("p.kind = '{p}'")),
+                    "{k:?}"
+                ),
+                None => assert!(!k.legs()[0].from.contains("piece_sightings"), "{k:?}"),
+            }
+        }
+        assert_eq!(LinkKind::Key.shown("SHA256:a+b/c"), "SHA256:a+b/c");
+        assert_eq!(
+            LinkKind::Stager.shown("https://example.org/x"),
+            "hxxps://example[.]org/x"
+        );
+    }
+
     #[test]
     fn a_user_agent_is_a_software_kind() {
-        assert_eq!(LinkKind::ALL.len(), 14);
-        assert_eq!(LinkKind::LIST.len(), 13);
+        assert_eq!(LinkKind::ALL.len(), 19);
+        assert_eq!(LinkKind::LIST.len(), 18);
         assert_eq!(LinkKind::IDENTITY.len(), 4);
         assert!(!LinkKind::IDENTITY.contains(&LinkKind::Ua));
         assert!(!LinkKind::Ua.identity());
