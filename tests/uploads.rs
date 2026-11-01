@@ -552,6 +552,45 @@ async fn only_new_content_counts_against_the_hourly_rate() {
     assert_eq!(scalar(&store, "SELECT COUNT(*) FROM upload_blobs").await, 2);
 }
 
+/// The answer each `path` gets, from a source that never uploaded.
+async fn answer_to(base: &str, store: &Store, path: &str) -> String {
+    send(base, "GET", path, "198.51.100.9", None, vec![]).await;
+    sqlx::query_scalar("SELECT answer FROM requests WHERE method = 'GET' ORDER BY id DESC LIMIT 1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+/// A file put on a path the trap answers itself takes nothing from it:
+/// one `PUT /` must not blank the landing page for every later visitor,
+/// nor a `PUT /.env` silence a decoy. The upload is still recorded.
+#[tokio::test]
+async fn a_put_leaves_the_landing_page_and_the_decoys_alone() {
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    let paths = [
+        ("/", "landing"),
+        ("/.env", "decoy:dotenv"),
+        ("/wp-login.php", "decoy:wp-login"),
+        ("/mcp", "decoy:mcp:get"),
+    ];
+    for (path, want) in paths {
+        assert_eq!(answer_to(&base, &store, path).await, want, "before: {path}");
+        let r = send(&base, "PUT", path, "203.0.113.50", None, b"x".to_vec()).await;
+        assert_eq!(r.status(), 201, "{path}");
+        assert_eq!(answer_to(&base, &store, path).await, want, "after: {path}");
+    }
+    assert_eq!(scalar(&store, "SELECT COUNT(*) FROM uploads").await, 4);
+}
+
+/// Nodes hit by the bug hold `/` in their stored uploads, and load it on
+/// every start: they heal with the upgrade, without a migration.
+#[tokio::test]
+async fn a_root_path_loaded_from_stored_uploads_is_not_answered() {
+    let (base, store, _dir, state) = serve(UNGATED, true).await;
+    state.webshells.insert("/", false, "stored-before-the-fix");
+    assert_eq!(answer_to(&base, &store, "/").await, "landing");
+}
+
 /// A later request to an answered path gets the webshell's canned reply,
 /// from any source, and never anything the upload carried (slice 3).
 #[tokio::test]
