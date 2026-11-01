@@ -113,25 +113,50 @@ pub fn mask_ranges(xray: &Xray, layer: usize) -> Vec<(usize, usize)> {
     all_masks(xray).into_iter().nth(layer).unwrap_or_default()
 }
 
+/// Where the first key marker of `text` starts.
+pub(super) fn marker_start(text: &[u8]) -> Option<usize> {
+    BEGIN.find(text).map(|m| m.start())
+}
+
+/// Where the keys of `text` sit, and nothing about the layers around it.
+pub(super) fn ranges(text: &[u8]) -> Vec<(usize, usize)> {
+    blocks(text).iter().map(|b| (b.start, b.end)).collect()
+}
+
+/// `range` of `text` and every exact repeat of it: decoding opens the same
+/// text once, so a repeated run has no layer of its own.
+fn with_repeats(text: &[u8], (start, end): (usize, usize)) -> Vec<(usize, usize)> {
+    let Some(run) = text.get(start..end).filter(|r| !r.is_empty()) else {
+        return vec![(start, end)];
+    };
+    let mut found: Vec<(usize, usize)> = text
+        .windows(run.len())
+        .enumerate()
+        .filter(|(_, window)| *window == run)
+        .map(|(at, _)| (at, at + run.len()))
+        .collect();
+    found.push((start, end));
+    found
+}
+
 /// [`mask_ranges`] of every layer.
 pub(super) fn all_masks(xray: &Xray) -> Vec<Vec<(usize, usize)>> {
-    let mut masks: Vec<Vec<(usize, usize)>> = xray
-        .layers
-        .iter()
-        .map(|l| blocks(&l.text).iter().map(|b| (b.start, b.end)).collect())
-        .collect();
+    let mut masks: Vec<Vec<(usize, usize)>> = xray.layers.iter().map(|l| ranges(&l.text)).collect();
     let holders: Vec<usize> = (0..masks.len()).filter(|&i| !masks[i].is_empty()).collect();
     for holder in holders {
         let mut at = holder;
         while let Some(parent) = xray.layers[at].parent {
             let layer = &xray.layers[at];
-            // The query is no part of the body, its parent. Other text
-            // with no place in its parent may be anywhere in it.
-            if layer.kind == LayerKind::Query {
+            // The query and the path are no part of the body, their parent.
+            // Other text with no place in its parent may be anywhere in it.
+            if matches!(layer.kind, LayerKind::Query | LayerKind::Path) {
                 break;
             }
-            let whole = (0, xray.layers[parent].text.len());
-            masks[parent].push(layer.from.map_or(whole, |s| (s.start, s.end)));
+            let text = &xray.layers[parent].text;
+            match layer.from {
+                Some(s) => masks[parent].extend(with_repeats(text, (s.start, s.end))),
+                None => masks[parent].push((0, text.len())),
+            }
             at = parent;
         }
     }
@@ -423,6 +448,18 @@ TsAXSDEff5ClOxPtM4GqAAAADXBlZXBob2xlLXRlc3Q=
         assert_ne!(layer, 0);
         assert_eq!(mask_ranges(&x, layer), [(0, KEY.trim_end().len())]);
         assert_eq!(mask_ranges(&x, 0), [(0, encoded.len())]);
+    }
+
+    #[test]
+    fn a_repeated_encoded_key_is_masked_each_time() {
+        let encoded = BASE64.encode(KEY.as_bytes());
+        let text = format!("{encoded} and {encoded}");
+        let x = body(text.as_bytes());
+        let second = encoded.len() + " and ".len();
+        assert_eq!(
+            mask_ranges(&x, 0),
+            [(0, encoded.len()), (second, text.len())]
+        );
     }
 
     #[test]

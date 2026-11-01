@@ -52,6 +52,8 @@ pub struct Span {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
     Raw,
+    /// What a request path holds past its plain part, when that is shell.
+    Path,
     Query,
     Form,
     MultipartField,

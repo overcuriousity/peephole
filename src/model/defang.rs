@@ -39,17 +39,36 @@ fn ipv6(s: &str) -> String {
         let end = run.find(|c| !is_part(c)).unwrap_or(run.len());
         let (run, tail) = run.split_at(end);
         out.push_str(&rest[..start]);
-        let bare = run.trim_end_matches('.');
-        if bare.parse::<Ipv6Addr>().is_ok() {
-            out.push_str(&bare.replace(':', "[:]"));
-            out.push_str(&run[bare.len()..]);
-        } else {
-            out.push_str(run);
-        }
+        let (lead, bare, trail) = address(run);
+        out.push_str(lead);
+        out.push_str(&bare.replace(':', "[:]"));
+        out.push_str(trail);
         rest = tail;
     }
     out.push_str(rest);
     out
+}
+
+/// `run` cut into what comes before the address in it, the address, and what
+/// comes after. With none, all of it comes before. A lone `:` on either end
+/// is punctuation (`host:2001:db8::1`, `2001:db8::1:`), unless the address
+/// needs it.
+fn address(run: &str) -> (&str, &str, &str) {
+    let trimmed = run.trim_end_matches('.');
+    let front = usize::from(trimmed.starts_with(':'));
+    let back = usize::from(trimmed.ends_with(':'));
+    for (lead, end) in [
+        (0, trimmed.len()),
+        (front, trimmed.len()),
+        (0, trimmed.len() - back),
+        (front, trimmed.len() - back),
+    ] {
+        let candidate = trimmed.get(lead..end).unwrap_or("");
+        if candidate.parse::<Ipv6Addr>().is_ok() {
+            return (&run[..lead], candidate, &run[end..]);
+        }
+    }
+    (run, "", "")
 }
 
 fn dots(s: &str) -> String {
@@ -92,6 +111,18 @@ mod tests {
         );
         assert_eq!(defang("::ffff:192.0.2.1"), "[:][:]ffff[:]192[.]0[.]2[.]1");
         assert_eq!(defang("12:30"), "12:30");
+        assert_eq!(defang("host:2001:db8::1"), "host:2001[:]db8[:][:]1");
+        assert_eq!(defang("2001:db8::1:"), "2001[:]db8[:][:]1:");
+        assert_eq!(defang("::1:"), "[:][:]1:");
+        assert_eq!(defang(":::1"), ":[:][:]1");
+        assert_eq!(
+            defang("http://user:pw@example.org/x"),
+            "hxxp://user:pw@example[.]org/x"
+        );
+        assert_eq!(
+            defang("http://user:pw@[2001:db8::1]/x"),
+            "hxxp://user:pw@[2001[:]db8[:][:]1]/x"
+        );
     }
 
     #[test]
@@ -99,6 +130,8 @@ mod tests {
         for s in [
             "https://192.0.2.1/sh",
             "2001:db8::1",
+            "host:2001:db8::1",
+            "2001:db8::1:",
             "http://[2001:db8::1]/x.sh",
             "ftp://example.org",
             "plain text. with a dot",

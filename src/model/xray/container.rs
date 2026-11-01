@@ -13,10 +13,12 @@ use regex::bytes::Regex;
 use serde::de::IgnoredAny;
 use serde_json::Value;
 
-use super::{Budget, Layer, LayerKind, OpaqueReason, Policy, Span, Xray, decode, pieces, shell};
+use super::{
+    Budget, Layer, LayerKind, OpaqueReason, Policy, Span, Xray, decode, key, pieces, shell,
+};
 
-/// Where the text comes from. `method`, `path` and `sender` are read by the
-/// piece extractor only.
+/// Where the text comes from. `method` and `sender` are read by the piece
+/// extractor only.
 pub enum Source<'a> {
     Request {
         method: &'a str,
@@ -43,8 +45,10 @@ const CHR_MIN: usize = 3;
 
 static CONTENT_DISPOSITION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?im-u)^content-disposition:").expect("static regex"));
-static PHP_BLOCK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is-u)<\?(?:php|=)(.*?)(?:\?>|\z)").expect("static regex"));
+static PHP_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    // `eval('?>' . …)`: that string closes nothing.
+    Regex::new(r#"(?is-u)<\?(?:php|=)((?:'\?>'|"\?>"|.)*?)(?:\?>|\z)"#).expect("static regex")
+});
 /// `-d allow_url_include=1`, with the soft hyphen (0xAD) CVE-2012-1823
 /// style requests use for the dash.
 static PHP_CGI: LazyLock<Regex> = LazyLock::new(|| {
@@ -69,16 +73,18 @@ static CHR_ONE: LazyLock<Regex> = LazyLock::new(|| {
 /// A word shell text would hold. `x.sh` and `ssh` are not `sh`.
 static SHELL_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?-u)(?:^|[^A-Za-z0-9_.-])(?:wget|curl|tftp|ftpget|scp|busybox|sh|bash|ash|chmod|eval|python[23]?|perl)(?:[^A-Za-z0-9_-]|$)",
+        r"(?-u)(?:^|[^A-Za-z0-9_.-])(?:wget|curl|tftp|ftpget|scp|busybox|sh|bash|ash|chmod|eval|python[23]?|perl|nc|ncat|netcat|certutil|powershell|pwsh)(?:[^A-Za-z0-9_-]|$)|/dev/(?:tcp|udp)/",
     )
     .expect("static regex")
 });
 
 /// Parse `source` into its layers.
 pub fn parse(source: Source<'_>, policy: &Policy) -> Xray {
-    let (body, query, name) = match source {
-        Source::Request { query, body, .. } => (body.unwrap_or(&[]), query, None),
-        Source::Upload { name, text, .. } => (text, None, name),
+    let (body, query, name, path) = match source {
+        Source::Request {
+            query, body, path, ..
+        } => (body.unwrap_or(&[]), query, None, Some(path)),
+        Source::Upload { name, text, .. } => (text, None, name, None),
     };
     let mut xray = Xray::new(body);
     xray.layers[0].name = name.map(|n| n.as_bytes().to_vec());
@@ -100,6 +106,21 @@ pub fn parse(source: Source<'_>, policy: &Policy) -> Xray {
         let before = at;
         body_is_php = read_query(&mut xray, at, &mut budget);
         settle(&mut xray, before, &mut budget);
+    }
+
+    if let Some(text) = path.and_then(path_shell)
+        && let Some(at) = add(
+            &mut xray,
+            0,
+            LayerKind::Path,
+            None,
+            text,
+            None,
+            0,
+            &mut budget,
+        )
+    {
+        settle(&mut xray, at, &mut budget);
     }
 
     xray.php_body = body_is_php;
@@ -129,12 +150,24 @@ pub fn parse(source: Source<'_>, policy: &Policy) -> Xray {
     xray
 }
 
+/// The shell a request path carries (`/x;wget${IFS}http://…`), decoded, from
+/// where it leaves the plain path: the path in front of it is no command. A
+/// path that only names a shell (`/bin/sh`) carries none.
+fn path_shell(path: &str) -> Option<Vec<u8>> {
+    let plain = path.split('?').next().unwrap_or(path);
+    let decoded = pct_decode(plain.as_bytes(), true);
+    let at = decoded.iter().position(|b| b";|&$` ".contains(b))?;
+    let text = &decoded[at..];
+    SHELL_WORD.is_match(text).then(|| text.to_vec())
+}
+
 /// Read the recipes. Every `Shell` layer open by now holds the text of a PHP
 /// shell function. The ones the shell reader opens come after them, and it
 /// reads those itself. Other text is read only with a word of shell in it,
 /// so prose costs no steps and no false limit. A container is read through
 /// its parts: as one text, its syntax only gives false steps.
 fn read_shell(xray: &mut Xray, budget: &mut Budget) {
+    let masks = key::all_masks(xray);
     let mut container = vec![false; xray.layers.len()];
     for layer in &xray.layers {
         let Some(parent) = layer.parent else { continue };
@@ -151,7 +184,7 @@ fn read_shell(xray: &mut Xray, budget: &mut Budget) {
     for (at, container) in container.into_iter().enumerate() {
         let layer = &xray.layers[at];
         if layer.kind == LayerKind::Shell || (!container && SHELL_WORD.is_match(&layer.text)) {
-            shell::read_recipes(xray, at, budget);
+            shell::read_recipes(xray, at, budget, &masks);
         }
     }
 }
@@ -416,7 +449,7 @@ fn read_layer(xray: &mut Xray, i: usize, budget: &mut Budget) {
     let text = xray.layers[i].text.clone();
     match kind {
         LayerKind::Php => return php_calls(xray, i, &text, budget),
-        LayerKind::PhpCgi | LayerKind::Shell | LayerKind::Query => return,
+        LayerKind::PhpCgi | LayerKind::Shell | LayerKind::Query | LayerKind::Path => return,
         _ => {}
     }
     let (start, end) = trim(&text);
