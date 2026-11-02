@@ -130,6 +130,8 @@ struct ChainsPage {
     campaign: Option<String>,
     /// The Dead ends tab is open, with these rows.
     dead_ends: Option<Vec<DeadEnd>>,
+    /// An address or campaign filter was given, which the tab ignores.
+    filtered: bool,
 }
 
 async fn index(
@@ -149,6 +151,7 @@ async fn index(
             ip: None,
             campaign: None,
             dead_ends: Some(st.store.dead_ends_all(DEAD_END_ROWS).await?),
+            filtered: ip.is_some() || campaign.is_some(),
         });
     }
     // An address the store does not know matches no row (id 0 is never
@@ -173,6 +176,7 @@ async fn index(
         ip,
         campaign,
         dead_ends: None,
+        filtered: false,
     })
 }
 
@@ -701,5 +705,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("/x/s[.]php"), "{html}");
         assert!(!html.contains("/found/"), "{html}");
+        assert!(!html.contains("do not apply"), "{html}");
+        let uri = "/admin/evidence/chains?tab=dead-ends&ip=203.0.113.70";
+        let (_, html) = page(&app, Some(&cookie), uri).await;
+        assert!(html.contains("filters do not apply"), "{html}");
+        assert!(html.contains("/x/s[.]php"), "{html}");
     }
 }

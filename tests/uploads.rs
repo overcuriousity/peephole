@@ -789,15 +789,15 @@ async fn get_of_the_landed_file_answers_as_webshell_and_records_the_command() {
 
 #[tokio::test]
 async fn file_there_does_not_take_over_a_decoy_path() {
-    let (base, store, _dir, state) = serve(UNGATED, true).await;
-    // A file named `wp-login.php`, landing in lib/files, is not at the
-    // decoy; and a decoy path put in the table still answers as the decoy.
-    let (ct, b) = multipart("upload[]", "wp-login.php", b"<?php system($_GET['c']);");
+    let (base, store, _dir, _state) = serve(UNGATED, true).await;
+    // `elfinder.php` is a name the trap answers itself, wherever it is.
+    let (ct, b) = multipart("upload[]", "elfinder.php", b"<?php system($_GET['c']);");
     send(&base, "POST", CONNECTOR, "203.0.113.40", Some(&ct), b).await;
-    state.webshells.insert("/wp-login.php", false, "stored");
+    let landed = format!("{LIB_FILES}/elfinder.php");
+    assert_eq!(uploads(&store).await[0].answered_path, landed);
     assert_eq!(
-        answer_to(&base, &store, "/wp-login.php").await,
-        "decoy:wp-login"
+        answer_to(&base, &store, &format!("{landed}?cmd=id")).await,
+        "decoy:file-manager"
     );
 }
 
