@@ -2,6 +2,7 @@
 {% block title %}peephole — scan #{{ s.id }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("investigate", "scans") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/investigate/scans" %}{% let crumb_label = "Scans" %}{% include "_detail_head.html" %}
 <div class="page-head"><div>
   <h1>Scan #{{ s.id }} · <a class="mono" href="/ip/{{ s.ip }}">{{ s.ip }}</a>{% let value = s.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h1>
   <div class="meta"><span>level {{ s.level }}</span><span>started <span class="mono">{{ s.started_at }}</span></span>

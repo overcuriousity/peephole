@@ -3,7 +3,8 @@
 {% block head %}<script src="/assets/js/xray.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("traps", "uploads") %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Upload</h1><p class="muted"><a href="/admin/traps/uploads">← Uploads</a></p></div></div>
+{% let crumb_href = "/admin/traps/uploads" %}{% let crumb_label = "Uploads" %}{% include "_detail_head.html" %}
+<div class="page-head"><div><h1>Upload</h1></div></div>
 <div class="stack">
 {% include "_chain_strip.html" %}
 <section class="card">

@@ -267,6 +267,130 @@ pub(crate) mod tests {
         r
     }
 
+    /// The detail pages share one frame (`_detail_head.html`): a crumb back
+    /// to the owning list, directly above the title.
+    #[test]
+    fn every_detail_template_includes_the_shared_header() {
+        for (name, src) in [
+            ("request", include_str!("../../templates/request.html")),
+            ("ip", include_str!("../../templates/ip.html")),
+            ("upload", include_str!("../../templates/admin_upload.html")),
+            ("campaign", include_str!("../../templates/campaign.html")),
+            ("link", include_str!("../../templates/admin_link.html")),
+            ("scan", include_str!("../../templates/admin_scan.html")),
+            (
+                "canary decoy",
+                include_str!("../../templates/admin_canary_decoy.html"),
+            ),
+            (
+                "member",
+                include_str!("../../templates/admin_cluster_node.html"),
+            ),
+            ("asn", include_str!("../../templates/asn.html")),
+            ("net", include_str!("../../templates/net.html")),
+        ] {
+            assert_eq!(
+                src.matches("{% include \"_detail_head.html\" %}").count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                !src.contains("← All campaigns")
+                    && !src.contains("<a href=\"/admin/traps/uploads\">← Uploads"),
+                "{name}: no hand-written back link"
+            );
+        }
+    }
+
+    /// Each rendered detail page has the crumb to its list and its h1 after it.
+    #[tokio::test]
+    async fn every_detail_page_has_the_shared_header() {
+        let (st, cookie, app, _d) = app().await;
+        upload(&st, "u1", "a.php", b"<?php", true).await;
+        crate::store::campaigns::tests::feed(&st.store, crate::store::campaigns::tests::fixture())
+            .await;
+        st.store.recompute_campaigns(true).await.unwrap();
+        let ip = st
+            .store
+            .upsert_ip("192.0.2.1".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let req_page = format!("/admin/requests/{id}");
+        for (path, crumb) in [
+            (req_page.as_str(), "href=\"/requests\">← Requests</a>"),
+            ("/ip/192.0.2.1", "href=\"/ips\">← IPs</a>"),
+            (
+                "/admin/traps/uploads/u1",
+                "href=\"/admin/traps/uploads\">← Uploads</a>",
+            ),
+            (
+                "/admin/evidence/campaigns/192.0.2.3",
+                "href=\"/admin/evidence/campaigns\">← Campaigns</a>",
+            ),
+            (
+                "/admin/evidence/links/stager/example.org%3A8080",
+                "href=\"/admin/evidence/links\">← Links</a>",
+            ),
+            ("/admin/asn/64500", "href=\"/ips\">← IPs</a>"),
+        ] {
+            let (status, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(html.matches("class=\"crumb\"").count(), 1, "{path}");
+            let c = html
+                .find(crumb)
+                .unwrap_or_else(|| panic!("{path}: {crumb}"));
+            let h = html.find("<h1").unwrap();
+            assert!(c < h, "{path}: the crumb sits above the title");
+        }
+    }
+
+    /// Every admin detail page with a list in the admin tree keeps the admin
+    /// nav; the request and IP pages, which are shared with the top bar's own
+    /// lists, do not get it.
+    #[tokio::test]
+    async fn admin_nav_rule_is_the_same_on_every_detail_page() {
+        let (st, cookie, app, _d) = app().await;
+        upload(&st, "u1", "a.php", b"<?php", true).await;
+        crate::store::campaigns::tests::feed(&st.store, crate::store::campaigns::tests::fixture())
+            .await;
+        st.store.recompute_campaigns(true).await.unwrap();
+        for (path, nav) in [
+            ("/admin/traps/uploads/u1", true),
+            ("/admin/evidence/campaigns/192.0.2.3", true),
+            ("/admin/evidence/links/stager/example.org%3A8080", true),
+            ("/ip/192.0.2.1", false),
+        ] {
+            let (_, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(
+                html.contains("aria-label=\"Admin sections\""),
+                nav,
+                "{path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_pages_ask_for_a_session() {
         let (st, _cookie, app, _d) = app().await;

@@ -2,8 +2,9 @@
 {% block title %}peephole — canaries of #{{ d.row.id }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "canaries") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/evidence/canaries" %}{% let crumb_label = "Canaries" %}{% include "_detail_head.html" %}
 <div class="page-head"><div><h1>Canaries of request #{{ d.row.id }}</h1>
-  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a> · <a href="/admin/evidence/canaries">all canaries</a></p></div></div>
+  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a>.</p></div></div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ served.len() }}</div></div>

@@ -3,6 +3,7 @@
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "campaigns") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/evidence/campaigns" %}{% let crumb_label = "Campaigns" %}{% include "_detail_head.html" %}
 <div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
 <div class="meta">
   {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
@@ -13,7 +14,7 @@
   <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
   <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
 </div>
-<p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
+</div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
 <div class="stack">
 {% include "_chain_flow.html" %}
 {% include "_chain_strip.html" %}

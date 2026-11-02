@@ -599,7 +599,7 @@ mod tests {
             assert!(a.contains(want), "{want} missing:\n{a}");
         }
         for want in [
-            "<a href=\"/admin/evidence/campaigns\">← All campaigns</a>",
+            "<a href=\"/admin/evidence/campaigns\">← Campaigns</a>",
             "soft · <a href=\"/admin/evidence/links\">what counts →</a>",
             "<span class=\"muted\">per day, last 26 weeks, UTC</span>",
         ] {

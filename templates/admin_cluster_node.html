@@ -2,6 +2,7 @@
 {% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("network", "members") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/network/members" %}{% let crumb_label = "Members" %}{% include "_detail_head.html" %}
 <div class="page-head"><div>
   <h1>{{ m.name }} <span class="mono muted">{{ m.short }}</span>{% if m.sibling %} <span class="badge badge-status" data-status="done">yours</span>{% endif %}{% if m.is_self %} <span class="muted small">this node</span>{% endif %}</h1>
   <div class="meta">{% if m.blocked %}<span class="badge badge-status" data-status="failed">{% if m.purged %}purged{% else %}blocked{% endif %}</span>{% else if !m.active %}<span class="badge badge-status" data-status="failed">{{ m.state }}</span>{% else if m.live %}<span class="badge badge-status" data-status="done">live</span>{% else %}<span class="badge badge-status" data-status="queued">not seen</span>{% endif %}</div>

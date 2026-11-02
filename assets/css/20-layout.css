@@ -39,3 +39,6 @@
   .nav a { white-space: nowrap; }
   .shell { padding-top: 1.25rem; }
 }
+.crumb { margin: 0 0 0.35rem; font-size: var(--text-sm); }
+.crumb a { color: var(--color-fg-secondary); }
+.crumb a:hover { color: var(--color-fg-primary); }

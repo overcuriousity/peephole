@@ -2193,6 +2193,23 @@ show_labels = {show_labels}
         assert!(html.contains("203.0.113.61"), "{html}");
     }
 
+    /// The detail frame's crumb is for admins; the public IP page gains no
+    /// admin content and no admin nav.
+    #[tokio::test]
+    async fn public_ip_page_has_no_admin_nav() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert!(!public.contains("class=\"crumb\""), "{public}");
+        assert!(!public.contains("Admin sections"), "{public}");
+        assert!(!public.contains("/admin"), "{public}");
+        let (_, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(admin.matches("class=\"crumb\"").count(), 1, "{admin}");
+        assert!(admin.contains("href=\"/ips\">← IPs</a>"), "{admin}");
+    }
+
     /// An admin's `AS{n}` badges lead to the network's page; the public
     /// ones keep the filtered list (the page needs a session).
     #[tokio::test]

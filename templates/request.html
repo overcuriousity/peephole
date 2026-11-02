@@ -2,6 +2,7 @@
 {% block title %}peephole — request #{{ d.row.id }}{% endblock %}
 {% block head %}<script src="/assets/js/xray.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
+{% let crumb_href = "/requests" %}{% let crumb_label = "Requests" %}{% include "_detail_head.html" %}
 <div class="page-head req-head"><div>
   <h1>Request #{{ d.row.id }}</h1>
   <div class="meta"><span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% let value = d.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</span><span class="mono">{{ d.row.ts }}</span>{% if let Some(n) = d.node %}<span>recorded by {{ n }}</span>{% endif %}{% if let Some((key, num)) = campaign %}<a class="chip" href="/admin/evidence/campaigns/{{ key }}">member of campaign #{{ num }}</a>{% endif %}{% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}</div>
