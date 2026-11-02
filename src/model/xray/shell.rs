@@ -928,8 +928,6 @@ struct Reader<'a> {
     xray: &'a mut Xray,
     budget: &'a mut Budget,
     queue: &'a mut VecDeque<usize>,
-    /// Layers whose output is run as code.
-    run_output: &'a mut Vec<usize>,
     layer: usize,
     text: &'a [u8],
     /// Where in `text` a key sits.
@@ -940,7 +938,8 @@ struct Reader<'a> {
     cmd: Command,
     redir: Option<Redir>,
     files: Vec<File>,
-    /// Substitutions in what `echo`, `printf` and `cat` print.
+    /// Substitutions whose output is printed: by `echo`, `printf`, or `cat`
+    /// reading a `<(…)`. A plain `cat "$(…)"` prints a file by that name.
     fed: Vec<(usize, usize)>,
     stopped: bool,
     /// A substitution was refused.
@@ -1048,15 +1047,17 @@ impl Reader<'_> {
     }
 
     /// The substitution may have been refused, or be open already under
-    /// another parent, so it is found by its text.
+    /// another parent, of any kind and maybe still to be read, so every
+    /// layer with its text is marked by index.
     fn output_is_run(&mut self, (start, end): (usize, usize)) {
         let text = &self.text[start..end];
-        let layer = self.xray.layers.iter().position(|l| l.text == text);
-        if !text.is_empty()
-            && let Some(layer) = layer
-            && !self.run_output.contains(&layer)
-        {
-            self.run_output.push(layer);
+        if text.is_empty() {
+            return;
+        }
+        for (layer, l) in self.xray.layers.iter().enumerate() {
+            if l.text == text && !self.budget.run_output.contains(&layer) {
+                self.budget.run_output.push(layer);
+            }
         }
     }
 
@@ -1115,9 +1116,17 @@ impl Reader<'_> {
                         return;
                     }
                     // A pasted PEM block is no shell, and its lines must
-                    // not turn into steps.
+                    // not turn into steps. A key has an end: what follows
+                    // it is read.
                     if word.text.starts_with(b"-----BEGIN") {
-                        self.stopped = true;
+                        let key = self
+                            .mask
+                            .iter()
+                            .find(|&&(s, e)| s <= word.start && word.start < e);
+                        match key {
+                            Some(&(_, end)) => self.lex.at = self.lex.at.max(end),
+                            None => self.stopped = true,
+                        }
                         return;
                     }
                 }
@@ -1351,9 +1360,12 @@ impl Reader<'_> {
         if is_payload_path(&head.text) {
             return self.run_binary(head, args);
         }
-        if matches!(name, b"echo" | b"printf" | b"cat") {
+        if matches!(name, b"echo" | b"printf") {
             let subs = args.iter().flat_map(|w| w.subs.iter().copied());
             self.fed.extend(subs);
+        } else if name == b"cat" {
+            self.fed
+                .extend(args.iter().filter_map(Word::process_substitution));
         }
         match name {
             b"cd" | b"pushd" | b"mkdir" | b"export" | b"umask" | b"ulimit" | b"unset" | b"set" => {
@@ -1791,19 +1803,18 @@ pub(crate) fn read_recipes(
     masks: &[Vec<(usize, usize)>],
 ) {
     let mut queue = VecDeque::from([layer]);
-    let mut run_output = Vec::new();
     while let Some(at) = queue.pop_front() {
         if at >= xray.layers.len() {
             continue;
         }
         let text = take(&mut xray.layers[at].text);
         let mask = masks.get(at).cloned().unwrap_or_else(|| key::ranges(&text));
-        read_layer(xray, at, &text, mask, budget, &mut queue, &mut run_output);
+        read_layer(xray, at, &text, mask, budget, &mut queue);
         xray.layers[at].text = text;
     }
     // Last, as the run may come after the layer holding the fetch was read.
     for recipe in &mut xray.recipes {
-        if run_output.contains(&recipe.layer) {
+        if budget.run_output.contains(&recipe.layer) {
             walk(&mut recipe.nodes, &mut |step| {
                 if let Step::Fetch { saves, .. } = step {
                     *saves = true;
@@ -1820,14 +1831,12 @@ fn read_layer(
     mask: Vec<(usize, usize)>,
     budget: &mut Budget,
     queue: &mut VecDeque<usize>,
-    run_output: &mut Vec<usize>,
 ) {
     let steps = budget.steps;
     let mut reader = Reader {
         xray,
         budget,
         queue,
-        run_output,
         layer,
         text,
         mask,
@@ -2865,6 +2874,10 @@ mod tests {
             "echo $(curl -s http://example.org/x) && a | sh",
             "sh /tmp/a <<< \"$(curl -s http://example.org/x)\"",
             "grep a <<< \"$(curl -s http://example.org/x)\"",
+            // What it prints is a file by that name.
+            "cat \"$(curl -s http://example.org/x)\" | sh",
+            "cat $(curl -s http://example.org/x) | sh",
+            "cat `curl -s http://example.org/x` | sh",
         ] {
             assert_eq!(all_saved(&read(line)), [false], "{line}");
         }
