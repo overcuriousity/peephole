@@ -1215,6 +1215,10 @@ mod tests {
         refresh(&s).await;
         let got = s.piece_results(h).await.unwrap();
         assert_eq!((got.len(), got[0].id), (1, id));
+        // A chain pass rebuilds the chains; the result is not theirs.
+        s.recompute_campaigns(true).await.unwrap();
+        let got = s.piece_results(h).await.unwrap();
+        assert_eq!((got.len(), got[0].id), (1, id));
         // The source goes: the piece stays for its result.
         s.delete_request(a).await.unwrap();
         refresh(&s).await;

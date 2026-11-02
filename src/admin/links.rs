@@ -722,7 +722,7 @@ mod tests {
         let got = st.store.piece_results(hash).await.unwrap();
         assert_eq!(got.len(), 1);
         // The session is a bare one: who entered it is kept with it.
-        assert!(!got[0].added_by.is_empty());
+        assert_eq!(got[0].added_by, "password");
         assert!(!got[0].added_at.is_empty());
         assert_eq!(got[0].family.as_deref(), Some("Mirai"));
     }
