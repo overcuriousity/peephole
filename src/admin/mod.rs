@@ -5,6 +5,7 @@ pub mod auth;
 pub mod blocklist;
 pub mod campaigns;
 pub mod chains;
+pub mod chains_json;
 pub mod cli;
 pub mod cluster;
 pub mod cluster_access;

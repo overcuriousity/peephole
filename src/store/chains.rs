@@ -1519,6 +1519,13 @@ impl Store {
         self.chains_upto(a, CHAINS_MAX).await
     }
 
+    /// The chain of this key, whatever the cap of [`Store::chains_of`]; None
+    /// when no chain has it.
+    pub async fn chain_by_key(&self, key: &str) -> Result<Option<Chain>> {
+        let mut conn = self.read.acquire().await?;
+        keyed(&mut conn, key, &Here::default()).await
+    }
+
     /// [`Store::chains_of`], building at most `max`.
     pub async fn chains_upto(&self, a: Anchor<'_>, max: usize) -> Result<Vec<Chain>> {
         let mut conn = self.read.acquire().await?;
