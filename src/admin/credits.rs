@@ -994,11 +994,12 @@ mod tests {
         assert!(html.contains("does not qualify"));
         assert!(!html.contains("A relay lease"));
         assert!(!html.contains("Relays leased"), "advertised: none taken");
+        assert!(html.contains("<h1>Credits</h1>"));
         page.relays_leased = Some(vec![]);
         assert!(
             page.render()
                 .unwrap()
-                .contains("No relay leased: nothing can reach this node's outbox yet.")
+                .contains("No relay leased: nothing can reach this node&#39;s outbox yet.")
         );
         page.relays_leased = Some(vec![LeaseRow {
             relay: "node-charlie".into(),

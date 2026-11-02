@@ -6,7 +6,15 @@
 {% let crumb_href = "/requests" %}{% let crumb_label = "Requests" %}{% include "_detail_head.html" %}
 <div class="page-head req-head"><div>
   <h1>Request #{{ d.row.id }}</h1>
-  <div class="meta"><span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a>{{ c::copy(d.ip.as_str(), "IP address", false) }}</span><span class="mono">{{ d.row.ts }}</span>{% if let Some(n) = d.node %}<span>recorded by {{ n }}</span>{% endif %}{% if let Some((key, num)) = campaign %}<a class="chip" href="/admin/evidence/campaigns/{{ key }}">member of campaign #{{ num }}</a>{% endif %}{% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}{% for l in labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}" title="{{ crate::admin::views::family_name(crate::classify::label_family(l)) }}">{{ l }}</span>{% endfor %}{% for o in owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }} · {{ crate::admin::views::owasp_name(o) }}</span>{% endfor %}</div>
+  <div class="meta">
+    <span>from <a class="mono" href="/ip/{{ d.ip }}">{{ d.ip }}</a>{{ c::copy(d.ip.as_str(), "IP address", false) }}</span>
+    <span class="mono">{{ d.row.ts }}</span>
+    {% if let Some(n) = d.node %}<span>recorded by {{ n }}</span>{% endif %}
+    {% if let Some((key, num)) = campaign %}<a class="chip" href="/admin/evidence/campaigns/{{ key }}">member of campaign #{{ num }}</a>{% endif %}
+    {% if d.row.is_fp_claim %}<span class="badge badge-label">fp claim</span>{% endif %}
+    {% for l in labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}" title="{{ crate::admin::views::family_name(crate::classify::label_family(l)) }}">{{ l }}</span>{% endfor %}
+    {% for o in owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }} · {{ crate::admin::views::owasp_name(o) }}</span>{% endfor %}
+  </div>
 </div>
 <div class="row">{% let dossier_kind = "request" %}{% let dossier_id = d.row.id %}{% include "_dossier_link.html" %}
 {% if can_delete %}<button class="btn btn-danger" type="button" data-confirm="dlg-del">Delete request</button>

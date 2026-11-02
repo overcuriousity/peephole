@@ -1,14 +1,13 @@
 {% extends "layout.html" %}
-{% block title %}peephole — cluster{% endblock %}
+{% block title %}peephole — members{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("network", "members") %}{% include "_admin_nav.html" %}
+<div class="page-head"><div><h1>Members</h1></div></div>
 {% if standalone %}
-<div class="page-head"><div><h1>Cluster</h1></div></div>
 <section class="card"><h2>Standalone</h2>
   <p>To join, add a <code>[cluster]</code> section to <code>config.toml</code> and restart. See <a href="https://github.com/overcuriousity/peephole/blob/master/docs/operations.md#cluster-administration">Cluster administration</a>.</p>
   <p class="muted">Cooldown and roles: <a href="/admin/system/settings">System › Settings</a>. Scan pace: <a href="/admin/investigate/scans#pace">Scans</a>.</p></section>
 {% else %}
-<div class="page-head"><div><h1>Cluster</h1></div></div>
 {% if let Some(d) = detached %}<div class="banner banner-warning">{{ d }}</div>{% endif %}
 {% if let Some(u) = unserved %}<div class="banner banner-warning">History incomplete for {{ u }}: waiting for a full member.</div>{% endif %}
 <section class="card">

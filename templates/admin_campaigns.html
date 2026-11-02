@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_empty.html" as e %}
 {% block title %}peephole — campaigns{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "campaigns") %}{% include "_admin_nav.html" %}
@@ -29,12 +30,12 @@
 <section class="card">
   <div class="card-head"><h2>Excluded values</h2><span class="muted">on more than {{ fanout_max }} IPs, or past an address's newest {{ crate::store::campaigns::MAX_JOINERS_PER_IP }} values · no edge</span></div>
   {% if let Some(r) = report %}
-  {% if r.excluded.is_empty() %}<p class="empty">None.</p>{% else %}
+  {% if r.excluded.is_empty() %}{{ e::empty("None.") }}{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Kind</th><th>Value</th><th class="num">IPs</th></tr></thead><tbody>
   {% for e in r.excluded %}<tr><td>{{ e.kind }}</td><td class="mono hk-fp">{% if let Some(k) = crate::store::links::LinkKind::parse(e.kind.as_str()) %}<a href="{{ crate::admin::views::link_href(k.key(), e.value.as_str()) }}">{{ e.value }}</a>{% else %}{{ e.value }}{% endif %}</td><td class="num">{{ e.ips }}</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
   <p class="muted">Last recompute{% if let Some(at) = r.at %} <span class="mono">{{ crate::admin::views::minute(at.as_str()) }}</span> UTC{% endif %}, took {{ "{:.2}"|format(r.seconds) }} s.</p>
-  {% else %}<p class="empty">No recompute has run on this node yet.</p>{% endif %}
+  {% else %}{{ e::empty("No recompute has run on this node yet.") }}{% endif %}
 </section>
 </div>
 {% endblock %}

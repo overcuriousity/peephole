@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_empty.html" as e %}
 {% block title %}peephole — canaries of #{{ d.row.id }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "canaries") %}{% include "_admin_nav.html" %}
@@ -20,7 +21,7 @@
 </section>
 <section class="card">
   <div class="card-head"><h2>Used by</h2>{% if uses.len() as i64 >= crate::admin::links::DECOY_USES %}<span class="muted">newest {{ uses.len() }}</span>{% endif %}</div>
-  {% if uses.is_empty() %}<p class="empty">None of these canaries has come back.</p>{% else %}
+  {% if uses.is_empty() %}{{ e::empty("None of these canaries has come back.") }}{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Request</th><th>IP</th><th>Kind</th><th>Where</th><th>Δt</th></tr></thead><tbody>
   {% for r in uses %}<tr>
     <td><a href="/admin/requests/{{ r.used_request_id }}">#{{ r.used_request_id }}</a> · <span class="mono">{{ r.used_ts }}</span>{% if let Some(n) = r.used_node %} · <span class="muted">{{ n }}</span>{% endif %}</td>

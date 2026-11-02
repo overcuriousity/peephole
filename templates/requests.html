@@ -58,7 +58,7 @@
       <td class="mono">{{ r.method }}</td>
       <td class="path"><a href="{{ crate::admin::views::pivot_href("path", r.path.as_str()) }}">{{ r.path }}</a>{% if let Some(q) = r.query %}<span class="muted">?{{ q }}</span>{% endif %}</td>
       <td>{% let sev = r.severity %}{% include "_severity.html" %}</td>
-      <td><span class="chips">{% for l in r.labels() %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp() %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>
+      <td><span class="chips">{% let lab_list = r.labels() %}{% let owasp_list = r.owasp() %}{% include "_labels.html" %}</span></td>
       {% if !nodes.is_empty() %}<td class="muted">{{ r.node.as_deref().unwrap_or("") }}</td>{% endif %}
       {% if chrome.authed %}<td class="nowrap">{% include "_canary_marks.html" %}<a class="btn btn-sm btn-ghost" href="/admin/requests/{{ r.id }}">inspect</a></td>{% endif %}
     </tr>

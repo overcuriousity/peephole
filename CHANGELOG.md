@@ -92,6 +92,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
+- Admin page titles follow the nav labels: Now (was Overview), Status (was
+  System), Members (was Cluster), Credits (was Market); the tab titles of
+  Access and Ownership drop "cluster". The two nav rows take less height. The
+  scan queue rows, the label and OWASP badges and the card-level empty states
+  each come from one template. Addresses are unchanged.
 - The request page opens with the evidence: chain strip, then the X-ray, then
   the facts. Headers are collapsed (count and first names in the summary; a
   `#headers` link opens them), labels are chips in the header, and facts with

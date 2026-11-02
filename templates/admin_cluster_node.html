@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_empty.html" as e %}
 {% import "_copy.html" as c %}
 {% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
@@ -70,7 +71,7 @@
 </section>
 {% if m.scanner %}
 <section class="card"><h2>Pace</h2>
-  {% match m.pace %}{% when Some(p) %}<p>{{ p.max_workers }} workers{% if !m.level_weights.is_empty() %} · {{ m.level_weights }}{% endif %}.</p>{% when None %}<p class="muted">Pace not reported yet.</p>{% endmatch %}
+  {% match m.pace %}{% when Some(p) %}<p>{{ p.max_workers }} workers{% if !m.level_weights.is_empty() %} · {{ m.level_weights }}{% endif %}.</p>{% when None %}{{ e::empty("Pace not reported yet.") }}{% endmatch %}
 </section>
 {% endif %}
 <section class="card"><h2>Settings</h2>
@@ -110,7 +111,7 @@
   </form>{% endif %}
 
   <h3>Its invites</h3>
-  {% if status.invites.is_empty() %}<p class="muted">None.</p>{% else %}
+  {% if status.invites.is_empty() %}{{ e::empty("None.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>For</th><th>Uses</th><th>Expires (UTC)</th><th></th></tr></thead>
     <tbody>{% for i in status.invites %}<tr{% if !i.usable %} class="muted"{% endif %}>

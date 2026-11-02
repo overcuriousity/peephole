@@ -400,7 +400,7 @@ paths, user agents, JA4, methods, open ports, products, OS guesses, abuse
 scores; every row opens the matching requests or IPs), a search box for
 IPs, networks, AS numbers, requests, paths and fingerprints, per-IP pages
 with every enrichment result and counter-scan, the scan pace with the live
-queue and every finished job, a "needs attention" list on the Overview, a
+queue and every finished job, a "needs attention" list on Now, a
 Links area (every browser fingerprint, SSH host key, TLS certificate, JA4,
 JA4H, HASSH and JA4X, filterable, each with a graph of the IPs it was seen
 on and what else links them), canary reuse, the false-positive inbox,
@@ -462,7 +462,7 @@ The public dashboard, the IP directory, IP pages, `/api/stats`, `/api/map` and
 a random 0 to `jitter_minutes` (5 + 0–5 min by default), counted from when
 this node stored it. Someone probing an address and watching the dashboard can't
 tell from the timing whether it was one of yours. Signed-in admins see
-everything at once; the live feed is on the admin Overview. A changed delay
+everything at once; the live feed is on the admin Now page. A changed delay
 applies to requests stored after the restart. Setting both to 0 publishes
 at once (logged as a warning).
 
@@ -568,7 +568,7 @@ its metadata are written whatever the state. If the same content is held
 from another upload, the button appears even on a row that says dropped.
 
 The bounds are runtime settings (`peephole settings set KEY VALUE`; the
-System page shows how much is held of the ceiling):
+Status page shows how much is held of the ceiling):
 
 | Key | Default | |
 |---|---|---|

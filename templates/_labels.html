@@ -1,0 +1,2 @@
+{# A row's rule labels and OWASP tags as badges (`lab_list`, `owasp_list`: Vec<String>). The caller wraps them in `<span class="chips">`. #}
+{% for l in lab_list %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in owasp_list %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}

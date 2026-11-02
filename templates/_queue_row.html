@@ -1,10 +1,15 @@
+{# One scan job (`j`: QueueJob). `live`: the live queue, with the start time; otherwise the job history of one IP, with finish time and error. #}
 <tr data-job="{{ j.id }}">
   <td class="mono">#{{ j.id }}</td>
   <td class="ip"><a href="/ip/{{ j.ip }}">{{ j.ip }}</a></td>
   <td>{{ j.level }}</td>
-  <td><span class="badge badge-status" data-status="{{ j.status }}">{{ j.status }}</span></td>
+  <td><span class="badge badge-status" data-status="{{ j.status }}">{{ j.status }}</span>{% if let Some(t) = j.retry_at %} <span class="badge" title="Retry of a failed scan, not before {{ t }} UTC">retry</span>{% endif %}</td>
   <td class="ts">{{ j.queued_at }}</td>
+  {% if live %}
+  <td class="ts">{{ j.started_at.as_deref().unwrap_or("") }}</td>
+  {% else %}
   <td class="ts">{{ j.finished_at.as_deref().unwrap_or("") }}</td>
   <td class="mono wrap">{{ j.error.as_deref().unwrap_or("") }}</td>
+  {% endif %}
   <td class="muted">{% if let Some(s) = j.scanner %}{{ s }}{% endif %}{% if let Some(a) = j.arbiter %}<span class="node-via"> via {{ a }}</span>{% endif %}</td>
 </tr>

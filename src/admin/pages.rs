@@ -533,6 +533,35 @@ mod short_strings_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
 
+    /// The page title and its h1 are the nav label, and the Members page
+    /// has exactly one h1 whichever branch it draws.
+    #[tokio::test]
+    async fn titles_follow_nav_labels() {
+        let (_state, cookie, app, _d) = app().await;
+        for (path, title, h1) in [
+            ("/admin", "peephole — now", "<h1>Now</h1>"),
+            (
+                "/admin/system/status",
+                "peephole — status",
+                "<h1>Status</h1>",
+            ),
+            (
+                "/admin/network/members",
+                "peephole — members",
+                "<h1>Members</h1>",
+            ),
+        ] {
+            let r = Request::get(path)
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie);
+            let (st, _, html) = send(&app, r, Body::empty()).await;
+            assert_eq!(st, StatusCode::OK, "{path}");
+            assert!(html.contains(&format!("<title>{title}</title>")), "{path}");
+            assert_eq!(html.matches("<h1").count(), 1, "{path}");
+            assert!(html.contains(h1), "{path}: {h1}");
+        }
+    }
+
     #[tokio::test]
     async fn analyst_pages_carry_the_short_strings() {
         let (_state, cookie, app, _d) = app().await;
