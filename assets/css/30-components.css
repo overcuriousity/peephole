@@ -113,9 +113,9 @@ dialog { border: 1px solid var(--color-border-strong); border-radius: var(--radi
 dialog::backdrop { background: rgba(0,0,0,0.5); }
 dialog .actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem; }
 
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; font-size: var(--text-sm); }
-.kv dt { color: var(--color-fg-muted); }
-.kv dd { margin: 0; font-family: var(--font-mono); word-break: break-all; }
+.kv, .facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; font-size: var(--text-sm); }
+.kv dt, .facts dt { color: var(--color-fg-muted); }
+.kv dd, .facts dd { margin: 0; font-family: var(--font-mono); word-break: break-all; }
 pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 0.75rem 1rem; overflow: auto; font-size: var(--text-xs); max-height: 32rem; white-space: pre-wrap; word-break: break-all; }
 [data-copy] { cursor: copy; }
 [data-copy][data-copied] { border-color: var(--color-accent); }
@@ -126,7 +126,7 @@ pre.panel { background: var(--color-bg-surface); border: 1px solid var(--color-b
 .req-head h1 { font-size: clamp(var(--text-lg), 5.5vw, var(--text-2xl)); }
 .ip-head h1 .badge { font-family: var(--font-sans); vertical-align: middle; }
 .ip-head .tiles { margin-bottom: 0; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); min-width: min(100%, 20rem); }
-.kv dd.plain { font-family: inherit; word-break: normal; }
+.kv dd.plain, .facts dd.plain { font-family: inherit; word-break: normal; }
 .intel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
 .intel { border: 1px solid var(--color-border-subtle); border-radius: var(--radius-md); padding: 0.75rem 1rem; min-width: 0; }
 .intel h3 { margin: 0 0 0.5rem; font-size: var(--text-sm); }

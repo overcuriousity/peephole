@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_copy.html" as c %}
 {% block title %}peephole — {{ m.name }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("network", "members") %}{% include "_admin_nav.html" %}
@@ -26,8 +27,8 @@
 </div>
 <div class="stack">
 <section class="card"><h2>Details</h2>
-  <dl class="kv">
-    <dt>Key</dt><dd class="mono break">{{ m.key }}{% let value = m.key.as_str() %}{% let what = "node key" %}{% let subtle = false %}{% include "_copy.html" %}</dd>
+  <dl class="facts">
+    <dt>Key</dt><dd class="mono break">{{ m.key }}{{ c::copy(m.key.as_str(), "node key", false) }}</dd>
     <dt>Persona</dt><dd>{{ m.persona }} <span class="muted small">on its IP; each DNS name it is reached by can present another</span></dd>
     <dt>Roles</dt><dd>{{ m.roles }}{% if !m.providers.is_empty() %} <span class="muted small">looks up: {{ m.providers }}</span>{% endif %}</dd>
     <dt>Address</dt><dd class="mono">{{ m.address }}</dd>
@@ -41,7 +42,7 @@
   </dl>
 </section>
 <section class="card"><h2>Rules</h2>
-  <dl class="kv">
+  <dl class="facts">
     <dt>Carried</dt><dd><span class="mono">{{ m.ruleset }}</span>{% match m.ruleset_same %}{% when Some(true) %} <span class="muted small">same as ours</span>{% when Some(false) %} <span class="muted small">differs from ours</span>{% when None %}{% endmatch %}</dd>
     {% if !m.is_self %}<dt>Classified again here</dt><dd>{{ m.rules }} <span class="muted small">details: <code>peephole cluster agreement {{ m.short }}</code></span></dd>{% endif %}
   </dl>
@@ -51,7 +52,7 @@
     <thead><tr><th></th><th class="num">Here</th>{% if credits.there.is_some() %}<th class="num">As {{ m.name }} counts them</th>{% endif %}</tr></thead>
     <tbody><tr><td>Balance</td><td class="num">{{ credits.balance }}</td>{% if let Some(t) = credits.there %}<td class="num">{{ t }}</td>{% endif %}</tr></tbody>
   </table></div>
-  <dl class="kv">
+  <dl class="facts">
     <dt>Earns here</dt><dd>{% if credits.earns %}<span class="badge badge-status" data-status="done">yes</span>{% else %}<span class="badge badge-status" data-status="failed">no</span>{% endif %}{% for r in credits.reasons %} <span class="small">{{ r }}{% if !loop.last %};{% endif %}</span>{% endfor %}</dd>
     {% if let Some(f) = credits.fork %}<dt>Showed two histories</dt><dd>{{ f }}.{% if credits.fork_proof %} <a href="/admin/network/members/{{ m.key }}/fork-proof">Download the proof</a>{% endif %} <span class="muted small">Its credits are void here, for good.</span></dd>{% endif %}
     <dt>Audits, 7 days</dt><dd>{{ credits.counted.0 }} agree · {{ credits.counted.1 }} differ · {{ credits.counted.2 }} inconclusive <span class="muted small">by this node and your other nodes: these count</span>{% if credits.others.0 + credits.others.1 + credits.others.2 > 0 %}<br>{{ credits.others.0 }} agree · {{ credits.others.1 }} differ · {{ credits.others.2 }} inconclusive <span class="muted small">by other members: shown, not counted</span>{% endif %}</dd>

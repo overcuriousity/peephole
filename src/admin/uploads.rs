@@ -361,6 +361,83 @@ pub(crate) mod tests {
         }
     }
 
+    /// The scan, canary-decoy and network pages carry the frame too.
+    #[tokio::test]
+    async fn scan_decoy_and_net_pages_have_the_shared_header() {
+        let (st, cookie, app, _d) = app().await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at, scanner)
+             VALUES ('j-1', x'01', x'01', 1, ?1, 2, 'done', datetime('now'), x'02')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+             VALUES ((SELECT id FROM scan_jobs WHERE uid = 'j-1'), ?1, 2, datetime('now'),
+                     datetime('now'), 's-1', x'02', 'j-1')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let scan: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE uid = 's-1'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        let req = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/.env".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                page_token: Some("tok".into()),
+                answer: Some("decoy:dotenv".into()),
+                decoy_v: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scan_page = format!("/admin/investigate/scans/{scan}");
+        let decoy_page = format!("/admin/evidence/canaries/served/{req}");
+        for (path, crumb, nav) in [
+            (
+                scan_page.as_str(),
+                "href=\"/admin/investigate/scans\">← Scans</a>",
+                true,
+            ),
+            (
+                decoy_page.as_str(),
+                "href=\"/admin/evidence/canaries\">← Canaries</a>",
+                true,
+            ),
+            ("/admin/net/NET-1", "href=\"/ips\">← IPs</a>", false),
+        ] {
+            let (status, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(html.matches("class=\"crumb\"").count(), 1, "{path}");
+            assert!(
+                html.find(crumb).unwrap() < html.find("<h1").unwrap(),
+                "{path}"
+            );
+            assert_eq!(html.contains("Admin sections"), nav, "{path}");
+        }
+    }
+
     /// Every admin detail page with a list in the admin tree keeps the admin
     /// nav; the request and IP pages, which are shared with the top bar's own
     /// lists, do not get it.

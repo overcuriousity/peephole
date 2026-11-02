@@ -76,6 +76,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
+- Detail pages (request, IP, upload, campaign, link, scan, member, canary
+  decoy, network, AS) share one frame: a "← list" crumb above the title, in the
+  same place on each, replacing the hand-written back links. The public IP
+  page does not show it. Facts on the upload, link, member and AS pages use
+  one `facts` list style; the copy button is one macro. No URL changes.
 - The X-ray calls its query layer "Query".
 - The request page shows up to 64 KiB of a body (was 16 KiB). The dossier and
   API `body_text` and `body_b64` grow to 64 KiB with it.

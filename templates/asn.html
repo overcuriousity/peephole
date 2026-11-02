@@ -8,7 +8,7 @@
 <section class="card">
   <h2>Network</h2>
   <p class="muted">From what this node already holds: the geo lookups and the RDAP answers stored for the network's IPs. A count is the number of IPs the value holds for.</p>
-  <dl class="kv">
+  <dl class="facts">
     <dt>Registrant</dt><dd class="plain">{% if facts.orgs.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.orgs %}{% if !loop.first %} · {% endif %}{{ v }} <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
     <dt>Country</dt><dd class="plain">{% if facts.countries.is_empty() %}<span class="muted">not known</span>{% else %}{% for (v, n) in facts.countries %}{% if !loop.first %} · {% endif %}<a href="/ips?asn={{ asn }}&amp;country={{ crate::admin::public::urlencode(v) }}">{{ v }}</a> <span class="muted">×{{ n }}</span>{% endfor %}{% endif %}</dd>
     <dt>Registry</dt><dd class="plain">{% if let Some(g) = registry %}{{ g }}{% else %}<span class="muted">not known</span>{% endif %}</dd>
