@@ -45,6 +45,8 @@ const UPLOAD: u8 = 1;
 
 /// The roles that join, for a `role IN` clause.
 pub(super) const JOINER_ROLES: &str = "('stager', 'key', 'file')";
+/// The kinds that join: a piece of one in a chain is a joiner of it.
+const JOINER_KINDS: &str = "('stager', 'key', 'file')";
 /// The kinds that describe.
 const DESCRIBER_KINDS: &str = "('exploit', 'recipe', 'tag', 'shell-profile')";
 
@@ -72,8 +74,14 @@ const TIMELINE_UPLOADS: usize = 8;
 const FOLLOW_READS_MAX: usize = 32;
 /// Most pieces a chain shows, joiners first. The rest are counted.
 const FOUND_MAX: usize = 200;
-/// Newest sources a chain pairs its exploits and tags in.
+/// Newest sources a chain's strip reads: its pairs of exploits and tags, and
+/// how many of them hold each piece.
 const TAG_SOURCES_MAX: i64 = 2000;
+/// Newest joiners of a chain those sources are read from.
+const SOURCE_JOINERS_MAX: i64 = 64;
+/// Newest sightings of a piece read for its roles when it is not in those
+/// sources. A piece's kind sets its grade, and only `stager` has more roles.
+const OLD_SIGHTINGS_MAX: i64 = 64;
 
 /// Most chains [`Store::chains_of`] builds: one forged body can name 256
 /// stagers, each its own chain.
@@ -424,7 +432,8 @@ pub async fn uploads_of(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<
         "SELECT {UPLOAD_COLS} WHERE u.id IN
            (SELECT g.source_id FROM chain_pieces c JOIN pieces p ON p.hash = c.piece
             JOIN piece_sightings g ON g.piece = c.piece
-            WHERE c.chain = ? AND g.source_kind = 'upload' AND g.role IN {JOINER_ROLES})
+            WHERE c.chain = ? AND p.kind IN {JOINER_KINDS} AND g.source_kind = 'upload'
+              AND g.role IN {JOINER_ROLES})
          ORDER BY u.id DESC LIMIT ?"
     )))
     .bind(chain)
@@ -1382,21 +1391,28 @@ fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
 }
 
 /// These sources as a condition on `piece_sightings g`. Their ids are
-/// integers, so they go in the text and no bound runs out.
+/// integers, so they go in the text and no bound runs out. A kind with none
+/// is left out: `IN ()` next to an `OR` makes SQLite scan the table.
 fn sources_in(sources: &[(u8, i64)]) -> String {
-    let ids = |kind: u8| {
-        let of_kind = sources.iter().filter(|s| s.0 == kind);
-        of_kind
+    let of_kind = |kind: u8, name: &str| {
+        let ids: Vec<String> = sources
+            .iter()
+            .filter(|s| s.0 == kind)
             .map(|s| s.1.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
+            .collect();
+        (!ids.is_empty()).then(|| {
+            format!(
+                "(g.source_kind = '{name}' AND g.source_id IN ({}))",
+                ids.join(",")
+            )
+        })
     };
-    format!(
-        "((g.source_kind = 'request' AND g.source_id IN ({})) \
-         OR (g.source_kind = 'upload' AND g.source_id IN ({})))",
-        ids(REQUEST),
-        ids(UPLOAD)
-    )
+    let kinds = [of_kind(REQUEST, "request"), of_kind(UPLOAD, "upload")];
+    match kinds {
+        [Some(a), Some(b)] => format!("({a} OR {b})"),
+        [Some(one), None] | [None, Some(one)] => one,
+        [None, None] => "0".to_string(),
+    }
 }
 
 /// The newest chains with a joiner in a sighting `cond` picks. `campaign`
@@ -1422,6 +1438,84 @@ async fn keys_where(
     Ok(q.bind(max as i64).fetch_all(&mut *conn).await?)
 }
 
+/// A piece a chain shows, as stored.
+#[derive(sqlx::FromRow)]
+struct TopPiece {
+    hash: i64,
+    kind: String,
+    value: String,
+    ips: i64,
+    sources: i64,
+}
+
+/// The chain's newest sources, at most [`TAG_SOURCES_MAX`]: the newest of each
+/// of its joiners, newest joiner first, merged. A botnet's stager can have a
+/// million sources, and the index reads only these. A joiner too old to
+/// change the result is not read.
+async fn newest_sources(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<(u8, i64)>> {
+    let joiners: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT p.hash, p.last_seen FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         WHERE m.chain = ? AND p.kind IN {JOINER_KINDS} ORDER BY p.last_seen DESC LIMIT ?"
+    )))
+    .bind(chain)
+    .bind(SOURCE_JOINERS_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let keep = TAG_SOURCES_MAX as usize;
+    let mut newest: HashMap<(u8, i64), String> = HashMap::new();
+    let mut oldest: Option<String> = None;
+    for (piece, last_seen) in joiners {
+        if oldest.as_ref().is_some_and(|o| &last_seen < o) {
+            break;
+        }
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT source_kind, source_id, ts FROM piece_sightings
+             INDEXED BY idx_sightings_piece_ts
+             WHERE piece = ? AND role IN {JOINER_ROLES} ORDER BY ts DESC LIMIT ?"
+        )))
+        .bind(piece)
+        .bind(TAG_SOURCES_MAX)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (kind, id, ts) in rows {
+            let at = newest.entry(source_of(&kind, id)).or_default();
+            *at = ts.max(std::mem::take(at));
+        }
+        if newest.len() >= keep {
+            let mut times: Vec<&String> = newest.values().collect();
+            times.select_nth_unstable_by(keep - 1, |a, b| b.cmp(a));
+            let last = times[keep - 1].clone();
+            newest.retain(|_, ts| *ts >= last);
+            oldest = Some(last);
+        }
+    }
+    let mut sources: Vec<((u8, i64), String)> = newest.into_iter().collect();
+    sources.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    sources.truncate(keep);
+    Ok(sources.into_iter().map(|(source, _)| source).collect())
+}
+
+/// The roles of a piece in none of a chain's newest sources, and how far each
+/// is confirmed, from its own newest sightings. What it counts is the piece's
+/// own: how much of that is this chain's is past what a strip reads.
+async fn older_roles(
+    conn: &mut SqliteConnection,
+    t: &TopPiece,
+) -> Result<Vec<(String, i64, bool)>> {
+    let roles: Vec<(String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT role, MAX(grade = 'seen') FROM
+           (SELECT role, grade FROM piece_sightings INDEXED BY idx_sightings_piece_ts
+            WHERE piece = ? AND role IN {STRIP_ROLES} ORDER BY ts DESC LIMIT ?)
+         GROUP BY role"
+    )))
+    .bind(t.hash)
+    .bind(OLD_SIGHTINGS_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let n = t.sources.max(1);
+    Ok(roles.into_iter().map(|(r, seen)| (r, n, seen)).collect())
+}
+
 /// A chain from its key; `None` when nothing of it is left to show.
 async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Option<Chain>> {
     let row: Option<(String, String, i64, i64)> =
@@ -1435,28 +1529,22 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
     // From `chain_pieces`, not from the sources: a source naming a joiner
     // of another chain must not show it here. The key's joiner, then the
     // other joiners, then what most addresses share.
-    let mut found: Vec<Found> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "WITH top AS (
-           SELECT p.hash, p.kind, p.value, p.ips, p.sources
-           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
-           WHERE m.chain = ?1
-           ORDER BY p.hash IS ?2 DESC, p.kind IN ('stager', 'key', 'file') DESC,
-                    p.ips DESC, p.value
-           LIMIT ?3)
-         SELECT t.hash, t.kind, t.value, g.role, MAX(g.grade = 'seen') AS seen, t.ips, t.sources
-         FROM top t JOIN piece_sightings g ON g.piece = t.hash
-         WHERE g.role IN {STRIP_ROLES}
-         GROUP BY t.hash, g.role ORDER BY t.value"
+    let top: Vec<TopPiece> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT p.hash, p.kind, p.value, p.ips, p.sources
+         FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         WHERE m.chain = ?1
+         ORDER BY p.hash IS ?2 DESC, p.kind IN {JOINER_KINDS} DESC, p.ips DESC, p.value
+         LIMIT ?3"
     )))
     .bind(key)
     .bind(key_piece(key))
     .bind(FOUND_MAX as i64)
     .fetch_all(&mut *conn)
     .await?;
-    if found.is_empty() {
+    if top.is_empty() {
         return Ok(None);
     }
-    let shown = found.iter().map(|p| p.hash).collect::<HashSet<_>>().len() as i64;
+    let shown = top.len() as i64;
     let mut more = 0;
     if shown >= FOUND_MAX as i64 {
         let all: i64 = sqlx::query_scalar(
@@ -1468,42 +1556,46 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
         .await?;
         more = all - shown;
     }
+    let held = sources_in(&newest_sources(conn, key).await?);
     let tags: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "WITH src AS (SELECT g.source_kind AS k, g.source_id AS i
-           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
-           JOIN piece_sightings g ON g.piece = m.piece
-           WHERE m.chain = ?1 AND g.role IN {JOINER_ROLES}
-           GROUP BY g.source_kind, g.source_id ORDER BY MAX(g.ts) DESC LIMIT ?2)
-         SELECT DISTINCT e.piece, t.piece FROM src
-         JOIN piece_sightings e ON e.source_kind = src.k AND e.source_id = src.i
-         JOIN piece_sightings t ON t.source_kind = src.k AND t.source_id = src.i
-         WHERE e.role = 'exploit' AND t.role = 'tag'"
+        "SELECT DISTINCT g.piece, t.piece FROM piece_sightings g
+         JOIN piece_sightings t ON t.source_kind = g.source_kind AND t.source_id = g.source_id
+         WHERE g.role = 'exploit' AND t.role = 'tag' AND {held}"
     )))
-    .bind(key)
-    .bind(TAG_SOURCES_MAX)
     .fetch_all(&mut *conn)
     .await?;
     // `pieces.sources` counts every source: a recipe many chains share would
     // look as busy in each.
-    let counts: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "WITH src AS (SELECT g.source_kind AS k, g.source_id AS i
-           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
-           JOIN piece_sightings g ON g.piece = m.piece
-           WHERE m.chain = ?1 AND g.role IN {JOINER_ROLES}
-           GROUP BY g.source_kind, g.source_id ORDER BY MAX(g.ts) DESC LIMIT ?2)
-         SELECT g.piece, g.role, COUNT(*) FROM src
-         JOIN piece_sightings g ON g.source_kind = src.k AND g.source_id = src.i
-         WHERE g.role IN {STRIP_ROLES} GROUP BY g.piece, g.role"
+    let counts: Vec<(i64, String, i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT g.piece, g.role, COUNT(*), MAX(g.grade = 'seen') FROM piece_sightings g
+         WHERE g.role IN {STRIP_ROLES} AND {held} GROUP BY g.piece, g.role"
     )))
-    .bind(key)
-    .bind(TAG_SOURCES_MAX)
     .fetch_all(&mut *conn)
     .await?;
-    let counts: HashMap<(i64, String), i64> =
-        counts.into_iter().map(|(p, r, n)| ((p, r), n)).collect();
-    for p in &mut found {
-        p.sources = counts.get(&(p.hash, p.role.clone())).copied().unwrap_or(0);
+    let mut roles: HashMap<i64, Vec<(String, i64, bool)>> = HashMap::new();
+    for (piece, role, n, seen) in counts {
+        roles.entry(piece).or_default().push((role, n, seen));
     }
+    let mut found: Vec<Found> = vec![];
+    for t in top {
+        let read = match roles.remove(&t.hash) {
+            Some(read) => read,
+            None => older_roles(conn, &t).await?,
+        };
+        found.extend(read.into_iter().map(|(role, sources, seen)| Found {
+            hash: t.hash,
+            kind: t.kind.clone(),
+            value: t.value.clone(),
+            role,
+            seen,
+            ips: t.ips,
+            sources,
+        }));
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    found.sort_by(|a, b| a.value.cmp(&b.value));
     let uploads = uploads_of(conn, key).await?;
     let follow = gather_follow_ups(conn, &uploads).await?;
     let results = results_of(conn, &found).await?;
@@ -1723,8 +1815,7 @@ async fn of_piece(conn: &mut SqliteConnection, hash: i64) -> Result<Vec<Chain>> 
     };
     let key: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT m.chain FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
-         JOIN piece_sightings g ON g.piece = m.piece
-         WHERE m.piece = ? AND g.role IN {JOINER_ROLES} LIMIT 1"
+         WHERE m.piece = ? AND p.kind IN {JOINER_KINDS} LIMIT 1"
     )))
     .bind(hash)
     .fetch_optional(&mut *conn)
@@ -1735,9 +1826,10 @@ async fn of_piece(conn: &mut SqliteConnection, hash: i64) -> Result<Vec<Chain>> 
         return Ok(vec![chain]);
     }
     let held: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT source_kind, source_id FROM piece_sightings
-         WHERE piece = ? AND role IN {STRIP_ROLES}
-         GROUP BY source_kind, source_id ORDER BY MAX(ts) DESC LIMIT ?"
+        "SELECT DISTINCT source_kind, source_id FROM
+           (SELECT source_kind, source_id FROM piece_sightings
+            INDEXED BY idx_sightings_piece_ts
+            WHERE piece = ? AND role IN {STRIP_ROLES} ORDER BY ts DESC LIMIT ?)"
     )))
     .bind(hash)
     .bind(SHARED_SOURCES_MAX)
@@ -1750,20 +1842,22 @@ async fn of_piece(conn: &mut SqliteConnection, hash: i64) -> Result<Vec<Chain>> 
     let Some(mut chain) = unkeyed(conn, &sources, &here).await? else {
         return Ok(vec![]);
     };
-    // Over the cap, `unkeyed` covers the newest sources; the figures do not stop there.
-    let (ips, n, first, last): (i64, i64, Option<String>, Option<String>) =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(DISTINCT ip_id), COUNT(DISTINCT source_kind || ':' || source_id),
-                    MIN(ts), MAX(ts)
-             FROM piece_sightings WHERE piece = ? AND role IN {STRIP_ROLES}"
-        )))
-        .bind(hash)
-        .fetch_one(&mut *conn)
-        .await?;
-    chain.ips = ips;
-    chain.sources = n;
-    chain.first_seen = first.unwrap_or_default();
-    chain.last_seen = last.unwrap_or_default();
+    // Over the cap, `unkeyed` covers the newest sources; the figures do not
+    // stop there. The piece's own, as counting its sightings is what the cap
+    // spares: they can lag the last extraction, and include a queried URL.
+    if held.len() as i64 >= SHARED_SOURCES_MAX {
+        let row: Option<(i64, i64, String, String)> =
+            sqlx::query_as("SELECT ips, sources, first_seen, last_seen FROM pieces WHERE hash = ?")
+                .bind(hash)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some((ips, n, first, last)) = row {
+            chain.ips = chain.ips.max(ips);
+            chain.sources = chain.sources.max(n);
+            chain.first_seen = chain.first_seen.min(first);
+            chain.last_seen = chain.last_seen.max(last);
+        }
+    }
     Ok(vec![chain])
 }
 
@@ -1791,6 +1885,7 @@ struct ListedChain {
     sources: i64,
     exploits: i64,
     text_held: bool,
+    result_held: bool,
 }
 
 /// Which chains the list shows.
@@ -1808,6 +1903,23 @@ impl Store {
     /// without a key, of what it holds; nothing to show gives none.
     pub async fn chains_of(&self, a: Anchor<'_>) -> Result<Vec<Chain>> {
         self.chains_upto(a, CHAINS_MAX).await
+    }
+
+    /// How many chains a request and what it carried belong to, past the
+    /// cap of [`Store::chains_of`].
+    pub async fn chains_of_request(&self, id: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(DISTINCT m.chain) FROM piece_sightings g
+             JOIN chain_pieces m ON m.piece = g.piece
+             WHERE g.role IN {JOINER_ROLES} AND (
+               (g.source_kind = 'request' AND g.source_id = ?1)
+               OR (g.source_kind = 'upload' AND g.source_id IN
+                 (SELECT u.id FROM uploads u JOIN requests r ON r.uid = u.request_uid
+                  WHERE r.id = ?1)))"
+        )))
+        .bind(id)
+        .fetch_one(&self.read)
+        .await?)
     }
 
     /// The chain of this key, whatever the cap of [`Store::chains_of`]; None
@@ -1861,13 +1973,18 @@ impl Store {
             }
             Anchor::Ip(ip) => {
                 let keys = keys_where(conn, &format!("g.ip_id = {ip}"), None, max).await?;
-                let pieces: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                let marks = vec!["?"; keys.len()].join(",");
+                // Of these chains: an address can have sent millions of pieces.
+                let sql = format!(
                     "SELECT DISTINCT piece FROM piece_sightings
-                     WHERE ip_id = ? AND role IN {STRIP_ROLES}"
-                )))
-                .bind(ip)
-                .fetch_all(&mut *conn)
-                .await?;
+                     WHERE ip_id = ? AND role IN {STRIP_ROLES} AND piece IN
+                       (SELECT piece FROM chain_pieces WHERE chain IN ({marks}))"
+                );
+                let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).bind(ip);
+                for key in &keys {
+                    q = q.bind(key);
+                }
+                let pieces: Vec<i64> = q.fetch_all(&mut *conn).await?;
                 let here = Here {
                     pieces: pieces.into_iter().collect(),
                     ..Here::default()
@@ -1949,7 +2066,10 @@ impl Store {
                EXISTS(SELECT 1 FROM chain_pieces x JOIN pieces p ON p.hash = x.piece
                  JOIN piece_sightings g ON g.piece = x.piece AND g.source_kind = 'upload'
                  JOIN uploads u ON u.id = g.source_id
-                 WHERE x.chain = c.key AND g.role IN {JOINER_ROLES} AND {HELD_TEXT}) AS text_held
+                 WHERE x.chain = c.key AND p.kind IN {JOINER_KINDS}
+                   AND g.role IN {JOINER_ROLES} AND {HELD_TEXT}) AS text_held,
+               EXISTS(SELECT 1 FROM chain_pieces x JOIN piece_results r ON r.piece = x.piece
+                 WHERE x.chain = c.key) AS result_held
              FROM chains c {only} ORDER BY c.last_seen DESC, c.key LIMIT ? OFFSET ?"
         );
         let mut q = sqlx::query_as::<_, ListedChain>(sqlx::AssertSqlSafe(sql));
@@ -1991,7 +2111,11 @@ impl Store {
                 ips: r.ips,
                 sources: r.sources,
                 exploits: r.exploits,
-                payload: if r.text_held { Mark::Seen } else { Mark::Gap },
+                payload: match (r.text_held, r.result_held) {
+                    (true, _) => Mark::Seen,
+                    (false, true) => Mark::External,
+                    (false, false) => Mark::Gap,
+                },
             })
             .collect();
         Ok(Page::from_rows(rows, page))
@@ -2467,6 +2591,104 @@ mod tests {
         assert_eq!(p.members.len(), DESCRIBERS_MAX + 1);
     }
 
+    /// `n` sources of `piece` from `ip`, numbered from `first`, at `ts`.
+    async fn sightings(s: &Store, piece: i64, first: i64, n: i64, ip: i64, ts: &str) {
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT ?2, 'request', ?3 + i, ?4, 'stager', 'claimed', ?5 FROM c",
+        )
+        .bind(n)
+        .bind(piece)
+        .bind(first)
+        .bind(ip)
+        .bind(ts)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chain_reads_its_newest_sources_and_a_piece_past_them_keeps_its_count() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        let recipe = sight(&s, RECIPE, ("request", 1), 10).await;
+        sightings(&s, a, 1_000, TAG_SOURCES_MAX, 10, T1).await;
+        run(&s).await;
+        let sources = {
+            let mut c = s.read.acquire().await.unwrap();
+            newest_sources(&mut c, &key_of(a)).await.unwrap()
+        };
+        assert_eq!(sources.len(), TAG_SOURCES_MAX as usize);
+        assert!(!sources.contains(&(REQUEST, 1)), "the oldest goes");
+        let chain = s.chain_by_key(&key_of(a)).await.unwrap().unwrap();
+        let row = one(&chain, "Command");
+        assert_eq!(row.piece, Some(recipe));
+        assert_eq!(row.requests, 1, "its own count, not 0");
+    }
+
+    #[tokio::test]
+    async fn sources_merge_across_joiners() {
+        let (s, _d) = store().await;
+        sight(&s, STAGER_A, ("request", 1), 10).await;
+        sight(&s, STAGER_B, ("request", 2), 11).await;
+        // Connected through two addresses naming both.
+        for (id, ip) in [(3, 10), (4, 11)] {
+            sight(&s, STAGER_A, ("request", id), ip).await;
+            sight(&s, STAGER_B, ("request", id), ip).await;
+        }
+        run(&s).await;
+        let mut c = s.read.acquire().await.unwrap();
+        let key = sqlx::query_scalar::<_, String>("SELECT key FROM chains")
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+        let sources = newest_sources(&mut c, &key).await.unwrap();
+        assert_eq!(sources.len(), 4);
+        assert!(sources.contains(&(REQUEST, 1)) && sources.contains(&(REQUEST, 2)));
+    }
+
+    #[tokio::test]
+    async fn a_request_counts_chains_past_the_cap() {
+        let (s, _d) = store().await;
+        let request = s.upsert_ip(UPLOADER.parse().unwrap()).await.unwrap();
+        let (id, _) = sighted(&s, UPLOADER, "/many", &[]).await;
+        for j in 0..CHAINS_MAX as i64 + 3 {
+            let value = format!("h{j}.example.org");
+            let stager = ("stager", value.as_str(), "stager");
+            sight(&s, stager, ("request", id), request.id).await;
+            // Another address keeps it: this one holds its newest 16.
+            sight(&s, stager, ("request", id + 1 + j), request.id + 1 + j).await;
+        }
+        run(&s).await;
+        assert_eq!(
+            s.chains_of_request(id).await.unwrap(),
+            CHAINS_MAX as i64 + 3
+        );
+        assert_eq!(
+            s.chains_of(Anchor::Request(id)).await.unwrap().len(),
+            CHAINS_MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn the_list_says_external_where_a_result_is_all_there_is() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        run(&s).await;
+        let payload = async |s: &Store| {
+            let page = s.chains_page(1, ChainFilter::default()).await.unwrap();
+            page.items[0].payload
+        };
+        assert_eq!(payload(&s).await, Mark::Gap);
+        let result = crate::store::pieces::NewResult {
+            family: Some("mirai".into()),
+            ..Default::default()
+        };
+        s.add_piece_result(a, &result, "admin").await.unwrap();
+        assert_eq!(payload(&s).await, Mark::External);
+    }
+
     #[tokio::test]
     async fn store_plan_writes_more_than_a_batch() {
         let (s, _d) = store().await;
@@ -2695,6 +2917,16 @@ mod tests {
 
     fn seen(hash: i64) -> sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
         sqlx::query("UPDATE piece_sightings SET grade = 'seen' WHERE piece = ?").bind(hash)
+    }
+
+    #[test]
+    fn a_kind_with_no_source_is_left_out_of_the_condition() {
+        assert_eq!(
+            sources_in(&[(REQUEST, 1), (REQUEST, 2)]),
+            "(g.source_kind = 'request' AND g.source_id IN (1,2))"
+        );
+        assert!(sources_in(&[(REQUEST, 1), (UPLOAD, 2)]).contains(" OR "));
+        assert_eq!(sources_in(&[]), "0");
     }
 
     fn stage<'a>(c: &'a Chain, name: &str) -> &'a [StageRow] {

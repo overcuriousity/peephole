@@ -583,6 +583,15 @@ mod tests {
                 "2026-10-01 00:00:00",
             )
             .await;
+            // Another address keeps it: this one holds its newest 16.
+            sight(
+                &st,
+                ("stager", &value, "stager", "claimed"),
+                id + 1000 + i,
+                ip + 1000 + i,
+                "2026-10-01 00:00:00",
+            )
+            .await;
         }
         pass(&st).await;
         let (_, html) = page(

@@ -190,7 +190,8 @@ pub struct ChainRowJson {
     pub ips: i64,
     pub sources: i64,
     pub exploits: i64,
-    /// Whether uploaded text backs the payload: `seen` or `gap`.
+    /// What backs the payload: uploaded text (`seen`), else a sandbox result
+    /// (`external`), else nothing (`gap`).
     pub payload: String,
 }
 

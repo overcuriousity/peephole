@@ -1019,7 +1019,7 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
         fingerprint: d.fingerprint,
     };
     let mut chains = store.chains_of(Anchor::Request(id)).await?;
-    let other_chains = chains.len().saturating_sub(1) as i64;
+    let other_chains = store.chains_of_request(id).await?.saturating_sub(1);
     chains.truncate(1);
     let xray = crate::admin::xray::read_request(&d.row, &d.ip, xray_summary).await?;
     let body = RequestDossier {

@@ -567,7 +567,7 @@ A chain is an attack in five stages: `Exploit`, `Command`, `Delivery`,
 Chains, newest first, 50 a page: `{items:[{key, joiner, page, first_seen,
 last_seen, ips, sources, exploits, payload}], page, has_next}`. `joiner`
 is the name of the chain, defanged; `payload` is `seen` when uploaded text
-backs it, else `gap`. `ip` and `campaign` narrow it as on the admin list
+backs it, `external` when only a sandbox result does, else `gap`. `ip` and `campaign` narrow it as on the admin list
 (an unknown address matches nothing). Read scope.
 
 ### `GET /api/v1/chains/{key}`

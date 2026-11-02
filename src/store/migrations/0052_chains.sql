@@ -24,6 +24,9 @@ CREATE TABLE piece_sightings (
 ) WITHOUT ROWID;
 CREATE INDEX idx_sightings_source ON piece_sightings(source_kind, source_id);
 CREATE INDEX idx_sightings_ip ON piece_sightings(ip_id);
+-- A piece's newest sightings: a popular piece has millions, and a strip reads
+-- the newest (`store::chains`).
+CREATE INDEX idx_sightings_piece_ts ON piece_sightings(piece, ts);
 
 CREATE TABLE piece_urls (                    -- raw attacker text, shown defanged
   piece INTEGER NOT NULL, url TEXT NOT NULL,
