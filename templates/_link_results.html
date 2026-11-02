@@ -1,0 +1,20 @@
+{% if !results.is_empty() || can_add_result %}
+<section class="card" id="results">
+  <div class="card-head"><h2>Sandbox results</h2><span class="muted">external: entered by an admin, not seen by this node</span></div>
+  {% if !results.is_empty() %}
+  <div class="table-wrap"><table class="table"><thead><tr><th>Family</th><th>SHA-256</th><th>Sandbox URL (defanged)</th><th>Note</th><th>Entered</th></tr></thead><tbody>
+  {% for r in results %}<tr><td>{% if let Some(f) = r.family %}{{ f }}{% else %}—{% endif %}</td><td class="mono break">{% if let Some(h) = r.sha256 %}{{ h }}{% else %}—{% endif %}</td><td class="mono break">{% if let Some(u) = r.url %}{{ u }}{% else %}—{% endif %}</td><td class="plain">{% if let Some(n) = r.note %}{{ n }}{% else %}—{% endif %}</td><td class="ts">{{ crate::admin::views::when(Some(r.at.as_str())) }} by {{ r.by }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+  {% if can_add_result %}
+  <form class="filters" method="post" action="{{ results_action }}">
+    <label>SHA-256 <input class="mono" name="sha256" maxlength="64" autocomplete="off" spellcheck="false"></label>
+    <label>Family <input name="family" maxlength="64" autocomplete="off"></label>
+    <label>Sandbox URL <input name="source_url" maxlength="2000" autocomplete="off" spellcheck="false"></label>
+    <label>Note <input name="note" maxlength="2000" autocomplete="off"></label>
+    <button class="btn btn-sm" type="submit">Add result</button>
+  </form>
+  <p class="muted">The URL is kept as text and never opened by this node. Results stay on this node.</p>
+  {% endif %}
+</section>
+{% endif %}

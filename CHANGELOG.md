@@ -12,6 +12,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   404. Other upload scripts keep `/uploads/`. A new *Dead ends* tab on the
   Chains list (`/admin/evidence/chains?tab=dead-ends`) groups by path the
   404s an address got within a minute after its upload, defanged.
+- Sandbox results: on a stager or file page that joins a chain, an admin
+  enters the SHA-256, family, sandbox URL and a note from an external
+  sandbox. Each result fills the Payload stage of the whole chain as one row
+  marked external. The URL is shown defanged as text, never a link. Results
+  are kept on this node only, are not replicated, survive a recompute or an
+  X-ray version change, and are logged with who entered them.
 - The chain strip shows an attack in five stages (Exploit, Command, Delivery,
   Payload, Follow-up) on the request, upload, address, campaign and piece
   pages: the same chain from any of them, with "you are here" on a source's
