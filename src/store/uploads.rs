@@ -587,6 +587,9 @@ pub struct TimelineRow {
     pub query: Option<String>,
     pub status: Option<i64>,
     pub answer: Option<String>,
+    /// The upload whose timeline holds this row, in [`timelines`].
+    #[sqlx(default)]
+    pub upload: String,
 }
 
 /// Most requests an upload's timeline shows.
@@ -686,7 +689,7 @@ pub async fn timelines(
         return Ok(vec![]);
     }
     let one = "SELECT * FROM (
-         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer, ? AS upload
          FROM requests r JOIN ips i ON i.id = r.ip_id
          WHERE r.origin IS ? AND r.path >= ?
            AND (r.path = ? OR (? AND substr(r.path, 1, length(?)) = ?))
@@ -699,6 +702,7 @@ pub async fn timelines(
     let mut q = sqlx::query_as(sqlx::AssertSqlSafe(sql));
     for u in uploads {
         q = q
+            .bind(&u.uid)
             .bind(&u.origin)
             .bind(&u.answered_path)
             .bind(&u.answered_path)

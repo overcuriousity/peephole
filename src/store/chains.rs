@@ -347,7 +347,8 @@ pub async fn uploads_of(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<
 /// [`TIMELINE_UPLOADS`] uploads, from any address,
 /// without the requests to a path the trap answers itself. Until `411e2a6`
 /// a `PUT /` or `PUT /.env` made that path answer as a webshell for everyone,
-/// so those rows, `webshell` or not, are ordinary traffic and stay out.
+/// so those rows, `webshell` or not, are ordinary traffic and stay out. A
+/// request two uploads share belongs to the newer: its file is what answered.
 pub async fn follow_ups(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<TimelineRow>> {
     let uploads = uploads_of(conn, chain).await?;
     follow_ups_of(conn, &uploads).await
@@ -359,8 +360,15 @@ async fn follow_ups_of(
     uploads: &[UploadRow],
 ) -> Result<Vec<TimelineRow>> {
     let newest = &uploads[..uploads.len().min(TIMELINE_UPLOADS)];
+    let age: HashMap<&str, usize> = newest
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.uid.as_str(), i))
+        .collect();
+    let mut timelines = uploads::timelines(conn, newest).await?;
+    timelines.sort_by_key(|r| std::cmp::Reverse(age.get(r.upload.as_str()).copied()));
     let mut rows = BTreeMap::new();
-    for r in uploads::timelines(conn, newest).await? {
+    for r in timelines {
         if !keeps_its_own_answer(&r.method, &r.path, r.query.as_deref()) {
             rows.insert((r.ts.clone(), r.id), r);
         }
@@ -589,7 +597,7 @@ struct Found {
     role: String,
     seen: bool,
     ips: i64,
-    /// Requests and uploads that named it.
+    /// Requests and uploads of this chain that named it in this role.
     sources: i64,
 }
 
@@ -627,6 +635,119 @@ fn label(s: &str) -> String {
     match shown.char_indices().nth(LABEL_MAX) {
         Some((end, _)) => format!("{}…", &shown[..end]),
         None => shown,
+    }
+}
+
+/// A step of a recipe's normal form in a word; `None` for what only readies
+/// things, which a label does not need.
+fn recipe_word(step: &str) -> Option<&str> {
+    // A step the piece limit cut has no `)`: its word may be cut too.
+    let (name, inner) = step.trim_end().split_once('(')?;
+    let word = inner.strip_suffix(')')?.split(' ').next()?;
+    match (name, word) {
+        ("run", "<file>") => Some("run"),
+        ("other", "<word>") => None,
+        ("fetch" | "run" | "other", word) => Some(word),
+        _ => None,
+    }
+}
+
+/// `items` in order. A group with an `else` inside is put in brackets when
+/// something follows it, so it is clear where the `else` ends.
+fn recipe_steps(items: &[String]) -> String {
+    let last = items.len().saturating_sub(1);
+    let shown = items.iter().enumerate().map(|(i, item)| {
+        if i < last && item.contains(" → else ") {
+            format!("({item})")
+        } else {
+            item.clone()
+        }
+    });
+    shown.collect::<Vec<_>>().join(" → ")
+}
+
+/// Both branches of a recipe's `try`, as one item.
+fn recipe_branches(first: Vec<String>, fallback: Vec<String>) -> Vec<String> {
+    if first.is_empty() || fallback.is_empty() {
+        return if first.is_empty() { fallback } else { first };
+    }
+    match (first.as_slice(), fallback.as_slice()) {
+        ([a], [b]) if !a.contains(" → ") && !b.contains(" → ") => {
+            if a.split(" || ").any(|tool| tool == b) {
+                first
+            } else {
+                vec![format!("{a} || {b}")]
+            }
+        }
+        _ => {
+            let (a, b) = (recipe_steps(&first), recipe_steps(&fallback));
+            vec![format!("{a} → else {b}")]
+        }
+    }
+}
+
+/// A group of a recipe's normal form while it is read; `tried` is the `try`
+/// part once its `else` is reached.
+#[derive(Default)]
+struct RecipeGroup {
+    items: Vec<String>,
+    tried: Option<Vec<String>>,
+}
+
+/// A recipe's normal form as a label: what it fetches and runs, every
+/// branch kept, like `scp → run → else wget || curl → sh`. The piece's page
+/// has the whole form. Written by the parser, but read as any text: a value
+/// cut at the piece limit just ends its open groups. A form with nothing to
+/// show comes back as it is.
+fn compact_recipe(normal: &str) -> String {
+    fn close(group: RecipeGroup, into: &mut Vec<String>) {
+        into.extend(match group.tried {
+            Some(first) => recipe_branches(first, group.items),
+            None => group.items,
+        });
+    }
+    let (mut rest, mut root, mut open) = (normal, vec![], Vec::<RecipeGroup>::new());
+    loop {
+        rest = rest.trim_start_matches([' ', '→', '|']);
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(inner) = rest.strip_prefix("try[") {
+            open.push(RecipeGroup::default());
+            rest = inner;
+        } else if let Some(after) = rest.strip_prefix(']') {
+            rest = after;
+            let Some(mut group) = open.pop() else {
+                continue;
+            };
+            match rest.strip_prefix(" else [") {
+                Some(inner) if group.tried.is_none() => {
+                    group.tried = Some(std::mem::take(&mut group.items));
+                    open.push(group);
+                    rest = inner;
+                }
+                _ => close(group, open.last_mut().map_or(&mut root, |g| &mut g.items)),
+            }
+        } else {
+            let end = [" → ", " | ", " ]"]
+                .iter()
+                .filter_map(|sep| rest.find(sep))
+                .min()
+                .unwrap_or(rest.len());
+            if let Some(word) = recipe_word(&rest[..end]) {
+                let into = open.last_mut().map_or(&mut root, |g| &mut g.items);
+                into.push(word.to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    while let Some(group) = open.pop() {
+        close(group, open.last_mut().map_or(&mut root, |g| &mut g.items));
+    }
+    if root.is_empty() {
+        normal.to_string()
+    } else {
+        recipe_steps(&root)
     }
 }
 
@@ -715,7 +836,11 @@ fn command_rows(found: &[Found], here: &Here) -> Vec<StageRow> {
             "recipe" => "shell recipe",
             _ => "webshell profile",
         };
-        piece_row(p, p.on_addresses(what), here)
+        let mut r = piece_row(p, p.on_addresses(what), here);
+        if p.kind == "recipe" {
+            r.label = label(&compact_recipe(&p.value));
+        }
+        r
     });
     recipes.collect()
 }
@@ -903,7 +1028,8 @@ struct FollowUps {
     unread: i64,
 }
 
-/// A follow-up as the X-ray reads it.
+/// A follow-up as the X-ray reads it, with the inputs of the webshell it was
+/// sent to.
 struct Sent {
     id: i64,
     ip: String,
@@ -911,14 +1037,42 @@ struct Sent {
     path: String,
     query: Option<String>,
     body: Option<Vec<u8>>,
+    inputs: Vec<String>,
 }
 
-/// The inputs a chain's webshells read, from their profiles.
-fn shell_inputs(found: &[Found]) -> Vec<String> {
-    let profiles = found.iter().filter(|p| p.kind == "shell-profile");
-    let lists = profiles.filter_map(|p| p.value.split(';').find_map(|f| f.strip_prefix("input=")));
+/// The inputs a webshell reads, from its profiles.
+fn shell_inputs<'a>(profiles: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let lists = profiles.filter_map(|p| p.split(';').find_map(|f| f.strip_prefix("input=")));
     let inputs: BTreeSet<&str> = lists.flat_map(|l| l.split(',')).collect();
     inputs.into_iter().map(str::to_string).collect()
+}
+
+/// The inputs of the webshell in each of `uploads`, by upload: two shells of
+/// one chain can read the same field for different things.
+async fn inputs_of(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<HashMap<String, Vec<String>>> {
+    let marks = vec!["?"; uploads.len()].join(",");
+    let sql = format!(
+        "SELECT u.uid, p.value FROM uploads u
+         JOIN piece_sightings g ON g.source_kind = 'upload' AND g.source_id = u.id
+         JOIN pieces p ON p.hash = g.piece
+         WHERE u.uid IN ({marks}) AND p.kind = 'shell-profile'"
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+    for u in uploads {
+        q = q.bind(&u.uid);
+    }
+    let mut profiles: HashMap<String, Vec<String>> = HashMap::new();
+    for (uid, value) in q.fetch_all(&mut *conn).await? {
+        profiles.entry(uid).or_default().push(value);
+    }
+    let inputs = |values: Vec<String>| shell_inputs(values.iter().map(String::as_str));
+    Ok(profiles
+        .into_iter()
+        .map(|(uid, values)| (uid, inputs(values)))
+        .collect())
 }
 
 /// `bytes` as one line of text, if there is any.
@@ -971,7 +1125,7 @@ fn input_value(x: &Xray, r: &Sent, input: &str) -> Option<String> {
 /// What a follow-up runs: the literal command a shell's input received, or
 /// the recipe the X-ray found. A request holding a private key shows only
 /// its recipe, which has no literal text in it.
-fn read_sent(r: &Sent, inputs: &[String]) -> Option<String> {
+fn read_sent(r: &Sent) -> Option<String> {
     let x = parse(
         Source::Request {
             method: &r.method,
@@ -983,12 +1137,12 @@ fn read_sent(r: &Sent, inputs: &[String]) -> Option<String> {
         Policy::embedded(),
     );
     let key = holds_key(&x);
-    let command = || inputs.iter().find_map(|i| input_value(&x, r, i));
+    let command = || r.inputs.iter().find_map(|i| input_value(&x, r, i));
     let literal = if key { None } else { command() };
     let recipe = || {
         x.recipes
             .iter()
-            .map(|l| l.normal.clone())
+            .map(|l| compact_recipe(&l.normal))
             .find(|n| !n.is_empty())
     };
     let withheld = || key.then(|| format!("{} [private key withheld]", r.method));
@@ -1001,7 +1155,6 @@ fn read_sent(r: &Sent, inputs: &[String]) -> Option<String> {
 async fn gather_follow_ups(
     conn: &mut SqliteConnection,
     uploads: &[UploadRow],
-    found: &[Found],
 ) -> Result<FollowUps> {
     let dead = dead_ends_for(conn, uploads).await?;
     let stopped: HashSet<i64> = dead.iter().map(|r| r.id).collect();
@@ -1025,6 +1178,7 @@ async fn gather_follow_ups(
     .fetch_all(&mut *conn)
     .await?;
     let mut bodies: HashMap<i64, Option<Vec<u8>>> = bodies.into_iter().collect();
+    let inputs = inputs_of(conn, &uploads[..uploads.len().min(TIMELINE_UPLOADS)]).await?;
     let requests: Vec<Sent> = sent
         .iter()
         .map(|r| Sent {
@@ -1034,12 +1188,12 @@ async fn gather_follow_ups(
             path: r.path.clone(),
             query: r.query.clone(),
             body: bodies.remove(&r.id).flatten(),
+            inputs: inputs.get(&r.upload).cloned().unwrap_or_default(),
         })
         .collect();
-    let inputs = shell_inputs(found);
     let reads = tokio::task::spawn_blocking(move || {
         let read = requests.iter().filter_map(|r| {
-            let text = read_sent(r, &inputs)?;
+            let text = read_sent(r)?;
             Some((r.id, text))
         });
         read.collect::<HashMap<_, _>>()
@@ -1190,7 +1344,7 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
     // From `chain_pieces`, not from the sources: a source naming a joiner
     // of another chain must not show it here. The key's joiner, then the
     // other joiners, then what most addresses share.
-    let found: Vec<Found> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut found: Vec<Found> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "WITH top AS (
            SELECT p.hash, p.kind, p.value, p.ips, p.sources
            FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
@@ -1238,8 +1392,29 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
     .bind(TAG_SOURCES_MAX)
     .fetch_all(&mut *conn)
     .await?;
+    // `pieces.sources` counts every source: a recipe many chains share would
+    // look as busy in each.
+    let counts: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH src AS (SELECT g.source_kind AS k, g.source_id AS i
+           FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+           JOIN piece_sightings g ON g.piece = m.piece
+           WHERE m.chain = ?1 AND g.role IN {JOINER_ROLES}
+           GROUP BY g.source_kind, g.source_id ORDER BY MAX(g.ts) DESC LIMIT ?2)
+         SELECT g.piece, g.role, COUNT(*) FROM src
+         JOIN piece_sightings g ON g.source_kind = src.k AND g.source_id = src.i
+         WHERE g.role IN {STRIP_ROLES} GROUP BY g.piece, g.role"
+    )))
+    .bind(key)
+    .bind(TAG_SOURCES_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let counts: HashMap<(i64, String), i64> =
+        counts.into_iter().map(|(p, r, n)| ((p, r), n)).collect();
+    for p in &mut found {
+        p.sources = counts.get(&(p.hash, p.role.clone())).copied().unwrap_or(0);
+    }
     let uploads = uploads_of(conn, key).await?;
-    let follow = gather_follow_ups(conn, &uploads, &found).await?;
+    let follow = gather_follow_ups(conn, &uploads).await?;
     let results = results_of(conn, &found).await?;
     let stages = stages(
         &Parts {
@@ -1281,7 +1456,6 @@ struct SourcePiece {
     value: String,
     role: String,
     ips: i64,
-    sources: i64,
 }
 
 /// What these sources hold: their pieces, each exploit and tag that shared
@@ -1292,7 +1466,7 @@ async fn read_sources(
 ) -> Result<Option<(Vec<Found>, Vec<(i64, i64)>, Span)>> {
     let rows: Vec<SourceSighting> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT g.source_kind, g.source_id, g.ip_id, g.ts, g.grade,
-                p.hash, p.kind, p.value, g.role, p.ips, p.sources
+                p.hash, p.kind, p.value, g.role, p.ips
          FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
          WHERE g.role IN {STRIP_ROLES} AND {}",
         sources_in(sources)
@@ -1317,7 +1491,10 @@ async fn read_sources(
         let seen = r.grade == "seen";
         found
             .entry((p.value.clone(), p.hash, p.role.clone()))
-            .and_modify(|f| f.seen |= seen)
+            .and_modify(|f| {
+                f.seen |= seen;
+                f.sources += 1;
+            })
             .or_insert(Found {
                 hash: p.hash,
                 kind: p.kind,
@@ -1325,7 +1502,7 @@ async fn read_sources(
                 role: p.role,
                 seen,
                 ips: p.ips,
-                sources: p.sources,
+                sources: 1,
             });
     }
     if found.is_empty() {
@@ -1386,7 +1563,7 @@ async fn unkeyed(
     .bind(UPLOADS_MAX)
     .fetch_all(&mut *conn)
     .await?;
-    let follow = gather_follow_ups(conn, &uploads, &found).await?;
+    let follow = gather_follow_ups(conn, &uploads).await?;
     let results = results_of(conn, &found).await?;
     let stages = stages(
         &Parts {
@@ -2636,7 +2813,8 @@ mod tests {
             },
             Policy::embedded(),
         );
-        let want = label(&x.recipes[0].normal);
+        let want = compact_recipe(&x.recipes[0].normal);
+        assert_eq!(want, "curl → sh");
         let rows = follow_rows(&s, &uid).await;
         assert!(rows.iter().any(|r| r.label == want), "{want}: {rows:?}");
     }
@@ -2795,24 +2973,157 @@ mod tests {
     }
 
     #[test]
-    fn inputs_come_from_every_profile() {
-        let p = |value: &str| Found {
+    fn inputs_come_from_every_profile_of_the_shell() {
+        let found = [
+            "input=$_GET[a],$_POST[b];exec=system;marker=x",
+            "input=php://input;exec=eval",
+        ];
+        assert_eq!(
+            shell_inputs(found.into_iter()),
+            ["$_GET[a]", "$_POST[b]", "php://input"]
+        );
+    }
+
+    #[test]
+    fn a_recipe_label_keeps_both_branches() {
+        for (normal, want) in [
+            (
+                "try[ try[ prepare(cd) ] else [ prepare(cd) ] ] else [ prepare(cd) ] → write → \
+                 prepare(chmod) → try[ fetch(scp <url>) → arm → run(<file> <tag>) ] else \
+                 [ try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] | run(sh <tag>) ] → cleanup",
+                "scp → run → else wget || curl → sh",
+            ),
+            (
+                "try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] | run(sh <tag>)",
+                "wget || curl → sh",
+            ),
+            (
+                "try[ fetch(nc <url>) ] else [ other(socat) ] | run(sh)",
+                "nc || socat → sh",
+            ),
+            (
+                "prepare(cd) → try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] → arm → run(<file>)",
+                "wget || curl → run",
+            ),
+            (
+                "try[ try[ fetch(wget <url>) ] else [ fetch(wget <url>) ] ] else [ fetch(curl <url>) ]",
+                "wget || curl",
+            ),
+            // Something after the `else`: it is clear where that ends.
+            (
+                "try[ fetch(scp <url>) → run(sh) ] else [ fetch(curl <url>) → run(bash) ] → other(ls)",
+                "(scp → sh → else curl → bash) → ls",
+            ),
+            // Only readying: nothing to shorten.
+            ("prepare(cd) → write", "prepare(cd) → write"),
+            // Cut at the piece limit.
+            ("try[ fetch(wget <url>) ] else [ try[ fetch(cu", "wget"),
+            ("try[ fetch(wget <url>) ] else [", "wget"),
+            // No form the parser writes: it stays as it is, and nothing breaks.
+            (
+                "] ] else [ try[ fetch(curl <url>) ",
+                "] ] else [ try[ fetch(curl <url>) ",
+            ),
+        ] {
+            assert_eq!(compact_recipe(normal), want, "{normal}");
+        }
+    }
+
+    #[test]
+    fn a_long_recipe_label_shows_its_fallback() {
+        let mut normal = "prepare(cd) → ".repeat(30);
+        normal += "try[ fetch(scp <url>) ] else [ fetch(wget <url>) ] | run(sh)";
+        assert!(label(&normal).ends_with('…'));
+        let found = Found {
             hash: 1,
-            kind: "shell-profile".into(),
-            value: value.into(),
+            kind: "recipe".into(),
+            value: normal,
             role: "recipe".into(),
-            seen: true,
+            seen: false,
             ips: 1,
             sources: 1,
         };
-        let found = [
-            p("input=$_GET[a],$_POST[b];exec=system;marker=x"),
-            p("input=php://input;exec=eval"),
-        ];
-        assert_eq!(
-            shell_inputs(&found),
-            ["$_GET[a]", "$_POST[b]", "php://input"]
-        );
+        let rows = command_rows(&[found], &Here::default());
+        assert_eq!(rows[0].label, "scp || wget → sh");
+    }
+
+    /// One chain, two shells: each reads only its own field, and a request
+    /// holding both fields shows what the shell it reached reads.
+    #[tokio::test]
+    async fn a_follow_up_reads_the_inputs_of_its_own_shell() {
+        let (s, _d) = store().await;
+        let one = b"<?php system($_GET['c']); echo 'a shell of 32 bytes or so'; ?>";
+        let two = b"<?php system($_GET['d']); echo 'b shell of 32 bytes or so'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", one).await;
+        seed_upload(&s, UPLOADER, "/up/b.php", two).await;
+        seed_upload(&s, OTHER, "/up/a.php", one).await;
+        seed_upload(&s, OTHER, "/up/b.php", two).await;
+        sent(&s, "/up/a.php", Some("d=whoami&c=id"), None).await;
+        sent(&s, "/up/b.php", Some("c=id&d=whoami"), None).await;
+        extract(&s.pool).await.unwrap();
+        // Joiners connect through a source naming both, from two addresses.
+        let files: Vec<String> = sqlx::query_scalar("SELECT value FROM pieces WHERE kind = 'file'")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        let both = files.iter().map(|f| ("file", f.as_str(), "file"));
+        let both: Vec<_> = both.collect();
+        sighted(&s, UPLOADER, "/both", &both).await;
+        sighted(&s, OTHER, "/both", &both).await;
+        run(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        let by_path = |path: &str| {
+            rows.iter()
+                .find(|r| r.mark == Mark::Seen && r.detail.contains(path))
+                .map(|r| r.label.as_str())
+        };
+        assert_eq!(by_path("/up/a[.]php"), Some("id"), "{rows:?}");
+        assert_eq!(by_path("/up/b[.]php"), Some("whoami"), "{rows:?}");
+    }
+
+    /// `pieces.sources` is 3 here, and each chain holds its own share.
+    #[tokio::test]
+    async fn a_row_counts_the_requests_of_its_own_chain() {
+        let (s, _d) = store().await;
+        const SHARED: (&str, &str, &str) = ("recipe", "fetch(curl <url>) | run(sh)", "recipe");
+        let other_stager = ("stager", "203.0.113.200", "stager");
+        for (i, ip) in [UPLOADER, OTHER].into_iter().enumerate() {
+            sighted(&s, ip, &format!("/a{i}"), &[STAGER_A, SHARED]).await;
+        }
+        for ip in ["192.0.2.71", "192.0.2.72"] {
+            sighted(&s, ip, "/b", &[other_stager]).await;
+        }
+        sighted(&s, "192.0.2.72", "/c", &[other_stager, SHARED]).await;
+        run(&s).await;
+        let hash = piece_hash("recipe", SHARED.1);
+        let global: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM piece_sightings WHERE piece = ?")
+                .bind(hash)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(global, 3);
+        let requests = |stager: (&'static str, &'static str, &'static str)| {
+            let key = key_of(piece_hash(stager.0, stager.1));
+            let s = &s;
+            async move {
+                let c = s.chain_by_key(&key).await.unwrap().unwrap();
+                one(&c, "Command").requests
+            }
+        };
+        assert_eq!(requests(STAGER_A).await, 2);
+        assert_eq!(requests(other_stager).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_a_key_counts_its_own_sources() {
+        let (s, _d) = store().await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[RECIPE]).await;
+        sighted(&s, OTHER, "/b", &[RECIPE]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(one(&chains[0], "Command").requests, 1);
     }
 
     #[tokio::test]
