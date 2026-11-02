@@ -2,9 +2,9 @@
 //! behind. A sighting with the role `stager`, `key` or `file` is a joiner
 //! (the role, not the kind: every URL piece has the kind `stager`). Two
 //! joiners connect only when they appear together in sources from at least
-//! two addresses, so one forged body naming two stagers fuses nothing, and a
-//! shared recipe or one address using both connects nothing. A joiner that
-//! connects to none is a chain of its own.
+//! two addresses and a tenth of the larger joiner's, so a forged body naming
+//! two stagers fuses nothing, and a shared recipe or one address using both
+//! connects nothing. A joiner that connects to none is a chain of its own.
 //!
 //! A chain's sources are the sources holding one of its joiners, and its
 //! describers the ones sighted in those sources. What came after an upload
@@ -83,8 +83,15 @@ fn find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
     root
 }
 
-/// The joiner pairs that appear together in sources from at least two
-/// addresses, as a union of everything each joins: `piece -> parent`.
+/// How many addresses must name two joiners together, of how many name each:
+/// two, and a tenth of the larger, the campaign pass's rule for joiner values.
+fn addresses_to_connect(a: usize, b: usize) -> usize {
+    a.max(b).div_ceil(10).max(2)
+}
+
+/// The joiner pairs that appear together in sources from enough addresses
+/// ([`addresses_to_connect`]), as a union of everything each joins:
+/// `piece -> parent`.
 fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
     let mut sources: HashMap<(u8, i64), (i64, BTreeSet<i64>)> = HashMap::new();
     let mut addresses: HashMap<i64, HashSet<i64>> = HashMap::new();
@@ -99,8 +106,8 @@ fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
     // A joiner on one address cannot connect, and an address sending the
     // same list again says nothing new: neither costs a pair.
     let mut read: HashSet<(i64, Vec<i64>)> = HashSet::new();
-    // The first address of each pair: a second one connects it.
-    let mut pairs: HashMap<(i64, i64), i64> = HashMap::new();
+    // The addresses of each pair, until there are enough.
+    let mut pairs: HashMap<(i64, i64), HashSet<i64>> = HashMap::new();
     for (ip, joiners) in sources.into_values() {
         if joiners.len() > PAIRED_JOINERS_MAX {
             continue;
@@ -114,7 +121,9 @@ fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
         }
         for (i, &a) in shared.iter().enumerate() {
             for &b in &shared[i + 1..] {
-                if *pairs.entry((a, b)).or_insert(ip) != ip {
+                let need = addresses_to_connect(addresses[&a].len(), addresses[&b].len());
+                let seen = pairs.entry((a, b)).or_default();
+                if seen.len() < need && seen.insert(ip) && seen.len() == need {
                     let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
                     if ra != rb {
                         parent.insert(ra, rb);
@@ -440,6 +449,33 @@ mod tests {
             at(3, (REQUEST, 4), 13, T0),
         ]);
         assert_eq!(joiners(&c), [[1, 2, 3]]);
+    }
+
+    /// `shared` addresses name joiners 1 and 2 together, and `each` more
+    /// name each alone.
+    fn overlapping(shared: i64, each: i64) -> Vec<JoinerSighting> {
+        let mut rows = vec![];
+        for ip in 0..shared {
+            rows.extend([at(1, (REQUEST, ip), ip, T0), at(2, (REQUEST, ip), ip, T0)]);
+        }
+        for ip in shared..shared + each {
+            rows.push(at(1, (REQUEST, ip), ip, T0));
+            rows.push(at(2, (UPLOAD, ip), ip + each, T0));
+        }
+        rows
+    }
+
+    #[test]
+    fn two_addresses_on_two_large_joiners_fuse_nothing() {
+        assert_eq!(joiners(&connect(&overlapping(2, 28))), [[1], [2]]);
+    }
+
+    #[test]
+    fn a_tenth_of_the_larger_joiner_connects() {
+        assert_eq!(joiners(&connect(&overlapping(3, 27))), [[1, 2]]);
+        // 37 addresses on both of 100 each, 163 in all.
+        assert_eq!(joiners(&connect(&overlapping(37, 63))), [[1, 2]]);
+        assert_eq!(joiners(&connect(&overlapping(9, 91))), [[1], [2]]);
     }
 
     #[test]

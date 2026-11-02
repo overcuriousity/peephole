@@ -76,7 +76,7 @@ pub fn kind_help(kind: LinkKind) -> &'static str {
 
 const PATH_SHAPE_HELP: &str = "A request path with the parts that vary per target or run (ids, hashes, random names) replaced by placeholders. Matching sets of rare shapes: the same target list or tool; campaigns join IPs on them as soft edges.";
 
-const JOINER_HELP: &str = "Two IPs naming one stager, SSH key or uploaded file. Anyone can name someone else's stager or upload a public webshell, so it is a claim, not proof of one operator. Addresses in no group form a cloud per value, and two clouds connect only when at least 2 addresses, and a tenth of the smaller cloud, name both. Two groups or clouds merge only when 2 addresses in each name the same value, counted before anything joins, and otherwise the edge is listed as not merged. A lone address joins the group sharing most with it and adds to no count. An attacker with two addresses in each of two groups can still merge them, shown as claimed.";
+const JOINER_HELP: &str = "Two IPs naming one stager, SSH key or uploaded file. Anyone can name someone else's stager or upload a public webshell, so it is a claim, not proof of one operator. So joiners only group IPs with no campaign of their own, and never merge, grow or shrink a campaign: an edge touching one is listed as not merged, and the chain shows the link across campaigns. Two values connect only when at least 2 addresses, and a tenth of the larger value's, name both, so forging a link takes that many addresses.";
 
 /// The line of `key`: a [`LinkKind`] key, [`PATH_SHAPE`], `paths` or
 /// [`JOINER`]; `""` for anything else.
@@ -145,9 +145,10 @@ mod tests {
     fn a_claimed_edge_says_what_it_does_not_prove() {
         let h = help(JOINER);
         assert!(h.contains("not proof") && h.contains("not merged"), "{h}");
+        assert!(h.contains("never merge"), "{h}");
         let k = crate::store::campaigns::K_SOFT_MERGE;
-        assert!(h.contains(&format!("merge only when {k} addresses")), "{h}");
-        assert!(h.contains("two addresses in each of two groups"), "{h}");
+        assert!(h.contains(&format!("at least {k} addresses")), "{h}");
+        assert!(!h.contains("two groups"), "{h}");
         assert!(entries().iter().any(|e| e == &("Claimed edge", h)));
     }
 }

@@ -1142,8 +1142,8 @@ impl From<crate::store::campaigns::Edge> for EdgeJson {
     }
 }
 
-/// The edges between two of `members`, and whether any was left out. An edge
-/// to another campaign was not merged and is not one of these.
+/// The edges between two of `members`, and whether any was left out. A
+/// joiner edge that was not merged ties nothing and is not one of these.
 fn member_edges(
     edges: Vec<crate::store::campaigns::Edge>,
     members: &[crate::store::campaigns::Member],

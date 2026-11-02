@@ -9,19 +9,19 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 - Campaigns join on stagers, SSH keys and uploaded files as claimed edges
   (clustering v3; migration 0053 adds `campaign_edges.merged` and
   `campaigns.joiner_edges`). Addresses naming one stager form a campaign,
-  past the 50-address cap. Anyone can name a stager, so groups merge only
-  when two addresses in each name the same value, counted before anything
-  joined; one body counts once, and one address cannot bridge two campaigns.
-  An unmet merge keeps its edge, shown as "not merged" on both campaigns.
-  Claimed edges are not counted as hard evidence. A file on more than 50
-  addresses ties nothing, an address counts for its newest 64 values, and
-  both are listed as excluded. The Evidence table lists the first 500 edges.
+  past the 50-address cap. Anyone can name a stager, so joiners only group
+  addresses with no campaign of their own and never merge or change a
+  campaign: an edge touching one is shown as "not merged", and the chain
+  shows the link across campaigns. Claimed edges are not counted as hard
+  evidence. A file on more than 50 addresses ties nothing, an address counts
+  for its newest 16 values, and both are listed as excluded. The Evidence
+  table lists the first 500 edges.
   Dossiers carry `joiner_edges` and defanged edge values.
 - Attack chains are built in the campaign pass: stagers, SSH keys and
   uploaded files form one chain only when they appear together in sources
-  from at least two addresses, so one forged body fuses nothing. A file on
-  more than 50 addresses is left out, and a source naming more than 64
-  joiners connects none. The trap's own check whether a dropped file may
+  from at least two addresses and a tenth of the larger one's, so a forged
+  body fuses nothing. A file on more than 50 addresses is left out, and a
+  source naming more than 64 joiners connects none. The trap's own check whether a dropped file may
   answer stays per request (`answers_itself`); stored rows are read with
   `keeps_its_own_answer`, so a chain's follow-ups leave out `/` and the
   decoy paths.

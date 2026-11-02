@@ -143,8 +143,9 @@ per `ip` first (`DISTINCT ON`, `group_by(...).first()`).
 
 A campaign is a group of addresses tied by evidence: a shared SSH host key,
 TLS certificate, browser fingerprint or canary, a similar set of normalized
-paths, or a stager, SSH key or uploaded file several addresses name (a
-claim, guarded so one forged body merges nothing). The column is derived,
+paths, or, for addresses with no other tie, a stager, SSH key or uploaded
+file several addresses name (a claim, which never merges or changes a
+campaign standing on other evidence). The column is derived,
 not recorded: every node recomputes campaigns from the replicated rows about
 once an hour, so it is node-local in timing (a node that has not caught up
 yet, or not recomputed yet, can still miss a new member). The claimed edges

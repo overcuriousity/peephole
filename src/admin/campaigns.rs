@@ -259,7 +259,7 @@ impl CampaignPage {
     }
 
     /// The claimed edges for the Evidence head. The stored count holds only
-    /// those inside the campaign, so it says so when more rows are listed.
+    /// those that tie the campaign, so it says so when more rows are listed.
     fn claimed_note(&self) -> String {
         let joiner = self.c.row.joiner_edges;
         match self.edges.iter().filter(|v| !v.e.merged).count() {

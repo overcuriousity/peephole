@@ -405,40 +405,36 @@ evidence of one operator:
   someone else's stager or upload a public webshell, so these are claims:
   they run after the hard and soft edges, never count as either, and the
   edge list marks them as claimed. A value on one address forms no edge.
-  Everything is counted on the membership as it stood before anything
-  joined, so the result does not depend on how values are named or ordered:
+  Joiners only ever group addresses that have no campaign of their own.
+  They never merge, grow or shrink a group of two or more addresses, so a
+  claimed string cannot change a campaign that stands on real evidence. The
+  chain still shows the link across campaigns, which is what the Chains views
+  are for.
 
-  1. The addresses of a value that are in no group form a cloud. Two clouds
-     connect when the addresses naming both number at least two and at least
-     a tenth of the smaller cloud, so a stager and its key are one cloud and
-     one or two forged addresses are no bridge.
-  2. An address in two unconnected clouds goes to the larger one, and it
-     counts for that cloud's values only.
-  3. Groups and clouds of two or more addresses merge only when at least two
-     addresses in each name the same value. The guard counts addresses, not
-     links, so one body naming a stager and its key counts once. Merges do
-     not cascade: what two merged groups name together counts for nothing.
-  4. An address left alone joins the group sharing the most members with it
-     and adds to no count.
+  1. Two values connect when the addresses in no group naming both number at
+     least two and at least a tenth of the larger value's. So a stager and
+     its key connect, and neither a few forged addresses nor a fresh small
+     value is a bridge. Connected values are a cloud, and clouds holding the
+     same addresses are one.
+  2. An address in several clouds goes to the largest, ties by the sorted
+     members, never by a value's name.
+  3. In a cloud, the addresses it kept group by the cloud's values they
+     share, so a group's members share evidence. One left alone stays in no
+     campaign.
 
-  In each group, the addresses naming a value link to the oldest of them, and
-  groups that stayed apart get one edge between them, shown as "not merged"
-  on both campaigns. So n addresses make n−1 edges, and every member has
-  evidence inside its campaign. A campaign's `joiner_edges` counts merged
-  edges only. A file on more than 50 addresses is a public webshell and ties
+  In a group the joiners made, the addresses naming a value link to the
+  oldest of them. Every other edge, across groups or inside a group that
+  stands on other evidence, tied nothing and is shown as "not merged". So n
+  addresses make n−1 edges. A campaign's `joiner_edges` counts only the edges
+  that tie it. A file on more than 50 addresses is a public webshell and ties
   nothing. Stagers and keys have no such cap: a stager is a joiner only when
   a command fetches from it, and a shared host such as a paste site joins by
-  the full URL, not by the host. An address counts for its newest 64 values;
+  the full URL, not by the host. An address counts for its newest 16 values;
   one naming more is listed under Excluded values.
 
-  An attacker controlling two addresses in each of two groups can still
-  merge them. The edge list shows such a merge as claimed, so a person can
-  see why.
-
-User agent, JA4 alone, JA4H alone, HASSH, JA4X, JARM, favicon and the
-HTTP body, 404 and ETag hashes do not feed campaigns: they identify the
-software or the product, which many unrelated operators share, not the
-operator. They stay pivots on the Links page.
+  Known limit: to connect two values, forged addresses need to be at least a
+  tenth of the larger value's namers. Such a link joins only addresses with
+  no campaign, and the edge list shows it as claimed.
 
 The Links page also lists what the body X-ray finds, read from this node's
 own sightings and not replicated: stagers (only those a command fetches from,

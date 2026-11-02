@@ -34,7 +34,7 @@
   {% for v in self.listed() %}<tr class="edge-{% if v.hard() %}hard{% else if v.claimed() %}claimed{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
     <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}{% if v.claimed() %} <span class="muted" title="{{ crate::admin::glossary::help("joiner") }}">claimed</span>{% endif %}</td>
-    <td class="why">{% if v.hard() || v.claimed() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% if !v.e.merged %} <span class="badge" title="These IPs are in separate campaigns: a merge needs {{ crate::store::campaigns::K_SOFT_MERGE }} addresses in each naming the value.">not merged</span>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
+    <td class="why">{% if v.hard() || v.claimed() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% if !v.e.merged %} <span class="badge" title="This claim tied nothing: joiners only group IPs with no campaign of their own, and never merge or change one.">not merged</span>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
       <ul>
         <li>{{ v.score_rule() }}</li>
         <li>{{ v.agreement_rule() }}</li>
