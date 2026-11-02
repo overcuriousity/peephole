@@ -11,6 +11,11 @@
 //! is tied through the file ([`follow_ups`], [`dead_ends`]), never through
 //! the address, so a noisy scanner cannot fill a chain.
 //!
+//! A pass reads each address's first [`MAX_JOINERS_PER_IP`] joiners, in SQL,
+//! so what it holds grows with addresses and what they name, not with what
+//! they send ([`ranked_joiners`]); describers stop at [`DESCRIBERS_MAX`] per
+//! joiner. An address over the cap is listed in the campaign report.
+//!
 //! Derived on each node from its sightings, rebuilt in the campaign pass
 //! ([`plan`] in its read snapshot, [`store_plan`] in its write transaction),
 //! never replicated, never exported.
@@ -20,7 +25,7 @@
 //! [`Stage`]s. It reads upload metadata, never upload content.
 use super::Store;
 use super::browse::{PAGE_SIZE, Page, offset};
-use super::campaigns::HARD_FANOUT_MAX;
+use super::campaigns::{HARD_FANOUT_MAX, MAX_JOINERS_PER_IP};
 use super::pieces::PieceResult;
 use super::uploads::{self, HELD_TEXT, TimelineRow, UPLOAD_COLS, UploadRow};
 use crate::admin::views::link_href;
@@ -45,8 +50,12 @@ const DESCRIBER_KINDS: &str = "('exploit', 'recipe', 'tag', 'shell-profile')";
 
 /// Most joiners a source may name and still connect them. A body can name
 /// 256 pieces, so 32,640 pairs; no real source names this many, so a source
-/// over it costs no pair. Its joiners stay chains, it just joins none.
+/// over it costs no pair. Its joiners stay chains, it just joins none. Each
+/// address keeps fewer than this, so it is what a source names that counts.
 const PAIRED_JOINERS_MAX: usize = 64;
+/// Most describers a pass keeps per joiner, the newest: a body can name 255
+/// fresh ones ten times a second, and a chain shows [`FOUND_MAX`] pieces.
+const DESCRIBERS_MAX: usize = 512;
 /// Rows per `INSERT`: well under SQLite's bound variables.
 const INSERT_BATCH: usize = 400;
 
@@ -80,13 +89,24 @@ const CHAIN_RESULTS_MAX: i64 = 64;
 /// Paths an Exploit row lists.
 const ROW_PATHS_MAX: usize = 6;
 
-/// A joiner in a source. `source` is the kind ([`REQUEST`] or [`UPLOAD`])
-/// and the row's id.
-pub struct JoinerSighting {
+/// A joiner on one address.
+pub struct JoinerSpan {
     piece: i64,
-    source: (u8, i64),
     ip: i64,
-    ts: String,
+    first: String,
+    last: String,
+}
+
+/// The sources of one address that name these joiners, in order, and no
+/// others of those it kept. An address sending one list a million times is
+/// one row, so what a pass holds grows with what addresses name, not with
+/// how often they send it.
+pub struct JoinerList {
+    ip: i64,
+    joiners: Vec<i64>,
+    sources: i64,
+    /// Under [`PAIRED_JOINERS_MAX`] in all, so its joiners may be paired.
+    paired: bool,
 }
 
 /// A chain as [`connect`] finds it.
@@ -99,8 +119,8 @@ pub(crate) struct ChainOut {
     first_seen: String,
     last_seen: String,
     ips: i64,
-    /// Every source holding one of its joiners, in order.
-    sources: Vec<(u8, i64)>,
+    /// How many sources hold one of its joiners.
+    sources: i64,
     /// In order.
     joiners: Vec<i64>,
 }
@@ -127,15 +147,10 @@ fn addresses_to_connect(a: usize, b: usize) -> usize {
 /// The joiner pairs that appear together in sources from enough addresses
 /// ([`addresses_to_connect`]), as a union of everything each joins:
 /// `piece -> parent`.
-fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
-    let mut sources: HashMap<(u8, i64), (i64, BTreeSet<i64>)> = HashMap::new();
-    let mut addresses: HashMap<i64, HashSet<i64>> = HashMap::new();
-    for s in sightings {
-        let (_, joiners) = sources
-            .entry(s.source)
-            .or_insert_with(|| (s.ip, BTreeSet::new()));
-        joiners.insert(s.piece);
-        addresses.entry(s.piece).or_default().insert(s.ip);
+fn unions(spans: &[JoinerSpan], lists: &[JoinerList]) -> HashMap<i64, i64> {
+    let mut addresses: HashMap<i64, usize> = HashMap::new();
+    for s in spans {
+        *addresses.entry(s.piece).or_default() += 1;
     }
     let mut parent = HashMap::new();
     // A joiner on one address cannot connect, and an address sending the
@@ -143,20 +158,21 @@ fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
     let mut read: HashSet<(i64, Vec<i64>)> = HashSet::new();
     // The addresses of each pair, until there are enough.
     let mut pairs: HashMap<(i64, i64), HashSet<i64>> = HashMap::new();
-    for (ip, joiners) in sources.into_values() {
-        if joiners.len() > PAIRED_JOINERS_MAX {
-            continue;
-        }
-        let shared: Vec<i64> = joiners
-            .into_iter()
-            .filter(|j| addresses[j].len() >= 2)
+    for list in lists.iter().filter(|l| l.paired) {
+        let ip = list.ip;
+        let on = |j: &i64| addresses.get(j).copied().unwrap_or(0);
+        let shared: Vec<i64> = list
+            .joiners
+            .iter()
+            .copied()
+            .filter(|j| on(j) >= 2)
             .collect();
         if shared.len() < 2 || !read.insert((ip, shared.clone())) {
             continue;
         }
         for (i, &a) in shared.iter().enumerate() {
             for &b in &shared[i + 1..] {
-                let need = addresses_to_connect(addresses[&a].len(), addresses[&b].len());
+                let need = addresses_to_connect(on(&a), on(&b));
                 let seen = pairs.entry((a, b)).or_default();
                 if seen.len() < need && seen.insert(ip) && seen.len() == need {
                     let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
@@ -171,28 +187,36 @@ fn unions(sightings: &[JoinerSighting]) -> HashMap<i64, i64> {
 }
 
 /// The chains these joiners form, by key.
-pub(crate) fn connect(sightings: &[JoinerSighting]) -> Vec<ChainOut> {
+pub(crate) fn connect(spans: &[JoinerSpan], lists: &[JoinerList]) -> Vec<ChainOut> {
     #[derive(Default)]
     struct Group<'a> {
         /// Each joiner's oldest sighting.
         joiners: BTreeMap<i64, &'a str>,
         ips: HashSet<i64>,
-        sources: BTreeSet<(u8, i64)>,
+        sources: i64,
         first: &'a str,
         last: &'a str,
     }
-    let mut parent = unions(sightings);
+    let mut parent = unions(spans, lists);
     let mut groups: HashMap<i64, Group> = HashMap::new();
-    for s in sightings {
+    for s in spans {
         let g = groups.entry(find(&mut parent, s.piece)).or_default();
-        let oldest = g.joiners.entry(s.piece).or_insert(&s.ts);
-        *oldest = (*oldest).min(&s.ts);
+        let oldest = g.joiners.entry(s.piece).or_insert(&s.first);
+        *oldest = (*oldest).min(&s.first);
         g.ips.insert(s.ip);
-        g.sources.insert(s.source);
-        if g.first.is_empty() || s.ts.as_str() < g.first {
-            g.first = &s.ts;
+        if g.first.is_empty() || s.first.as_str() < g.first {
+            g.first = &s.first;
         }
-        g.last = g.last.max(&s.ts);
+        g.last = g.last.max(&s.last);
+    }
+    for list in lists {
+        // Once per chain: a source's joiners can be of one or of several.
+        let roots: BTreeSet<i64> = list.joiners.iter().map(|&j| find(&mut parent, j)).collect();
+        for root in roots {
+            if let Some(g) = groups.get_mut(&root) {
+                g.sources += list.sources;
+            }
+        }
     }
     let mut out: Vec<ChainOut> = groups
         .into_values()
@@ -207,7 +231,7 @@ pub(crate) fn connect(sightings: &[JoinerSighting]) -> Vec<ChainOut> {
                 first_seen: g.first.to_string(),
                 last_seen: g.last.to_string(),
                 ips: g.ips.len() as i64,
-                sources: g.sources.into_iter().collect(),
+                sources: g.sources,
                 joiners: g.joiners.into_keys().collect(),
             }
         })
@@ -220,26 +244,80 @@ fn source_of(kind: &str, id: i64) -> (u8, i64) {
     (if kind == "upload" { UPLOAD } else { REQUEST }, id)
 }
 
-/// The joiner sightings chains are built from. A file on more than
-/// [`HARD_FANOUT_MAX`] addresses is left out: it is a public webshell, not
-/// an operator. Counted from the sightings, as `pieces.ips` can lag.
-async fn joiner_sightings(tx: &mut SqliteConnection) -> Result<Vec<JoinerSighting>> {
-    let rows: Vec<(i64, String, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT piece, source_kind, source_id, ip_id, ts FROM piece_sightings
-             WHERE role IN {JOINER_ROLES} AND piece NOT IN
-               (SELECT piece FROM piece_sightings WHERE role = 'file'
-                GROUP BY piece HAVING COUNT(DISTINCT ip_id) > ?)"
+/// Common table expressions ending in `ranked`: each address's joiners, one
+/// row per joiner and address, with their first and last sighting, `held`,
+/// how many that address has, and two ranks. Those two addresses name come
+/// first, as only they can connect anything, then the newest. `nth` is a row
+/// number; `tied` leaves joiners of one second level. A file on more than
+/// [`HARD_FANOUT_MAX`] addresses is left out, counted from the sightings as
+/// `pieces.ips` can lag: it is a public webshell, not an operator.
+///
+/// Both the chains and the campaigns read through this, so one address
+/// holds at most [`MAX_JOINERS_PER_IP`] of them in memory however many it
+/// sent: a body can name 256 fresh ones, ten times a second.
+pub(super) fn ranked_joiners() -> String {
+    format!(
+        "named (role, piece, ip_id, first_ts, last_ts) AS (
+           SELECT role, piece, ip_id, MIN(ts), MAX(ts) FROM piece_sightings
+           WHERE role IN {JOINER_ROLES} GROUP BY role, piece, ip_id),
+         spread (piece, ips) AS (SELECT piece, COUNT(*) FROM named GROUP BY piece),
+         listed AS (
+           SELECT n.*, s.ips >= 2 AS shared FROM named n JOIN spread s ON s.piece = n.piece
+           WHERE n.role <> 'file' OR s.ips <= {HARD_FANOUT_MAX}),
+         ranked AS (
+           SELECT *,
+             ROW_NUMBER() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC, piece)
+               AS nth,
+             RANK() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC) AS tied,
+             COUNT(*) OVER (PARTITION BY ip_id) AS held
+           FROM listed)"
+    )
+}
+
+/// What each address names, within [`MAX_JOINERS_PER_IP`].
+async fn joiner_spans(conn: &mut SqliteConnection) -> Result<Vec<JoinerSpan>> {
+    let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {} SELECT piece, ip_id, first_ts, last_ts FROM ranked WHERE nth <= ?",
+        ranked_joiners()
     )))
-    .bind(HARD_FANOUT_MAX as i64)
-    .fetch_all(&mut *tx)
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(piece, kind, id, ip, ts)| JoinerSighting {
+        .map(|(piece, ip, first, last)| JoinerSpan {
             piece,
-            source: source_of(&kind, id),
             ip,
-            ts,
+            first,
+            last,
+        })
+        .collect())
+}
+
+/// Which of [`joiner_spans`] the sources name together.
+async fn joiner_lists(conn: &mut SqliteConnection) -> Result<Vec<JoinerList>> {
+    let rows: Vec<(i64, String, bool, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         sources AS (
+           SELECT g.ip_id, COUNT(*) AS n, group_concat(k.piece, ',' ORDER BY k.piece) AS list
+           FROM piece_sightings g LEFT JOIN kept k ON k.piece = g.piece AND k.ip_id = g.ip_id
+           WHERE g.role IN {JOINER_ROLES} GROUP BY g.source_kind, g.source_id)
+         SELECT ip_id, list, n <= ?2, COUNT(*) FROM sources
+         WHERE list IS NOT NULL GROUP BY ip_id, list, n <= ?2",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(PAIRED_JOINERS_MAX as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ip, list, paired, sources)| JoinerList {
+            ip,
+            joiners: list.split(',').filter_map(|j| j.parse().ok()).collect(),
+            sources,
+            paired,
         })
         .collect())
 }
@@ -254,27 +332,40 @@ pub struct Plan {
 /// Read the sightings and work out the chains, in memory. Called in the
 /// pass's read snapshot, so the write lock is not held for any of this.
 pub async fn plan(conn: &mut SqliteConnection) -> Result<Plan> {
-    let chains = connect(&joiner_sightings(conn).await?);
-    let mut holders: HashMap<(u8, i64), Vec<usize>> = HashMap::new();
+    let spans = joiner_spans(conn).await?;
+    let lists = joiner_lists(conn).await?;
+    let chains = connect(&spans, &lists);
+    let mut chain_of: HashMap<i64, usize> = HashMap::new();
     let mut members: BTreeSet<(usize, i64)> = BTreeSet::new();
     for (i, c) in chains.iter().enumerate() {
-        for &source in &c.sources {
-            holders.entry(source).or_default().push(i);
-        }
+        chain_of.extend(c.joiners.iter().map(|&j| (j, i)));
         members.extend(c.joiners.iter().map(|&j| (i, j)));
     }
-    let describers: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT DISTINCT g.piece, g.source_kind, g.source_id
-         FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
-         WHERE p.kind IN {DESCRIBER_KINDS} AND EXISTS
-           (SELECT 1 FROM piece_sightings j
-            WHERE j.source_kind = g.source_kind AND j.source_id = g.source_id
-              AND j.role IN {JOINER_ROLES})"
+    let describers: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         beside AS (
+           SELECT j.piece AS joiner, g.piece AS piece, MAX(g.ts) AS last_ts
+           FROM kept k
+           JOIN piece_sightings j ON j.piece = k.piece AND j.ip_id = k.ip_id
+           JOIN piece_sightings g
+             ON g.source_kind = j.source_kind AND g.source_id = j.source_id
+           JOIN pieces p ON p.hash = g.piece
+           WHERE j.role IN {JOINER_ROLES} AND p.kind IN {DESCRIBER_KINDS}
+           GROUP BY j.piece, g.piece)
+         SELECT joiner, piece FROM (
+           SELECT joiner, piece, ROW_NUMBER() OVER
+             (PARTITION BY joiner ORDER BY last_ts DESC, piece) AS n
+           FROM beside)
+         WHERE n <= ?2",
+        ranked_joiners()
     )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(DESCRIBERS_MAX as i64)
     .fetch_all(&mut *conn)
     .await?;
-    for (piece, kind, id) in describers {
-        for &i in holders.get(&source_of(&kind, id)).into_iter().flatten() {
+    for (joiner, piece) in describers {
+        if let Some(&i) = chain_of.get(&joiner) {
             members.insert((i, piece));
         }
     }
@@ -307,7 +398,7 @@ pub async fn store_plan(tx: &mut SqliteConnection, plan: &Plan) -> Result<()> {
                 .bind(&c.first_seen)
                 .bind(&c.last_seen)
                 .bind(c.ips)
-                .bind(c.sources.len() as i64)
+                .bind(c.sources)
                 .bind(CHAIN_V);
         }
         q.execute(&mut *tx).await?;
@@ -1921,6 +2012,53 @@ mod tests {
     /// More than the 32 bytes a `file` piece needs.
     const FILE: &[u8] = b"<?php echo 'a file of at least thirty-two bytes'; ?>";
 
+    /// A joiner in a source, as a test states it. `source` is the kind
+    /// ([`REQUEST`] or [`UPLOAD`]) and the row's id.
+    struct JoinerSighting {
+        piece: i64,
+        source: (u8, i64),
+        ip: i64,
+        ts: String,
+    }
+
+    /// [`super::connect`] of these sightings, as the pass's reads give them.
+    fn connect(rows: &[JoinerSighting]) -> Vec<ChainOut> {
+        let mut spans: BTreeMap<(i64, i64), JoinerSpan> = BTreeMap::new();
+        let mut sources: BTreeMap<(u8, i64), (i64, BTreeSet<i64>)> = BTreeMap::new();
+        for r in rows {
+            let span = spans.entry((r.piece, r.ip)).or_insert(JoinerSpan {
+                piece: r.piece,
+                ip: r.ip,
+                first: r.ts.clone(),
+                last: r.ts.clone(),
+            });
+            span.first = span.first.as_str().min(&r.ts).to_string();
+            span.last = span.last.as_str().max(&r.ts).to_string();
+            sources
+                .entry(r.source)
+                .or_insert((r.ip, BTreeSet::new()))
+                .1
+                .insert(r.piece);
+        }
+        let mut lists: BTreeMap<(i64, Vec<i64>), i64> = BTreeMap::new();
+        for (ip, joiners) in sources.into_values() {
+            *lists
+                .entry((ip, joiners.into_iter().collect()))
+                .or_default() += 1;
+        }
+        let lists: Vec<JoinerList> = lists
+            .into_iter()
+            .map(|((ip, joiners), sources)| JoinerList {
+                ip,
+                paired: joiners.len() <= PAIRED_JOINERS_MAX,
+                joiners,
+                sources,
+            })
+            .collect();
+        let spans: Vec<JoinerSpan> = spans.into_values().collect();
+        super::connect(&spans, &lists)
+    }
+
     fn at(piece: i64, source: (u8, i64), ip: i64, ts: &str) -> JoinerSighting {
         JoinerSighting {
             piece,
@@ -1963,7 +2101,7 @@ mod tests {
             at(2, (UPLOAD, 1), 11, T1),
         ]);
         assert_eq!(joiners(&c), [[1, 2]]);
-        assert_eq!((c[0].ips, c[0].sources.len()), (2, 2));
+        assert_eq!((c[0].ips, c[0].sources), (2, 2));
         assert_eq!(
             (c[0].first_seen.as_str(), c[0].last_seen.as_str()),
             (T0, T1)
@@ -2038,7 +2176,7 @@ mod tests {
         let over = connect(&named_together(PAIRED_JOINERS_MAX as i64 + 1));
         assert_eq!(over.len(), PAIRED_JOINERS_MAX + 1);
         // Left out of the pairs only: each still has its sources.
-        assert!(over.iter().all(|c| c.sources.len() == 2 && c.ips == 2));
+        assert!(over.iter().all(|c| c.sources == 2 && c.ips == 2));
     }
 
     #[test]
@@ -2086,8 +2224,8 @@ mod tests {
             at(1, (REQUEST, 2), 10, T1),
         ]);
         assert_eq!(joiners(&c), [[1], [2]]);
-        assert_eq!(the(&c, 1).sources, [(REQUEST, 1), (REQUEST, 2)]);
-        assert_eq!(the(&c, 2).sources, [(REQUEST, 1)]);
+        assert_eq!(the(&c, 1).sources, 2);
+        assert_eq!(the(&c, 2).sources, 1);
     }
 
     async fn store() -> (Store, tempfile::TempDir) {
@@ -2198,6 +2336,135 @@ mod tests {
         assert_eq!(chains(&s).await.len(), 1);
         assert_eq!(chains(&s).await[0].0, key_of(b));
         assert_eq!(pieces_of(&s, &key_of(a)).await, Vec::<i64>::new());
+    }
+
+    /// `n` joiners of `ip`, the kind `stager`, numbered from `from`, in
+    /// `n / per` sources from `first_source`, each a second newer than the
+    /// last. What a flood leaves behind, without parsing it.
+    async fn flood(s: &Store, ip: i64, from: i64, n: i64, per: i64, first_source: i64) {
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             SELECT ?2 + i, 'stager', 'h' || (?2 + i) || '.example.org', ?3, ?3, 0, 0 FROM c",
+        )
+        .bind(n)
+        .bind(from)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT ?2 + i, 'request', ?3 + i / ?4, ?5, 'stager', 'claimed',
+                    datetime(?6, '+' || (i / ?4) || ' seconds') FROM c",
+        )
+        .bind(n)
+        .bind(from)
+        .bind(first_source)
+        .bind(per)
+        .bind(ip)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn rows_of(s: &Store, table: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_address_naming_thousands_of_joiners_keeps_its_cap() {
+        let (s, _d) = store().await;
+        let ip = s.upsert_ip("203.0.113.10".parse().unwrap()).await.unwrap();
+        // Each body names 256 fresh stagers, as a 5 KiB PHP body can.
+        flood(&s, ip.id, 1_000, 25_600, 256, 1).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let spans = joiner_spans(&mut c).await.unwrap();
+        assert_eq!(spans.len(), MAX_JOINERS_PER_IP);
+        let lists = joiner_lists(&mut c).await.unwrap();
+        assert_eq!(lists.len(), 1, "the newest body holds all it kept");
+        assert!(!lists[0].paired, "a source over the limit pairs nothing");
+        let input = crate::store::campaigns::Input::read(&mut c).await.unwrap();
+        assert!(input.joiners.len() <= 256, "{}", input.joiners.len());
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
+        assert_eq!(p.chains.len(), MAX_JOINERS_PER_IP);
+        assert_eq!(p.members.len(), MAX_JOINERS_PER_IP);
+        run(&s).await;
+        assert_eq!(rows_of(&s, "chains").await, MAX_JOINERS_PER_IP as i64);
+        assert_eq!(rows_of(&s, "chain_pieces").await, MAX_JOINERS_PER_IP as i64);
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert!(r.excluded.iter().any(|e| e.kind == "joiner cap"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn two_addresses_naming_fresh_stagers_together_keep_their_cap() {
+        let (s, _d) = store().await;
+        // The same 64-stager bodies from both, each body with fresh hosts.
+        flood(&s, 10, 1_000, 6_400, 64, 1).await;
+        flood(&s, 11, 1_000, 6_400, 64, 1_000).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(
+            joiner_spans(&mut c).await.unwrap().len(),
+            2 * MAX_JOINERS_PER_IP
+        );
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
+        assert_eq!(p.chains.len(), 1, "the newest body's joiners connect");
+        assert_eq!(p.members.len(), MAX_JOINERS_PER_IP);
+    }
+
+    #[tokio::test]
+    async fn sending_one_list_again_costs_a_count() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 0), 10).await;
+        for id in 1..2_000 {
+            sight(&s, STAGER_A, ("request", id), 10).await;
+        }
+        let mut c = s.pool.acquire().await.unwrap();
+        let lists = joiner_lists(&mut c).await.unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(
+            (lists[0].sources, lists[0].joiners.clone()),
+            (2_000, vec![a])
+        );
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.chains[0].sources, 2_000);
+    }
+
+    #[tokio::test]
+    async fn fresh_describers_stop_at_their_cap() {
+        let (s, _d) = store().await;
+        sight(&s, STAGER_A, ("request", 1), 10).await;
+        let over = DESCRIBERS_MAX as i64 + 40;
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             SELECT i + 1000, 'tag', 't' || i, ?2, ?2, 0, 0 FROM c",
+        )
+        .bind(over)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT i + 1000, 'request', 1, 10, 'tag', 'claimed', ?2 FROM c",
+        )
+        .bind(over)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut c = s.pool.acquire().await.unwrap();
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.members.len(), DESCRIBERS_MAX + 1);
     }
 
     #[tokio::test]

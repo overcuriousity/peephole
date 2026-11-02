@@ -45,9 +45,14 @@ pub const HARD_FANOUT_MAX: usize = 50;
 /// Soft edges two groups of two or more IPs need between them to merge, and
 /// the fewest addresses naming both of two joiner values that connect them.
 pub const K_SOFT_MERGE: usize = 2;
-/// Joiner values considered per IP, its newest first: one body can name 256
-/// fresh values, each would be an edge, and values are paired per address.
+/// Joiner values considered per IP, those another address names first, then
+/// its newest: one body can name 256 fresh values, each would be an edge, and
+/// values are paired per address. The pass reads no more than this
+/// ([`super::chains::ranked_joiners`]).
 pub const MAX_JOINERS_PER_IP: usize = 16;
+/// Addresses and files the report lists by name, most over first: the rest
+/// are one count, however many there are.
+const EXCLUDED_LISTED: usize = 32;
 /// Fewest shared shapes a pair needs for an order term.
 pub const ORDER_MIN_SHARED: usize = 8;
 /// Fewest untied pairs of shared shapes a pair needs for an order term (8
@@ -860,9 +865,14 @@ pub(crate) struct Input {
     shapes: Vec<(i64, i64, String, String)>,
     /// (JA4, JA4H) pairs seen per IP.
     tls: Vec<(i64, String, String)>,
-    /// Joiner sightings: kind, value, IP, time. Files over
-    /// [`HARD_FANOUT_MAX`] are here too: [`compute`] lists them as excluded.
+    /// Joiner sightings: kind, value, IP, time. A value's first and last
+    /// per address, of each address's newest [`MAX_JOINERS_PER_IP`].
     pub(crate) joiners: Vec<(&'static str, String, i64, String)>,
+    /// How many joiner values an address has, read or not.
+    joiners_held: HashMap<i64, usize>,
+    /// Files on more than [`HARD_FANOUT_MAX`] addresses, the widest first, at
+    /// most [`EXCLUDED_LISTED`], with how many. [`compute`] lists them.
+    wide_files: Vec<(String, i64)>,
 }
 
 impl Input {
@@ -915,26 +925,37 @@ impl Input {
         .fetch_all(&mut *conn)
         .await?;
         // An address's first and last sighting of each value: a botnet's
-        // stager has far more sightings than addresses.
-        let joiners: Vec<(String, String, i64, String)> =
+        // stager has far more sightings than addresses. `tied`, not `nth`:
+        // `joiner_values` cuts a tie by who names a value, never by its text.
+        let joiners: Vec<(String, String, i64, String, String, i64)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT g.role, p.value, g.ip_id, MIN(g.ts)
-                 FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
-                 WHERE g.role IN {JOINER_ROLES} GROUP BY g.role, g.piece, g.ip_id
-                 UNION
-                 SELECT g.role, p.value, g.ip_id, MAX(g.ts)
-                 FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
-                 WHERE g.role IN {JOINER_ROLES} GROUP BY g.role, g.piece, g.ip_id"
+                "WITH {} SELECT k.role, p.value, k.ip_id, k.first_ts, k.last_ts, k.held
+                 FROM ranked k JOIN pieces p ON p.hash = k.piece WHERE k.tied <= ?",
+                super::chains::ranked_joiners()
             )))
+            .bind(MAX_JOINERS_PER_IP as i64)
             .fetch_all(&mut *conn)
             .await?;
-        input.joiners = joiners
-            .into_iter()
-            .filter_map(|(role, value, ip, ts)| {
-                let kind = JOINERS.into_iter().find(|k| k.key() == role)?;
-                Some((kind.key(), value, ip, ts))
-            })
-            .collect();
+        for (role, value, ip, first, last, held) in joiners {
+            let Some(kind) = JOINERS.into_iter().find(|k| k.key() == role) else {
+                continue;
+            };
+            input.joiners_held.insert(ip, held as usize);
+            if first != last {
+                input.joiners.push((kind.key(), value.clone(), ip, first));
+            }
+            input.joiners.push((kind.key(), value, ip, last));
+        }
+        input.wide_files = sqlx::query_as(
+            "SELECT p.value, COUNT(DISTINCT g.ip_id) AS n
+             FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
+             WHERE g.role = 'file' GROUP BY g.piece HAVING n > ?
+             ORDER BY n DESC, p.value LIMIT ?",
+        )
+        .bind(HARD_FANOUT_MAX as i64)
+        .bind(EXCLUDED_LISTED as i64)
+        .fetch_all(&mut *conn)
+        .await?;
         Ok(input)
     }
 }
@@ -1076,13 +1097,19 @@ type JoinerValues<'a> = BTreeMap<(&'static str, &'a str), BTreeMap<usize, Span>>
 /// addresses goes to `excluded`: it is a public webshell. Stagers and keys
 /// have no such cap: the X-ray's role and shared-host filters decide those.
 /// An address keeps its newest [`MAX_JOINERS_PER_IP`] of what is left, and
-/// one over that goes to `excluded`.
+/// one holding more, of any joiner, goes to `excluded` as a count.
 fn joiner_values<'a>(
     input: &'a Input,
     index: &HashMap<i64, usize>,
     ip_text: &impl Fn(usize) -> &'a str,
     excluded: &mut Vec<Excluded>,
 ) -> JoinerValues<'a> {
+    let file = LinkKind::File.key();
+    excluded.extend(input.wide_files.iter().map(|(value, ips)| Excluded {
+        kind: file.to_string(),
+        value: value.clone(),
+        ips: *ips as usize,
+    }));
     let mut values = JoinerValues::new();
     for (kind, value, ip, ts) in &input.joiners {
         let Some(&i) = index.get(ip) else { continue };
@@ -1122,22 +1149,42 @@ fn joiner_values<'a>(
         }
     }
     let mut dropped = vec![];
-    for (i, mut named) in held {
-        if named.len() <= MAX_JOINERS_PER_IP {
-            continue;
+    let mut over: BTreeMap<usize, usize> = BTreeMap::new();
+    for (ip, n) in &input.joiners_held {
+        if let Some(&i) = index.get(ip) {
+            over.insert(i, *n);
         }
-        named.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
-        let over = named.split_off(MAX_JOINERS_PER_IP);
+    }
+    for (i, mut named) in held {
+        let all = over.entry(i).or_default();
+        *all = (*all).max(named.len());
+        if named.len() > MAX_JOINERS_PER_IP {
+            named.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
+            let cut = named.split_off(MAX_JOINERS_PER_IP);
+            dropped.extend(cut.into_iter().map(|(_, _, key)| (key, i)));
+        }
+    }
+    let mut capped: Vec<(usize, usize)> = over
+        .into_iter()
+        .filter(|&(_, n)| n > MAX_JOINERS_PER_IP)
+        .map(|(i, n)| (i, n - MAX_JOINERS_PER_IP))
+        .collect();
+    capped.sort_by_key(|&(i, n)| (std::cmp::Reverse(n), i));
+    let rest = capped.split_off(capped.len().min(EXCLUDED_LISTED));
+    excluded.extend(capped.into_iter().map(|(i, n)| Excluded {
+        kind: JOINER_CAP.to_string(),
+        value: format!(
+            "{}: {n} values past the newest {MAX_JOINERS_PER_IP}",
+            ip_text(i)
+        ),
+        ips: 1,
+    }));
+    if !rest.is_empty() {
         excluded.push(Excluded {
             kind: JOINER_CAP.to_string(),
-            value: format!(
-                "{}: {} values past the newest {MAX_JOINERS_PER_IP}",
-                ip_text(i),
-                over.len()
-            ),
-            ips: 1,
+            value: format!("more addresses past the newest {MAX_JOINERS_PER_IP}"),
+            ips: rest.len(),
         });
-        dropped.extend(over.into_iter().map(|(_, _, key)| (key, i)));
     }
     for (key, i) in dropped {
         if let Some(ips) = values.get_mut(&key) {
@@ -3758,6 +3805,44 @@ pub(crate) mod tests {
             row.value,
             format!("{a}: 6 values past the newest {MAX_JOINERS_PER_IP}")
         );
+    }
+
+    #[test]
+    fn the_report_names_the_addresses_most_over_and_counts_the_rest() {
+        let ips = addresses(EXCLUDED_LISTED + 8);
+        let mut input = Input::default();
+        name(&mut input, "stager", S, &strs(&ips));
+        for (i, ip) in ips.iter().enumerate() {
+            let id = id_of(&mut input, ip);
+            input.joiners_held.insert(id, MAX_JOINERS_PER_IP + 1 + i);
+        }
+        let out = v2(&input);
+        assert_eq!(out.excluded.len(), EXCLUDED_LISTED + 1);
+        assert!(
+            out.excluded[0]
+                .value
+                .starts_with(ips.last().unwrap().as_str())
+        );
+        let last = out.excluded.last().unwrap();
+        assert_eq!((last.kind.as_str(), last.ips), (JOINER_CAP, 8));
+    }
+
+    #[tokio::test]
+    async fn a_wide_file_is_listed_from_the_store() {
+        let (s, _d) = store().await;
+        for ip in addresses(HARD_FANOUT_MAX + 1) {
+            sighted(&s, "file", "file", "aa", &ip, "2026-10-01 00:00:00").await;
+        }
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert_eq!(
+            r.excluded,
+            [Excluded {
+                kind: "file".into(),
+                value: "aa".into(),
+                ips: HARD_FANOUT_MAX + 1,
+            }]
+        );
+        assert_eq!(r.campaigns, 0);
     }
 
     #[test]

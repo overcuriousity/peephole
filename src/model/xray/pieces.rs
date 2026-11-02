@@ -1042,9 +1042,7 @@ impl Urls<'_> {
                     None => keeps || call_of(text, start - 1).is_some_and(|c| copying.contains(&c)),
                 },
                 // A literal only assigned is a fetch's when the fetch uses it.
-                Literal::Assigned(name) => {
-                    copied.contains(name) || fetched_by_name(name)
-                }
+                Literal::Assigned(name) => copied.contains(name) || fetched_by_name(name),
                 Literal::Other => false,
             };
             let at = Span { layer, start, end };
@@ -1461,7 +1459,11 @@ mod tests {
         body.extend(b"$late='http://late.example.org/x';copy($late,'y');");
         let x = post(std::str::from_utf8(&body).unwrap());
         assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
-        assert!(of(&x, PieceKind::Stager).iter().all(|p| p.role != Role::Stager));
+        assert!(
+            of(&x, PieceKind::Stager)
+                .iter()
+                .all(|p| p.role != Role::Stager)
+        );
     }
 
     #[test]
