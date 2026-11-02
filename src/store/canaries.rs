@@ -353,34 +353,48 @@ const REUSE_SELECT: &str = "
     LEFT JOIN skipped_batches sb ON sb.id = c.batch_id
     WHERE (c.request_id IS NULL OR c.request_id != t.request_id)";
 
+/// The statement of [`Store::reuses`]; its binds follow its conditions.
+fn reuses_sql(f: &ReuseFilter) -> String {
+    let mut sql = REUSE_SELECT.to_string();
+    if f.kind.is_some() {
+        sql.push_str(" AND c.kind = ?");
+    }
+    if f.node.is_some() {
+        sql.push_str(" AND ? IN ((SELECT name FROM members m WHERE m.id = COALESCE(sr.origin, sb.origin)), (SELECT name FROM members m WHERE m.id = u.origin))");
+    }
+    if let Some(same) = f.same_source {
+        sql.push_str(if same {
+            " AND c.ip_id = u.ip_id"
+        } else {
+            " AND c.ip_id != u.ip_id"
+        });
+    }
+    if f.request.is_some() {
+        // A row of this request holds a value this request either sent or
+        // was served. That set is an index search, where the condition
+        // alone, on two tables, scans every request.
+        sql.push_str(
+            " AND t.value_hash IN (
+                 SELECT value_hash FROM request_tokens WHERE request_id = ?
+                 UNION SELECT value_hash FROM canaries WHERE request_id = ?)
+              AND ? IN (c.request_id, u.id)",
+        );
+    }
+    if f.ip_id.is_some() {
+        sql.push_str(" AND ? IN (c.ip_id, u.ip_id)");
+    }
+    if f.range.since().is_some() {
+        // The period is when the canary was served, as in the summary.
+        sql.push_str(" AND c.ts >= datetime('now', ?)");
+    }
+    sql.push_str(" GROUP BY u.id, c.value_hash ORDER BY u.ts DESC, u.id DESC LIMIT ?");
+    sql
+}
+
 impl Store {
     /// Reuses matching `f`, newest use first, one row per (use, canary).
     pub async fn reuses(&self, f: &ReuseFilter) -> Result<Vec<Reuse>> {
-        let mut sql = REUSE_SELECT.to_string();
-        if f.kind.is_some() {
-            sql.push_str(" AND c.kind = ?");
-        }
-        if f.node.is_some() {
-            sql.push_str(" AND ? IN ((SELECT name FROM members m WHERE m.id = COALESCE(sr.origin, sb.origin)), (SELECT name FROM members m WHERE m.id = u.origin))");
-        }
-        if let Some(same) = f.same_source {
-            sql.push_str(if same {
-                " AND c.ip_id = u.ip_id"
-            } else {
-                " AND c.ip_id != u.ip_id"
-            });
-        }
-        if f.request.is_some() {
-            sql.push_str(" AND ? IN (c.request_id, u.id)");
-        }
-        if f.ip_id.is_some() {
-            sql.push_str(" AND ? IN (c.ip_id, u.ip_id)");
-        }
-        if f.range.since().is_some() {
-            // The period is when the canary was served, as in the summary.
-            sql.push_str(" AND c.ts >= datetime('now', ?)");
-        }
-        sql.push_str(" GROUP BY u.id, c.value_hash ORDER BY u.ts DESC, u.id DESC LIMIT ?");
+        let sql = reuses_sql(f);
         let mut q = sqlx::query_as::<_, Reuse>(sqlx::AssertSqlSafe(sql));
         if let Some(k) = &f.kind {
             q = q.bind(k);
@@ -389,7 +403,7 @@ impl Store {
             q = q.bind(n);
         }
         if let Some(r) = f.request {
-            q = q.bind(r);
+            q = q.bind(r).bind(r).bind(r);
         }
         if let Some(i) = f.ip_id {
             q = q.bind(i);
@@ -1199,6 +1213,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(diff.len(), 1);
+        // One request's reuses: served by it, or sent by it.
+        let id_of = |path: &'static str| {
+            sqlx::query_scalar::<_, i64>("SELECT id FROM requests WHERE path = ?")
+                .bind(path)
+                .fetch_one(&s.pool)
+        };
+        for (path, rows) in [("/.git/config", 2), ("/x", 1), ("/y", 1)] {
+            let of_one = ReuseFilter {
+                request: Some(id_of(path).await.unwrap()),
+                ..all.clone()
+            };
+            let got = s.reuses(&of_one).await.unwrap();
+            assert_eq!(got.len(), rows, "{path}");
+        }
         let srv_ip: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '198.51.100.1'")
             .fetch_one(&s.pool)
             .await
@@ -1433,6 +1461,31 @@ mod tests {
             s.reuses(&f).await.unwrap().is_empty(),
             "harvested before the period"
         );
+    }
+
+    /// Asked on every request page.
+    #[tokio::test]
+    async fn one_requests_reuses_scan_no_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let sql = reuses_sql(&ReuseFilter {
+            request: Some(1),
+            range: crate::store::stats::Range::All,
+            ..Default::default()
+        });
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .bind(1)
+                .bind(1)
+                .bind(1)
+                .bind(50)
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(!plan.is_empty());
+        assert!(plan.iter().all(|p| !p.3.starts_with("SCAN")), "{plan:?}");
     }
 
     async fn derived(pool: &sqlx::SqlitePool) -> (i64, i64) {

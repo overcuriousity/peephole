@@ -647,6 +647,16 @@ impl Store {
         .await?)
     }
 
+    /// How many sightings only queried this piece.
+    pub async fn piece_queried(&self, hash: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM piece_sightings WHERE piece = ? AND role = 'queried'",
+        )
+        .bind(hash)
+        .fetch_one(&self.read)
+        .await?)
+    }
+
     /// The URLs of a piece, newest first (at most [`MAX_URLS`]).
     pub async fn piece_urls(&self, hash: i64) -> Result<Vec<PieceUrl>> {
         Ok(sqlx::query_as(
