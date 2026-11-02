@@ -981,7 +981,7 @@ impl Urls<'_> {
         for (child, l) in xray.layers.iter().enumerate() {
             let decoded = matches!(
                 l.kind,
-                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
             );
             if !decoded || l.parent != Some(layer) {
                 continue;

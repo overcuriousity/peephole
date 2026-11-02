@@ -240,7 +240,7 @@ fn add(
         if kind == LayerKind::Php
             && matches!(
                 l.kind,
-                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
             )
         {
             l.kind = LayerKind::Php;
@@ -253,7 +253,7 @@ fn add(
             l.text == bytes
                 && matches!(
                     l.kind,
-                    LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                    LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
                 )
         })
     {
@@ -875,8 +875,12 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
             let limit = budget.output.min(inflate_left);
             let step = match name.as_str() {
                 "base64_decode" => decode::base64_lenient(&bytes).map(|b| (b, LayerKind::Base64)),
-                "gzinflate" => decode::inflate_raw(&bytes, limit).map(|b| (b, LayerKind::Gzip)),
-                "gzuncompress" => decode::inflate_zlib(&bytes, limit).map(|b| (b, LayerKind::Gzip)),
+                "gzinflate" => {
+                    decode::inflate_raw(&bytes, limit).map(|b| (b, LayerKind::Compressed))
+                }
+                "gzuncompress" => {
+                    decode::inflate_zlib(&bytes, limit).map(|b| (b, LayerKind::Compressed))
+                }
                 "hex2bin" => decode::hex_bytes(&bytes).map(|b| (b, LayerKind::Hex)),
                 "str_rot13" => Some((rot13(&bytes), LayerKind::Escapes)),
                 "strrev" => Some((bytes.iter().rev().copied().collect(), LayerKind::Escapes)),
@@ -899,7 +903,7 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
                 bytes.clear();
                 break;
             };
-            if matches!(k, LayerKind::Gzip) {
+            if matches!(k, LayerKind::Compressed) {
                 inflate_left = inflate_left.saturating_sub(next.len());
             }
             bytes = next;

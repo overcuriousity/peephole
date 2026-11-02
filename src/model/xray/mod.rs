@@ -62,7 +62,8 @@ pub enum LayerKind {
     Php,
     PhpCgi,
     Base64,
-    Gzip,
+    /// Gzip, zlib or raw deflate, inflated.
+    Compressed,
     Hex,
     Escapes,
     Shell,

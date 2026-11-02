@@ -274,7 +274,7 @@ fn open_compressed(
     let over = out.len() > limit;
     out.truncate(limit);
     if !out.is_empty() {
-        open(xray, parent, LayerKind::Gzip, at, out, budget, queue);
+        open(xray, parent, LayerKind::Compressed, at, out, budget, queue);
     }
     if over {
         push_opaque(xray, at, OpaqueReason::OverLimit);
@@ -517,7 +517,7 @@ mod tests {
         let x = run(&b64(&gzip(CMD)));
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, CMD);
         assert_eq!(x.layers[2].parent, Some(1));
@@ -567,7 +567,11 @@ mod tests {
         // Behind base64, the encoded bomb counts against the same total.
         let x = run(&b64(&bomb));
         assert!(decoded_total(&x) <= 256 * 1024);
-        let gz = x.layers.iter().find(|l| l.kind == LayerKind::Gzip).unwrap();
+        let gz = x
+            .layers
+            .iter()
+            .find(|l| l.kind == LayerKind::Compressed)
+            .unwrap();
         assert!(gz.text.len() <= 256 * 1024);
         assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
     }
@@ -668,12 +672,12 @@ mod tests {
     #[test]
     fn zlib_opens_raw_and_after_base64() {
         let x = run(&zlib(CMD));
-        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Gzip]);
+        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Compressed]);
         assert_eq!(x.layers[1].text, CMD);
         let x = run(&b64(&zlib(CMD)));
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, CMD);
     }
@@ -716,7 +720,7 @@ mod tests {
         let x = run(&e.finish().unwrap());
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Gzip, LayerKind::Base64]
+            [LayerKind::Raw, LayerKind::Compressed, LayerKind::Base64]
         );
     }
 
@@ -770,7 +774,7 @@ mod tests {
         let x = run(&wrapped);
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, varied_text(40));
     }
