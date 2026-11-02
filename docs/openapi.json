@@ -2736,13 +2736,17 @@
               },
               "reuses": {
                 "type": "boolean"
+              },
+              "chains": {
+                "type": "boolean"
               }
             },
             "required": [
               "events",
               "uploads",
               "commands",
-              "reuses"
+              "reuses",
+              "chains"
             ],
             "additionalProperties": false
           },
@@ -4140,6 +4144,9 @@
               },
               "commands": {
                 "type": "boolean"
+              },
+              "chains": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -4147,7 +4154,8 @@
               "members",
               "edges",
               "uploads",
-              "commands"
+              "commands",
+              "chains"
             ],
             "additionalProperties": false
           },

@@ -473,7 +473,7 @@ plus:
 - `canaries`: `{used_elsewhere, used_from, reuses:[{kind, place,
   served_request_id, served_ip, served_at, served_answer, used_request_id,
   used_ip, used_at, delta_s, same_source}]}`, reuses newest 50.
-- Capped: `truncated.events`, `uploads`, `commands`, `reuses`.
+- Capped: `truncated.events`, `uploads`, `commands`, `reuses`, `chains`.
 - `chains`: its attack chains, newest first, at most 32, as
   [chains](#chains) describe them.
 
@@ -524,7 +524,8 @@ plus:
 - `uploads` (metadata) and `commands` (`[{command, count, ips, last_at}]`),
   50 each; `events`: the members' newest 200, each with its `ip`
   (`truncated.events`); `agent`.
-- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`.
+- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`,
+  `chains`.
 - `chains`: the chains its members are in, newest first, at most 32.
 
 ### Chains

@@ -92,7 +92,8 @@ fn ids(hashes: &[i64]) -> Vec<String> {
         .collect()
 }
 
-/// The chains as JSON, with the text of each piece read in one pass.
+/// The chains as JSON (a stager's URLs only where a stager-role sighting
+/// named them: one only queried joins nobody), with the text of each piece read in one pass.
 pub async fn chains_json(store: &Store, chains: &[Chain]) -> Result<Vec<ChainJson>> {
     let mut hashes: Vec<i64> = chains
         .iter()
@@ -112,8 +113,14 @@ pub async fn chains_json(store: &Store, chains: &[Chain]) -> Result<Vec<ChainJso
         .await?;
         stored.extend(rows.into_iter().map(|p| (p.hash, p)));
         let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT piece, url FROM piece_urls WHERE piece IN ({list})
-             ORDER BY piece, last_seen DESC, url"
+            "SELECT u.piece, u.url FROM piece_urls u WHERE u.piece IN ({list})
+               AND EXISTS (
+                 SELECT 1 FROM piece_url_sources n
+                 JOIN piece_sightings g ON g.piece = n.piece
+                   AND g.source_kind = n.source_kind AND g.source_id = n.source_id
+                   AND g.role = 'stager'
+                 WHERE n.piece = u.piece AND n.url = u.url)
+             ORDER BY u.piece, u.last_seen DESC, u.url"
         )))
         .fetch_all(&store.read)
         .await?;

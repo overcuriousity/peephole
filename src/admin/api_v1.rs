@@ -670,23 +670,14 @@ async fn chain(
     State(state): State<Arc<AdminState>>,
     Path(key): Path<String>,
 ) -> Response {
-    let hash = (key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| u64::from_str_radix(&key, 16).ok())
-        .flatten();
-    let Some(hash) = hash else {
+    if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return err(StatusCode::NOT_FOUND, "not_found", "no such chain");
-    };
+    }
     let key = key.to_ascii_lowercase();
-    let found = match state
-        .store
-        .chains_of(crate::store::chains::Anchor::Piece(hash as i64))
-        .await
-    {
-        Ok(c) => c,
+    let found = match state.store.chain_by_key(&key).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "not_found", "no such chain"),
         Err(e) => return internal(e),
-    };
-    let Some(found) = found.into_iter().find(|c| c.key.as_deref() == Some(&key)) else {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such chain");
     };
     match crate::admin::chains_json::chains_json(&state.store, &[found]).await {
         Ok(mut c) => Json(json!({ "chain": c.pop() })).into_response(),
