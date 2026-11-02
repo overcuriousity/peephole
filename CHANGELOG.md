@@ -92,6 +92,13 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
+- The request page opens with the evidence: chain strip, then the X-ray, then
+  the facts. Headers are collapsed (count and first names in the summary; a
+  `#headers` link opens them), labels are chips in the header, and facts with
+  no value (transport, JA4, JA4H) are not listed. The campaign header keeps
+  strength, size and first/last seen, with the key and compute time on a muted
+  second line. The upload page shows the X-ray before its facts. Fragment
+  links keep landing; a link into a closed `<details>` opens it.
 - Detail pages (request, IP, upload, campaign, link, scan, member, canary
   decoy, network, AS) share one frame: a "← list" crumb above the title, in the
   same place on each, replacing the hand-written back links. The public IP

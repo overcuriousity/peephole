@@ -596,6 +596,21 @@
     }
   }
 
+  // A fragment that names a collapsed <details> (or sits inside one) opens it.
+  var openFragment = function () {
+    if (location.hash.length < 2) return;
+    var el = null;
+    try { el = document.getElementById(decodeURIComponent(location.hash.slice(1))); } catch (e) { return; }
+    if (!el) return;
+    var d = el.closest("details");
+    if (d && !d.open) { d.open = true; el.scrollIntoView(); }
+  };
+  window.addEventListener("hashchange", openFragment);
+  document.querySelectorAll("details[id]").forEach(function (d) {
+    document.querySelectorAll("a[href='#" + d.id + "']").forEach(function (a) { a.addEventListener("click", function () { d.open = true; }); });
+  });
+  openFragment();
+
   // A link to #glossary opens the collapsed fingerprint glossary.
   var gloss = document.getElementById("glossary");
   if (gloss) {

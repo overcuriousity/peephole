@@ -302,6 +302,116 @@ pub(crate) mod tests {
         }
     }
 
+    /// Position of `needle` in `html`, or a panic naming it.
+    fn at(html: &str, needle: &str) -> usize {
+        html.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    }
+
+    async fn request_html(labels: &str, ja4: Option<&str>) -> String {
+        let (st, cookie, app, _d) = app().await;
+        let ip = st
+            .store
+            .upsert_ip("192.0.2.1".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                headers_json: r#"[["Host","example.org"],["Accept","*/*"]]"#.into(),
+                labels_json: labels.into(),
+                ja4: ja4.map(Into::into),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (status, _, html) = send(
+            &app,
+            Request::get(format!("/admin/requests/{id}")).header("cookie", &cookie),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        html
+    }
+
+    /// The request page opens with the evidence: strip, X-ray, facts, then
+    /// headers and related requests.
+    #[tokio::test]
+    async fn request_page_order_is_strip_xray_facts() {
+        let html = request_html("[]", None).await;
+        let xray = at(&html, "id=\"xray\"");
+        let facts = at(&html, "class=\"req-facts\"");
+        let headers = at(&html, "id=\"headers\"");
+        let related = at(&html, "Same IP");
+        assert!(xray < facts && facts < headers && headers < related);
+    }
+
+    /// Headers sit in a closed `<details>` that a `#headers` link can open.
+    #[tokio::test]
+    async fn headers_are_collapsed() {
+        let html = request_html("[]", None).await;
+        let d = at(&html, "<details class=\"card headers\" id=\"headers\">");
+        assert!(!html[d..d + 60].contains(" open"));
+        let sum = &html[d..d + html[d..].find("</summary>").unwrap()];
+        assert!(
+            sum.contains("<summary>") && sum.contains("2 headers"),
+            "{sum}"
+        );
+        assert!(sum.contains("Host"), "first names in the summary");
+        assert!(html[d..].contains("<dd>example.org</dd>"));
+        let js = include_str!("../../assets/js/app.js");
+        assert!(js.contains("details[id]"), "a fragment link opens it");
+    }
+
+    /// Labels are chips in the header; unset facts have no row.
+    #[tokio::test]
+    async fn labels_are_header_chips_and_empty_facts_are_hidden() {
+        let html = request_html(r#"["sqli"]"#, None).await;
+        assert!(!html.contains("<h2>Labels</h2>"));
+        let chip = at(&html, "badge-label");
+        assert!(chip > at(&html, "<h1") && chip < at(&html, "class=\"req-facts\""));
+        assert!(!html.contains("not recorded") && !html.contains("<dt>Transport</dt>"));
+        assert!(!html.contains("Its link graph") && !html.contains("<dt>Unrecorded"));
+        assert!(html.contains("<dt>Severity</dt>") && html.contains("<dt>Answered</dt>"));
+        let with = request_html("[]", Some("t13d1516h2_aaaaaaaaaaaa_bbbbbbbbbbbb")).await;
+        assert!(with.contains("t13d1516h2_aaaaaaaaaaaa_bbbbbbbbbbbb"));
+        assert!(!with.contains("badge-label"), "no labels, no chips");
+    }
+
+    /// The upload page: strip, X-ray, facts, timeline.
+    #[tokio::test]
+    async fn upload_page_order_is_strip_xray_facts() {
+        let (st, cookie, app, _d) = app().await;
+        super::tests::upload(&st, "u1", "a.php", b"<?php echo 1;", true).await;
+        let (status, _, html) = send(
+            &app,
+            Request::get("/admin/traps/uploads/u1").header("cookie", &cookie),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let x = at(&html, "id=\"xray\"");
+        let f = at(&html, "class=\"facts\"");
+        let t = at(&html, "<h2>Timeline</h2>");
+        assert!(x < f && f < t);
+    }
+
+    /// Fragment targets keep landing: each id is still on the page.
+    #[tokio::test]
+    async fn fragment_links_still_land() {
+        let html = request_html("[]", None).await;
+        assert!(html.contains("id=\"headers\""));
+        let t = include_str!("../../templates/request.html");
+        for id in ["id=\"drops\"", "id=\"canaries\""] {
+            assert!(t.contains(id), "{id}");
+        }
+        assert!(include_str!("../../templates/_target.html").contains("id=\"scans\""));
+    }
+
     /// Each rendered detail page has the crumb to its list and its h1 after it.
     #[tokio::test]
     async fn every_detail_page_has_the_shared_header() {
