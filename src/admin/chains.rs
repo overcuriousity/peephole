@@ -653,6 +653,59 @@ mod tests {
         );
     }
 
+    /// The campaign page reads flow map, chain strip, Members, Evidence; the
+    /// header keeps the key and compute time on a muted second line.
+    #[tokio::test]
+    async fn campaign_order_is_flow_chains_members_evidence() {
+        let (st, cookie, app, _d) = app().await;
+        let (id, ip) = request(&st, IP, "/a").await;
+        let t = "2026-10-01 00:00:00";
+        sight(
+            &st,
+            ("stager", "a.example.org", "stager", "claimed"),
+            id,
+            ip,
+            t,
+        )
+        .await;
+        sight(&st, ("recipe", "fetch|run", "recipe", "claimed"), id, ip, t).await;
+        pass(&st).await;
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+               hard_edges, soft_edges, v, computed_at)
+             VALUES (?1, 1, ?2, 1, ?3, ?3, 0, 0, 1, ?3)",
+        )
+        .bind(IP)
+        .bind(ip)
+        .bind(t)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, ?)")
+            .bind(ip)
+            .bind(IP)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let (status, html) = page(
+            &app,
+            Some(&cookie),
+            &format!("/admin/evidence/campaigns/{IP}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let at = |n: &str| html.find(n).unwrap_or_else(|| panic!("missing {n}"));
+        let flow = at("data-section=\"flow\"");
+        let strip = at("data-section=\"chains\"");
+        let members = at("<h2>Members</h2>");
+        let evidence = at("<h2>Evidence</h2>");
+        assert!(flow < strip && strip < members && members < evidence);
+        let sub = at("meta meta-sub");
+        assert!(sub < members && html[sub..members].contains("key <span"));
+        assert!(html[sub..members].contains("computed"));
+        assert!(at("first seen") < sub);
+    }
+
     #[tokio::test]
     async fn upload_page_shows_its_chain() {
         let (st, cookie, app, _d) = app().await;

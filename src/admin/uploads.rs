@@ -382,33 +382,6 @@ pub(crate) mod tests {
         assert!(!with.contains("badge-label"), "no labels, no chips");
     }
 
-    /// The campaign page: flow, chains, members, then the evidence; the header
-    /// keeps four items and a muted second line.
-    #[tokio::test]
-    async fn campaign_order_is_flow_chains_members_evidence() {
-        let (st, cookie, app, _d) = app().await;
-        crate::store::campaigns::tests::feed(&st.store, crate::store::campaigns::tests::fixture())
-            .await;
-        st.store.recompute_campaigns(true).await.unwrap();
-        let (status, _, html) = send(
-            &app,
-            Request::get("/admin/evidence/campaigns/192.0.2.3").header("cookie", &cookie),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let members = at(&html, "<h2>Members</h2>");
-        let evidence = at(&html, "<h2>Evidence</h2>");
-        assert!(at(&html, "<h1") < members && members < evidence);
-        if let Some(f) = html.find("class=\"chain-flow") {
-            assert!(f < members);
-        }
-        let sub = at(&html, "meta meta-sub");
-        assert!(sub < members && html[sub..members].contains("computed"));
-        assert!(html[sub..members].contains("key <span"));
-        assert!(at(&html, "first seen") < sub);
-    }
-
     /// The upload page: strip, X-ray, facts, timeline.
     #[tokio::test]
     async fn upload_page_order_is_strip_xray_facts() {
