@@ -1116,8 +1116,8 @@ impl Reader<'_> {
                         return;
                     }
                     // A pasted PEM block is no shell, and its lines must
-                    // not turn into steps. A key has an end: what follows
-                    // it is read.
+                    // not turn into steps. A key with an `END` marker ends
+                    // there, and what follows it is read.
                     if word.text.starts_with(b"-----BEGIN") {
                         let key = self
                             .mask

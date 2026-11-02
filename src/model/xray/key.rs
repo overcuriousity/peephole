@@ -2,7 +2,6 @@
 //! the public fingerprint, the only form of a key ever kept. The bytes are
 //! read for that alone: nothing is decrypted, stored or used.
 
-use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use data_encoding::{BASE64_NOPAD, HEXLOWER};
@@ -14,15 +13,6 @@ use super::{LayerKind, Xray, decode};
 /// Fewest bytes a PEM body decodes to for it to count as a key: less is a
 /// placeholder, and its value would be the same for everybody.
 const MIN_PEM: usize = 32;
-
-/// The part of a line of a key with no `END` marker that counts as key text
-/// whatever comes after it. A shorter one needs a closing quote or the like:
-/// `wget` on the next line is a command.
-const KEY_TAIL_MIN: usize = 16;
-
-/// Most lines of keys with no `END` marker searched for further on in a text.
-/// Past this, all of the text after the first such key is masked.
-const REPEATS_MAX: usize = 256;
 
 const OPENSSH: &[u8] = b"OPENSSH PRIVATE KEY";
 const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
@@ -67,8 +57,7 @@ static END: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// One key's place in a text. `head` ends the `BEGIN` marker, `body_end`
-/// starts the `END` marker or ends the key text, and `ended` says there is
-/// an `END` marker.
+/// starts the `END` marker, and `ended` says there is one.
 struct Block {
     start: usize,
     head: usize,
@@ -83,16 +72,14 @@ fn blocks(text: &[u8]) -> Vec<Block> {
     while let Some(begin) = BEGIN.find_at(text, from) {
         let (start, head) = (begin.start(), begin.end());
         let Some(end) = END.find_at(text, head) else {
-            let body_end = unended(text, head);
             found.push(Block {
                 start,
                 head,
-                body_end,
-                end: body_end,
+                body_end: text.len(),
+                end: text.len(),
                 ended: false,
             });
-            from = body_end;
-            continue;
+            break;
         };
         found.push(Block {
             start,
@@ -104,88 +91,6 @@ fn blocks(text: &[u8]) -> Vec<Block> {
         from = end.end();
     }
     found
-}
-
-/// Width of a byte of base64 at the start of `rest`, perhaps percent-encoded.
-fn key_byte(rest: &[u8]) -> Option<usize> {
-    match rest {
-        [b'%', hex @ ..] => [&b"2B"[..], b"2F", b"3D"]
-            .iter()
-            .any(|h| hex.len() >= 2 && hex[..2].eq_ignore_ascii_case(h))
-            .then_some(3),
-        [b, ..] if b.is_ascii_alphanumeric() || b"+/=".contains(b) => Some(1),
-        _ => None,
-    }
-}
-
-/// Width of a line end at the start of `rest`: plain, written `\n` in a
-/// script or a string, or percent-encoded.
-fn line_end(rest: &[u8]) -> Option<usize> {
-    match rest {
-        [b'\n' | b'\r', ..] => Some(1),
-        [b'\\', b'n' | b'r', ..] => Some(2),
-        [b'%', b'0', b'A' | b'a' | b'D' | b'd', ..] => Some(3),
-        _ => None,
-    }
-}
-
-fn blank(rest: &[u8]) -> Option<usize> {
-    match rest {
-        [b' ' | b'\t', ..] => Some(1),
-        [b'%', b'2', b'0', ..] | [b'%', b'0', b'9', ..] => Some(3),
-        _ => None,
-    }
-}
-
-/// Where the text of a key with no `END` marker stops: at the first line
-/// that cannot be base64 key text, past the base64 such a line starts with
-/// when that is the key's last line (`AAAA' > /tmp/k`). The line of the
-/// `BEGIN` marker is read to its last word that can be key text: a key can
-/// be written in one line.
-fn unended(text: &[u8], head: usize) -> usize {
-    let mut at = head;
-    let mut marker_line = true;
-    loop {
-        loop {
-            if let Some(width) = line_end(&text[at..]) {
-                marker_line = false;
-                at += width;
-            } else if let Some(width) = blank(&text[at..]) {
-                at += width;
-            } else {
-                break;
-            }
-        }
-        if at >= text.len() {
-            return text.len();
-        }
-        let rest = &text[at..];
-        if !marker_line && (rest.starts_with(b"Proc-Type:") || rest.starts_with(b"DEK-Info:")) {
-            while at < text.len() && line_end(&text[at..]).is_none() {
-                at += 1;
-            }
-            continue;
-        }
-        let mut end = at;
-        while let Some(width) = key_byte(&text[end..]) {
-            end += width;
-        }
-        let mut after = end;
-        while let Some(width) = blank(&text[after..]) {
-            after += width;
-        }
-        let line_done = after >= text.len() || line_end(&text[after..]).is_some();
-        if line_done || (marker_line && after > end) {
-            at = after;
-            continue;
-        }
-        let closed = b"'\"`\\)<>;,&|".contains(&text[after]);
-        return if marker_line || end - at >= KEY_TAIL_MIN || (closed && end > at) {
-            end
-        } else {
-            at
-        };
-    }
 }
 
 fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -234,46 +139,9 @@ pub(super) fn marker_start(text: &[u8]) -> Option<usize> {
     BEGIN.find(text).map(|m| m.start())
 }
 
-/// Where the keys of `text` sit, sorted, and nothing about the layers around
-/// it.
+/// Where the keys of `text` sit, and nothing about the layers around it.
 pub(super) fn ranges(text: &[u8]) -> Vec<(usize, usize)> {
-    let blocks = blocks(text);
-    let mut found: Vec<(usize, usize)> = blocks.iter().map(|b| (b.start, b.end)).collect();
-    found.extend(repeats(text, &blocks));
-    found.sort_unstable();
-    found
-}
-
-/// Where lines of the keys with no `END` marker come again after the first
-/// of them: such a key's mask stops early, and its text is still key text
-/// when a later word repeats it. One search, however many keys there are.
-fn repeats(text: &[u8], blocks: &[Block]) -> Vec<(usize, usize)> {
-    let cut: Vec<&Block> = blocks.iter().filter(|b| !b.ended).collect();
-    let Some(from) = cut.first().map(|b| b.end) else {
-        return vec![];
-    };
-    let body = cut.iter().flat_map(|b| lines(&text[b.head..b.body_end]));
-    let words = body.flat_map(|l| l.split(u8::is_ascii_whitespace));
-    let words: BTreeSet<&[u8]> = words.filter(|w| w.len() >= KEY_TAIL_MIN).collect();
-    if words.is_empty() {
-        return vec![];
-    }
-    let rest = vec![(from, text.len())];
-    if words.len() > REPEATS_MAX {
-        return rest;
-    }
-    let patterns = words
-        .iter()
-        .map(|w| regex::escape(&String::from_utf8_lossy(w)))
-        .collect::<Vec<_>>()
-        .join("|");
-    match Regex::new(&format!("(?-u){patterns}")) {
-        Ok(search) => search
-            .find_iter(&text[from..])
-            .map(|m| (from + m.start(), from + m.end()))
-            .collect(),
-        Err(_) => rest,
-    }
+    blocks(text).iter().map(|b| (b.start, b.end)).collect()
 }
 
 /// `range` of `text` and every exact repeat of it: decoding opens the same
@@ -539,76 +407,12 @@ TsAXSDEff5ClOxPtM4GqAAAADXBlZXBob2xlLXRlc3Q=
     fn key_masked_by_marker_alone() {
         for text in [
             "head -----BEGIN OPENSSH PRIVATE KEY-----\nabc",
+            "head -----BEGIN RSA PRIVATE KEY-----\n!!! not a key !!!\n",
             "head -----BEGIN PRIVATE KEY",
         ] {
             let x = body(text.as_bytes());
             assert_eq!(mask_ranges(&x, 0), [(5, text.len())], "{text}");
         }
-    }
-
-    #[test]
-    fn a_key_with_no_end_stops_at_the_first_line_that_is_no_key_text() {
-        let begin = "-----BEGIN RSA PRIVATE KEY-----";
-        let line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU=";
-        for (tail, kept) in [
-            ("wget http://example.org/x", "wget http://example.org/x"),
-            ("' > /tmp/k; id", "' > /tmp/k; id"),
-            ("AAAA' > /tmp/k", "' > /tmp/k"),
-            ("AAAA > /tmp/k", " > /tmp/k"),
-            ("  \\", "\\"),
-        ] {
-            let text = format!("{begin}\n{line}\n{tail}\n");
-            let x = Xray::new(text.as_bytes());
-            let end = text.rfind(kept).unwrap();
-            assert_eq!(mask_ranges(&x, 0), [(0, end)], "{tail}");
-        }
-        // Written with `\n`, on the line of the marker, with PEM headers.
-        for (text, kept) in [
-            (format!("'{begin}\\n{line}\\nAA' > k; id"), "' > k; id"),
-            (format!("{begin} {line} AAAA | tee k"), "| tee k"),
-            (format!("{begin}{line}?x=1"), "?x=1"),
-            (
-                format!("{begin}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES,00\n\n{line}\nid x\n"),
-                "id x",
-            ),
-            (format!("{begin}%0A{line}%0AAA&a=b"), "&a=b"),
-        ] {
-            let x = Xray::new(text.as_bytes());
-            let start = text.find("-----").unwrap();
-            let end = text.rfind(kept).unwrap();
-            assert_eq!(mask_ranges(&x, 0), [(start, end)], "{text}");
-        }
-    }
-
-    #[test]
-    fn a_line_of_a_key_with_no_end_is_masked_where_it_comes_again() {
-        let line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU";
-        let key = format!("-----BEGIN RSA PRIVATE KEY-----\n{line}\n");
-        let text = format!("{key}sh /tmp/k {line}; id");
-        let at = text.rfind(line).unwrap();
-        let x = Xray::new(text.as_bytes());
-        assert_eq!(mask_ranges(&x, 0), [(0, key.len()), (at, at + line.len())]);
-        assert!(!masked(&text).contains(line), "{}", masked(&text));
-    }
-
-    #[test]
-    fn too_many_lines_mask_the_rest_of_the_text() {
-        let body: String = (0..300)
-            .map(|n| format!("AAAAAAAAAAAAAAAAAAAA{n}\n"))
-            .collect();
-        let key = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}");
-        let text = format!("{key}id x");
-        let x = Xray::new(text.as_bytes());
-        assert_eq!(mask_ranges(&x, 0), [(0, text.len())]);
-    }
-
-    #[test]
-    fn two_keys_with_no_end_are_both_masked() {
-        let a = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n";
-        let text = format!("{a}id x\n-----BEGIN EC PRIVATE KEY-----\nBBBB\n");
-        let x = Xray::new(text.as_bytes());
-        let second = text.find("-----BEGIN EC").unwrap();
-        assert_eq!(mask_ranges(&x, 0), [(0, a.len()), (second, text.len())]);
     }
 
     #[test]
