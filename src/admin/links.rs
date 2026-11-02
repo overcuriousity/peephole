@@ -681,8 +681,11 @@ mod tests {
         assert!(status.is_redirection());
         assert_eq!(headers["location"], "/login");
         assert_eq!(results_in(&st).await, 0);
-        let (status, _, _) =
-            send_form(&app, form(RESULTS, Some(&cookie), Some("same-origin"), body)).await;
+        let (status, _, _) = send_form(
+            &app,
+            form(RESULTS, Some(&cookie), Some("same-origin"), body),
+        )
+        .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(results_in(&st).await, 1);
     }
@@ -694,7 +697,9 @@ mod tests {
         use tower::ServiceExt;
         let r = app.clone().oneshot(req).await.unwrap();
         let (status, headers) = (r.status(), r.headers().clone());
-        let b = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, headers, String::from_utf8_lossy(&b).into_owned())
     }
 
@@ -705,7 +710,12 @@ mod tests {
         join(&st, hash).await;
         let (status, _, _) = send_form(
             &app,
-            form(RESULTS, Some(&cookie), Some("same-origin"), "family=Mirai&note=n"),
+            form(
+                RESULTS,
+                Some(&cookie),
+                Some("same-origin"),
+                "family=Mirai&note=n",
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
@@ -722,9 +732,16 @@ mod tests {
         let (st, cookie, app, _d) = app().await;
         let hash = seed(&st).await;
         join(&st, hash).await;
-        for body in ["sha256=zz", "family=", &format!("family={}", "f".repeat(65))] {
-            let (status, headers, _) =
-                send_form(&app, form(RESULTS, Some(&cookie), Some("same-origin"), body)).await;
+        for body in [
+            "sha256=zz",
+            "family=",
+            &format!("family={}", "f".repeat(65)),
+        ] {
+            let (status, headers, _) = send_form(
+                &app,
+                form(RESULTS, Some(&cookie), Some("same-origin"), body),
+            )
+            .await;
             assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
             assert!(
                 headers
@@ -743,13 +760,20 @@ mod tests {
         let hash = seed(&st).await;
         join(&st, hash).await;
         let body = "family=%3Cb%3Ex%3C%2Fb%3E&source_url=https%3A%2F%2Fexample.org%2Freport%3Fa%3D1&note=%3Cscript%3E";
-        send_form(&app, form(RESULTS, Some(&cookie), Some("same-origin"), body)).await;
+        send_form(
+            &app,
+            form(RESULTS, Some(&cookie), Some("same-origin"), body),
+        )
+        .await;
         let (_, html) = page(&cookie, &app, STAGER_PAGE).await;
         assert!(html.contains("hxxps://example[.]org/report?a=1"), "{html}");
         assert!(!html.contains("https://example.org/report"), "{html}");
         assert!(!html.contains("href=\"hxxp"));
-        assert!(!html.contains("<script>") && !html.contains("<b>x"), "{html}");
-        assert!(html.contains("&lt;b&gt;x"), "{html}");
+        assert!(
+            !html.contains("<script>") && !html.contains("<b>x"),
+            "{html}"
+        );
+        assert!(html.contains("&#60;b&#62;x"), "{html}");
     }
 
     #[tokio::test]
@@ -774,7 +798,10 @@ mod tests {
             .unwrap();
         let (status, html) = page(&cookie, &app, STAGER_PAGE).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("Mirai") && html.contains("Not seen"), "{html}");
+        assert!(
+            html.contains("Mirai") && html.contains("Not seen"),
+            "{html}"
+        );
         assert!(!html.contains("Add result"));
     }
 

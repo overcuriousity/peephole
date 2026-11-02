@@ -534,6 +534,15 @@ the trap. The `/api/v1` upload endpoints, the dossiers and the dataset export
 carry upload metadata only. Only the upload store reads the stored bytes
 (`upload_blobs`).
 
+**Sandbox results.** The node never fetches a payload. After you run one in
+an external sandbox, open the stager or file page (Evidence, Links) and use
+*Add result* with the SHA-256 (64 hex digits), family (64 characters), sandbox
+URL and note (2,000 characters each). The result fills the Payload stage of
+the whole chain, marked external. The URL is kept and shown as defanged text,
+never a link. Results stay on the node that holds them: they are not
+replicated or exported, and survive a recompute. A page whose sightings are
+gone still shows its results.
+
 **When the bytes are not there.** If there is no button, *Content* reads
 `content not held` followed by the reason (on the list, hover over it):
 
