@@ -119,3 +119,56 @@ Task 9: complete (commits 47d0730..cfa25d2, review clean), fast-forwarded into f
 Open for final pass: browser check of the strip in light, dark and narrow; query cost on a large chain; shell inputs are the union across a chain's profiles.
 
 Stopped 2026-11-01 at the user's request (machine off): agents for T10, T13, T14 and the T11 re-review stopped. WIP committed on ac/t10, ac/t13, ac/t14, unverified. Handoff: docs/superpowers/plans/2026-11-01-attack-chains-handoff.md
+Resumed 2026-11-02 on the same machine: all branches intact, T10, T13, T14 and the T11 re-review resumed from their commits.
+Task 13: implementer done e63c1cc + empty af26ebe on ac/t13; review next
+Task 10: implementer done ce87818 on ac/t10; review next
+Task 13: review needs fixes (1 important test, 2 minor page notes); fix round 1 sent.
+Task 10: review needs fixes (2 important, 2 minor); fix round 1 sent.
+Task 14: implementer done 542acf4 on ac/t14; review next
+Task 14: review approved; 2 small test additions sent.
+Task 11: fix round 1/5 re-review NOT clean: 2 critical (two addresses join two groups; a fresh value bypasses the 10 % rule), 4 important. Round 2 sent. Findings: task-11-findings-2.md
+Ruling: joiners only group addresses with no campaign and never merge, grow or shrink an existing group; values connect at max(k, 10 % of the LARGER value's loose namers); MAX_JOINERS_PER_IP 16; chains use the same threshold — each patch of the merge rule opened a new forgery, and the chain view already shows links across campaigns — costs a real link between two existing campaigns showing as a chain and a "not merged" edge rather than one campaign. This tightens the rule the user approved.
+Task 13: fix round 1/5 (3 addressed; commit fff401a, diff read by controller)
+Task 13: complete (commits cfa25d2..fff401a), merged into feat
+Task 14: complete (commits cfa25d2..f0737fa, review approved), merged into feat; CHANGELOG conflict resolved by keeping both sides.
+Task 10: fix round 1/5 implementer done 943cf37; merged into feat as dd2e3a3; quick re-review running.
+Task 10: fix round 1/5 (4 addressed, 0 open; commits ce87818..943cf37)
+Task 10: complete (commits cfa25d2..943cf37, review clean), merged into feat
+Task 11: fix round 2/5 implementer done ded626e; merge of feat and cleanups sent, forgery re-review after that.
+Ruling: stars inside existing groups stay merged = 0, so joiner_edges counts only joiner-formed campaigns and hard campaigns keep their evidence strength — costs a dossier not listing those rows, though its chains still show them.
+Ruling: cap rank includes each address's last time as well as the address set — otherwise a name could decide a tie — costs nothing.
+Task 11: implementer done 4ce9ca9, fast-forwarded into feat and pushed; forgery re-review of ded626e running beside T12. Temporary ac/ branches removed from GitHub.
+Open for final pass: Store::campaign loads every member; campaign_graph fetches all edge rows before stopping at GRAPH_EDGE_MAX.
+Task 11: fix round 2/5 forgery check: core rule holds by construction (no joiner can change a hard or soft group; independent of names and row order; 163+37 and the 11-address dropper work).
+Task 11: complete (commits 47d0730..4ce9ca9, one accepted limit)
+Ruling: the tenth protects a value, not a whole loose cloud, so 2 forged addresses can bridge two loose clouds through a thin value (5 for two 163+37 clouds); accepted — only addresses with no campaign are affected, it shows as claimed, and every further rule so far opened another hole — costs a possible false loose campaign. docs/detection.md:435 and src/admin/glossary.rs:79 must say this plainly (final pass).
+Task 12: implementer done b1e2ce6 on ac/t12; review next
+Task 12: complete (commits 4ce9ca9..b1e2ce6, review approved), fast-forwarded into feat and pushed.
+Open for final pass: flow band width uses pieces.sources, a global count, not this campaign's: scope it or say so in the lane note.
+Task 15: on the copy: 163-address campaign from one stager plus key (198 joiner edges), 12-address surge.sh stager, 22 chains (7 on 2+ addresses), tags apache 143, cve_2024_4577 32, .selfrep 8, php2shell 1, jaws 18; 223 campaigns, 6 joiner-formed, other campaigns unchanged. Remaining items checked by a subagent on the copy.
+Task 15: complete: items 1-8 pass on the copy; azure half of item 3 absent from the data; landed-path half of item 5 is covered by tests/uploads.rs; page times 70 ms campaign, 23 ms address, 1.2 s request (a pre-existing canary query). No browser here, so light, dark and narrow are unchecked.
+Ruling: X-ray original-bytes and layer panes stay undefanged as the evidence, already ruled at Task 5, reconfirmed.
+Final pass: 15 items in final-pass.md running on ac/fp beside the T16 audit.
+Task 16: audit committed 69775db (20 changes, 7 decisions); STOP for user approval before Tasks 17-19. Final pass still running on ac/fp.
+Task 16: complete; user approved the audit: decisions in phase2-decisions.md, item 3 pending, item 4 dropped, item 7 kept separate. The audit's description of Delete was wrong for cluster nodes: it appears only on standalone nodes.
+Task 16: user decided item 3: hide empty fact rows. Delete stays on standalone nodes.
+Task 17: implementer done 75106aa on ac/t17; rest of the audit's Task 17 table sent back.
+Task 17: implementer done 84afdd2, fast-forwarded into feat; quick review beside T18.
+Ruling: the frame is a crumb partial, h1, meta and actions stay per page — askama includes have no slots — costs less shared markup than planned.
+Task 17: complete (commits 69775db..84afdd2, review approved). Minors for T19: rename the import alias in admin_inbox.html that shares `c` with a loop variable, move .crumb rules before the media block.
+Task 18: implementer done 811556f on ac/t18; one weak test sent back.
+Final pass: 15 items done on ac/fp to 5dbaabb. 
+Ruling: revert item 7 (unended keys mask to end of text) — showing no key text outranks a missed fetch after a cut key — costs that fetch.
+Ruling: revert the array promotion in item 8 — a false join on credit links is worse than a missed stager — costs stagers given only in arrays.
+Final pass: complete (ac/fp to 5a9aa21): 15 items, items 7 and 8 reverted as ruled, merged into feat.
+Task 18: implementer done d2cd95f, merged into feat, quick review beside T19.
+Task 18: complete (commits 84afdd2..d2cd95f, review approved)
+Task 19: implementer done 3e916eb, fast-forwarded into feat and pushed. Task 20 starts: full suite and clippy.
+Task 19: complete (commit 3e916eb); its review folds into the final whole-branch review.
+Task 20: clippy found 5 trivial lints, to fix in the final fix wave; full suite and whole-branch review running.
+Task 20: full suite stopped at one guard failure: a test in src/store/chains.rs:2653 names upload_blobs. 2071 passed so far. Integration tests re-run with --no-fail-fast.
+Task 20: tests: 2071 lib and 267 integration pass; only the guard test fails. Final review: 1 critical (hourly chain pass unbounded in memory), 5 important, 18 minor. One fix wave running. Findings: final-review.md, rulings: final-fixes.md
+Ruling: raw value and url stay in API and dossiers beside defanged — scripts and sandboxes need them behind a scoped token — costs raw addresses in those JSON fields.
+Ruling: header parsing goes to the roadmap as next item — plan's Source has no headers — Shellshock-style payloads in User-Agent give no pieces yet.
+Ruling: joiner-formed campaigns stay out of the public tile — spec says public pages do not change — public counts miss them.
+Stopped 2026-11-02 at the user's request (machine off): final fix round stopped after 5 commits (d00f75e..67c2f00), unreviewed. See the handoff's Current state.

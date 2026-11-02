@@ -1,5 +1,33 @@
 # Attack chains: handoff
 
+**Current state, 2026-11-02. This replaces everything below where they differ.**
+
+Nothing is merged to master, no PR is open, nothing is released. All work is on `feat/attack-chains`. Tasks 1-19 are complete, and the temporary `ac/` branches are gone.
+
+Task 20 is in progress. Last full run, before the fix round: 2,071 unit and 267 integration tests passed; the one failure was the `upload_blobs` guard test.
+
+The final whole-branch review is `2026-11-01-attack-chains-final-review.md`, and its rulings are `2026-11-01-attack-chains-final-fixes.md`. Read both. The fix round was stopped when the machine had to go off. Its five commits are on the branch, unreviewed, and targeted tests were not confirmed after the last of them:
+
+- d00f75e: clippy lints, I1 guard test, stale names
+- 3c134a5: I2
+- 445c804: M1, M2, M13 as far as its message says
+- 43fb284: C1
+- 67c2f00: I4
+
+**Next:**
+1. Compare `git log 3e916eb..HEAD` with the findings. Finish what is left: at least I3, I5 and most Minors. Check each done item, because no report was written.
+2. Re-review the fix range, quickly and targeted.
+3. Run `cargo clippy --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, then `cargo test --locked --no-fail-fast`, alone.
+4. Open the one PR, watch checks, merge, cut the one release: Task 20 in the plan. The user asked for this; the PR body names the campaign `#N` change and first-start backfill.
+
+**User decisions since the older text below:** joiners never change an existing campaign; interface decisions are in the plan's Task 16 audit, `docs/superpowers/specs/2026-11-02-interface-audit.md`, as agreed: headers collapsed, Labels as header chips, empty fact rows hidden, back link on request and IP pages, page titles match nav labels, "Security keys" stays separate, the delete card stays on standalone nodes.
+
+**Not possible here:** no browser on this machine, so light, dark and narrow screens are unchecked. If the next machine has one, check the strip, flow map, X-ray and request page.
+
+---
+
+## Older notes, from 2026-11-01
+
 Written 2026-11-01 when the machine had to be switched off. Work stopped mid-plan. Nothing is merged to master, no PR is open and nothing is released.
 
 Read these first, in this order:
