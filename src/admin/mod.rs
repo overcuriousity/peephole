@@ -16,6 +16,7 @@ pub mod decoys;
 pub mod devices;
 pub mod dossier;
 pub mod error;
+pub mod flow;
 pub mod glossary;
 pub mod limit;
 pub mod links;

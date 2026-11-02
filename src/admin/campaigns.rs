@@ -211,6 +211,8 @@ struct CampaignPage {
     props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
     /// Every chain of its members.
     strips: crate::admin::chains::Strips,
+    /// The same chains as a flow map; empty without one.
+    flow: crate::admin::flow::FlowView,
 }
 
 /// Wave lines on a campaign's page, at most.
@@ -328,8 +330,10 @@ async fn campaign(
         crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
             .await?;
     let strips = crate::admin::chains::of_campaign(&st, &key).await?;
+    let flow = crate::admin::flow::flow(&strips.chains);
     render(&CampaignPage {
         strips,
+        flow,
         props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),
@@ -413,6 +417,80 @@ mod tests {
         assert!(row.contains(">agent traces</span>"), "{row}");
         assert!(camp.contains("class=\"campaign-strength"), "{camp}");
         assert!(!page("/ip/192.0.2.2").await.contains("badge-agent"));
+    }
+
+    /// A stager and an exploit sighted in a member's first request.
+    async fn seed_chain(st: &crate::admin::AdminState, ip: &str) {
+        use crate::store::pieces::piece_hash;
+        let (ip_id, id): (i64, i64) = sqlx::query_as(
+            "SELECT i.id, (SELECT MIN(id) FROM requests WHERE ip_id = i.id)
+             FROM ips i WHERE i.ip = ?",
+        )
+        .bind(ip)
+        .fetch_one(&st.store.pool)
+        .await
+        .unwrap();
+        for (kind, value, grade) in [
+            ("stager", "x.example.org", "claimed"),
+            ("exploit", "POST /a", "seen"),
+        ] {
+            let hash = piece_hash(kind, value);
+            sqlx::query(
+                "INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+                 VALUES (?, ?, ?, '2026-10-01 00:00:00', '2026-10-01 00:00:00', 1, 4)",
+            )
+            .bind(hash)
+            .bind(kind)
+            .bind(value)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO piece_sightings VALUES (?, 'request', ?, ?, ?, ?, '2026-10-01 00:00:00')",
+            )
+            .bind(hash)
+            .bind(id)
+            .bind(ip_id)
+            .bind(kind)
+            .bind(grade)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        }
+        st.store.recompute_campaigns(true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn campaign_page_has_flow_above_members() {
+        let (state, cookie, app, _d) = app().await;
+        feed(&state.store, fixture()).await;
+        state.store.recompute_campaigns(true).await.unwrap();
+        seed_chain(&state, "192.0.2.1").await;
+        let r = Request::get("/admin/evidence/campaigns/192.0.2.3")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", &cookie);
+        let (st, _, html) = send(&app, r, Body::empty()).await;
+        assert_eq!(st, StatusCode::OK);
+        let flow = html.find("data-section=\"flow\"").expect("the flow map");
+        assert!(flow < html.find("<h2>Members</h2>").unwrap(), "{html}");
+        assert!(html.contains("<svg class=\"flow\""), "{html}");
+        assert!(html.contains("x[.]example[.]org"), "{html}");
+        let map = &html[flow..html.find("data-section=\"chains\"").unwrap()];
+        assert!(!map.contains("x.example.org"), "never a raw address: {map}");
+    }
+
+    #[tokio::test]
+    async fn campaign_without_chains_has_no_flow() {
+        let (state, cookie, app, _d) = app().await;
+        feed(&state.store, fixture()).await;
+        state.store.recompute_campaigns(true).await.unwrap();
+        let r = Request::get("/admin/evidence/campaigns/192.0.2.3")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", &cookie);
+        let (st, _, html) = send(&app, r, Body::empty()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(!html.contains("flow-card") && !html.contains("<svg class=\"flow\""));
+        assert!(!html.contains("Attack flow"), "{html}");
     }
 
     #[tokio::test]

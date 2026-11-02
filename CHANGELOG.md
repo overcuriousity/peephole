@@ -6,6 +6,11 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- Campaign pages open with a flow map: each attack chain as bands sized by
+  requests through Exploit, Command, Delivery, Payload and Follow-up, in
+  server-rendered SVG (light and dark, no script). Seen, claimed, external,
+  gap and dead end differ by line style and are also written out; a stage
+  groups past 12 pieces into "n more", and a table view lists every row.
 - Campaigns join on stagers, SSH keys and uploaded files as claimed edges
   (clustering v3; migration 0053 adds `campaign_edges.merged` and
   `campaigns.joiner_edges`). Addresses naming one stager form a campaign,

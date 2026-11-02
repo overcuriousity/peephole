@@ -279,3 +279,29 @@ td.nowrap { white-space: nowrap; }
   table.stack-narrow.devices > tbody > tr > td.act { grid-column: 2; grid-row: 1 / span 5; align-self: start; }
   table.stack-narrow.devices > tbody > tr > td[data-label]::before { content: attr(data-label) " "; color: var(--color-fg-muted); font-family: var(--font-sans); }
 }
+
+/* ---- Flow map (campaign page) ---------------------------------------- */
+/* Bands and boxes say how far a row is confirmed by line style, and the
+   box's second line says it in words: seen solid, claimed dashed, external
+   heavy, gap hatched, dead end in the danger colour. */
+.flow-scroll { overflow-x: auto; }
+.flow { display: block; max-width: none; font-family: var(--font-sans); }
+.flow-hatch-bg { fill: var(--color-bg-inset); }
+.flow-hatch-line { stroke: var(--color-border-strong); stroke-width: 1.5; }
+.flow-col { fill: var(--color-fg-muted); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+.flow-lane { fill: var(--color-fg-secondary); font-size: 12px; font-family: var(--font-mono); }
+.flow-label { fill: var(--color-fg-primary); font-size: 11px; font-family: var(--font-mono); }
+.flow-sub { fill: var(--color-fg-secondary); font-size: 10px; }
+.flow-band { fill: var(--color-accent); fill-opacity: 0.28; stroke: var(--color-accent); stroke-width: 1; }
+.flow-band.claimed { fill-opacity: 0.12; stroke-dasharray: 5 3; }
+.flow-band.external { stroke-width: 2.5; }
+.flow-band.gap { fill: url(#flow-hatch); fill-opacity: 1; stroke: var(--color-border-strong); stroke-dasharray: 2 3; }
+.flow-band.dead-end { fill: var(--color-danger); fill-opacity: 0.2; stroke: var(--color-danger); }
+.flow-box rect { fill: var(--color-bg-inset); stroke: var(--color-border-strong); stroke-width: 1; }
+.flow-box.claimed rect { stroke-dasharray: 5 3; }
+.flow-box.external rect { stroke-width: 3; }
+.flow-box.gap rect { fill: url(#flow-hatch); stroke: var(--color-border); }
+.flow-box.dead-end rect { stroke: var(--color-danger); }
+.flow-box.dead-end .flow-sub { fill: var(--color-danger); }
+.flow-table { margin-top: 0.6rem; }
+.flow-table > summary { cursor: pointer; font-size: var(--text-sm); }

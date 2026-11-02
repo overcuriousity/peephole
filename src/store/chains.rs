@@ -516,6 +516,10 @@ pub struct StageRow {
     /// The anchor is a source, and did not use this stage.
     pub dim: bool,
     pub href: Option<String>,
+    /// How many requests (or uploads) stand behind it; 0 where it is a
+    /// label only, such as a gap or an entered result. The flow map sizes
+    /// its bands by it.
+    pub requests: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +589,8 @@ struct Found {
     role: String,
     seen: bool,
     ips: i64,
+    /// Requests and uploads that named it.
+    sources: i64,
 }
 
 impl Found {
@@ -634,6 +640,7 @@ fn row(label: String, detail: String, mark: Mark) -> StageRow {
         here: false,
         dim: false,
         href: None,
+        requests: 0,
     }
 }
 
@@ -642,6 +649,7 @@ fn piece_row(p: &Found, detail: String, here: &Here) -> StageRow {
         piece: Some(p.hash),
         here: here.pieces.contains(&p.hash),
         href: p.href(),
+        requests: p.sources,
         ..row(label(&p.value), detail, p.mark())
     }
 }
@@ -692,6 +700,7 @@ fn exploit_rows(found: &[Found], tags: &[(i64, i64)], here: &Here) -> Vec<StageR
         let mut r = piece_row(tags[0], detail, here);
         r.label = label(stem);
         r.here = used || tags.iter().any(|t| here.pieces.contains(&t.hash));
+        r.requests = tags.iter().map(|t| t.sources).sum();
         rows.push(r);
     }
     let bare = exploits.values().filter(|e| !tagged.contains(&e.hash));
@@ -768,6 +777,7 @@ fn payload_rows(
                 .find(|p| p.role == "file" && p.value == u.hash());
             StageRow {
                 piece: piece.map(|p| p.hash),
+                requests: same.len() as i64,
                 here: same.iter().any(|u| here.uploads.contains(&u.uid))
                     || piece.is_some_and(|p| here.pieces.contains(&p.hash)),
                 href: Some(format!(
@@ -874,6 +884,7 @@ fn request_rows(
     }
     let rows = sent.into_iter().map(|(r, text, n, used)| StageRow {
         here: used,
+        requests: n,
         href: Some(format!("/admin/requests/{}", r.id)),
         ..row(text, detail(r, n), mark)
     });
@@ -1073,6 +1084,7 @@ fn follow_up_rows(uploads: &[UploadRow], f: &FollowUps, here: &Here) -> Vec<Stag
     if f.unread > 0 {
         let more = count(f.unread, "more request", "more requests");
         rows.push(StageRow {
+            requests: f.unread,
             href: uploads.first().map(|u| {
                 let uid = crate::admin::public::urlencode(&u.uid);
                 format!("/admin/traps/uploads/{uid}")
@@ -1180,13 +1192,13 @@ async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Op
     // other joiners, then what most addresses share.
     let found: Vec<Found> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "WITH top AS (
-           SELECT p.hash, p.kind, p.value, p.ips
+           SELECT p.hash, p.kind, p.value, p.ips, p.sources
            FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
            WHERE m.chain = ?1
            ORDER BY p.hash IS ?2 DESC, p.kind IN ('stager', 'key', 'file') DESC,
                     p.ips DESC, p.value
            LIMIT ?3)
-         SELECT t.hash, t.kind, t.value, g.role, MAX(g.grade = 'seen') AS seen, t.ips
+         SELECT t.hash, t.kind, t.value, g.role, MAX(g.grade = 'seen') AS seen, t.ips, t.sources
          FROM top t JOIN piece_sightings g ON g.piece = t.hash
          WHERE g.role IN {STRIP_ROLES}
          GROUP BY t.hash, g.role ORDER BY t.value"
@@ -1269,6 +1281,7 @@ struct SourcePiece {
     value: String,
     role: String,
     ips: i64,
+    sources: i64,
 }
 
 /// What these sources hold: their pieces, each exploit and tag that shared
@@ -1279,7 +1292,7 @@ async fn read_sources(
 ) -> Result<Option<(Vec<Found>, Vec<(i64, i64)>, Span)>> {
     let rows: Vec<SourceSighting> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT g.source_kind, g.source_id, g.ip_id, g.ts, g.grade,
-                p.hash, p.kind, p.value, g.role, p.ips
+                p.hash, p.kind, p.value, g.role, p.ips, p.sources
          FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
          WHERE g.role IN {STRIP_ROLES} AND {}",
         sources_in(sources)
@@ -1312,6 +1325,7 @@ async fn read_sources(
                 role: p.role,
                 seen,
                 ips: p.ips,
+                sources: p.sources,
             });
     }
     if found.is_empty() {
@@ -2789,6 +2803,7 @@ mod tests {
             role: "recipe".into(),
             seen: true,
             ips: 1,
+            sources: 1,
         };
         let found = [
             p("input=$_GET[a],$_POST[b];exec=system;marker=x"),
