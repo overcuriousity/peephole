@@ -62,7 +62,8 @@ pub enum LayerKind {
     Php,
     PhpCgi,
     Base64,
-    Gzip,
+    /// Gzip, zlib or raw deflate, inflated.
+    Compressed,
     Hex,
     Escapes,
     Shell,
@@ -162,6 +163,9 @@ pub struct Budget {
     seen: std::collections::HashMap<u64, usize>,
     /// Off for a layer that is kept under a second name.
     dedupe: bool,
+    /// Layers whose output a shell runs. Kept across layers: such a layer
+    /// may be read after the one that runs it.
+    run_output: Vec<usize>,
 }
 
 impl Default for Budget {
@@ -174,6 +178,7 @@ impl Default for Budget {
             steps: MAX_STEPS,
             seen: std::collections::HashMap::new(),
             dedupe: true,
+            run_output: Vec::new(),
         }
     }
 }

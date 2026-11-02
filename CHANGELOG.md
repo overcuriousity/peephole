@@ -6,6 +6,22 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- The body X-ray and chains read more closely: each line of a base64 run that
+  does not read as one is tried alone, a payload split over padding-looking
+  fields is joined, and multipart boundaries are found behind a preamble.
+  What follows a private key's `END` marker is read. A key with no `END`
+  marker stays masked to the end of the text, so a fetch after it is missed
+  rather than risk showing key text. A URL handed to a function's parameter
+  that `copy()` reads is a stager; URLs in PHP arrays stay queried, as they are
+  often credit links. Decompressed layers are titled *Compressed*, `compressed`
+  in the API, as they may be gzip, zlib or deflate. `cat "$(…)"` no longer
+  counts as running the fetched output.
+- A recipe's label keeps both branches (`scp → run → else wget || curl → sh`).
+  A follow-up reads the inputs of the webshell it was sent to, not of every
+  shell in the chain. Band widths and row counts cover the chain's own
+  sources. A campaign loads its first 500 members, and its page says so past
+  that. A stager page for a host that was only queried says so, with its
+  sightings count.
 - Campaign pages open with a flow map: each attack chain as bands sized by
   requests through Exploit, Command, Delivery, Payload and Follow-up, in
   server-rendered SVG (light and dark, no script). Seen, claimed, external,

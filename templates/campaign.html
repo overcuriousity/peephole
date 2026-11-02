@@ -19,7 +19,7 @@
 {% include "_chain_flow.html" %}
 {% include "_chain_strip.html" %}
 <section class="card">
-  <div class="card-head"><h2>Members</h2></div>
+  <div class="card-head"><h2>Members</h2>{% if c.row.size > c.members.len() as i64 %}<span class="muted">first {{ c.members.len() }} of {{ crate::admin::views::thousands(c.row.size) }}</span>{% endif %}</div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>
   {% for m in c.members %}<tr>
     <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a>{% if let Some(p) = props.get(m.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", m.ip) %}{% include "_ip_props.html" %}{% endif %}</td>

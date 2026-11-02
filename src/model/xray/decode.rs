@@ -1,7 +1,8 @@
 //! The decoders: find encoded runs in a layer's text and open them as child
 //! layers. Candidates come from `regex::bytes`, which does not backtrack,
 //! and overlaps are tracked in a bitmap, so a layer costs time linear in
-//! its size (times a small constant for the base64 retries).
+//! its size (times a small constant for the base64 retries, which each line
+//! of a run that does not read as one gets once more).
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -10,7 +11,9 @@ use std::sync::LazyLock;
 use data_encoding::{Encoding, HEXLOWER_PERMISSIVE, Specification};
 use regex::bytes::Regex;
 
-use super::{Budget, Layer, LayerKind, MAX_LAYERS, MAX_OUTPUT, Opaque, OpaqueReason, Span, Xray};
+use super::{
+    Budget, Layer, LayerKind, MAX_LAYERS, MAX_OUTPUT, Opaque, OpaqueReason, Span, Xray, key,
+};
 
 /// Shortest base64 run looked at, and shortest hex run (characters).
 const B64_MIN: usize = 16;
@@ -103,8 +106,8 @@ fn scan(xray: &mut Xray, at: usize, text: &[u8], budget: &mut Budget, queue: &mu
         }
     }
     let mut taken = vec![false; text.len()];
-    let decoders: [Decoder; 4] = [percent, backslash_x, hex, base64];
-    let regexes: [&Regex; 4] = [&PERCENT, &BACKSLASH_X, &HEX, &B64];
+    let decoders: [Decoder; 3] = [percent, backslash_x, hex];
+    let regexes: [&Regex; 3] = [&PERCENT, &BACKSLASH_X, &HEX];
     for (decoder, regex) in decoders.iter().zip(regexes) {
         for m in regex.find_iter(text) {
             if saturated(xray, budget) {
@@ -114,25 +117,42 @@ fn scan(xray: &mut Xray, at: usize, text: &[u8], budget: &mut Budget, queue: &mu
             if taken[start..end].iter().any(|&t| t) {
                 continue;
             }
-            let Some(found) = decoder(text, start, end) else {
-                continue;
-            };
-            let skip = match found {
-                Found::Open { skip, .. } | Found::Opaque(_, skip) => skip,
-            };
-            let at_span = Span {
-                layer: at,
-                start: start + skip,
-                end,
-            };
-            taken[start..end].fill(true);
-            match found {
-                Found::Opaque(reason, _) => push_opaque(xray, at_span, reason),
-                Found::Open { kind, bytes, .. } => {
-                    open(xray, at, kind, at_span, bytes, budget, queue)
-                }
+            if let Some(found) = decoder(text, start, end) {
+                taken[start..end].fill(true);
+                record(xray, at, (start, end), found, budget, queue);
             }
         }
+    }
+    for m in B64.find_iter(text) {
+        for (range, found) in base64(text, (m.start(), m.end()), &taken) {
+            if saturated(xray, budget) {
+                return;
+            }
+            record(xray, at, range, found, budget, queue);
+        }
+    }
+}
+
+/// Note what was found at `start..end` of layer `at`.
+fn record(
+    xray: &mut Xray,
+    at: usize,
+    (start, end): (usize, usize),
+    found: Found,
+    budget: &mut Budget,
+    queue: &mut VecDeque<usize>,
+) {
+    let skip = match found {
+        Found::Open { skip, .. } | Found::Opaque(_, skip) => skip,
+    };
+    let span = Span {
+        layer: at,
+        start: start + skip,
+        end,
+    };
+    match found {
+        Found::Opaque(reason, _) => push_opaque(xray, span, reason),
+        Found::Open { kind, bytes, .. } => open(xray, at, kind, span, bytes, budget, queue),
     }
 }
 
@@ -274,7 +294,7 @@ fn open_compressed(
     let over = out.len() > limit;
     out.truncate(limit);
     if !out.is_empty() {
-        open(xray, parent, LayerKind::Gzip, at, out, budget, queue);
+        open(xray, parent, LayerKind::Compressed, at, out, budget, queue);
     }
     if over {
         push_opaque(xray, at, OpaqueReason::OverLimit);
@@ -321,11 +341,9 @@ fn entropy(bytes: &[u8]) -> f64 {
         .sum()
 }
 
-/// Decode one base64 attempt: line breaks dropped, padding cut, both
-/// alphabets read as one.
-fn try_base64(run: &[u8]) -> Option<Found> {
-    let clean: Vec<u8> = run
-        .iter()
+/// A base64 run as one alphabet: line breaks dropped, padding cut.
+fn base64_text(run: &[u8]) -> Vec<u8> {
+    run.iter()
         .copied()
         .filter(|&b| b != b'\r' && b != b'\n')
         .take_while(|&b| b != b'=')
@@ -334,7 +352,12 @@ fn try_base64(run: &[u8]) -> Option<Found> {
             b'_' => b'/',
             b => b,
         })
-        .collect();
+        .collect()
+}
+
+/// Decode one base64 attempt.
+fn try_base64(run: &[u8]) -> Option<Found> {
+    let clean = base64_text(run);
     if clean.len() < B64_MIN || clean.len() % 4 == 1 {
         return None;
     }
@@ -359,10 +382,9 @@ fn with_skip(found: Found, skip: usize) -> Found {
     }
 }
 
-fn base64(text: &[u8], start: usize, end: usize) -> Option<Found> {
-    let run = &text[start..end];
-    // The whole run, then the payload behind a path-like prefix, then the
-    // first line alone (when what follows it is not base64 after all).
+/// The best reading of `run`, whole or behind a path-like prefix, and how
+/// much junk it holds. Opaque counts as all junk.
+fn read_base64(run: &[u8]) -> Option<(usize, Found)> {
     let mut starts = vec![0];
     starts.extend(
         run.iter()
@@ -373,13 +395,8 @@ fn base64(text: &[u8], start: usize, end: usize) -> Option<Found> {
     );
     let mut opaque = None;
     let mut best: Option<(usize, Found)> = None;
-    let first_line = run.iter().position(|&b| b == b'\n').map(|n| &run[..n]);
-    let attempts = starts
-        .iter()
-        .map(|&s| (s, &run[s..]))
-        .chain(first_line.map(|l| (0, l)));
-    for (skip, part) in attempts {
-        match try_base64(part) {
+    for skip in starts {
+        match try_base64(&run[skip..]) {
             // A misaligned start still decodes to a little junk before the
             // payload; the attempt with the least junk is the right one.
             Some(Found::Open { kind, bytes, .. }) => {
@@ -396,7 +413,78 @@ fn base64(text: &[u8], start: usize, end: usize) -> Option<Found> {
             _ => {}
         }
     }
-    best.map(|(_, found)| found).or(opaque)
+    best.or(opaque.map(|found| (usize::MAX, found)))
+}
+
+/// The lines of the run at `start..end` of `text`, without their line ends.
+fn run_lines(text: &[u8], (start, end): (usize, usize)) -> Vec<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut from = start;
+    for line in text[start..end].split(|&b| b == b'\n') {
+        let to = from + line.len();
+        lines.push((from, to - usize::from(line.ends_with(b"\r"))));
+        from = to + 1;
+    }
+    lines
+}
+
+/// A private key in the run, read at each alignment, as noise in front of it
+/// shifts it. Its lines stay one run: alone, a line of its body would open as
+/// plain text behind no marker, with nothing to mask it.
+fn holds_key(run: &[u8]) -> bool {
+    let clean = base64_text(run);
+    (0..4).any(|skip| {
+        let part = clean.get(skip..).unwrap_or_default();
+        let part = &part[..part.len() - usize::from(part.len() % 4 == 1)];
+        BASE64_LENIENT
+            .decode(part)
+            .is_ok_and(|bytes| key::marker_start(&bytes).is_some())
+    })
+}
+
+/// What the run at `range` of `text` holds. The whole run comes first: one
+/// that reads clean is wrapped text. Otherwise what follows a line may be no
+/// part of it, so each line is read alone, and the lines win when they hold
+/// less junk. Lines another decoder took are left out; a run that holds a
+/// key is not cut up.
+fn base64(text: &[u8], range: (usize, usize), taken: &[bool]) -> Vec<((usize, usize), Found)> {
+    let (start, end) = range;
+    let run = &text[start..end];
+    let free = |(s, e): (usize, usize)| !taken[s..e].iter().any(|&t| t);
+    let whole = if free(range) { read_base64(run) } else { None };
+    let lines = run_lines(text, range);
+    let clean = matches!(whole, Some((0, _)));
+    if lines.len() < 2 || clean {
+        return whole.map(|(_, found)| (range, found)).into_iter().collect();
+    }
+    if holds_key(run) {
+        let (s, e) = lines[0];
+        let first = read_base64(&text[s..e]).filter(|_| free(range));
+        let junk = |read: &Option<(usize, Found)>| read.as_ref().map_or(usize::MAX, |r| r.0);
+        let best = if junk(&first) < junk(&whole) {
+            first
+        } else {
+            whole
+        };
+        return best.map(|(_, found)| (range, found)).into_iter().collect();
+    }
+    let (mut hits, mut junk) = (Vec::new(), 0usize);
+    for line in lines.into_iter().filter(|&l| free(l)) {
+        let (s, e) = line;
+        match read_base64(&text[s..e]) {
+            Some((j, found @ Found::Open { .. })) => {
+                junk = junk.saturating_add(j);
+                hits.push((line, found));
+            }
+            // A short line is the tail of something, not a token.
+            _ if e - s >= B64_MIN => junk += (e - s) / 4 * 3,
+            _ => {}
+        }
+    }
+    match whole {
+        Some((least, found)) if hits.is_empty() || least <= junk => vec![(range, found)],
+        _ => hits,
+    }
 }
 
 fn hex(text: &[u8], start: usize, end: usize) -> Option<Found> {
@@ -517,7 +605,7 @@ mod tests {
         let x = run(&b64(&gzip(CMD)));
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, CMD);
         assert_eq!(x.layers[2].parent, Some(1));
@@ -567,7 +655,11 @@ mod tests {
         // Behind base64, the encoded bomb counts against the same total.
         let x = run(&b64(&bomb));
         assert!(decoded_total(&x) <= 256 * 1024);
-        let gz = x.layers.iter().find(|l| l.kind == LayerKind::Gzip).unwrap();
+        let gz = x
+            .layers
+            .iter()
+            .find(|l| l.kind == LayerKind::Compressed)
+            .unwrap();
         assert!(gz.text.len() <= 256 * 1024);
         assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
     }
@@ -668,12 +760,12 @@ mod tests {
     #[test]
     fn zlib_opens_raw_and_after_base64() {
         let x = run(&zlib(CMD));
-        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Gzip]);
+        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Compressed]);
         assert_eq!(x.layers[1].text, CMD);
         let x = run(&b64(&zlib(CMD)));
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, CMD);
     }
@@ -716,7 +808,7 @@ mod tests {
         let x = run(&e.finish().unwrap());
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Gzip, LayerKind::Base64]
+            [LayerKind::Raw, LayerKind::Compressed, LayerKind::Base64]
         );
     }
 
@@ -770,9 +862,96 @@ mod tests {
         let x = run(&wrapped);
         assert_eq!(
             kinds(&x),
-            [LayerKind::Raw, LayerKind::Base64, LayerKind::Gzip]
+            [LayerKind::Raw, LayerKind::Base64, LayerKind::Compressed]
         );
         assert_eq!(x.layers[2].text, varied_text(40));
+    }
+
+    #[test]
+    fn a_token_on_the_line_after_noise_is_read() {
+        // Its length is no multiple of 4, so the two never read as one.
+        let noise = "Zk3pQ9xLm2Vb7TnR4sYd8WcA1uHe6JgFq";
+        let body = [noise.as_bytes(), b"\n", b64(CMD).as_slice()].concat();
+        let x = run(&body);
+        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Base64]);
+        assert_eq!(x.layers[1].text, CMD);
+        assert_eq!(x.layers[1].from.unwrap().start, noise.len() + 1);
+        assert_eq!(x.layers[1].from.unwrap().end, body.len());
+    }
+
+    #[test]
+    fn two_tokens_on_two_lines_both_open() {
+        let (a, b) = (&b"echo first token!"[..], &b"echo the other one"[..]);
+        assert_ne!(b64(a).len() % 4, 0);
+        let body = [b64(a), b64(b)].join(&b'\n');
+        let x = run(&body);
+        assert_eq!(x.layers.len(), 3, "{:?}", x.layers);
+        assert_eq!(x.layers[1].text, a);
+        assert_eq!(x.layers[2].text, b);
+        assert_eq!(x.layers[1].from.unwrap().end, b64(a).len());
+    }
+
+    #[test]
+    fn a_token_after_a_line_another_decoder_took_is_read() {
+        let hex = data_encoding::HEXLOWER.encode(b"echo this was hex text");
+        let body = [hex.as_bytes(), b"\n", b64(CMD).as_slice()].concat();
+        let x = run(&body);
+        assert_eq!(
+            kinds(&x),
+            [LayerKind::Raw, LayerKind::Hex, LayerKind::Base64]
+        );
+        assert_eq!(x.layers[2].text, CMD);
+    }
+
+    #[test]
+    fn a_tail_that_is_no_token_keeps_the_first_line() {
+        let body = [b64(CMD).as_slice(), b"\nabc"].concat();
+        let x = run(&body);
+        assert_eq!(kinds(&x), [LayerKind::Raw, LayerKind::Base64]);
+        assert_eq!(x.layers[1].text, CMD);
+    }
+
+    #[test]
+    fn wrapped_binary_stays_one_run() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        let enc = b64(&noise);
+        let x = run(&enc.chunks(76).collect::<Vec<_>>().join(&b'\n'));
+        assert_eq!(x.layers.len(), 1);
+        assert_eq!(x.opaque.len(), 1);
+        assert_eq!(x.opaque[0].reason, OpaqueReason::HighEntropy);
+    }
+
+    /// Fake key text, printable, so that a line of it alone would open. A
+    /// stray character keeps the run from reading as one.
+    #[test]
+    fn a_wrapped_key_is_not_cut_into_lines() {
+        let body = "ThisIsNotAKeyOnlyTextOfTheShapeOfOne".repeat(4);
+        let pem =
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\n");
+        let mut enc = b64(pem.as_bytes());
+        while enc.len() % 4 != 0 {
+            enc.push(b'A');
+        }
+        enc.push(b'A');
+        let wrapped = enc.chunks(40).collect::<Vec<_>>().join(&b'\n');
+        let x = run(&wrapped);
+        for l in &x.layers[1..] {
+            let text = String::from_utf8_lossy(&l.text);
+            assert!(
+                !text.contains("OnlyText") || text.contains("BEGIN"),
+                "{text}"
+            );
+        }
+        let masks = key::all_masks(&x);
+        assert_eq!(masks[0], [(0, wrapped.len())]);
     }
 
     #[test]

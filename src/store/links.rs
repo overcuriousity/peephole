@@ -891,22 +891,19 @@ impl Store {
         let mut g = LinkGraph::default();
         let ips: Vec<String> = sqlx::query_scalar(
             "SELECT i.ip FROM campaign_members m JOIN ips i ON i.id = m.ip_id
-             WHERE m.campaign_key = ?1 ORDER BY i.ip <> ?1, i.ip",
+             WHERE m.campaign_key = ?1 ORDER BY i.ip <> ?1, i.ip LIMIT ?2",
         )
         .bind(key)
+        .bind(GRAPH_MAX as i64 + 1)
         .fetch_all(&self.read)
         .await?;
-        let mut ids = std::collections::HashSet::new();
         for ip in ips {
             if g.nodes.len() >= GRAPH_MAX {
                 g.truncated = true;
                 break;
             }
             let hop = u32::from(ip != key);
-            if let Some(node) = self.graph_node(&Focus::Ip(ip), hop).await? {
-                ids.insert(node.id.clone());
-                g.nodes.push(node);
-            }
+            g.nodes.extend(self.graph_node(&Focus::Ip(ip), hop).await?);
         }
         type Row = (
             String,
@@ -918,24 +915,28 @@ impl Store {
             i64,
             Option<f64>,
         );
+        // Only edges between drawn members count, so those are what the
+        // limit applies to; one more says it was reached.
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support,
+            "WITH drawn AS (
+               SELECT m.ip_id FROM campaign_members m JOIN ips i ON i.id = m.ip_id
+               WHERE m.campaign_key = ?1 ORDER BY i.ip <> ?1, i.ip LIMIT ?2)
+             SELECT ia.ip, ib.ip, e.kind, e.value, e.score, e.shared, e.fp_support,
                     e.agreement
              FROM campaign_edges e
-             JOIN campaign_members m ON m.ip_id = e.a
+             JOIN drawn da ON da.ip_id = e.a JOIN drawn db ON db.ip_id = e.b
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
-             WHERE m.campaign_key = ?
              ORDER BY e.kind = 'paths', e.kind IN ('stager', 'key', 'file'), e.score DESC,
-                      ia.ip, ib.ip, e.kind, e.value",
+                      ia.ip, ib.ip, e.kind, e.value
+             LIMIT ?3",
         )
         .bind(key)
+        .bind(GRAPH_MAX as i64)
+        .bind(GRAPH_EDGE_MAX as i64 + 1)
         .fetch_all(&self.read)
         .await?;
         for (a, b, kind, value, score, shared, fp, agreement) in rows {
             let (a, b) = (format!("ip:{a}"), format!("ip:{b}"));
-            if !ids.contains(&a) || !ids.contains(&b) {
-                continue;
-            }
             if g.edges.len() >= GRAPH_EDGE_MAX {
                 g.truncated = true;
                 break;

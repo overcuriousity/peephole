@@ -276,7 +276,7 @@ fn layer_title(kind: LayerKind) -> &'static str {
         LayerKind::Php => "PHP string",
         LayerKind::PhpCgi => "PHP-CGI body",
         LayerKind::Base64 => "base64",
-        LayerKind::Gzip => "decompressed",
+        LayerKind::Compressed => "Compressed",
         LayerKind::Hex => "hex",
         LayerKind::Escapes => "escapes",
         LayerKind::Shell => "shell text",

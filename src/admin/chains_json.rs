@@ -256,7 +256,7 @@ fn layer_kind(k: LayerKind) -> &'static str {
         LayerKind::Php => "php",
         LayerKind::PhpCgi => "php_cgi",
         LayerKind::Base64 => "base64",
-        LayerKind::Gzip => "gzip",
+        LayerKind::Compressed => "compressed",
         LayerKind::Hex => "hex",
         LayerKind::Escapes => "escapes",
         LayerKind::Shell => "shell",

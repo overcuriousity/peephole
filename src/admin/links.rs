@@ -157,6 +157,8 @@ struct LinkPage {
     urls: Vec<StagerUrl>,
     /// `ip` pages: the address is stored.
     ip_seen: bool,
+    /// A stager page: sightings that only queried it.
+    queried: i64,
     /// A piece's chain, or the sources sharing it.
     strips: Strips,
     /// Sandbox results entered for a stager or file.
@@ -220,6 +222,7 @@ async fn item(
     let mut strips = Strips::default();
     let mut results = vec![];
     let mut can_add_result = false;
+    let mut queried = 0;
     let (kind_name, value, shown, item, ip_seen) = if kind == "ip" {
         let addr = canonical_ip(&value);
         let seen = st.store.ip_by_addr(&addr).await?.is_some();
@@ -243,6 +246,9 @@ async fn item(
         }
         if let Some(piece) = k.piece_kind() {
             let hash = piece_hash(piece, &value);
+            if k == LinkKind::Stager && item.is_none() {
+                queried = st.store.piece_queried(hash).await?;
+            }
             strips = crate::admin::chains::of_piece(&st, hash).await?;
             if results_kind(piece) {
                 results = st
@@ -289,6 +295,7 @@ async fn item(
         item,
         urls,
         ip_seen,
+        queried,
         strips,
         results,
         can_add_result,
@@ -801,6 +808,29 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("Add result"));
+    }
+
+    #[tokio::test]
+    async fn a_queried_host_says_so_and_how_often() {
+        let (st, cookie, app, _d) = app().await;
+        let hash = seed(&st).await;
+        for q in [
+            "UPDATE piece_sightings SET role = 'queried' WHERE piece = ?1",
+            "INSERT INTO piece_sightings
+             SELECT piece, source_kind, 2, ip_id, role, grade, ts FROM piece_sightings
+             WHERE piece = ?1",
+        ] {
+            sqlx::query(q)
+                .bind(hash)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+        }
+        let (status, html) = page(&cookie, &app, STAGER_PAGE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Only queried"), "{html}");
+        assert!(html.contains("2 sightings"), "{html}");
+        assert!(!html.contains("Not seen"), "{html}");
     }
 
     #[tokio::test]
