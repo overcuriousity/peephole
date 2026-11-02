@@ -432,9 +432,10 @@ evidence of one operator:
   the full URL, not by the host. An address counts for its newest 16 values;
   one naming more is listed under Excluded values.
 
-  Known limit: to connect two values, forged addresses need to be at least a
-  tenth of the larger value's namers. Such a link joins only addresses with
-  no campaign, and the edge list shows it as claimed.
+  Accepted limit: joiners group only addresses with no campaign and never
+  touch an existing campaign. The tenth protects a value, not a whole loose
+  cloud, so a few forged addresses can bridge two loose clouds through a thin
+  value. Such a bridge shows as claimed in the edge list.
 
 The Links page also lists what the body X-ray finds, read from this node's
 own sightings and not replicated: stagers (only those a command fetches from,

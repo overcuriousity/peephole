@@ -56,7 +56,7 @@ pub const DOSSIER_V: u32 = 1;
 /// Newest timeline events per dossier (the store's page maximum).
 pub const EVENTS: i64 = crate::store::events::MAX_LIMIT;
 /// Campaign members per dossier.
-pub const MEMBERS: usize = 500;
+pub const MEMBERS: usize = crate::store::campaigns::CAMPAIGN_MEMBERS as usize;
 /// Campaign edges per dossier, the most telling first.
 pub const EDGES: i64 = crate::store::campaigns::CAMPAIGN_EDGES;
 /// Every other capped list per dossier: an ASN's busiest IPs, a request's
@@ -1245,11 +1245,10 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
     }
     let key = canonical_ip(key);
     let store = &state.store;
-    let Some(mut c) = store.campaign(&key).await? else {
+    let Some(c) = store.campaign(&key).await? else {
         return Ok(None);
     };
-    let members_more = c.members.len() > MEMBERS;
-    c.members.truncate(MEMBERS);
+    let members_more = c.row.size > c.members.len() as i64;
     let merged = c.edges_total - c.edges_unmerged;
     let (edges, edges_more) = member_edges(c.edges, &c.members, merged);
     let page = store.campaign_events(&key, None, EVENTS).await?;
