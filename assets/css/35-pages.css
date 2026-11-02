@@ -231,3 +231,15 @@ a.chain-label { color: var(--color-accent); }
 .xr-d1 { margin-left: 0.75rem; } .xr-d2 { margin-left: 1.5rem; } .xr-d3 { margin-left: 2.25rem; } .xr-d4 { margin-left: 3rem; }
 .xr-d5 { margin-left: 3.75rem; } .xr-d6 { margin-left: 4.5rem; } .xr-d7 { margin-left: 5.25rem; } .xr-d8 { margin-left: 6rem; }
 @media (max-width: 50rem) { .xr-grid { grid-template-columns: 1fr; } }
+
+/* ---- Evidence first: collapsed headers, campaign second line -------- */
+.req-head .meta .badge { align-self: center; }
+details.headers > summary { cursor: pointer; list-style: none; }
+details.headers > summary::-webkit-details-marker { display: none; }
+details.headers > summary h2 { display: inline; margin: 0; }
+details.headers > summary h2::before { content: "▸"; display: inline-block; margin-right: 0.5rem; color: var(--color-fg-muted); transition: transform 0.15s; }
+details.headers[open] > summary h2::before { transform: rotate(90deg); }
+details.headers > summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+details.headers[open] > summary { margin-bottom: 0.75rem; }
+.meta.meta-sub { margin-top: 0.25rem; font-size: var(--text-xs); }
+@media (prefers-reduced-motion: reduce) { details.headers > summary h2::before { transition: none; } }

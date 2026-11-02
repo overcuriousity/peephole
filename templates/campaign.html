@@ -9,11 +9,10 @@
   {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
   <span class="campaign-strength{% if c.row.hard_edges == 0 %} soft{% endif %}">{{ self.strength() }} · <a href="/admin/evidence/links">what counts →</a></span>
   <span>{{ c.row.size }} IPs</span>
-  <span>key <span class="mono">{{ c.row.key }}</span></span>
   <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>
   <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
-  <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
 </div>
+<div class="meta meta-sub muted"><span>key <span class="mono">{{ c.row.key }}</span></span><span>computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span></div>
 </div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
 <div class="stack">
 {% include "_chain_flow.html" %}

@@ -7,6 +7,7 @@
 <div class="page-head"><div><h1>Upload</h1></div></div>
 <div class="stack">
 {% include "_chain_strip.html" %}
+{% if let Some(xv) = xray %}{% let xv_title = "Content" %}{% include "_xray.html" %}{% else if u.held %}<section class="card"><h2>Content</h2><p class="muted">Only text is read here. Binary content is never parsed, shown or unpacked: take the zip.</p></section>{% endif %}
 <section class="card">
   <dl class="facts">
     <dt>Time (UTC)</dt><dd class="mono">{{ u.ts }}</dd>
@@ -21,7 +22,6 @@
     <dt>Content</dt><dd>{% if u.held %}<a class="btn btn-sm" href="/admin/traps/uploads/{{ u.uid|urlencode }}/content.zip">Download zip</a> <span class="muted small">password <span class="mono">infected</span></span>{% else %}<span class="muted">content not held</span> <span class="mono small">{{ u.content_state }}</span>{% endif %}</dd>
   </dl>
 </section>
-{% if let Some(xv) = xray %}{% let xv_title = "Content" %}{% include "_xray.html" %}{% else if u.held %}<section class="card"><h2>Content</h2><p class="muted">Only text is read here. Binary content is never parsed, shown or unpacked: take the zip.</p></section>{% endif %}
 <section class="card">
   <div class="card-head"><h2>Timeline</h2><span class="muted">requests to its reported location</span></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Request</th><th>Answer</th><th class="num">Status</th></tr></thead><tbody>
