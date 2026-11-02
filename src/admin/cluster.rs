@@ -101,7 +101,7 @@ pub struct MemberView {
 
 impl MemberView {
     /// What needs a look, in words; empty when nothing does. The Members
-    /// table's badge and Overview's strip both read this.
+    /// table's badge and the Now page's strip both read this.
     pub fn issues(&self) -> Vec<String> {
         let mut v = vec![];
         if self.incompatible {

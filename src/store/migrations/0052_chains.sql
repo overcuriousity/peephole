@@ -1,4 +1,4 @@
--- Attack chains (docs/cluster.md, "Attack chains"): the pieces the X-ray
+-- Attack chains (docs/detection.md, `store::chains`): the pieces the X-ray
 -- finds in stored requests and uploads, and the chains they join into.
 -- Derived on each node from rows it holds (`store::pieces`), never
 -- replicated, never exported. Decoded text is never stored.

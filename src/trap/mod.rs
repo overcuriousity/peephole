@@ -83,7 +83,7 @@ pub struct TrapState {
     /// Flood protection for the recording path.
     pub guards: Guards,
     /// The slow answer for severity-4 sources; shared with the admin's
-    /// System page, and kept across listener restarts.
+    /// Status page, and kept across listener restarts.
     pub tarpit: Arc<tarpit::Tarpit>,
     /// Legacy MCP SSE streams on this node.
     pub sse: Arc<decoy::sse::SseHub>,

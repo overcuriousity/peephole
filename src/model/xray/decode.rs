@@ -937,7 +937,7 @@ mod tests {
         let pem =
             format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\n");
         let mut enc = b64(pem.as_bytes());
-        while enc.len() % 4 != 0 {
+        while !enc.len().is_multiple_of(4) {
             enc.push(b'A');
         }
         enc.push(b'A');

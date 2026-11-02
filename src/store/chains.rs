@@ -1934,7 +1934,7 @@ mod tests {
         chains.iter().map(|c| c.joiners.clone()).collect()
     }
 
-    fn the<'a>(chains: &'a [ChainOut], piece: i64) -> &'a ChainOut {
+    fn the(chains: &[ChainOut], piece: i64) -> &ChainOut {
         chains.iter().find(|c| c.joiners.contains(&piece)).unwrap()
     }
 
@@ -2650,10 +2650,7 @@ mod tests {
         );
         assert!(row.here);
         // Not held: the file is known, its text is not.
-        sqlx::query("DELETE FROM upload_blobs")
-            .execute(&s.pool)
-            .await
-            .unwrap();
+        crate::store::uploads::forget_content(&s).await;
         let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
         assert_eq!(one(&chains[0], "Payload").mark, Mark::Gap);
         assert_eq!(stage(&chains[0], "Delivery").len(), 1);
@@ -3133,7 +3130,7 @@ mod tests {
         let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A, EXPLOIT_A]).await;
         run(&s).await;
         let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
-        assert_eq!(one(&chains[0], "Exploit").dim, false);
+        assert!(!one(&chains[0], "Exploit").dim);
         assert!(one(&chains[0], "Exploit").here);
         assert!(one(&chains[0], "Delivery").here);
         // Another source's recipe still shows, dimmed.

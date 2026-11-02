@@ -810,6 +810,15 @@ pub(crate) async fn seed_upload(
     uid
 }
 
+/// Test fixture: every upload's content is gone, as after a purge.
+#[cfg(test)]
+pub(crate) async fn forget_content(store: &super::Store) {
+    sqlx::query("DELETE FROM upload_blobs")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

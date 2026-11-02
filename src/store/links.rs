@@ -1860,7 +1860,7 @@ mod tests {
             assert_eq!(LinkKind::parse(k.key()), Some(k));
         }
         assert_eq!(LinkKind::Stager.key(), "stager");
-        // The campaigns do not read them yet.
+        // The campaigns read them apart, last: a body can name anything.
         assert!(!LinkKind::IDENTITY.contains(&LinkKind::Stager));
         // Identity kinds stay together in the list.
         let at = |k| LinkKind::LIST.iter().position(|x| *x == k).unwrap();

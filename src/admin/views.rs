@@ -13,7 +13,7 @@ pub struct Chrome {
 }
 
 tokio::task_local! {
-    /// Whether this node runs a cluster (the Market page answers), set by
+    /// Whether this node runs a cluster (the Network pages answer), set by
     /// the admin router's middleware for the nav.
     pub(crate) static MARKET: bool;
 }
