@@ -13,7 +13,6 @@ use crate::admin::api_v1::{rfc3339, summaries_json};
 use crate::admin::auth::SessionUser;
 use crate::admin::chains_json::{ChainJson, XraySummary, chains_json, xray_summary};
 use crate::admin::error::{AppError, AppResult};
-use crate::model::xray::{Policy, Source, parse};
 use crate::store::browse::{CalendarDay, canonical_ip};
 use crate::store::chains::Anchor;
 use crate::store::events::{Event, EventKind, EventPage};
@@ -1022,16 +1021,7 @@ pub async fn request(state: &AdminState, id: &str) -> Result<Option<Envelope<Req
     let mut chains = store.chains_of(Anchor::Request(id)).await?;
     let other_chains = chains.len().saturating_sub(1) as i64;
     chains.truncate(1);
-    let xray = xray_summary(&parse(
-        Source::Request {
-            method: &d.row.method,
-            path: &d.row.path,
-            query: d.row.query.as_deref(),
-            body: d.row.body.as_deref(),
-            sender: Some(&d.ip),
-        },
-        Policy::embedded(),
-    ));
+    let xray = crate::admin::xray::read_request(&d.row, &d.ip, xray_summary).await?;
     let body = RequestDossier {
         chain: match chains.pop() {
             Some(c) => chains_json(store, &[c]).await?.pop(),

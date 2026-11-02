@@ -3,7 +3,6 @@ use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
-use crate::model::xray::{Policy, Source, parse};
 use crate::store::analytics::{Analytics, RELATED_JA4_DAYS};
 use crate::store::browse::{IpFilter, RequestFilter};
 use crate::store::inspect::{FpClaimRow, RequestDetail};
@@ -224,16 +223,7 @@ async fn request_page(
         Some(q) => format!("{}?{q}", d.row.path),
         None => d.row.path.clone(),
     };
-    let xv = crate::admin::xray::xray_view(&parse(
-        Source::Request {
-            method: &d.row.method,
-            path: &d.row.path,
-            query: d.row.query.as_deref(),
-            body: d.row.body.as_deref(),
-            sender: Some(&d.ip),
-        },
-        Policy::embedded(),
-    ));
+    let xv = crate::admin::xray::read_request(&d.row, &d.ip, crate::admin::xray::xray_view).await?;
     let strips = crate::admin::chains::of_source(
         &st,
         crate::store::chains::Anchor::Request(id),

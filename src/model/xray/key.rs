@@ -160,8 +160,9 @@ fn with_repeats(text: &[u8], (start, end): (usize, usize)) -> Vec<(usize, usize)
     found
 }
 
-/// [`mask_ranges`] of every layer.
-pub(super) fn all_masks(xray: &Xray) -> Vec<Vec<(usize, usize)>> {
+/// [`mask_ranges`] of every layer, for a caller that wants more than one:
+/// each call reads every layer.
+pub fn all_masks(xray: &Xray) -> Vec<Vec<(usize, usize)>> {
     let mut masks: Vec<Vec<(usize, usize)>> = xray.layers.iter().map(|l| ranges(&l.text)).collect();
     let holders: Vec<usize> = (0..masks.len()).filter(|&i| !masks[i].is_empty()).collect();
     for holder in holders {

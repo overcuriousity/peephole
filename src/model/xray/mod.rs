@@ -11,7 +11,7 @@ pub mod key;
 pub mod pieces;
 pub mod shell;
 
-pub use key::mask_ranges;
+pub use key::{all_masks, mask_ranges};
 pub use pieces::{Grade, Piece, PieceKind, Policy, Role};
 pub use shell::{Node, Step};
 
@@ -118,6 +118,8 @@ pub struct Xray {
     /// The body is read as PHP as a whole (PHP-CGI option injection); the
     /// body layer is not copied.
     pub php_body: bool,
+    /// The whole source's size when only part of it was read, or 0.
+    pub size: usize,
 }
 
 impl Xray {
@@ -359,6 +361,7 @@ mod tests {
                 Source::Upload {
                     name: Some("a.php"),
                     text: &bytes,
+                    size: bytes.len(),
                     sender: None,
                 },
                 Policy::embedded(),

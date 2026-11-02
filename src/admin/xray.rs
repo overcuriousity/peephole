@@ -10,8 +10,34 @@
 
 use crate::model::defang::defang;
 use crate::model::xray::{
-    Grade, LayerKind, Node, OpaqueReason, PieceKind, Role, Span, Step, Xray, mask_ranges,
+    Grade, LayerKind, Node, OpaqueReason, PieceKind, Policy, Role, Source, Span, Step, Xray,
+    all_masks, parse,
 };
+use crate::store::requests::RequestRow;
+
+/// Read a stored request through the X-ray off the async threads, and hand
+/// the result to `f`, there too.
+pub async fn read_request<T: Send + 'static>(
+    row: &RequestRow,
+    ip: &str,
+    f: impl FnOnce(&Xray) -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let (method, path) = (row.method.clone(), row.path.clone());
+    let (query, body, ip) = (row.query.clone(), row.body.clone(), ip.to_string());
+    Ok(tokio::task::spawn_blocking(move || {
+        f(&parse(
+            Source::Request {
+                method: &method,
+                path: &path,
+                query: query.as_deref(),
+                body: body.as_deref(),
+                sender: Some(&ip),
+            },
+            Policy::embedded(),
+        ))
+    })
+    .await?)
+}
 
 /// Most bytes of the raw body shown (the store's display limit).
 pub const RAW_SHOWN: usize = crate::store::inspect::BODY_LIMIT;
@@ -479,8 +505,9 @@ pub fn xray_view(x: &Xray) -> XrayView {
         }
     }
 
+    let masks = all_masks(x);
     let (raw, raw_cut) = match x.layers.first() {
-        Some(l) => segments(&l.text, RAW_SHOWN, &marks[0], &mask_ranges(x, 0)),
+        Some(l) => segments(&l.text, RAW_SHOWN, &marks[0], &masks[0]),
         None => (Vec::new(), false),
     };
 
@@ -506,7 +533,7 @@ pub fn xray_view(x: &Xray) -> XrayView {
         let (segs, cut) = if i == 0 {
             (Vec::new(), false)
         } else {
-            segments(&l.text, LAYER_SHOWN, &marks[i], &mask_ranges(x, i))
+            segments(&l.text, LAYER_SHOWN, &marks[i], &masks[i])
         };
         let (own_pieces, own_steps, own_opaque) = (
             std::mem::take(&mut pieces[i]),
@@ -537,20 +564,20 @@ pub fn xray_view(x: &Xray) -> XrayView {
     XrayView {
         raw,
         raw_cut,
-        total: x.layers.first().map_or(0, |l| l.text.len()),
-        hex_b64: masked_b64(x),
+        total: x.size.max(x.layers.first().map_or(0, |l| l.text.len())),
+        hex_b64: masked_b64(x, masks.first().map_or(&[], Vec::as_slice)),
         layers,
     }
 }
 
 /// Base64 of the original bytes (the first [`RAW_SHOWN`]) with every
 /// private key range overwritten, for the hex view.
-fn masked_b64(x: &Xray) -> String {
+fn masked_b64(x: &Xray, mask: &[(usize, usize)]) -> String {
     let Some(l) = x.layers.first() else {
         return String::new();
     };
     let mut bytes = l.text[..l.text.len().min(RAW_SHOWN)].to_vec();
-    for (a, b) in mask_ranges(x, 0) {
+    for &(a, b) in mask {
         let (a, b) = (a.min(bytes.len()), b.min(bytes.len()));
         bytes[a..b].fill(b'*');
     }
@@ -560,13 +587,13 @@ fn masked_b64(x: &Xray) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::xray::{Policy, Source, parse};
 
     fn upload(text: &[u8]) -> Xray {
         parse(
             Source::Upload {
                 name: None,
                 text,
+                size: text.len(),
                 sender: None,
             },
             Policy::embedded(),
@@ -611,6 +638,22 @@ mod tests {
         let (segs, cut) = segments("aé€".as_bytes(), 2, &[], &[]);
         assert!(cut);
         assert_eq!(joined(&segs), "a");
+    }
+
+    #[test]
+    fn a_cut_upload_shows_its_whole_size() {
+        let x = parse(
+            Source::Upload {
+                name: None,
+                text: b"<?php exec('id'); ?>",
+                size: 300_000,
+                sender: None,
+            },
+            Policy::embedded(),
+        );
+        let v = xray_view(&x);
+        assert_eq!(v.total, 300_000);
+        assert!(v.layers[0].opaque[0].why.contains("limit"));
     }
 
     #[test]

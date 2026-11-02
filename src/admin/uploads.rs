@@ -120,17 +120,23 @@ async fn detail(
         return Err(AppError::NotFound);
     };
     let timeline = uploads::timeline(&mut conn, &u).await?;
-    let xray = uploads::text_for_xray(&mut conn, &u).await?.map(|text| {
-        crate::admin::xray::xray_view(&parse(
-            Source::Upload {
-                name: u.filename.as_deref(),
-                text: &text,
-                sender: Some(&u.ip),
-            },
-            Policy::embedded(),
-        ))
-    });
+    let text = uploads::text_for_xray(&mut conn, &u).await?;
     drop(conn);
+    let (name, size, ip) = (u.filename.clone(), u.size as usize, u.ip.clone());
+    let read = tokio::task::spawn_blocking(move || {
+        text.map(|text| {
+            crate::admin::xray::xray_view(&parse(
+                Source::Upload {
+                    name: name.as_deref(),
+                    text: &text,
+                    size,
+                    sender: Some(&ip),
+                },
+                Policy::embedded(),
+            ))
+        })
+    });
+    let xray = read.await.map_err(anyhow::Error::from)?;
     let ip_id = st.store.ip_by_addr(&u.ip).await?.map_or(0, |i| i.id);
     let strips = crate::admin::chains::of_source(
         &st,

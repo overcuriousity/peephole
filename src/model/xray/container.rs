@@ -29,7 +29,12 @@ pub enum Source<'a> {
     },
     Upload {
         name: Option<&'a str>,
+        /// What is read of it: at most its first
+        /// [`crate::store::uploads::XRAY_MAX`] bytes.
         text: &'a [u8],
+        /// The whole file's size. Over `text`'s, what was cut is marked as
+        /// over the limit.
+        size: usize,
         sender: Option<&'a str>,
     },
 }
@@ -80,14 +85,28 @@ static SHELL_WORD: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parse `source` into its layers.
 pub fn parse(source: Source<'_>, policy: &Policy) -> Xray {
-    let (body, query, name, path) = match source {
+    let (body, query, name, path, size) = match source {
         Source::Request {
             query, body, path, ..
-        } => (body.unwrap_or(&[]), query, None, Some(path)),
-        Source::Upload { name, text, .. } => (text, None, name, None),
+        } => {
+            let body = body.unwrap_or(&[]);
+            (body, query, None, Some(path), body.len())
+        }
+        Source::Upload {
+            name, text, size, ..
+        } => (text, None, name, None, size),
     };
     let mut xray = Xray::new(body);
     xray.layers[0].name = name.map(|n| n.as_bytes().to_vec());
+    if size > body.len() {
+        xray.size = size;
+        let at = Span {
+            layer: 0,
+            start: 0,
+            end: body.len(),
+        };
+        decode::push_opaque(&mut xray, at, OpaqueReason::OverLimit);
+    }
     let mut budget = Budget::default();
 
     let mut body_is_php = false;
@@ -1337,12 +1356,30 @@ mod tests {
             Source::Upload {
                 name: Some("shell.php"),
                 text: b"<?php exec('id'); ?>",
+                size: 20,
                 sender: None,
             },
             Policy::embedded(),
         );
         assert_eq!(x.layers[0].name.as_deref(), Some(&b"shell.php"[..]));
         assert!(has_text(&x, b" exec('id'); "));
+        assert!(x.opaque.is_empty());
+    }
+
+    #[test]
+    fn upload_text_cut_short_is_over_the_limit() {
+        let x = parse(
+            Source::Upload {
+                name: None,
+                text: b"<?php exec('id'); ?>",
+                size: 300_000,
+                sender: None,
+            },
+            Policy::embedded(),
+        );
+        assert_eq!(x.size, 300_000);
+        assert_eq!(x.opaque.len(), 1);
+        assert_eq!(x.opaque[0].reason, OpaqueReason::OverLimit);
     }
 
     #[test]

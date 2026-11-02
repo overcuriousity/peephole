@@ -1178,6 +1178,7 @@ mod tests {
             Source::Upload {
                 name: Some("a.txt"),
                 text: text.as_bytes(),
+                size: text.len(),
                 sender: Some(SENDER),
             },
             Policy::embedded(),

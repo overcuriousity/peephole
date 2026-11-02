@@ -733,7 +733,8 @@ pub async fn content_for_export(
     .await?)
 }
 
-/// Most bytes of an upload the admin's X-ray reads.
+/// Most bytes of an upload the X-ray reads: its limit on decoded output. A
+/// longer file is read from the start and marked as over the limit.
 pub const XRAY_MAX: usize = 256 * 1024;
 
 /// The held content of a text upload, for the admin page's X-ray: its

@@ -464,12 +464,13 @@ async fn extract_upload(pool: &SqlitePool, r: &UpRow) -> Result<Vec<Found>> {
         && let Some(text) = super::uploads::text_for_xray(&mut conn, &u).await?
     {
         drop(conn);
-        let (name, ip) = (u.filename, r.ip.clone());
+        let (name, ip, size) = (u.filename, r.ip.clone(), r.size as usize);
         out = tokio::task::spawn_blocking(move || {
             let x = parse(
                 Source::Upload {
                     name: name.as_deref(),
                     text: &text,
+                    size,
                     sender: Some(&ip),
                 },
                 Policy::embedded(),
