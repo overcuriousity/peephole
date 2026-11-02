@@ -385,7 +385,22 @@ mod tests {
             s.resize(64 * 1024, b'A');
             s
         };
-        for body in [b"$(".repeat(32 * 1024), b";".repeat(64 * 1024), nested] {
+        // Every literal a fetch's and a variable's, every `fopen` a variable.
+        let literals = {
+            let mut s = b"<?php copy('a','b');file_put_contents('x','y');".to_vec();
+            for i in 0..3000 {
+                s.extend(format!("$v{i}='http://a{i}.example/x';fopen($v{i},'r');").bytes());
+            }
+            s.resize(s.len().min(64 * 1024), b' ');
+            s
+        };
+        let bodies = [
+            b"$(".repeat(32 * 1024),
+            b";".repeat(64 * 1024),
+            nested,
+            literals,
+        ];
+        for body in bodies {
             let start = Instant::now();
             let x = parse(
                 Source::Request {

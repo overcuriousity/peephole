@@ -23,6 +23,10 @@ const PROFILE_NAMES: usize = 8;
 /// How far back the start of a statement is looked for.
 const MAX_STATEMENT: usize = 512;
 
+/// Most string literals of one PHP layer read for URLs. A 64 KiB body can hold
+/// thousands; past this the layer is marked as over the limit.
+const MAX_LITERALS: usize = 1024;
+
 /// Longest query argument name kept in an exploit value.
 const MAX_ARG: usize = 32;
 
@@ -79,6 +83,22 @@ static PHP_WRITE: LazyLock<Regex> = LazyLock::new(|| {
 static PHP_FOPEN: LazyLock<Regex> = LazyLock::new(|| {
     regex(&format!(
         r#"(?i-u){FUNCTION}fopen\s*\(\s*(?:['"]\s*(?:https?|ftps?|sftp|tftp|scp)://|\$([A-Za-z0-9_]+))"#
+    ))
+});
+/// A variable given a URL.
+static PHP_URL_VAR: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r#"(?-u)\$([A-Za-z0-9_]+)\s*=\s*['"]\s*(?:https?|ftps?|sftp|tftp|scp)://"#)
+});
+/// A name or variable handed to a call that fetches.
+static PHP_FETCHED: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|fopen|copy)\s*\(\s*(?:\$this\s*->\s*|\$)?([A-Za-z0-9_]+)"
+    ))
+});
+/// A name or variable set as a cURL handle's URL.
+static PHP_CURL_URL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?i-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*(?:\$this\s*->\s*|\$)?([A-Za-z0-9_]+)"
     ))
 });
 /// A fetch inside `eval` or `assert`: what it fetches is run.
@@ -454,9 +474,12 @@ fn overlaps(mask: &[(usize, usize)], start: usize, end: usize) -> bool {
 /// Where in `text` the word last is; a word changed by unquoting is not
 /// found, and the caller keeps the whole layer as its place.
 fn last_place(text: &[u8], word: &str) -> Option<(usize, usize)> {
-    let word = Regex::new(&regex::escape(word)).ok()?;
-    let last = word.find_iter(text).last()?;
-    Some((last.start(), last.end()))
+    let word = word.as_bytes();
+    if word.is_empty() {
+        return None;
+    }
+    let start = text.windows(word.len()).rposition(|w| w == word)?;
+    Some((start, start + word.len()))
 }
 
 fn recipes(xray: &Xray, masks: &[Vec<(usize, usize)>], found: &mut Found) {
@@ -825,15 +848,14 @@ fn php_fetches(text: &[u8]) -> bool {
     if PHP_FETCH.is_match(text) {
         return true;
     }
+    let holds_url: HashSet<&[u8]> = PHP_URL_VAR
+        .captures_iter(text)
+        .filter_map(|c| c.get(1))
+        .map(|m| m.as_bytes())
+        .collect();
     PHP_FOPEN.captures_iter(text).any(|c| match c.get(1) {
         None => true,
-        Some(var) => {
-            let pattern = format!(
-                r#"(?-u)\${}\s*=\s*['"]\s*(?:https?|ftps?|sftp|tftp|scp)://"#,
-                regex::escape(&String::from_utf8_lossy(var.as_bytes()))
-            );
-            Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
-        }
+        Some(var) => holds_url.contains(var.as_bytes()),
     })
 }
 
@@ -871,17 +893,21 @@ fn call_of(text: &[u8], quote: usize) -> Option<(Vec<u8>, usize)> {
     None
 }
 
-/// Whether the layer hands the variable or constant `name` to a fetch.
-fn fetched_by_name(text: &[u8], name: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
+/// The variables and constants the layer hands to a fetch, in lower case,
+/// read once: a layer can assign thousands of URLs. The search goes on from
+/// the argument, so `copy(file_get_contents($u), …)` gives both.
+fn fetched_names(text: &[u8]) -> HashSet<Vec<u8>> {
+    let mut names = HashSet::new();
+    let mut from = 0;
+    while let Some(c) = PHP_FETCHED.captures_at(text, from) {
+        let name = c.get(1).expect("the pattern's only group");
+        names.insert(name.as_bytes().to_ascii_lowercase());
+        // The byte before the name is one `FUNCTION` reads.
+        from = name.start() - 1;
     }
-    let name = regex::escape(&String::from_utf8_lossy(name));
-    let arg = format!(r"(?:\$this\s*->\s*|\$)?{name}\b");
-    let call = format!(
-        r"(?i-u){FUNCTION}(?:curl_init|file_get_contents|fopen|copy)\s*\(\s*{arg}|(?i-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*{arg}"
-    );
-    Regex::new(&call).is_ok_and(|r| r.is_match(text))
+    let set = PHP_CURL_URL.captures_iter(text).filter_map(|c| c.get(1));
+    names.extend(set.map(|m| m.as_bytes().to_ascii_lowercase()));
+    names
 }
 
 /// `define('NAME', '…')`: the constant, when the literal at `start` is its value.
@@ -994,7 +1020,15 @@ impl Urls<'_> {
             .collect();
         let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
         let copying = copying_parameters(text, &copied);
-        for (start, end) in php_literals(text) {
+        let fetched = if keeps {
+            fetched_names(text)
+        } else {
+            HashSet::new()
+        };
+        let fetched_by_name = |name: &[u8]| fetched.contains(&name.to_ascii_lowercase());
+        let literals = php_literals(text);
+        found.over |= literals.len() > MAX_LITERALS;
+        for &(start, end) in literals.iter().take(MAX_LITERALS) {
             let Some((0, len, url)) = urls_in(&text[start..end]).next() else {
                 continue;
             };
@@ -1004,12 +1038,12 @@ impl Urls<'_> {
             let promoted = match literal_use(text, start) {
                 Literal::Kept => true,
                 Literal::Argument => match defined_name(text, start) {
-                    Some(name) => keeps && fetched_by_name(text, name),
+                    Some(name) => fetched_by_name(name),
                     None => keeps || call_of(text, start - 1).is_some_and(|c| copying.contains(&c)),
                 },
                 // A literal only assigned is a fetch's when the fetch uses it.
                 Literal::Assigned(name) => {
-                    copied.contains(name) || (keeps && fetched_by_name(text, name))
+                    copied.contains(name) || fetched_by_name(name)
                 }
                 Literal::Other => false,
             };
@@ -1405,6 +1439,28 @@ mod tests {
             "<?php file_put_contents('a.php', file_get_contents('https://example.org/a')); ?>",
         );
         assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
+    }
+
+    #[test]
+    fn a_fetch_inside_a_fetch_reads_both_names() {
+        let names = fetched_names(b"copy(file_get_contents($u), $dst); fopen($this->Other, 'r');");
+        let names: BTreeSet<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([b"file_get_contents".as_slice(), b"u", b"other"])
+        );
+    }
+
+    #[test]
+    fn a_layer_past_the_literal_limit_says_so() {
+        let mut body = b"<?php copy('a','b');file_put_contents('x','y');".to_vec();
+        for i in 0..MAX_LITERALS {
+            body.extend(format!("$v{i}='';").bytes());
+        }
+        body.extend(b"$late='http://late.example.org/x';copy($late,'y');");
+        let x = post(std::str::from_utf8(&body).unwrap());
+        assert!(x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
+        assert!(of(&x, PieceKind::Stager).iter().all(|p| p.role != Role::Stager));
     }
 
     #[test]
