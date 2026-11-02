@@ -179,7 +179,7 @@ fn unended(text: &[u8], head: usize) -> usize {
             at = after;
             continue;
         }
-        let closed = b"'\"`\\)<>;,&|".contains(&text[end]);
+        let closed = b"'\"`\\)<>;,&|".contains(&text[after]);
         return if marker_line || end - at >= KEY_TAIL_MIN || (closed && end > at) {
             end
         } else {
@@ -554,6 +554,7 @@ TsAXSDEff5ClOxPtM4GqAAAADXBlZXBob2xlLXRlc3Q=
             ("wget http://example.org/x", "wget http://example.org/x"),
             ("' > /tmp/k; id", "' > /tmp/k; id"),
             ("AAAA' > /tmp/k", "' > /tmp/k"),
+            ("AAAA > /tmp/k", " > /tmp/k"),
             ("  \\", "\\"),
         ] {
             let text = format!("{begin}\n{line}\n{tail}\n");
