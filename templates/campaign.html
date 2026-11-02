@@ -32,7 +32,7 @@
 <section class="card">
   <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft{{ self.claimed_note() }} · <a href="/admin/evidence/links">what counts →</a></span></div>
   <div class="table-wrap"><table class="table stack-narrow edges"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
-  {% for v in self.listed() %}<tr class="edge-{% if v.hard() %}hard{% else if v.claimed() %}claimed{% else %}soft{% endif %}">
+  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else if v.claimed() %}claimed{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
     <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}{% if v.claimed() %} <span class="muted" title="{{ crate::admin::glossary::help("joiner") }}">claimed</span>{% endif %}</td>
     <td class="why">{% if v.hard() || v.claimed() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% if !v.e.merged %} <span class="badge" title="This claim tied nothing: joiners only group IPs with no campaign of their own, and never merge or change one.">not merged</span>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
@@ -50,7 +50,7 @@
     <td class="ts first">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts last">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
-  {% if edges.len() > self.listed().len() %}<p class="muted">First {{ self.listed().len() }} of {{ edges.len() }} edges, claimed ones last.</p>{% endif %}
+  {% if c.edges_total > edges.len() as i64 %}<p class="muted">First {{ edges.len() }} of {{ c.edges_total }} edges, claimed ones last.</p>{% endif %}
   {% include "_edge_legend.html" %}
 </section>
 <section class="card" data-section="artifacts">

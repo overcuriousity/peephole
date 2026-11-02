@@ -57,6 +57,8 @@ pub const DOSSIER_V: u32 = 1;
 pub const EVENTS: i64 = crate::store::events::MAX_LIMIT;
 /// Campaign members per dossier.
 pub const MEMBERS: usize = 500;
+/// Campaign edges per dossier, the most telling first.
+pub const EDGES: i64 = crate::store::campaigns::CAMPAIGN_EDGES;
 /// Every other capped list per dossier: an ASN's busiest IPs, a request's
 /// same-IP and same-JA4 requests, uploads, commands, canary reuses.
 pub const IPS: usize = 50;
@@ -94,12 +96,14 @@ pub struct NodeInfo {
 pub struct Limits {
     pub events: i64,
     pub members: usize,
+    pub edges: i64,
     pub ips: usize,
 }
 
 const LIMITS: Limits = Limits {
     events: EVENTS,
     members: MEMBERS,
+    edges: EDGES,
     ips: IPS,
 };
 
@@ -1192,21 +1196,21 @@ impl From<crate::store::campaigns::Edge> for EdgeJson {
     }
 }
 
-/// The edges between two of `members`, and whether any was left out. A
+/// The edges between two of `members`, and whether any of `merged` (how
+/// many the campaign has, `edges` being the first of them) was left out. A
 /// joiner edge that was not merged ties nothing and is not one of these.
 fn member_edges(
     edges: Vec<crate::store::campaigns::Edge>,
     members: &[crate::store::campaigns::Member],
+    merged: i64,
 ) -> (Vec<EdgeJson>, bool) {
     let carried: std::collections::HashSet<i64> = members.iter().map(|m| m.ip_id).collect();
-    let edges: Vec<_> = edges.into_iter().filter(|e| e.merged).collect();
-    let all = edges.len();
     let kept: Vec<EdgeJson> = edges
         .into_iter()
-        .filter(|e| carried.contains(&e.a_id) && carried.contains(&e.b_id))
+        .filter(|e| e.merged && carried.contains(&e.a_id) && carried.contains(&e.b_id))
         .map(EdgeJson::from)
         .collect();
-    let more = kept.len() < all;
+    let more = (kept.len() as i64) < merged;
     (kept, more)
 }
 
@@ -1246,7 +1250,8 @@ pub async fn campaign(state: &AdminState, key: &str) -> Result<Option<Envelope<C
     };
     let members_more = c.members.len() > MEMBERS;
     c.members.truncate(MEMBERS);
-    let (edges, edges_more) = member_edges(c.edges, &c.members);
+    let merged = c.edges_total - c.edges_unmerged;
+    let (edges, edges_more) = member_edges(c.edges, &c.members, merged);
     let page = store.campaign_events(&key, None, EVENTS).await?;
     let (events, events_more) = events_json(&page);
     let (uploads, uploads_more) = uploads_json(store.campaign_uploads(&key, IPS_PLUS).await?);
@@ -1370,7 +1375,7 @@ mod tests {
             assert_eq!(d["dossier_v"], 1, "{d}");
             assert_eq!(
                 d["limits"],
-                json!({"events": 200, "members": 500, "ips": 50})
+                json!({"events": 200, "members": 500, "edges": 500, "ips": 50})
             );
             assert!(d["generated_at"].as_str().unwrap().ends_with('Z'));
             assert_eq!(d["node"]["version"], env!("CARGO_PKG_VERSION"));
@@ -1644,10 +1649,10 @@ mod tests {
     #[test]
     fn edges_name_carried_members_only() {
         let edges = vec![edge(1, 2), edge(2, 3), edge(3, 1)];
-        let (kept, more) = member_edges(edges.clone(), &[member(1), member(2), member(3)]);
+        let (kept, more) = member_edges(edges.clone(), &[member(1), member(2), member(3)], 3);
         assert_eq!((kept.len(), more), (3, false));
         // Member 3 cut off by the cap: its edges go with it.
-        let (kept, more) = member_edges(edges, &[member(1), member(2)]);
+        let (kept, more) = member_edges(edges, &[member(1), member(2)], 3);
         let pairs: Vec<_> = kept.iter().map(|e| (e.a_id, e.b_id)).collect();
         assert_eq!((pairs, more), (vec![(1, 2)], true));
         assert_eq!(kept[0].first_ts, "2026-01-02T03:04:05Z");
@@ -1657,8 +1662,14 @@ mod tests {
     fn an_unmerged_edge_is_no_member_edge() {
         let mut other = edge(1, 9);
         other.merged = false;
-        let (kept, more) = member_edges(vec![edge(1, 2), other], &[member(1), member(2)]);
+        let (kept, more) = member_edges(vec![edge(1, 2), other], &[member(1), member(2)], 1);
         assert_eq!((kept.len(), more), (1, false));
+    }
+
+    #[test]
+    fn edges_past_the_store_limit_are_truncated() {
+        let (kept, more) = member_edges(vec![edge(1, 2)], &[member(1), member(2)], 2);
+        assert_eq!((kept.len(), more), (1, true));
     }
 
     #[test]

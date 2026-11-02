@@ -87,12 +87,6 @@ static PHP_FETCH_RUN: LazyLock<Regex> = LazyLock::new(|| {
         r"(?is-u){FUNCTION}(?:eval|assert)\s*\([^;]*?(?:file_get_contents|curl_exec|stream_get_contents)\s*\("
     ))
 });
-/// The cURL option that names the URL.
-static PHP_CURL_URL: LazyLock<Regex> = LazyLock::new(|| {
-    regex(&format!(
-        r"(?is-u){FUNCTION}curl_setopt\s*\([^,;]*,\s*CURLOPT_URL\s*,\s*"
-    ))
-});
 /// The variable `copy` reads.
 static PHP_COPY_VAR: LazyLock<Regex> =
     LazyLock::new(|| regex(&format!(r"(?i-u){FUNCTION}copy\s*\(\s*\$([A-Za-z0-9_]+)")));

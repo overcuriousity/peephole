@@ -213,9 +213,6 @@ struct CampaignPage {
     strips: crate::admin::chains::Strips,
 }
 
-/// Evidence rows on a campaign's page, at most, the claimed ones last.
-pub const CAMPAIGN_EDGES: usize = 500;
-
 /// Wave lines on a campaign's page, at most.
 pub const CAMPAIGN_WAVES: usize = 3;
 
@@ -237,11 +234,7 @@ impl CampaignPage {
                 if hard == 1 { "" } else { "s" }
             );
         }
-        let best = self
-            .edges
-            .iter()
-            .filter_map(|v| v.e.score)
-            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+        let best = self.c.best_score;
         let links = match (soft, joiner) {
             (1, 0) => "soft link only",
             (_, 0) => "soft links only",
@@ -255,16 +248,11 @@ impl CampaignPage {
         }
     }
 
-    /// The Evidence rows shown.
-    fn listed(&self) -> &[EdgeView] {
-        &self.edges[..self.edges.len().min(CAMPAIGN_EDGES)]
-    }
-
     /// The claimed edges for the Evidence head. The stored count holds only
     /// those that tie the campaign, so it says so when more rows are listed.
     fn claimed_note(&self) -> String {
         let joiner = self.c.row.joiner_edges;
-        match self.edges.iter().filter(|v| !v.e.merged).count() {
+        match self.c.edges_unmerged {
             0 if joiner == 0 => String::new(),
             0 => format!(", {joiner} claimed"),
             n => format!(", {joiner} claimed (merged only; {n} not merged also listed)"),
@@ -310,8 +298,14 @@ async fn campaign(
     let Some(mut c) = st.store.campaign(&key).await? else {
         return Err(AppError::NotFound);
     };
-    let mut detail = st.store.campaign_edge_detail(&key).await?;
-    let mut edges: Vec<EdgeView> = std::mem::take(&mut c.edges)
+    let pairs: Vec<(i64, i64)> = c
+        .edges
+        .iter()
+        .filter(|e| e.kind == "paths")
+        .map(|e| (e.a_id, e.b_id))
+        .collect();
+    let mut detail = st.store.campaign_edge_detail(&pairs).await?;
+    let edges = std::mem::take(&mut c.edges)
         .into_iter()
         .map(|e| {
             let d = match e.kind.as_str() {
@@ -321,7 +315,6 @@ async fn campaign(
             EdgeView::new(e, d)
         })
         .collect();
-    edges.sort_by_key(EdgeView::claimed);
     let calendar = st.store.campaign_calendar(&key).await?;
     let shapes = st.store.campaign_shapes(&key).await?;
     let uploads = st.store.campaign_uploads(&key, CAMPAIGN_ARTIFACTS).await?;
@@ -699,7 +692,7 @@ mod tests {
              INSERT INTO campaign_edges (a, b, kind, value, fp_support, first_ts, last_ts)
              SELECT e.a, e.b, 'key', 'SHA256:' || n.i, 0, 't', 't' FROM campaign_edges e, n",
         )
-        .bind(super::CAMPAIGN_EDGES as i64)
+        .bind(crate::store::campaigns::CAMPAIGN_EDGES)
         .execute(&s.pool)
         .await
         .unwrap();
@@ -709,7 +702,7 @@ mod tests {
         let (_, _, page) = send(&app, request, Body::empty()).await;
         assert_eq!(page.matches("class=\"edge-hard\"").count(), 1, "{page}");
         let rows = page.matches("class=\"edge-claimed\"").count();
-        assert_eq!(rows, super::CAMPAIGN_EDGES - 1);
+        assert_eq!(rows as i64, crate::store::campaigns::CAMPAIGN_EDGES - 1);
         assert!(page.contains("First 500 of 501 edges"), "{page}");
     }
 

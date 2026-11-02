@@ -297,12 +297,18 @@ pub struct CampaignCommand {
     pub last_ts: String,
 }
 
+/// Edges [`Store::campaign`] loads: a star over a botnet is thousands.
+pub const CAMPAIGN_EDGES: i64 = 500;
+/// The edges with an end in campaign `?1`, as `e`.
+const EDGES_OF: &str = "(e.a IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
+     OR e.b IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1))";
+
 /// Shapes listed on a campaign's page.
 pub const CAMPAIGN_SHAPES: i64 = 25;
 
 /// An evidence edge; `a`'s IP text sorts before `b`'s. All but a joiner edge
-/// that was not merged have both ends in one campaign; such an edge can have
-/// ends in other campaigns, or in none.
+/// that was not merged have both ends in one campaign; such an edge has at
+/// least one end in a campaign.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
 pub struct Edge {
     pub a_id: i64,
@@ -341,8 +347,14 @@ pub struct Campaign {
     pub row: CampaignRow,
     /// By IP text.
     pub members: Vec<Member>,
-    /// By `a`, `b`, kind, value.
+    /// The first [`CAMPAIGN_EDGES`]: hard and soft, then claimed, then those
+    /// not merged; each by `a`, `b`, kind, value.
     pub edges: Vec<Edge>,
+    /// Over every edge, loaded or not.
+    pub edges_total: i64,
+    pub edges_unmerged: i64,
+    /// The highest `paths` score.
+    pub best_score: Option<f64>,
 }
 
 const ROW_COLS: &str = "key, num, size, first_seen, last_seen, hard_edges, soft_edges, \
@@ -521,8 +533,8 @@ impl Store {
         )
     }
 
-    /// A campaign by key, with its members and edges. An edge that was not
-    /// merged is listed on the campaign of either end.
+    /// A campaign by key, with its members and first edges. An edge that
+    /// was not merged is listed on the campaign of either end.
     pub async fn campaign(&self, key: &str) -> Result<Option<Campaign>> {
         let Some(row) = sqlx::query_as::<_, CampaignRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {ROW_COLS} FROM campaigns WHERE key = ?"
@@ -542,47 +554,67 @@ impl Store {
         .bind(key)
         .fetch_all(&self.pool)
         .await?;
-        let edges = sqlx::query_as(
+        let edges = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT e.a AS a_id, ia.ip AS a, e.b AS b_id, ib.ip AS b, e.kind, e.value,
                     e.score, e.shared, e.fp_support, e.first_ts, e.last_ts, e.agreement,
                     e.merged
              FROM campaign_edges e
              JOIN ips ia ON ia.id = e.a JOIN ips ib ON ib.id = e.b
-             WHERE e.a IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
-                OR e.b IN (SELECT ip_id FROM campaign_members WHERE campaign_key = ?1)
-             ORDER BY ia.ip, ib.ip, e.kind, e.value",
-        )
+             WHERE {EDGES_OF}
+             ORDER BY e.kind IN {JOINER_ROLES}, NOT e.merged, ia.ip, ib.ip, e.kind, e.value
+             LIMIT ?2"
+        )))
         .bind(key)
+        .bind(CAMPAIGN_EDGES)
         .fetch_all(&self.pool)
         .await?;
+        let (edges_total, edges_unmerged, best_score): (i64, i64, Option<f64>) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*), COALESCE(SUM(NOT e.merged), 0), MAX(e.score)
+                 FROM campaign_edges e WHERE {EDGES_OF}"
+            )))
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(Some(Campaign {
             row,
             members,
             edges,
+            edges_total,
+            edges_unmerged,
+            best_score,
         }))
     }
 
-    /// The detail of each `paths` edge of a campaign, by (a, b) ip ids.
-    pub async fn campaign_edge_detail(&self, key: &str) -> Result<HashMap<(i64, i64), EdgeDetail>> {
-        let shapes: Vec<(i64, i64, String, i64)> = sqlx::query_as(
-            "SELECT e.a, e.b, COALESCE(s.text, '#' || e.shape), e.df
-             FROM campaign_edge_shapes e
-             JOIN campaign_members m ON m.ip_id = e.a
-             LEFT JOIN shapes s ON s.hash = e.shape
-             WHERE m.campaign_key = ? ORDER BY e.a, e.b, e.df, e.shape",
-        )
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await?;
-        let tls: Vec<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT e.a, e.b, e.ja4, e.ja4h FROM campaign_edge_tls e
-             JOIN campaign_members m ON m.ip_id = e.a
-             WHERE m.campaign_key = ? ORDER BY e.a, e.b, e.ja4, e.ja4h",
-        )
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await?;
+    /// The detail of these `paths` edges, by (a, b) ip ids.
+    pub async fn campaign_edge_detail(
+        &self,
+        pairs: &[(i64, i64)],
+    ) -> Result<HashMap<(i64, i64), EdgeDetail>> {
         let mut out: HashMap<(i64, i64), EdgeDetail> = HashMap::new();
+        if pairs.is_empty() {
+            return Ok(out);
+        }
+        let values = vec!["(?,?)"; pairs.len()].join(",");
+        let sql = format!(
+            "SELECT e.a, e.b, COALESCE(s.text, '#' || e.shape), e.df
+             FROM campaign_edge_shapes e LEFT JOIN shapes s ON s.hash = e.shape
+             WHERE (e.a, e.b) IN (VALUES {values}) ORDER BY e.a, e.b, e.df, e.shape"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, String, i64)>(sqlx::AssertSqlSafe(sql));
+        for &(a, b) in pairs {
+            q = q.bind(a).bind(b);
+        }
+        let shapes = q.fetch_all(&self.pool).await?;
+        let sql = format!(
+            "SELECT e.a, e.b, e.ja4, e.ja4h FROM campaign_edge_tls e
+             WHERE (e.a, e.b) IN (VALUES {values}) ORDER BY e.a, e.b, e.ja4, e.ja4h"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, String, String)>(sqlx::AssertSqlSafe(sql));
+        for &(a, b) in pairs {
+            q = q.bind(a).bind(b);
+        }
+        let tls = q.fetch_all(&self.pool).await?;
         for (a, b, text, df) in shapes {
             out.entry((a, b)).or_default().shapes.push((text, df));
         }
@@ -1585,6 +1617,11 @@ fn compute(input: &Input, p: &Params) -> Output {
         for ((kind, value), ips) in &values {
             links.extend(joiner_links(kind, value, ips, &grouped, &mut parent));
         }
+        // No page would show an edge with neither end in a campaign.
+        links.retain(|l| {
+            let (ra, rb) = (find(&mut parent, l.a), find(&mut parent, l.b));
+            l.merged || size[ra] >= 2 || size[rb] >= 2
+        });
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..n {
@@ -3378,6 +3415,74 @@ pub(crate) mod tests {
         // 2 and 3 go to the larger cloud, so 0 and 1 share no value left.
         let large: Vec<String> = [2, 3, 10, 11, 12, 13, 14, 15, 16].map(ip).to_vec();
         assert_eq!(partition(&input), sets(&[&strs(&large)]));
+    }
+
+    #[test]
+    fn an_edge_with_neither_end_in_a_campaign_is_not_stored() {
+        let ip = |i: usize| format!("198.51.100.{}", i + 1);
+        let mut input = Input::default();
+        for (value, ids) in [
+            ("v1", vec![0, 2, 3]),
+            ("v2", vec![1, 2, 3]),
+            ("d0", vec![2, 10, 11, 12, 13]),
+            ("d1", vec![3, 12, 13, 14, 15]),
+            ("d2", vec![10, 11, 14, 15, 16]),
+            // 0 and 1 belong to the larger cloud of v1 and v2, and end loose.
+            ("z", vec![0, 1]),
+        ] {
+            let ips: Vec<String> = ids.into_iter().map(ip).collect();
+            name(&mut input, "stager", value, &strs(&ips));
+        }
+        let out = v2(&input);
+        assert_eq!(partition(&input).len(), 1);
+        assert!(out.edges.iter().all(|e| e.value != "z"));
+        // An edge with one end in a campaign stays.
+        assert!(out.edges.iter().any(|e| e.value == "v1" && !e.merged));
+    }
+
+    #[tokio::test]
+    async fn a_big_campaign_loads_its_first_edges_and_counts_them_all() {
+        let (s, _d) = store().await;
+        feed(&s, group(H1, "hone")).await;
+        s.recompute_campaigns(true).await.unwrap();
+        // More unmerged claims than the limit, and paths edges past it.
+        for (kind, merged, score) in [("key", 0, "NULL"), ("paths", 1, "i / 1000.0")] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+                 INSERT INTO campaign_edges (a, b, kind, value, score, fp_support, first_ts,
+                                             last_ts, merged)
+                 SELECT e.a, e.b, ?, printf('%06d', i), {score}, 0, 't', 't', ?
+                 FROM (SELECT a, b FROM campaign_edges LIMIT 1) e, n"
+            )))
+            .bind(CAMPAIGN_EDGES)
+            .bind(kind)
+            .bind(merged)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let c = s.campaign("192.0.2.80").await.unwrap().unwrap();
+        assert_eq!(c.edges.len() as i64, CAMPAIGN_EDGES);
+        assert_eq!(c.edges_total, 3 + 2 * CAMPAIGN_EDGES);
+        assert_eq!(c.edges_unmerged, CAMPAIGN_EDGES);
+        assert_eq!(c.best_score, Some(CAMPAIGN_EDGES as f64 / 1000.0));
+        assert!(c.edges.iter().all(|e| !is_joiner(&e.kind)), "claimed last");
+    }
+
+    #[tokio::test]
+    async fn edge_detail_reads_only_the_pairs_asked_for() {
+        let (s, _d) = store().await;
+        feed(&s, fixture()).await;
+        tls_fixture(&s).await;
+        s.recompute_campaigns(true).await.unwrap();
+        assert!(s.campaign_edge_detail(&[]).await.unwrap().is_empty());
+        let c = s.campaign("198.51.100.30").await.unwrap().unwrap();
+        let e = &c.edges[0];
+        let pair = (e.a_id, e.b_id);
+        let d = s.campaign_edge_detail(&[pair]).await.unwrap();
+        assert_eq!(d.keys().collect::<Vec<_>>(), [&pair]);
+        assert_eq!(d[&pair].tls.len(), 1);
+        assert!(!d[&pair].shapes.is_empty());
     }
 
     #[test]

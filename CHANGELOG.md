@@ -15,8 +15,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   shows the link across campaigns. Claimed edges are not counted as hard
   evidence. A file on more than 50 addresses ties nothing, an address counts
   for its newest 16 values, and both are listed as excluded. The Evidence
-  table lists the first 500 edges.
-  Dossiers carry `joiner_edges` and defanged edge values.
+  table and a dossier list the first 500 edges. Dossiers carry
+  `joiner_edges` and defanged edge values, and `limits` gains `edges`.
 - A file sent to the WP File Manager connector is answered where the attack
   tool asks for it, `/wp-content/plugins/wp-file-manager/lib/files/<name>`,
   not at `/uploads/<name>`, so the tool's check finds a webshell instead of a

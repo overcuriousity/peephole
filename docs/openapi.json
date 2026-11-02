@@ -2710,12 +2710,17 @@
                 "type": "integer",
                 "const": 500
               },
+              "edges": {
+                "type": "integer",
+                "const": 500
+              },
               "ips": {
                 "type": "integer",
                 "const": 50
               }
             },
             "required": [
+              "edges",
               "events",
               "ips",
               "members"
@@ -3405,12 +3410,17 @@
                 "type": "integer",
                 "const": 500
               },
+              "edges": {
+                "type": "integer",
+                "const": 500
+              },
               "ips": {
                 "type": "integer",
                 "const": 50
               }
             },
             "required": [
+              "edges",
               "events",
               "ips",
               "members"
@@ -3607,12 +3617,17 @@
                 "type": "integer",
                 "const": 500
               },
+              "edges": {
+                "type": "integer",
+                "const": 500
+              },
               "ips": {
                 "type": "integer",
                 "const": 50
               }
             },
             "required": [
+              "edges",
               "events",
               "ips",
               "members"
@@ -4115,12 +4130,17 @@
                 "type": "integer",
                 "const": 500
               },
+              "edges": {
+                "type": "integer",
+                "const": 500
+              },
               "ips": {
                 "type": "integer",
                 "const": 50
               }
             },
             "required": [
+              "edges",
               "events",
               "ips",
               "members"

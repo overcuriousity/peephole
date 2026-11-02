@@ -537,8 +537,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
 
-    const RAW: &str = "https://example.org:8080/x.sh";
-
     /// A stager piece on one address, with the URL it came from.
     async fn seed(st: &AdminState) -> i64 {
         let ip = st

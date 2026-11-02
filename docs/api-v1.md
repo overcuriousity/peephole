@@ -418,7 +418,7 @@ the top level.
   "generated_at": "2026-10-20T09:00:00Z",
   "node": { "version": "0.22.0", "window_days": 0 },
   "page": "/ip/203.0.113.9",
-  "limits": { "events": 200, "members": 500, "ips": 50 },
+  "limits": { "events": 200, "members": 500, "edges": 500, "ips": 50 },
   "truncated": { "events": false, "uploads": false, "commands": false, "reuses": false },
   "totals": {},
   "…": "the kind's fields"
@@ -430,7 +430,8 @@ the top level.
 - `node.window_days`: days of history the node keeps, `0` for all.
 - `page`: the admin page the dossier describes (path only).
 - `limits`: the caps. `events` (newest Timeline events) 200, `members`
-  (campaign members) 500, `ips` 50: every other list (an ASN's busiest
+  (campaign members) 500, `edges` (campaign edges) 500, `ips` 50: every
+  other list (an ASN's busiest
   IPs; a request's `same_ip`, `same_ja4.recent`; `uploads`, `commands`,
   `canaries.reuses`).
 - `truncated`: one key per capped list of this kind, `true` when more
@@ -520,7 +521,8 @@ plus:
   the size).
 - `edges`: `[{a_id, a, b_id, b, kind, value, score, shared, fp_support,
   first_ts, last_ts, agreement}]`: only those between two carried
-  members. `truncated.edges` is `true` when the members cap left any out.
+  members, at most 500, hard and soft first. `truncated.edges` is `true`
+  when either cap left any out.
   The `value` of a `stager` or `file` edge is defanged. A claimed edge that
   tied nothing is not listed.
 - `shapes`: `[{text, members, df, first_seen, wave:{ips, window_start,
