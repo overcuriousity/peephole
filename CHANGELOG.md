@@ -6,6 +6,12 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 ## [Unreleased]
 
 ### Added
+- A file sent to the WP File Manager connector is answered where the attack
+  tool asks for it, `/wp-content/plugins/wp-file-manager/lib/files/<name>`,
+  not at `/uploads/<name>`, so the tool's check finds a webshell instead of a
+  404. Other upload scripts keep `/uploads/`. A new *Dead ends* tab on the
+  Chains list (`/admin/evidence/chains?tab=dead-ends`) groups by path the
+  404s an address got within a minute after its upload, defanged.
 - The chain strip shows an attack in five stages (Exploit, Command, Delivery,
   Payload, Follow-up) on the request, upload, address, campaign and piece
   pages: the same chain from any of them, with "you are here" on a source's

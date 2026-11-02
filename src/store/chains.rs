@@ -420,6 +420,21 @@ async fn dead_ends_for(
     Ok(rows.take(uploads::TIMELINE_MAX as usize).collect())
 }
 
+/// Most recent uploads [`Store::dead_ends_all`] reads.
+const DEAD_END_UPLOADS: i64 = 512;
+
+/// A path asked for after an upload, where the trap had no file: grouped by
+/// path across the cluster.
+#[derive(Debug, Clone)]
+pub struct DeadEnd {
+    pub path: String,
+    /// The path as shown: defanged, since the client chose it.
+    pub shown: String,
+    pub hits: i64,
+    pub ips: i64,
+    pub last_seen: String,
+}
+
 /// What a chain is read from.
 #[derive(Debug, Clone, Copy)]
 pub enum Anchor<'a> {
@@ -1507,6 +1522,47 @@ impl Store {
             }
             Anchor::Piece(hash) => of_piece(conn, hash).await,
         }
+    }
+
+    /// The 404s after the newest uploads ([`DEAD_END_UPLOADS`]) from any
+    /// address, grouped by path, newest first, at most `limit`. The condition
+    /// is [`dead_ends`]'s.
+    pub async fn dead_ends_all(&self, limit: i64) -> Result<Vec<DeadEnd>> {
+        let mut conn = self.read.acquire().await?;
+        let uploads: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {UPLOAD_COLS} ORDER BY u.id DESC LIMIT ?"
+        )))
+        .bind(DEAD_END_UPLOADS)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut seen = BTreeMap::new();
+        for batch in uploads.chunks(TIMELINE_UPLOADS) {
+            for r in dead_ends_for(&mut conn, batch).await? {
+                seen.insert(r.id, r);
+            }
+        }
+        let mut by_path: HashMap<String, (i64, BTreeSet<String>, String)> = HashMap::new();
+        for r in seen.into_values() {
+            let e = by_path.entry(r.path).or_default();
+            e.0 += 1;
+            e.1.insert(r.ip);
+            if r.ts > e.2 {
+                e.2 = r.ts;
+            }
+        }
+        let mut out: Vec<DeadEnd> = by_path
+            .into_iter()
+            .map(|(path, (hits, ips, last_seen))| DeadEnd {
+                shown: defang(&path),
+                path,
+                hits,
+                ips: ips.len() as i64,
+                last_seen,
+            })
+            .collect();
+        out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.path.cmp(&b.path)));
+        out.truncate(usize::try_from(limit).unwrap_or(0));
+        Ok(out)
     }
 
     /// One page of chains, newest first.
@@ -2806,5 +2862,29 @@ mod tests {
         let key = pass(&s).await;
         let mut c = s.pool.acquire().await.unwrap();
         assert_eq!(ids(dead_ends(&mut c, &key).await.unwrap()), [hit]);
+    }
+
+    #[tokio::test]
+    async fn dead_ends_group_by_path() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/s.php", FILE).await;
+        sqlx::query("UPDATE uploads SET ts = ?")
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let at = |n: u32| format!("2026-10-01 00:00:{n:02}");
+        let get = |p| ("GET", p);
+        request(&s, UPLOADER, get("/a/s.php"), 404, "default", &at(5)).await;
+        request(&s, UPLOADER, get("/a/s.php"), 404, "default", &at(9)).await;
+        request(&s, UPLOADER, get("/b/s.php"), 404, "default", &at(20)).await;
+        // Not a dead end: found, or another name.
+        request(&s, UPLOADER, get("/c/s.php"), 200, "default", &at(6)).await;
+        request(&s, UPLOADER, get("/c/t.php"), 404, "default", &at(6)).await;
+        let got = s.dead_ends_all(10).await.unwrap();
+        let paths: Vec<_> = got.iter().map(|d| (d.path.as_str(), d.hits)).collect();
+        assert_eq!(paths, [("/b/s.php", 1), ("/a/s.php", 2)]);
+        assert_eq!(got[1].last_seen, at(9));
+        assert_eq!(s.dead_ends_all(1).await.unwrap().len(), 1);
     }
 }
