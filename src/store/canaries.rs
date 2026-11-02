@@ -381,7 +381,14 @@ fn reuses_sql(f: &ReuseFilter) -> String {
         );
     }
     if f.ip_id.is_some() {
-        sql.push_str(" AND ? IN (c.ip_id, u.ip_id)");
+        // As for a request: the values this address was served or sent.
+        sql.push_str(
+            " AND t.value_hash IN (
+                 SELECT value_hash FROM canaries WHERE ip_id = ?
+                 UNION SELECT s.value_hash FROM requests r
+                 JOIN request_tokens s ON s.request_id = r.id WHERE r.ip_id = ?)
+              AND ? IN (c.ip_id, u.ip_id)",
+        );
     }
     if f.range.since().is_some() {
         // The period is when the canary was served, as in the summary.
@@ -406,7 +413,7 @@ impl Store {
             q = q.bind(r).bind(r).bind(r);
         }
         if let Some(i) = f.ip_id {
-            q = q.bind(i);
+            q = q.bind(i).bind(i).bind(i);
         }
         if let Some(m) = f.range.since() {
             q = q.bind(m);
@@ -1227,6 +1234,19 @@ mod tests {
             let got = s.reuses(&of_one).await.unwrap();
             assert_eq!(got.len(), rows, "{path}");
         }
+        // One address's reuses: served to it, or sent by it.
+        for (ip, rows) in [("198.51.100.1", 2), ("198.51.100.2", 1)] {
+            let id: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = ?")
+                .bind(ip)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+            let of_one = ReuseFilter {
+                ip_id: Some(id),
+                ..all.clone()
+            };
+            assert_eq!(s.reuses(&of_one).await.unwrap().len(), rows, "{ip}");
+        }
         let srv_ip: i64 = sqlx::query_scalar("SELECT id FROM ips WHERE ip = '198.51.100.1'")
             .fetch_one(&s.pool)
             .await
@@ -1463,29 +1483,41 @@ mod tests {
         );
     }
 
-    /// Asked on every request page.
+    /// Asked on every request page, and for an address's dossier.
     #[tokio::test]
-    async fn one_requests_reuses_scan_no_table() {
+    async fn the_reuses_of_a_request_or_an_address_scan_no_table() {
         let dir = tempfile::tempdir().unwrap();
         let s = crate::store::Store::connect(&dir.path().join("t.db"))
             .await
             .unwrap();
-        let sql = reuses_sql(&ReuseFilter {
-            request: Some(1),
+        let all = ReuseFilter {
             range: crate::store::stats::Range::All,
             ..Default::default()
-        });
-        let plan: Vec<(i64, i64, i64, String)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
-                .bind(1)
-                .bind(1)
-                .bind(1)
-                .bind(50)
-                .fetch_all(&s.pool)
-                .await
-                .unwrap();
-        assert!(!plan.is_empty());
-        assert!(plan.iter().all(|p| !p.3.starts_with("SCAN")), "{plan:?}");
+        };
+        for f in [
+            ReuseFilter {
+                request: Some(1),
+                ..all.clone()
+            },
+            ReuseFilter {
+                ip_id: Some(1),
+                ..all.clone()
+            },
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {}",
+                reuses_sql(&f)
+            )))
+            .bind(1)
+            .bind(1)
+            .bind(1)
+            .bind(50)
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+            assert!(!plan.is_empty());
+            assert!(plan.iter().all(|p| !p.3.starts_with("SCAN")), "{plan:?}");
+        }
     }
 
     async fn derived(pool: &sqlx::SqlitePool) -> (i64, i64) {
