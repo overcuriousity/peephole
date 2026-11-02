@@ -209,6 +209,8 @@ struct CampaignPage {
     agent: bool,
     /// The members' property strips, by address.
     props: std::collections::HashMap<String, crate::store::evidence::IpProps>,
+    /// Every chain of its members.
+    strips: crate::admin::chains::Strips,
 }
 
 /// Evidence rows on a campaign's page, at most, the claimed ones last.
@@ -332,7 +334,9 @@ async fn campaign(
     let props =
         crate::admin::public::page_props(&st, true, c.members.iter().map(|m| m.ip.as_str()))
             .await?;
+    let strips = crate::admin::chains::of_campaign(&st, &key).await?;
     render(&CampaignPage {
+        strips,
         props,
         chrome: chrome(),
         calendar_json: serde_json::to_string(&calendar).unwrap_or_else(|_| "[]".into()),

@@ -71,6 +71,14 @@ exists. Campaigns are read-only and admin-only; the public dashboard shows
 only their counts. Every row says which node recorded it, by name and
 key, and which build it ran.
 
+**Attack chains** follow one attack through what the trap held: the
+exploit, the commands, how the next stage was delivered, the payload, and
+what came after it. The same chain shows on the pages of a request, an
+upload, an address, a campaign and a piece, and each stage says what was
+seen, what the attacker only claimed, and what is missing. The Chains list
+under Evidence shows them newest first. Chains are derived on each node and
+admin-only.
+
 peephole is one binary with SQLite. Fonts, scripts and the world map are
 built in; its web pages make no external requests and come in light and
 dark themes.

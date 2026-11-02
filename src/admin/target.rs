@@ -47,6 +47,8 @@ pub struct Target {
     /// The shared reading (admin only; node-local, never public; nothing
     /// for one operator's address).
     pub sharing: Option<crate::store::evidence::SharingView>,
+    /// The chains it has sightings in (admin only).
+    pub chains: Option<crate::admin::chains::Strips>,
 }
 
 impl Target {
@@ -232,6 +234,11 @@ pub async fn load(
         ),
         _ => (None, vec![]),
     };
+    let chains = if authed {
+        Some(crate::admin::chains::of_address(state, ip.id, &ip.ip).await?)
+    } else {
+        None
+    };
     let (campaign, props, evidence, sharing) = if authed {
         (
             state.store.campaign_of_ip(ip.id).await?,
@@ -247,6 +254,7 @@ pub async fn load(
         (None, None, None, None)
     };
     Ok(Some(Target {
+        chains,
         campaign,
         props,
         evidence,

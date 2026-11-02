@@ -11,6 +11,7 @@
 <dialog id="dlg-del"><h3>Delete request #{{ d.row.id }}?</h3><form method="post" action="/admin/requests/{{ d.row.id }}/delete" class="actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn-danger" type="submit">Delete</button></form></dialog>{% endif %}</div>
 </div>
 <div class="stack">
+  {% include "_chain_strip.html" %}
   <section class="card">
     <div class="req-line"><span class="req-target"><span class="method">{{ d.row.method }}</span><a href="{{ crate::admin::views::pivot_href("path", d.row.path.as_str()) }}">{{ d.row.path }}</a>{% if let Some(q) = d.row.query %}<span class="muted">?{{ q }}</span>{% endif %}</span>{% let value = request_target.as_str() %}{% let what = "request target" %}{% let subtle = false %}{% include "_copy.html" %}</div>
     <dl class="req-facts">

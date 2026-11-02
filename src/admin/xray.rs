@@ -268,7 +268,7 @@ fn layer_title(kind: LayerKind) -> &'static str {
     match kind {
         LayerKind::Raw => "Body",
         LayerKind::Path => "Request path",
-        LayerKind::Query => "Query string",
+        LayerKind::Query => "Query",
         LayerKind::Form => "Form field",
         LayerKind::MultipartField => "Multipart field",
         LayerKind::Json => "JSON string",

@@ -538,6 +538,15 @@ the trap. The `/api/v1` upload endpoints, the dossiers and the dataset export
 carry upload metadata only. Only the upload store reads the stored bytes
 (`upload_blobs`).
 
+**Sandbox results.** The node never fetches a payload. After you run one in
+an external sandbox, open the stager or file page (Evidence, Links) and use
+*Add result* with the SHA-256 (64 hex digits), family (64 characters), sandbox
+URL and note (2,000 characters each). The result fills the Payload stage of
+the whole chain, marked external. The URL is kept and shown as defanged text,
+never a link. Results stay on the node that holds them: they are not
+replicated or exported, and survive a recompute. A page whose sightings are
+gone still shows its results.
+
 **When the bytes are not there.** If there is no button, *Content* reads
 `content not held` followed by the reason (on the list, hover over it):
 
@@ -578,6 +587,14 @@ own page; a `webshell` request shows the command line it sent (from the
 query or a form body), linked to every request that sent the same command.
 A path the trap answers itself (`/`, a decoy) keeps its own answer: the
 upload is recorded and told it landed, and nothing else changes there.
+
+A file sent to the WP File Manager connector
+(`.../wp-file-manager/lib/php/connector.minimal.php`) is answered at
+`/wp-content/plugins/wp-file-manager/lib/files/<name>`, where the attack tool
+looks for it; other upload scripts answer at `/uploads/<name>`. Requests that
+still found nothing (the same address, a path ending in the file's name, a
+`404`, within 60 seconds after the upload) are listed by path under
+Evidence, Chains, *Dead ends*.
 
 ## Cluster administration
 

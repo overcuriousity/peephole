@@ -17,6 +17,33 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   for its newest 16 values, and both are listed as excluded. The Evidence
   table lists the first 500 edges.
   Dossiers carry `joiner_edges` and defanged edge values.
+- A file sent to the WP File Manager connector is answered where the attack
+  tool asks for it, `/wp-content/plugins/wp-file-manager/lib/files/<name>`,
+  not at `/uploads/<name>`, so the tool's check finds a webshell instead of a
+  404. Other upload scripts keep `/uploads/`. A new *Dead ends* tab on the
+  Chains list (`/admin/evidence/chains?tab=dead-ends`) groups by path the
+  404s an address got within a minute after its upload, defanged.
+- Sandbox results: on a stager or file page that joins a chain, an admin
+  enters the SHA-256, family, sandbox URL and a note from an external
+  sandbox. Each result fills the Payload stage of the whole chain as one row
+  marked external. The URL is shown defanged as text, never a link. Results
+  are kept on this node only, are not replicated, survive a recompute or an
+  X-ray version change, and are logged with who entered them.
+- Dossiers carry attack chains: request dossiers a `chain` and an `xray`
+  summary (layer kinds, pieces, opaque reasons, no layer text), address and
+  campaign dossiers a `chains` list. New read-scope routes
+  `GET /api/v1/chains` and `GET /api/v1/chains/{key}`. Pieces appear as
+  `value` and `defanged`, a stager's URLs raw and defanged; upload text and
+  key material never do. `dossier_v` stays 1.
+- The chain strip shows an attack in five stages (Exploit, Command, Delivery,
+  Payload, Follow-up) on the request, upload, address, campaign and piece
+  pages: the same chain from any of them, with "you are here" on a source's
+  own pieces. Each row says in words whether it was seen, is only claimed, or
+  is a gap or a dead end, and joiners get an accent edge. Exploits group by
+  attacker's tag up to its first dot, uploaded text fills Payload, follow-ups
+  are read through the X-ray to the command a webshell received, and an
+  address's strip is admin only. Evidence opens on the new Chains list,
+  newest first, at `/admin/evidence/chains`.
 - Attack chains are built in the campaign pass: stagers, SSH keys and
   uploaded files form one chain only when they appear together in sources
   from at least two addresses and a tenth of the larger one's, so a forged
@@ -44,6 +71,7 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   metadata-only.
 
 ### Changed
+- The X-ray calls its query layer "Query".
 - The request page shows up to 64 KiB of a body (was 16 KiB). The dossier and
   API `body_text` and `body_b64` grow to 64 KiB with it.
 

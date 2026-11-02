@@ -113,6 +113,27 @@ pub fn mask_ranges(xray: &Xray, layer: usize) -> Vec<(usize, usize)> {
     all_masks(xray).into_iter().nth(layer).unwrap_or_default()
 }
 
+/// Whether a layer holds a private key, or text one was decoded from.
+pub fn holds_key(xray: &Xray) -> bool {
+    all_masks(xray).iter().any(|layer| !layer.is_empty())
+}
+
+/// `text` with every private key in it, unencoded or percent-encoded,
+/// replaced: for a value shown without its layers.
+pub fn masked(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let (mut out, mut at) = (vec![], 0);
+    for (start, end) in ranges(bytes) {
+        if start >= at {
+            out.extend_from_slice(&bytes[at..start]);
+            out.extend_from_slice(b"[private key]");
+            at = end;
+        }
+    }
+    out.extend_from_slice(&bytes[at.min(bytes.len())..]);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Where the first key marker of `text` starts.
 pub(super) fn marker_start(text: &[u8]) -> Option<usize> {
     BEGIN.find(text).map(|m| m.start())

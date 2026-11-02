@@ -107,6 +107,7 @@ struct UploadPage {
     timeline_max: i64,
     /// A text upload opened layer by layer; binaries have none.
     xray: Option<crate::admin::xray::XrayView>,
+    strips: crate::admin::chains::Strips,
 }
 
 async fn detail(
@@ -129,8 +130,18 @@ async fn detail(
             Policy::embedded(),
         ))
     });
+    drop(conn);
+    let ip_id = st.store.ip_by_addr(&u.ip).await?.map_or(0, |i| i.id);
+    let strips = crate::admin::chains::of_source(
+        &st,
+        crate::store::chains::Anchor::Upload(&uid),
+        ip_id,
+        &u.ip,
+    )
+    .await?;
     render(&UploadPage {
         chrome: Chrome::new(true, "admin"),
+        strips,
         xray,
         u,
         timeline,
@@ -311,8 +322,9 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// The hash is a pivot (MIK-498): it links to the list filtered to
-    /// that content, which lists only it; a value that is no sha256 is a 400.
+    /// The hash is a pivot (MIK-498): it links to the File page. The list
+    /// filtered to that content lists only it, and a value that is no sha256
+    /// is a 400.
     #[tokio::test]
     async fn the_hash_pivots_to_the_uploads_of_that_content() {
         let (st, cookie, app, _d) = app().await;
@@ -324,7 +336,7 @@ pub(crate) mod tests {
                 .header("cookie", cookie.clone())
                 .header("sec-fetch-site", "same-origin")
         };
-        let href = format!("href=\"/admin/traps/uploads?sha256={hash}\"");
+        let href = format!("href=\"/admin/evidence/links/file/{hash}\"");
         let (status, _, body) =
             send(&app, get("/admin/traps/uploads/ua".into()), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
