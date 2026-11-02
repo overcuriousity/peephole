@@ -1642,10 +1642,6 @@ mod tests {
 
     const T0: &str = "2026-10-01 00:00:00";
     const STAGER_URL: &str = "http://a.example.org:8080/x.sh";
-    /// The base64 of a body shaped like a key, 96 bytes of `Z`.
-    const FAKE_KEY_B64: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa\
-         WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa";
-
     /// A piece sighted in request `id` of address `ip_id`.
     async fn sight(s: &crate::store::Store, id: i64, ip_id: i64, p: (&str, &str, &str)) {
         let hash = crate::store::pieces::piece_hash(p.0, p.1);
@@ -1755,7 +1751,8 @@ mod tests {
         let d = serde_json::to_value(d).unwrap();
         let chain = &d["chain"];
         assert_eq!(chain["more"], 0);
-        assert_eq!(d["other_chains"], 0);
+        // The stager and the key each name a chain.
+        assert_eq!(d["other_chains"], 1);
         let stager = rows(chain)
             .into_iter()
             .find(|r| r["kind"] == "stager")
@@ -1848,9 +1845,10 @@ mod tests {
     async fn key_material_is_not_in_the_chain_or_xray_fields() {
         let (state, _req, _d) = chained().await;
         let ip = state.store.ip_by_addr("192.0.2.1").await.unwrap().unwrap();
-        let pem = format!(
-            "-----BEGIN OPENSSH PRIVATE KEY-----\n{FAKE_KEY_B64}\n-----END OPENSSH PRIVATE KEY-----\n"
-        );
+        // Bytes generated for the test; the label makes it the PEM form.
+        let b64 = data_encoding::BASE64.encode(&(0..96u8).collect::<Vec<_>>());
+        let pem =
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{b64}\n-----END RSA PRIVATE KEY-----\n");
         let id = state
             .store
             .insert_request(&crate::store::requests::NewRequest {
@@ -1881,7 +1879,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{all:?}"));
         assert!(key.len() < 100);
         for s in &all {
-            assert!(!s.contains("WlpaWlpa") && !s.contains("PRIVATE KEY"), "{s}");
+            assert!(!s.contains(&b64[..40]) && !s.contains("PRIVATE KEY"), "{s}");
         }
     }
 
