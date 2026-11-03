@@ -397,11 +397,24 @@ mod tests {
             s.resize(s.len().min(64 * 1024), b' ');
             s
         };
+        // Steps whose long tags differ only at the end: each is placed by a
+        // search from the end of the layer.
+        let tags = {
+            let (mut s, tag) = (vec![], "A".repeat(400));
+            for i in 0.. {
+                if s.len() > 60 * 1024 {
+                    break;
+                }
+                s.extend(format!("./a {tag}{i}B;").bytes());
+            }
+            s
+        };
         let bodies = [
             b"$(".repeat(32 * 1024),
             b";".repeat(64 * 1024),
             nested,
             literals,
+            tags,
         ];
         for body in bodies {
             let start = Instant::now();

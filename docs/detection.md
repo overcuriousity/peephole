@@ -429,8 +429,9 @@ evidence of one operator:
   that tie it. A file on more than 50 addresses is a public webshell and ties
   nothing. Stagers and keys have no such cap: a stager is a joiner only when
   a command fetches from it, and a shared host such as a paste site joins by
-  the full URL, not by the host. An address counts for its newest 16 values;
-  one naming more is listed under Excluded values.
+  the full URL, not by the host. An address counts for 16 values: first those
+  another address names too, then the newest. One with more than 16 that
+  other addresses name is listed under Excluded values.
 
   Accepted limit: joiners group only addresses with no campaign and never
   touch an existing campaign. The tenth protects a value, not a whole loose
@@ -456,8 +457,9 @@ An attack chain is a group of stagers, SSH keys and uploaded files that
 appear together in sources from at least two addresses, and from a tenth of
 the addresses of the larger value, with what those sources describe. A file
 on more than 50 addresses is a public webshell and joins nothing, a source
-naming more than 64 joiners connects none, and an address counts for its
-newest 16 joiners. The strip reads it in five stages, built from sightings on
+naming more than 64 joiners connects none, and an address counts for 16
+joiners: first those another address names too, then the newest. So an
+address holding 16 shared joiners gets no chain for a new one of its own. The strip reads it in five stages, built from sightings on
 this node:
 
 | Stage | Holds |
@@ -477,6 +479,11 @@ own pieces, without a key, and links to the chains its address is in. A
 source with nothing a strip shows has no strip. A chain reads its newest 64
 uploads, the timelines of the newest 8, and the first 32 follow-ups through
 the X-ray, and shows 200 pieces, joiners first; what is past a cap is counted.
+Its exploit pairs, tags and per-piece request counts come from the newest
+2,000 sources of each of its newest 64 joiners. A piece found only in older
+sources shows its count across all chains instead. An address sending more
+than 256 different sets of its joiners has the rest counted toward each of
+its chains.
 A page draws at most 5 strips (32 on a campaign's) with a link to the rest.
 
 A campaign's page lists every edge. A soft edge's row opens to the score

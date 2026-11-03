@@ -420,8 +420,9 @@ name is a claimed edge. Joiners only group IPs with no campaign of their own
 and never merge or change a campaign: an edge touching one is listed as "not
 merged", and the chain shows the link across campaigns. Filter by country, ASN, minimum size and
 period. Below the list are the excluded values (a hard value or a file on more
-than 50 IPs is shared infrastructure, not one operator; an address counts for its
-newest 16 joiner values, and one naming more is listed here too) and when the last pass ran
+than 50 IPs is shared infrastructure, not one operator; an address counts for 16
+joiner values, those another address names first, then the newest, and one
+with more than 16 shared values is listed here too) and when the last pass ran
 and how long it took. A campaign's page shows its members, every evidence
 edge with the reason, the members' requests per day and the path shapes most
 of them asked for, with how many IPs of the whole dataset asked for each.

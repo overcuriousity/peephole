@@ -79,6 +79,8 @@ const PATHS: &str = "paths";
 /// The [`Excluded`] kind of an IP naming more than [`MAX_JOINERS_PER_IP`]
 /// values; its value says which and how many.
 const JOINER_CAP: &str = "joiner cap";
+/// The [`Excluded`] row counting the files past [`EXCLUDED_LISTED`].
+const FILE_CAP: &str = "file cap";
 /// The edge kinds that join on what a body names: a role in `piece_sightings`
 /// and a `campaign_edges.kind`.
 const JOINERS: [LinkKind; 3] = [LinkKind::Stager, LinkKind::Key, LinkKind::File];
@@ -868,11 +870,14 @@ pub(crate) struct Input {
     /// Joiner sightings: kind, value, IP, time. A value's first and last
     /// per address, of each address's newest [`MAX_JOINERS_PER_IP`].
     pub(crate) joiners: Vec<(&'static str, String, i64, String)>,
-    /// How many joiner values an address has, read or not.
+    /// How many joiner values an address has that another address names
+    /// too, read or not.
     joiners_held: HashMap<i64, usize>,
     /// Files on more than [`HARD_FANOUT_MAX`] addresses, the widest first, at
     /// most [`EXCLUDED_LISTED`], with how many. [`compute`] lists them.
     wide_files: Vec<(String, i64)>,
+    /// How many such files there are in all.
+    wide_files_total: i64,
 }
 
 impl Input {
@@ -955,6 +960,13 @@ impl Input {
         .bind(HARD_FANOUT_MAX as i64)
         .bind(EXCLUDED_LISTED as i64)
         .fetch_all(&mut *conn)
+        .await?;
+        input.wide_files_total = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM piece_sightings WHERE role = 'file'
+             GROUP BY piece HAVING COUNT(DISTINCT ip_id) > ?)",
+        )
+        .bind(HARD_FANOUT_MAX as i64)
+        .fetch_one(&mut *conn)
         .await?;
         Ok(input)
     }
@@ -1110,6 +1122,16 @@ fn joiner_values<'a>(
         value: value.clone(),
         ips: *ips as usize,
     }));
+    let more = input.wide_files_total - input.wide_files.len() as i64;
+    if more > 0 {
+        // `ips` counts the files here, as the joiner cap's row counts
+        // addresses. Its own kind, so the page does not link it as a file.
+        excluded.push(Excluded {
+            kind: FILE_CAP.to_string(),
+            value: format!("more files on more than {HARD_FANOUT_MAX} addresses"),
+            ips: more as usize,
+        });
+    }
     let mut values = JoinerValues::new();
     for (kind, value, ip, ts) in &input.joiners {
         let Some(&i) = index.get(ip) else { continue };
@@ -1156,8 +1178,14 @@ fn joiner_values<'a>(
         }
     }
     for (i, mut named) in held {
+        // Only values another address names count: one no other names forms
+        // no edge, kept or not.
+        let shared = named
+            .iter()
+            .filter(|x| values.get(&x.2).is_some_and(|ips| ips.len() >= 2))
+            .count();
         let all = over.entry(i).or_default();
-        *all = (*all).max(named.len());
+        *all = (*all).max(shared);
         if named.len() > MAX_JOINERS_PER_IP {
             named.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
             let cut = named.split_off(MAX_JOINERS_PER_IP);
@@ -1174,7 +1202,7 @@ fn joiner_values<'a>(
     excluded.extend(capped.into_iter().map(|(i, n)| Excluded {
         kind: JOINER_CAP.to_string(),
         value: format!(
-            "{}: {n} values past the newest {MAX_JOINERS_PER_IP}",
+            "{}: {n} shared values past its {MAX_JOINERS_PER_IP}",
             ip_text(i)
         ),
         ips: 1,
@@ -1182,7 +1210,7 @@ fn joiner_values<'a>(
     if !rest.is_empty() {
         excluded.push(Excluded {
             kind: JOINER_CAP.to_string(),
-            value: format!("more addresses past the newest {MAX_JOINERS_PER_IP}"),
+            value: format!("more addresses past their {MAX_JOINERS_PER_IP} shared values"),
             ips: rest.len(),
         });
     }
@@ -3803,7 +3831,7 @@ pub(crate) mod tests {
         assert_eq!(row.kind, "joiner cap");
         assert_eq!(
             row.value,
-            format!("{a}: 6 values past the newest {MAX_JOINERS_PER_IP}")
+            format!("{a}: 6 shared values past its {MAX_JOINERS_PER_IP}")
         );
     }
 
@@ -3825,6 +3853,23 @@ pub(crate) mod tests {
         );
         let last = out.excluded.last().unwrap();
         assert_eq!((last.kind.as_str(), last.ips), (JOINER_CAP, 8));
+    }
+
+    #[test]
+    fn the_report_counts_the_wide_files_past_those_it_lists() {
+        let mut input = Input {
+            wide_files: (0..EXCLUDED_LISTED)
+                .map(|i| (format!("{i:064x}"), 60))
+                .collect(),
+            wide_files_total: EXCLUDED_LISTED as i64 + 8,
+            ..Input::default()
+        };
+        let out = v2(&input);
+        assert_eq!(out.excluded.len(), EXCLUDED_LISTED + 1);
+        let last = out.excluded.last().unwrap();
+        assert_eq!((last.kind.as_str(), last.ips), (FILE_CAP, 8));
+        input.wide_files_total = EXCLUDED_LISTED as i64;
+        assert_eq!(v2(&input).excluded.len(), EXCLUDED_LISTED);
     }
 
     #[tokio::test]

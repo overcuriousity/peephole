@@ -14,7 +14,9 @@ On first start a background task reads every stored request and text upload
 for pieces. On a copy of real data it took about 5 minutes for 320,000
 requests in a debug build. The node works meanwhile: the campaign pass runs
 on what has been read so far and once more when the first read is done, so
-chains and joiner campaigns fill in then. Campaign `#N` can change, and an
+chains and joiner campaigns fill in then. A later X-ray version reads every
+row again the same way, and campaigns and chains are built on partial
+sightings until it is done, so they can shift meanwhile. Campaign `#N` can change, and an
 address with no campaign can gain one, so campaign keys can shift in
 exports. A node with `retention_days` set derives pieces only from the rows
 it still holds.
@@ -57,7 +59,8 @@ Accepted limits:
   campaign: an edge touching one is shown as "not merged", and the chain
   shows the link across campaigns. Claimed edges are not counted as hard
   evidence. A file on more than 50 addresses ties nothing, an address counts
-  for its newest 16 values, and both are listed as excluded. The public
+  for 16 values, those another address names first, then the newest, and
+  both are listed as excluded. The public
   "Campaigns this period" tile leaves out campaigns the joiners formed. The
   Evidence table and a dossier list the first 500 edges. Dossiers carry
   `joiner_edges` and defanged edge values, and `limits` gains `edges`.

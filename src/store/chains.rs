@@ -58,6 +58,10 @@ const PAIRED_JOINERS_MAX: usize = 64;
 /// Most describers a pass keeps per joiner, the newest: a body can name 255
 /// fresh ones ten times a second, and a chain shows [`FOUND_MAX`] pieces.
 const DESCRIBERS_MAX: usize = 512;
+/// Most lists a pass keeps per address, those of the most sources. An
+/// address can send each subset of its kept joiners, 2^16 of them; the rest
+/// fold into one list of all it kept.
+const LISTS_PER_IP: i64 = 256;
 /// Rows per `INSERT`: well under SQLite's bound variables.
 const INSERT_BATCH: usize = 400;
 
@@ -106,15 +110,25 @@ pub struct JoinerSpan {
 }
 
 /// The sources of one address that name these joiners, in order, and no
-/// others of those it kept. An address sending one list a million times is
-/// one row, so what a pass holds grows with what addresses name, not with
-/// how often they send it.
+/// others of those it kept: what a chain's source count reads. An address
+/// sending one list a million times is one row, so what a pass holds grows
+/// with what addresses name, not with how often they send it. Past
+/// [`LISTS_PER_IP`] lists, one more holds the rest's count and all the
+/// address kept, so their sources count toward each of its chains.
 pub struct JoinerList {
+    /// Read by the tests; a count needs only the joiners.
+    #[cfg_attr(not(test), allow(dead_code))]
     ip: i64,
     joiners: Vec<i64>,
     sources: i64,
-    /// Under [`PAIRED_JOINERS_MAX`] in all, so its joiners may be paired.
-    paired: bool,
+}
+
+/// Two joiners an address kept that one of its sources names together, of
+/// at most [`PAIRED_JOINERS_MAX`] joiners; `a < b`. At most 120 per address.
+pub struct JoinerPair {
+    ip: i64,
+    a: i64,
+    b: i64,
 }
 
 /// A chain as [`connect`] finds it.
@@ -155,39 +169,26 @@ fn addresses_to_connect(a: usize, b: usize) -> usize {
 /// The joiner pairs that appear together in sources from enough addresses
 /// ([`addresses_to_connect`]), as a union of everything each joins:
 /// `piece -> parent`.
-fn unions(spans: &[JoinerSpan], lists: &[JoinerList]) -> HashMap<i64, i64> {
+fn unions(spans: &[JoinerSpan], named: &[JoinerPair]) -> HashMap<i64, i64> {
     let mut addresses: HashMap<i64, usize> = HashMap::new();
     for s in spans {
         *addresses.entry(s.piece).or_default() += 1;
     }
+    let on = |j: i64| addresses.get(&j).copied().unwrap_or(0);
     let mut parent = HashMap::new();
-    // A joiner on one address cannot connect, and an address sending the
-    // same list again says nothing new: neither costs a pair.
-    let mut read: HashSet<(i64, Vec<i64>)> = HashSet::new();
-    // The addresses of each pair, until there are enough.
+    // The addresses of each pair, until there are enough. A joiner on one
+    // address cannot connect, so it costs no entry.
     let mut pairs: HashMap<(i64, i64), HashSet<i64>> = HashMap::new();
-    for list in lists.iter().filter(|l| l.paired) {
-        let ip = list.ip;
-        let on = |j: &i64| addresses.get(j).copied().unwrap_or(0);
-        let shared: Vec<i64> = list
-            .joiners
-            .iter()
-            .copied()
-            .filter(|j| on(j) >= 2)
-            .collect();
-        if shared.len() < 2 || !read.insert((ip, shared.clone())) {
+    for &JoinerPair { ip, a, b } in named {
+        if on(a) < 2 || on(b) < 2 {
             continue;
         }
-        for (i, &a) in shared.iter().enumerate() {
-            for &b in &shared[i + 1..] {
-                let need = addresses_to_connect(on(&a), on(&b));
-                let seen = pairs.entry((a, b)).or_default();
-                if seen.len() < need && seen.insert(ip) && seen.len() == need {
-                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                    if ra != rb {
-                        parent.insert(ra, rb);
-                    }
-                }
+        let need = addresses_to_connect(on(a), on(b));
+        let seen = pairs.entry((a, b)).or_default();
+        if seen.len() < need && seen.insert(ip) && seen.len() == need {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent.insert(ra, rb);
             }
         }
     }
@@ -195,7 +196,11 @@ fn unions(spans: &[JoinerSpan], lists: &[JoinerList]) -> HashMap<i64, i64> {
 }
 
 /// The chains these joiners form, by key.
-pub(crate) fn connect(spans: &[JoinerSpan], lists: &[JoinerList]) -> Vec<ChainOut> {
+pub(crate) fn connect(
+    spans: &[JoinerSpan],
+    pairs: &[JoinerPair],
+    lists: &[JoinerList],
+) -> Vec<ChainOut> {
     #[derive(Default)]
     struct Group<'a> {
         /// Each joiner's oldest sighting.
@@ -205,7 +210,7 @@ pub(crate) fn connect(spans: &[JoinerSpan], lists: &[JoinerList]) -> Vec<ChainOu
         first: &'a str,
         last: &'a str,
     }
-    let mut parent = unions(spans, lists);
+    let mut parent = unions(spans, pairs);
     let mut groups: HashMap<i64, Group> = HashMap::new();
     for s in spans {
         let g = groups.entry(find(&mut parent, s.piece)).or_default();
@@ -254,7 +259,7 @@ fn source_of(kind: &str, id: i64) -> (u8, i64) {
 
 /// Common table expressions ending in `ranked`: each address's joiners, one
 /// row per joiner and address, with their first and last sighting, `held`,
-/// how many that address has, and two ranks. Those two addresses name come
+/// how many of them another address names too, and two ranks. Those two addresses name come
 /// first, as only they can connect anything, then the newest. `nth` is a row
 /// number; `tied` leaves joiners of one second level. A file on more than
 /// [`HARD_FANOUT_MAX`] addresses is left out, counted from the sightings as
@@ -277,7 +282,7 @@ pub(super) fn ranked_joiners() -> String {
              ROW_NUMBER() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC, piece)
                AS nth,
              RANK() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC) AS tied,
-             COUNT(*) OVER (PARTITION BY ip_id) AS held
+             SUM(shared) OVER (PARTITION BY ip_id) AS held
            FROM listed)"
     )
 }
@@ -302,17 +307,64 @@ async fn joiner_spans(conn: &mut SqliteConnection) -> Result<Vec<JoinerSpan>> {
         .collect())
 }
 
-/// Which of [`joiner_spans`] the sources name together.
+/// Which of [`joiner_spans`] the sources name together, for the counts:
+/// at most [`LISTS_PER_IP`] lists per address, and one of the rest.
 async fn joiner_lists(conn: &mut SqliteConnection) -> Result<Vec<JoinerList>> {
-    let rows: Vec<(i64, String, bool, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "WITH {},
          kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
          sources AS (
-           SELECT g.ip_id, COUNT(*) AS n, group_concat(k.piece, ',' ORDER BY k.piece) AS list
+           SELECT g.ip_id, group_concat(k.piece, ',' ORDER BY k.piece) AS list
            FROM piece_sightings g LEFT JOIN kept k ON k.piece = g.piece AND k.ip_id = g.ip_id
-           WHERE g.role IN {JOINER_ROLES} GROUP BY g.source_kind, g.source_id)
-         SELECT ip_id, list, n <= ?2, COUNT(*) FROM sources
-         WHERE list IS NOT NULL GROUP BY ip_id, list, n <= ?2",
+           WHERE g.role IN {JOINER_ROLES} GROUP BY g.source_kind, g.source_id),
+         lists AS (
+           SELECT ip_id, list, COUNT(*) AS n FROM sources
+           WHERE list IS NOT NULL GROUP BY ip_id, list),
+         ordered AS (
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY ip_id ORDER BY n DESC, list) AS r
+           FROM lists)
+         SELECT ip_id, list, n FROM ordered WHERE r <= ?2
+         UNION ALL
+         SELECT o.ip_id,
+                (SELECT group_concat(k.piece, ',' ORDER BY k.piece) FROM kept k
+                 WHERE k.ip_id = o.ip_id),
+                SUM(o.n)
+         FROM ordered o WHERE o.r > ?2 GROUP BY o.ip_id",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(LISTS_PER_IP)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ip, list, sources)| JoinerList {
+            ip,
+            joiners: list.split(',').filter_map(|j| j.parse().ok()).collect(),
+            sources,
+        })
+        .collect())
+}
+
+/// The pairs of [`joiner_spans`] one source names together, once per
+/// address, from sources of at most [`PAIRED_JOINERS_MAX`] joiners.
+async fn joiner_pairs(conn: &mut SqliteConnection) -> Result<Vec<JoinerPair>> {
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         small AS (
+           SELECT source_kind, source_id FROM piece_sightings
+           WHERE role IN {JOINER_ROLES}
+           GROUP BY source_kind, source_id HAVING COUNT(*) <= ?2),
+         inside AS (
+           SELECT g.source_kind, g.source_id, g.ip_id, g.piece
+           FROM piece_sightings g
+           JOIN kept k ON k.piece = g.piece AND k.ip_id = g.ip_id
+           JOIN small s ON s.source_kind = g.source_kind AND s.source_id = g.source_id
+           WHERE g.role IN {JOINER_ROLES})
+         SELECT DISTINCT a.ip_id, a.piece, b.piece FROM inside a JOIN inside b
+           ON b.source_kind = a.source_kind AND b.source_id = a.source_id
+          AND b.piece > a.piece",
         ranked_joiners()
     )))
     .bind(MAX_JOINERS_PER_IP as i64)
@@ -321,12 +373,7 @@ async fn joiner_lists(conn: &mut SqliteConnection) -> Result<Vec<JoinerList>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(ip, list, paired, sources)| JoinerList {
-            ip,
-            joiners: list.split(',').filter_map(|j| j.parse().ok()).collect(),
-            sources,
-            paired,
-        })
+        .map(|(ip, a, b)| JoinerPair { ip, a, b })
         .collect())
 }
 
@@ -341,8 +388,9 @@ pub struct Plan {
 /// pass's read snapshot, so the write lock is not held for any of this.
 pub async fn plan(conn: &mut SqliteConnection) -> Result<Plan> {
     let spans = joiner_spans(conn).await?;
+    let pairs = joiner_pairs(conn).await?;
     let lists = joiner_lists(conn).await?;
-    let chains = connect(&spans, &lists);
+    let chains = connect(&spans, &pairs, &lists);
     let mut chain_of: HashMap<i64, usize> = HashMap::new();
     let mut members: BTreeSet<(usize, i64)> = BTreeSet::new();
     for (i, c) in chains.iter().enumerate() {
@@ -2165,22 +2213,30 @@ mod tests {
                 .insert(r.piece);
         }
         let mut lists: BTreeMap<(i64, Vec<i64>), i64> = BTreeMap::new();
+        let mut pairs: BTreeSet<(i64, i64, i64)> = BTreeSet::new();
         for (ip, joiners) in sources.into_values() {
-            *lists
-                .entry((ip, joiners.into_iter().collect()))
-                .or_default() += 1;
+            let joiners: Vec<i64> = joiners.into_iter().collect();
+            if joiners.len() <= PAIRED_JOINERS_MAX {
+                for (i, &a) in joiners.iter().enumerate() {
+                    pairs.extend(joiners[i + 1..].iter().map(|&b| (ip, a, b)));
+                }
+            }
+            *lists.entry((ip, joiners)).or_default() += 1;
         }
         let lists: Vec<JoinerList> = lists
             .into_iter()
             .map(|((ip, joiners), sources)| JoinerList {
                 ip,
-                paired: joiners.len() <= PAIRED_JOINERS_MAX,
                 joiners,
                 sources,
             })
             .collect();
+        let pairs: Vec<JoinerPair> = pairs
+            .into_iter()
+            .map(|(ip, a, b)| JoinerPair { ip, a, b })
+            .collect();
         let spans: Vec<JoinerSpan> = spans.into_values().collect();
-        super::connect(&spans, &lists)
+        super::connect(&spans, &pairs, &lists)
     }
 
     fn at(piece: i64, source: (u8, i64), ip: i64, ts: &str) -> JoinerSighting {
@@ -2512,7 +2568,8 @@ mod tests {
         assert_eq!(spans.len(), MAX_JOINERS_PER_IP);
         let lists = joiner_lists(&mut c).await.unwrap();
         assert_eq!(lists.len(), 1, "the newest body holds all it kept");
-        assert!(!lists[0].paired, "a source over the limit pairs nothing");
+        let pairs = joiner_pairs(&mut c).await.unwrap();
+        assert!(pairs.is_empty(), "a source over the limit pairs nothing");
         let input = crate::store::campaigns::Input::read(&mut c).await.unwrap();
         assert!(input.joiners.len() <= 256, "{}", input.joiners.len());
         let p = plan(&mut c).await.unwrap();
@@ -2522,8 +2579,10 @@ mod tests {
         run(&s).await;
         assert_eq!(rows_of(&s, "chains").await, MAX_JOINERS_PER_IP as i64);
         assert_eq!(rows_of(&s, "chain_pieces").await, MAX_JOINERS_PER_IP as i64);
+        // No other address names them, so none could form an edge: the
+        // campaigns list no cap.
         let r = s.recompute_campaigns(true).await.unwrap();
-        assert!(r.excluded.iter().any(|e| e.kind == "joiner cap"), "{r}");
+        assert!(!r.excluded.iter().any(|e| e.kind == "joiner cap"), "{r}");
     }
 
     #[tokio::test]
@@ -2541,6 +2600,42 @@ mod tests {
         drop(c);
         assert_eq!(p.chains.len(), 1, "the newest body's joiners connect");
         assert_eq!(p.members.len(), MAX_JOINERS_PER_IP);
+    }
+
+    #[tokio::test]
+    async fn an_address_sending_every_subset_keeps_its_cap() {
+        let (s, _d) = store().await;
+        // Address 10 names 10 stagers in one body; address 11 names them in
+        // 600 bodies, each a different subset.
+        flood(&s, 10, 1_000, 10, 10, 1).await;
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 600),
+             b(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM b WHERE j < 15)
+             INSERT INTO piece_sightings
+             SELECT 1000 + j, 'request', 10000 + i, 11, 'stager', 'claimed', ?
+             FROM c, b WHERE (i >> j) & 1",
+        )
+        .bind(T1)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut c = s.pool.acquire().await.unwrap();
+        let lists = joiner_lists(&mut c).await.unwrap();
+        let of_11: Vec<&JoinerList> = lists.iter().filter(|l| l.ip == 11).collect();
+        assert_eq!(of_11.len(), LISTS_PER_IP as usize + 1);
+        assert_eq!(of_11.iter().map(|l| l.sources).sum::<i64>(), 600);
+        let rest = of_11
+            .iter()
+            .find(|l| l.sources > 1)
+            .expect("the rest's list");
+        assert_eq!((rest.sources, rest.joiners.len()), (600 - LISTS_PER_IP, 10));
+        let pairs = joiner_pairs(&mut c).await.unwrap();
+        // Once each, however many bodies: at most 10 * 9 / 2.
+        let of_11 = pairs.iter().filter(|p| p.ip == 11).count();
+        assert!((40..=45).contains(&of_11), "{of_11}");
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.chains.len(), 1);
+        assert_eq!(p.chains[0].sources, 601);
     }
 
     #[tokio::test]
