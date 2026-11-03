@@ -242,7 +242,11 @@ pub fn flow(chains: &[Chain]) -> FlowView {
             // Nothing known on either side: the band is a gap too.
             let mark = if from == Mark::Gap { Mark::Gap } else { mark };
             let requests = areq.min(breq);
-            let thick = (requests as f64 * scale).max(BAND_MIN).min(ah.min(bh));
+            // An empty stage has no height: its band still shows, at the
+            // minimum.
+            let thick = (requests as f64 * scale)
+                .max(BAND_MIN)
+                .min(ah.min(bh).max(BAND_MIN));
             let (a, b) = (ay + (ah - thick) / 2.0, by + (bh - thick) / 2.0);
             let (x0, x1) = (x_of(col) + COL_W, x_of(col + 1));
             let m = (x0 + x1) / 2.0;

@@ -55,17 +55,21 @@ pub async fn run(store: Store, standalone: bool, mut shutdown: tokio::sync::watc
         }
         if tokio::time::Instant::now() >= next_campaigns {
             next_campaigns = tokio::time::Instant::now() + super::campaigns::RECOMPUTE_EVERY;
-            if let Err(e) = super::pieces::extract(&store.pool).await {
-                tracing::warn!(?e, "attack-chain piece extraction failed");
-            }
+            // On the pieces read so far: extraction is its own task
+            // (`super::pieces::run`) and is not waited for.
             recompute_campaigns(&store).await;
         }
     }
 }
 
+/// One campaign pass at a time: the startup passes and the hourly one can
+/// meet.
+static RECOMPUTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Recompute the campaigns if their inputs changed, then the evidence rows.
 /// A failure is logged only: the next pass tries again.
 pub async fn recompute_campaigns(store: &Store) {
+    let _one = RECOMPUTING.lock().await;
     match store.recompute_campaigns(false).await {
         Ok(r) if r.unchanged => {}
         Ok(r) => tracing::info!(

@@ -1888,6 +1888,22 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn wall_leaves_out_campaigns_formed_by_joiners() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_campaigns(&st, 4).await;
+        sqlx::query("UPDATE campaigns SET joiner_edges = 1 WHERE num = 1")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["campaigns"]["active"].as_i64(), Some(3), "{json}");
+        let admin = st.store.stats(Range::D7).await.unwrap().campaigns.unwrap();
+        assert_eq!(admin.active, 4);
+    }
+
+    #[tokio::test]
     async fn wall_hides_campaigns_while_rows_await_their_publish_delay() {
         let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
         st.store

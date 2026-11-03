@@ -226,7 +226,7 @@ async fn write(
         .execute(&mut *conn)
         .await?;
         if let Some(url) = &f.url {
-            sqlx::query(
+            let added = sqlx::query(
                 "INSERT OR IGNORE INTO piece_url_sources
                    (piece, url, source_kind, source_id, ts)
                  VALUES (?, ?, ?, ?, ?)",
@@ -237,19 +237,23 @@ async fn write(
             .bind(source_id)
             .bind(ts)
             .execute(&mut *conn)
-            .await?;
+            .await?
+            .rows_affected() as i64;
+            // A new source adds one; counting them all here would cost a
+            // URL in many requests quadratic time under the write lock.
+            // `refresh_counts` corrects what deletes leave.
             sqlx::query(
                 "INSERT INTO piece_urls (piece, url, first_seen, last_seen, sources)
                  VALUES (?1, ?2, ?3, ?3, 1)
                  ON CONFLICT (piece, url) DO UPDATE SET
                    first_seen = MIN(first_seen, excluded.first_seen),
                    last_seen = MAX(last_seen, excluded.last_seen),
-                   sources = (SELECT COUNT(*) FROM piece_url_sources
-                              WHERE piece = ?1 AND url = ?2)",
+                   sources = sources + ?4",
             )
             .bind(hash)
             .bind(url)
             .bind(ts)
+            .bind(added)
             .execute(&mut *conn)
             .await?;
             trim_urls(conn, hash).await?;
@@ -292,7 +296,15 @@ pub async fn backfill(pool: &SqlitePool) -> Result<u64> {
 async fn backfill_at(pool: &SqlitePool, v: i64) -> Result<u64> {
     reset_if_changed(pool, v).await?;
     stamp_light(pool, v).await?;
-    Ok(walk_requests(pool, v).await? + walk_uploads(pool, v).await?)
+    // Up to the newest rows now, not the ones written while it reads: a
+    // flood that outruns extraction would keep a pass from ending, and the
+    // count refresh after it from ever running. The next pass takes them.
+    let (req_max, up_max): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT (SELECT MAX(id) FROM requests), (SELECT MAX(id) FROM uploads)")
+            .fetch_one(pool)
+            .await?;
+    Ok(walk_requests(pool, v, req_max.unwrap_or(0)).await?
+        + walk_uploads(pool, v, up_max.unwrap_or(0)).await?)
 }
 
 /// A new X-ray version reads every row again: clear what the old one
@@ -309,15 +321,21 @@ async fn reset_if_changed(pool: &SqlitePool, v: i64) -> Result<()> {
         return Ok(());
     }
     if stored.is_some() {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for sql in [
-            "DELETE FROM piece_sightings",
-            "DELETE FROM piece_url_sources",
-            "DELETE FROM piece_urls",
-        ] {
-            sqlx::query(sql).execute(&mut *tx).await?;
+        // One bucket of piece keys per transaction, as the refresh does, so
+        // the trap's writes are not held up behind one large delete. An
+        // interrupted reset runs again: the version is written last.
+        for (lo, hi) in buckets() {
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            for sql in [
+                "DELETE FROM piece_sightings WHERE piece >= ?1 AND piece <= ?2",
+                "DELETE FROM piece_url_sources WHERE piece >= ?1 AND piece <= ?2",
+                "DELETE FROM piece_urls WHERE piece >= ?1 AND piece <= ?2",
+            ] {
+                sqlx::query(sql).bind(lo).bind(hi).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            tokio::time::sleep(PAUSE / 25).await;
         }
-        tx.commit().await?;
         for (max_sql, sql) in [
             (
                 "SELECT MAX(id) FROM requests",
@@ -353,16 +371,21 @@ async fn reset_if_changed(pool: &SqlitePool, v: i64) -> Result<()> {
 }
 
 /// Stamp the requests with nothing to read, without reading them. Walks
-/// id ranges, so each row is looked at once.
+/// id ranges from the oldest unread row, so each row is looked at once and
+/// a node with nothing pending walks nothing.
 async fn stamp_light(pool: &SqlitePool, v: i64) -> Result<()> {
     let sql = format!(
         "UPDATE requests SET xray_v = ?1
          WHERE id > ?2 AND id <= ?3 AND xray_v = 0 AND NOT ({HEAVY})"
     );
-    let max: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM requests")
-        .fetch_one(pool)
-        .await?;
-    let mut lo = 0;
+    let (min, max): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT MIN(id), MAX(id) FROM requests WHERE xray_v = 0")
+            .fetch_one(pool)
+            .await?;
+    let Some(min) = min else {
+        return Ok(());
+    };
+    let mut lo = min - 1;
     while lo < max.unwrap_or(0) {
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(v)
@@ -376,15 +399,16 @@ async fn stamp_light(pool: &SqlitePool, v: i64) -> Result<()> {
     Ok(())
 }
 
-async fn walk_requests(pool: &SqlitePool, v: i64) -> Result<u64> {
+async fn walk_requests(pool: &SqlitePool, v: i64, upto: i64) -> Result<u64> {
     let (mut done, mut after) = (0u64, 0i64);
     loop {
         let rows: Vec<ReqRow> = sqlx::query_as(
             "SELECT r.id, r.ts, r.ip_id, i.ip, r.method, r.path, r.query, r.body
              FROM requests r JOIN ips i ON i.id = r.ip_id
-             WHERE r.xray_v = 0 AND r.id > ? ORDER BY r.id LIMIT ?",
+             WHERE r.xray_v = 0 AND r.id > ? AND r.id <= ? ORDER BY r.id LIMIT ?",
         )
         .bind(after)
+        .bind(upto)
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
@@ -422,15 +446,16 @@ async fn write_requests(
     Ok(())
 }
 
-async fn walk_uploads(pool: &SqlitePool, v: i64) -> Result<u64> {
+async fn walk_uploads(pool: &SqlitePool, v: i64, upto: i64) -> Result<u64> {
     let (mut done, mut after) = (0u64, 0i64);
     loop {
         let rows: Vec<UpRow> = sqlx::query_as(
             "SELECT u.id, u.uid, u.ts, u.ip_id, i.ip, u.size, u.sha256
              FROM uploads u JOIN ips i ON i.id = u.ip_id
-             WHERE u.xray_v = 0 AND u.id > ? ORDER BY u.id LIMIT ?",
+             WHERE u.xray_v = 0 AND u.id > ? AND u.id <= ? ORDER BY u.id LIMIT ?",
         )
         .bind(after)
+        .bind(upto)
         .bind(BATCH)
         .fetch_all(pool)
         .await?;
@@ -554,6 +579,42 @@ const REFRESH_BUCKETS: i128 = 256;
 const REFRESHED_KEY: &str = "pieces_refreshed_n";
 /// One extraction at a time: a version reset must not overlap another.
 static EXTRACTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// How often [`run`] reads what the trap wrote since its last pass.
+const EXTRACT_EVERY: Duration = Duration::from_secs(600);
+
+/// The `[lo, hi]` ranges of [`REFRESH_BUCKETS`] buckets covering every
+/// piece key.
+fn buckets() -> impl Iterator<Item = (i64, i64)> {
+    let width = (1i128 << 64) / REFRESH_BUCKETS;
+    (0..REFRESH_BUCKETS).map(move |b| {
+        let lo = i64::MIN as i128 + b * width;
+        (lo as i64, (lo + width - 1) as i64)
+    })
+}
+
+/// Extraction as its own background task, so a long backfill never holds
+/// up the maintenance loop: [`extract`] at start, then every
+/// [`EXTRACT_EVERY`]. The campaign pass runs hourly on what has been read
+/// so far; when the startup pass read rows it also runs at once, so the
+/// first chains do not wait for the hour.
+pub async fn run(store: Store, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let mut first = true;
+    loop {
+        match extract(&store.pool).await {
+            Ok(n) if n > 0 && first => super::maintenance::recompute_campaigns(&store).await,
+            Ok(_) => {}
+            Err(e) => tracing::warn!(?e, "attack-chain piece extraction failed"),
+        }
+        first = false;
+        tokio::select! {
+            _ = tokio::time::sleep(EXTRACT_EVERY) => {}
+            _ = shutdown.changed() => return,
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
 
 /// [`backfill`], then [`refresh_counts`] in short transactions, one per
 /// bucket of piece keys, unless nothing was read and the sighting count is
@@ -571,12 +632,9 @@ pub async fn extract(pool: &SqlitePool) -> Result<u64> {
     if n == 0 && last.as_deref() == Some(count.to_string().as_str()) {
         return Ok(0);
     }
-    let width = (1i128 << 64) / REFRESH_BUCKETS;
-    for b in 0..REFRESH_BUCKETS {
-        let lo = i64::MIN as i128 + b * width;
-        let hi = lo + width - 1;
+    for (lo, hi) in buckets() {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        refresh_range(&mut tx, lo as i64, hi as i64).await?;
+        refresh_range(&mut tx, lo, hi).await?;
         tx.commit().await?;
         tokio::time::sleep(PAUSE / 25).await;
     }
@@ -748,7 +806,9 @@ impl Store {
     /// log. Returns the result's id.
     pub async fn add_piece_result(&self, piece: i64, r: &NewResult, by: &str) -> Result<i64> {
         let r = r.checked().map_err(anyhow::Error::msg)?;
-        let mut tx = self.pool.begin().await?;
+        // Immediate: it reads and then writes, and a deferred transaction
+        // would fail on a busy node instead of waiting for the lock.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ok: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pieces WHERE hash = ?1 AND kind IN ('stager', 'file')
                             AND (EXISTS (SELECT 1 FROM chain_pieces WHERE piece = ?1)

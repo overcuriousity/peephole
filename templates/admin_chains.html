@@ -4,7 +4,7 @@
 {% let nav = crate::admin::views::Nav::new("evidence", "chains") %}{% include "_admin_nav.html" %}
 <div class="page-head"><div><h1>Chains</h1><p class="muted">Stagers, keys and uploaded files that belong together, newest first. Each chain is read from its sightings.</p></div></div>
 <div class="stack">
-<nav class="tabs"><a href="/admin/evidence/chains"{% if dead_ends.is_none() %} aria-current="page"{% endif %}>Chains</a> <a href="/admin/evidence/chains?tab=dead-ends"{% if dead_ends.is_some() %} aria-current="page"{% endif %}>Dead ends</a></nav>
+<div><nav class="seg" aria-label="Chains or dead ends"><a href="/admin/evidence/chains"{% if dead_ends.is_none() %} aria-current="true"{% endif %}>Chains</a><a href="/admin/evidence/chains?tab=dead-ends"{% if dead_ends.is_some() %} aria-current="true"{% endif %}>Dead ends</a></nav></div>
 {% if let Some(rows) = dead_ends %}
 <section class="card">
   <div class="card-head"><h2>Dead ends</h2><span class="muted">Paths the same address asked for within a minute after an upload, and got a 404. Defanged. Covers all addresses, the newest 512 uploads and the top 200 paths.</span>{% if filtered %}<span class="muted"> The address and campaign filters do not apply to this tab.</span>{% endif %}</div>

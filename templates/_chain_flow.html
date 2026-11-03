@@ -1,7 +1,7 @@
 {# The flow map: `flow` (admin::flow::FlowView), and nothing at all without a chain. Server-rendered SVG, no script. Every label is attacker text, so it is only ever printed with `{{ }}` and none of it is a link. Evidence is also in words (the second line of a box, the table), not only the line style. #}
 {% if !flow.is_empty() %}
 <section class="card flow-card" data-section="flow">
-  <div class="card-head"><h2>Attack flow</h2><span class="muted">band width is requests</span></div>
+  <div class="card-head"><h2>Attack flow</h2><span class="muted">band width is the chain's requests, across campaigns</span></div>
   <div class="flow-scroll">
   <svg class="flow" viewBox="0 0 {{ flow.width }} {{ flow.height }}" width="{{ flow.width }}" height="{{ flow.height }}" role="img" aria-labelledby="flow-title flow-desc">
     <title id="flow-title">Attack flow</title>

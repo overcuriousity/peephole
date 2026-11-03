@@ -713,13 +713,22 @@ impl Store {
     async fn campaign_tile_as(&self, r: Range, a: Audience) -> Result<Option<CampaignTile>> {
         let (w, since) = r.ts_clause("r.ts");
         let w = w + &a.released("r");
+        // The public pages count only campaigns formed without attack-chain
+        // joiners: as few as two forged addresses can form a loose one.
+        let joiners = match a {
+            Audience::Admin => "",
+            Audience::Public => {
+                " AND NOT EXISTS (SELECT 1 FROM campaigns c
+                   WHERE c.key = m.campaign_key AND c.joiner_edges > 0)"
+            }
+        };
         type Row = (String, i64, Option<i64>, Option<String>, String, i64);
         let rows = bind_since!(
             sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
                 "SELECT m.campaign_key, i.id, i.asn, i.country, r.labels_json, COUNT(*)
                  FROM requests r JOIN campaign_members m ON m.ip_id = r.ip_id
                  JOIN ips i ON i.id = r.ip_id
-                 WHERE 1=1{w} GROUP BY m.campaign_key, i.id, r.labels_json"
+                 WHERE 1=1{w}{joiners} GROUP BY m.campaign_key, i.id, r.labels_json"
             ))),
             since
         )

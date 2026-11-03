@@ -305,14 +305,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let store = store.clone();
         async move {
             let derived = store::shapes::backfill(&store.pool).await;
-            // Pieces before the campaign pass (chains build on them).
-            if let Err(e) = store::pieces::extract(&store.pool).await {
-                warn!(error = %e, "attack-chain pieces: extraction failed");
-            }
             store::maintenance::recompute_campaigns(&store).await;
             derived
         }
     });
+    // Attack-chain pieces, as their own task: the first backfill can take
+    // long, and the campaign passes run on what it has read so far. It runs
+    // the campaign pass again when its first pass is done.
+    background.spawn(
+        "attack-chain pieces",
+        store::pieces::run(store.clone(), shutdown_rx.clone()),
+    );
     background.backfill("host keys", "read stored scans again", {
         let pool = store.pool.clone();
         async move { store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await }
