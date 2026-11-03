@@ -568,6 +568,12 @@ impl UploadRow {
     pub fn hash(&self) -> String {
         data_encoding::HEXLOWER.encode(&self.sha256)
     }
+
+    /// Held, and text by its first bytes: as far as the metadata can tell,
+    /// without reading the content. [`text_for_xray`] looks at all of it.
+    pub fn held_text(&self) -> bool {
+        self.held && matches!(self.sniffed_type.as_str(), "text" | "php")
+    }
 }
 
 /// A later request to where an upload was told it landed.
@@ -581,6 +587,9 @@ pub struct TimelineRow {
     pub query: Option<String>,
     pub status: Option<i64>,
     pub answer: Option<String>,
+    /// The upload whose timeline holds this row, in [`timelines`].
+    #[sqlx(default)]
+    pub upload: String,
 }
 
 /// Most requests an upload's timeline shows.
@@ -592,6 +601,10 @@ pub(super) const UPLOAD_COLS: &str =
     EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256) AS held,
     (SELECT r.id FROM requests r WHERE r.uid = u.request_uid) AS request_id, u.origin
     FROM uploads u JOIN ips i ON i.id = u.ip_id";
+
+/// [`UploadRow::held_text`] in SQL, for a query on `uploads u`.
+pub(super) const HELD_TEXT: &str = "u.sniffed_type IN ('text', 'php')
+    AND EXISTS(SELECT 1 FROM upload_blobs b WHERE b.sha256 = u.sha256)";
 
 /// One page of uploads, newest first; with `ip`, only that address's;
 /// with `sha256`, only that content's (an equality on
@@ -662,22 +675,46 @@ pub async fn get(conn: &mut SqliteConnection, uid: &str) -> Result<Option<Upload
 /// in the path is no wildcard (A2). Requests in the upload's own second
 /// count if they came after its request.
 pub async fn timeline(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Vec<TimelineRow>> {
-    Ok(sqlx::query_as(
-        "SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+    timelines(conn, std::slice::from_ref(u)).await
+}
+
+/// [`timeline`] of each upload in one statement, oldest first, each with
+/// its own [`TIMELINE_MAX`], so one upload's noise cannot crowd out
+/// another's. A request two uploads share comes twice.
+pub async fn timelines(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<Vec<TimelineRow>> {
+    if uploads.is_empty() {
+        return Ok(vec![]);
+    }
+    let one = "SELECT * FROM (
+         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer, ? AS upload
          FROM requests r JOIN ips i ON i.id = r.ip_id
-         WHERE r.origin IS ?1 AND r.path >= ?2
-           AND (r.path = ?2 OR (?3 AND substr(r.path, 1, length(?2)) = ?2))
-           AND (r.ts > ?4 OR (r.ts = ?4 AND r.id > ?5))
-         ORDER BY r.ts, r.id LIMIT ?6",
-    )
-    .bind(&u.origin)
-    .bind(&u.answered_path)
-    .bind(u.path_is_prefix)
-    .bind(&u.ts)
-    .bind(u.request_id.unwrap_or(i64::MAX))
-    .bind(TIMELINE_MAX)
-    .fetch_all(&mut *conn)
-    .await?)
+         WHERE r.origin IS ? AND r.path >= ?
+           AND (r.path = ? OR (? AND substr(r.path, 1, length(?)) = ?))
+           AND (r.ts > ? OR (r.ts = ? AND r.id > ?))
+         ORDER BY r.ts, r.id LIMIT ?)";
+    let sql = format!(
+        "{} ORDER BY ts, id",
+        vec![one; uploads.len()].join(" UNION ALL ")
+    );
+    let mut q = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+    for u in uploads {
+        q = q
+            .bind(&u.uid)
+            .bind(&u.origin)
+            .bind(&u.answered_path)
+            .bind(&u.answered_path)
+            .bind(u.path_is_prefix)
+            .bind(&u.answered_path)
+            .bind(&u.answered_path)
+            .bind(&u.ts)
+            .bind(&u.ts)
+            .bind(u.request_id.unwrap_or(i64::MAX))
+            .bind(TIMELINE_MAX);
+    }
+    Ok(q.fetch_all(&mut *conn).await?)
 }
 
 /// An upload's held content, with its SHA-256, for the admin's encrypted
@@ -694,6 +731,42 @@ pub async fn content_for_export(
     .bind(uid)
     .fetch_optional(&mut *conn)
     .await?)
+}
+
+/// Most bytes of an upload the X-ray reads: its limit on decoded output. A
+/// longer file is read from the start and marked as over the limit.
+pub const XRAY_MAX: usize = 256 * 1024;
+
+/// The held content of a text upload, for the admin page's X-ray: its
+/// `sniffed_type` is `text` or `php`, and what is read (the first
+/// [`XRAY_MAX`] bytes) is printable. Anything else, and content not held,
+/// gives `None`: binaries are never parsed. The bytes go to the page's
+/// parser and the escaped view only, never to the API, export or trap.
+pub async fn text_for_xray(conn: &mut SqliteConnection, u: &UploadRow) -> Result<Option<Vec<u8>>> {
+    if !u.held || !matches!(u.sniffed_type.as_str(), "text" | "php") {
+        return Ok(None);
+    }
+    let content: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT substr(b.content, 1, ?) FROM uploads u JOIN upload_blobs b ON b.sha256 = u.sha256
+         WHERE u.uid = ?",
+    )
+    .bind(XRAY_MAX as i64)
+    .bind(&u.uid)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(content.filter(|c| printable(c, c.len() == XRAY_MAX)))
+}
+
+/// UTF-8 with no control bytes but tab, CR and LF. `cut` allows a character
+/// cut at the end.
+fn printable(b: &[u8], cut: bool) -> bool {
+    let valid = match std::str::from_utf8(b) {
+        Ok(_) => true,
+        Err(e) => cut && e.error_len().is_none(),
+    };
+    valid
+        && b.iter()
+            .all(|&c| c >= 0x20 && c != 0x7f || matches!(c, b'\t' | b'\r' | b'\n'))
 }
 
 /// Test fixture: a `PUT` of `content` to `path` from `ip` (a fixture
@@ -736,6 +809,15 @@ pub(crate) async fn seed_upload(
     };
     let (_, _, uid) = store.local().record_upload(r, content, true).await.unwrap();
     uid
+}
+
+/// Test fixture: every upload's content is gone, as after a purge.
+#[cfg(test)]
+pub(crate) async fn forget_content(store: &super::Store) {
+    sqlx::query("DELETE FROM upload_blobs")
+        .execute(&store.pool)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]

@@ -1888,6 +1888,22 @@ show_labels = {show_labels}
     }
 
     #[tokio::test]
+    async fn wall_leaves_out_campaigns_formed_by_joiners() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        seed_campaigns(&st, 4).await;
+        sqlx::query("UPDATE campaigns SET joiner_edges = 1 WHERE num = 1")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let app = crate::admin::full_router(st.clone());
+        let (_, json) = get_with(&app, "/api/stats?range=7d", None).await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["campaigns"]["active"].as_i64(), Some(3), "{json}");
+        let admin = st.store.stats(Range::D7).await.unwrap().campaigns.unwrap();
+        assert_eq!(admin.active, 4);
+    }
+
+    #[tokio::test]
     async fn wall_hides_campaigns_while_rows_await_their_publish_delay() {
         let (st, _d) = state_with(true, "delay_minutes = 60\njitter_minutes = 0").await;
         st.store
@@ -2191,6 +2207,23 @@ show_labels = {show_labels}
         assert_eq!(html.matches(badge).count(), 1, "{html}");
         assert_eq!(html.matches("member of campaign").count(), 1, "{html}");
         assert!(html.contains("203.0.113.61"), "{html}");
+    }
+
+    /// The detail frame's crumb is for admins; the public IP page gains no
+    /// admin content and no admin nav.
+    #[tokio::test]
+    async fn public_ip_page_has_no_admin_nav() {
+        let (st, _d) = state_with(true, "delay_minutes = 0\njitter_minutes = 0").await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let cookie = admin_cookie(&st).await;
+        let app = crate::admin::full_router(st.clone());
+        let (_, public) = get_with(&app, "/ip/203.0.113.1", None).await;
+        assert!(!public.contains("class=\"crumb\""), "{public}");
+        assert!(!public.contains("Admin sections"), "{public}");
+        assert!(!public.contains("/admin"), "{public}");
+        let (_, admin) = get_with(&app, "/ip/203.0.113.1", Some(&cookie)).await;
+        assert_eq!(admin.matches("class=\"crumb\"").count(), 1, "{admin}");
+        assert!(admin.contains("href=\"/ips\">← IPs</a>"), "{admin}");
     }
 
     /// An admin's `AS{n}` badges lead to the network's page; the public
@@ -3300,7 +3333,7 @@ show_labels = {show_labels}
         for (root, first) in [
             ("/admin/overview", "/admin"),
             ("/admin/investigate", "/admin/investigate/lookup"),
-            ("/admin/evidence", "/admin/evidence/campaigns"),
+            ("/admin/evidence", "/admin/evidence/chains"),
             ("/admin/traps", "/admin/traps/mcp"),
             ("/admin/network", "/admin/network/members"),
         ] {

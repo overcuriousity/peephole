@@ -1,0 +1,1 @@
+{% for s in segs %}{% if let Some(l) = s.link %}<span class="xr-hl{% if s.masked %} xr-mask{% endif %}" data-l="{{ l }}" tabindex="0">{{ s.text }}</span>{% else if s.masked %}<span class="xr-mask">{{ s.text }}</span>{% else %}{{ s.text }}{% endif %}{% endfor %}

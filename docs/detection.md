@@ -400,11 +400,91 @@ evidence of one operator:
   50 addresses each, active within 30 days of each other). A shared JA4
   and JA4H pair, or the shapes asked for in the same order, lowers the
   score needed to 0.45. JA4 and JA4H never tie two addresses on their own.
+- **Claimed edges**, one value two addresses name: a stager, an SSH key or
+  an uploaded file, read from this node's own sightings. Anyone can name
+  someone else's stager or upload a public webshell, so these are claims:
+  they run after the hard and soft edges, never count as either, and the
+  edge list marks them as claimed. A value on one address forms no edge.
+  Joiners only ever group addresses that have no campaign of their own.
+  They never merge, grow or shrink a group of two or more addresses, so a
+  claimed string cannot change a campaign that stands on real evidence. The
+  chain still shows the link across campaigns, which is what the Chains views
+  are for.
 
-User agent, JA4 alone, JA4H alone, HASSH, JA4X, JARM, favicon and the
-HTTP body, 404 and ETag hashes do not feed campaigns: they identify the
-software or the product, which many unrelated operators share, not the
-operator. They stay pivots on the Links page.
+  1. Two values connect when the addresses in no group naming both number at
+     least two and at least a tenth of the larger value's. So a stager and
+     its key connect, and neither a few forged addresses nor a fresh small
+     value is a bridge. Connected values are a cloud, and clouds holding the
+     same addresses are one.
+  2. An address in several clouds goes to the largest, ties by the sorted
+     members, never by a value's name.
+  3. In a cloud, the addresses it kept group by the cloud's values they
+     share, so a group's members share evidence. One left alone stays in no
+     campaign.
+
+  In a group the joiners made, the addresses naming a value link to the
+  oldest of them. Every other edge, across groups or inside a group that
+  stands on other evidence, tied nothing and is shown as "not merged". So n
+  addresses make n−1 edges. A campaign's `joiner_edges` counts only the edges
+  that tie it. A file on more than 50 addresses is a public webshell and ties
+  nothing. Stagers and keys have no such cap: a stager is a joiner only when
+  a command fetches from it, and a shared host such as a paste site joins by
+  the full URL, not by the host. An address counts for 16 values: first those
+  another address names too, then the newest. One with more than 16 that
+  other addresses name is listed under Excluded values.
+
+  Accepted limit: joiners group only addresses with no campaign and never
+  touch an existing campaign. The tenth protects a value, not a whole loose
+  cloud. As few as two forged addresses, naming a value of each group, can
+  show two unrelated loose groups as one false campaign. Such a bridge shows
+  as claimed in the edge list, and the public dashboard does not count a
+  campaign the joiners formed.
+
+The Links page also lists what the body X-ray finds, read from this node's
+own sightings and not replicated: stagers (only those a command fetches from,
+not addresses it merely queries), SSH key fingerprints and uploaded files (by
+SHA-256) as identity kinds, and shell recipes and exploit tags as software
+kinds. Stagers, keys and files feed campaigns as claimed edges; recipes and
+exploit tags do not. Values from payloads are shown and copied defanged and are never links. A stager's page lists its URLs, each
+with a "Copy for sandbox" button that puts the raw URL on the clipboard for
+an external sandbox; the node never fetches it. The API and dossiers carry
+the raw value and URLs too, beside the defanged ones, behind a scoped token.
+The X-ray masks a private key only by its `BEGIN` marker, so a key written
+line by line shows as text, and a request dossier's raw body holds any key
+in full (see [API v1](api-v1.md#kind-request)).
+
+An attack chain is a group of stagers, SSH keys and uploaded files that
+appear together in sources from at least two addresses, and from a tenth of
+the addresses of the larger value, with what those sources describe. A file
+on more than 50 addresses is a public webshell and joins nothing, a source
+naming more than 64 joiners connects none, and an address counts for 16
+joiners: first those another address names too, then the newest. So an
+address holding 16 shared joiners gets no chain for a new one of its own. The strip reads it in five stages, built from sightings on
+this node:
+
+| Stage | Holds |
+|---|---|
+| Exploit | Exploit shapes, grouped by attacker's tag up to its first dot, so `x` and `x.selfrep` are one row listing both paths. An exploit with no tag has its own row. |
+| Command | Shell recipes and webshell profiles. |
+| Delivery | Stagers, SSH keys and uploaded files. A URL a command only queried never appears. |
+| Payload | Uploaded text, held here and text by its first bytes, as seen. Otherwise a gap: the node never fetches a stager. |
+| Follow-up | What was sent to an uploaded file, tied through the file and never through the address, read through the X-ray: the command that reached the shell's own input when its profile names one, else the recipe. A request holding a private key shows only its recipe, and a request that carried an upload is read without its body. Also dead ends: a 404 for the file's name from the uploader within 60 seconds. With no upload, a gap: the commands never ran here. |
+
+Every row says in words how far it is confirmed, as well as by its border:
+solid for seen, dashed for claimed (attacker's text; a tag is a hint, never a
+verified CVE), double for external, hatched for a gap, the danger colour for
+a dead end. An accent edge marks a joiner, a piece that ties the chain
+together. A request or upload with no joiner in a chain gets a chain of its
+own pieces, without a key, and links to the chains its address is in. A
+source with nothing a strip shows has no strip. A chain reads its newest 64
+uploads, the timelines of the newest 8, and the first 32 follow-ups through
+the X-ray, and shows 200 pieces, joiners first; what is past a cap is counted.
+Its exploit pairs, tags and per-piece request counts come from the newest
+2,000 sources of each of its newest 64 joiners. A piece found only in older
+sources shows its count across all chains instead. An address sending more
+than 256 different sets of its joiners has the rest counted toward each of
+its chains.
+A page draws at most 5 strips (32 on a campaign's) with a link to the rest.
 
 A campaign's page lists every edge. A soft edge's row opens to the score
 and the threshold it met, the order agreement (−1 to 1), the shared

@@ -1,0 +1,2 @@
+{# A card-level empty state: `{{ e::empty("No devices paired yet.") }}`. `href` and `label` add one link after the message. Rows of a table keep `td.empty`. #}
+{% macro empty(msg, href="", label="") %}<p class="empty empty-card">{{ msg }}{% if !href.is_empty() %} <a href="{{ href }}">{{ label }}</a>{% endif %}</p>{% endmacro %}

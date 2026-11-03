@@ -201,7 +201,9 @@ const SCAN_SELECT: &str =
 
 const CLAIM_SELECT: &str = "SELECT c.id, c.ts, i.ip, c.contact_email, COALESCE(c.user_agent, '') AS user_agent FROM fp_claims c JOIN ips i ON c.ip_id = i.id";
 
-const BODY_LIMIT: usize = 16 * 1024;
+/// Bytes of a body the request page shows: the most the trap keeps
+/// (`trap::MAX_BODY`).
+pub(crate) const BODY_LIMIT: usize = 64 * 1024;
 /// Upper bound on a decompressed scan's raw nmap XML.
 pub(crate) const MAX_RAW_XML: u64 = 64 * 1024 * 1024;
 

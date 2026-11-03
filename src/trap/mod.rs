@@ -83,7 +83,7 @@ pub struct TrapState {
     /// Flood protection for the recording path.
     pub guards: Guards,
     /// The slow answer for severity-4 sources; shared with the admin's
-    /// System page, and kept across listener restarts.
+    /// Status page, and kept across listener restarts.
     pub tarpit: Arc<tarpit::Tarpit>,
     /// Legacy MCP SSE streams on this node.
     pub sse: Arc<decoy::sse::SseHub>,
@@ -990,9 +990,8 @@ async fn trap(
     // must not blank the landing page or a decoy for everyone after it.
     // Checked here, not at the upload: stored uploads load back on start.
     if state.uploads.read_or_recover().enabled
-        && path != "/"
         && ai.is_none()
-        && decoy::choose(method, path, parts.uri.query(), presented, word).is_none()
+        && !decoy::answers_itself(method, path, parts.uri.query(), presented, word)
         && let Some(uid) = state.webshells.lookup(path)
     {
         let form = (body.whole()

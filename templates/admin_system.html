@@ -1,8 +1,9 @@
 {% extends "layout.html" %}
-{% block title %}peephole — system{% endblock %}
+{% import "_empty.html" as e %}
+{% block title %}peephole — status{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("system", "status") %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>System</h1><p class="muted">Intel feeds and what this node runs.</p></div></div>
+<div class="page-head"><div><h1>Status</h1><p class="muted">Intel feeds and what this node runs.</p></div></div>
 {% if intel.stale %}<div class="banner banner-warning">Tor exit list or GeoIP data missing or older than 48 h.</div>{% endif %}
 <div class="stack">
 <section class="card">
@@ -17,7 +18,7 @@
 {% if let Some(shared) = shared %}
 <section class="card">
   <div class="card-head"><h2>Shared intel</h2><span class="muted">Tor exit list</span></div>
-  {% if shared.is_empty() %}<p class="muted">Nothing announced yet.</p>{% else %}
+  {% if shared.is_empty() %}{{ e::empty("Nothing announced yet.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>File</th><th>Version</th><th>Size</th><th>Fetched (UTC)</th><th>By</th><th>Here</th></tr></thead>
     <tbody>{% for i in shared %}<tr><td class="mono">{{ i.kind }}</td><td class="mono">{{ i.sha }}</td><td>{{ i.size }}</td><td class="ts">{{ i.fetched_at }}</td><td>{{ i.by }}</td>

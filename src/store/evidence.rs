@@ -467,6 +467,8 @@ impl Catalogue {
                         }
                     }
                 }
+                // Read by the body X-ray (`model::xray::Policy`), not a catalogue.
+                "shared_hosts.toml" => {}
                 other => bail!("unknown evidence catalogue {other}"),
             }
         }

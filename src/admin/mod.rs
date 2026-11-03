@@ -4,6 +4,8 @@ pub mod assets;
 pub mod auth;
 pub mod blocklist;
 pub mod campaigns;
+pub mod chains;
+pub mod chains_json;
 pub mod cli;
 pub mod cluster;
 pub mod cluster_access;
@@ -14,6 +16,7 @@ pub mod decoys;
 pub mod devices;
 pub mod dossier;
 pub mod error;
+pub mod flow;
 pub mod glossary;
 pub mod limit;
 pub mod links;
@@ -35,6 +38,7 @@ pub mod target;
 pub mod uploads;
 pub mod views;
 pub mod web_quote;
+pub mod xray;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -185,6 +189,7 @@ pub fn full_router(state: Arc<AdminState>) -> Router {
         .merge(pages::routes())
         .merge(links::routes())
         .merge(campaigns::routes())
+        .merge(chains::routes())
         .merge(dossier::routes())
         .merge(paths::routes())
         .merge(asn::routes())

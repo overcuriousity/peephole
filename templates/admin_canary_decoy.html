@@ -1,9 +1,11 @@
 {% extends "layout.html" %}
+{% import "_empty.html" as e %}
 {% block title %}peephole — canaries of #{{ d.row.id }}{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "canaries") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/evidence/canaries" %}{% let crumb_label = "Canaries" %}{% include "_detail_head.html" %}
 <div class="page-head"><div><h1>Canaries of request #{{ d.row.id }}</h1>
-  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a> · <a href="/admin/evidence/canaries">all canaries</a></p></div></div>
+  <p class="muted">Served in the <span class="mono">{{ d.decoy().unwrap_or_default() }}</span> decoy to <a href="/ip/{{ d.ip }}">{{ d.ip }}</a>{% if let Some(n) = d.node %} by {{ n }}{% endif %} at <span class="mono">{{ d.row.ts.format("%Y-%m-%d %H:%M:%S") }}</span>. <a href="/admin/requests/{{ d.row.id }}">The request</a>.</p></div></div>
 <div class="stack">
 <div class="tiles kpis">
   <div class="tile"><span class="label">Served</span><div class="value">{{ served.len() }}</div></div>
@@ -19,7 +21,7 @@
 </section>
 <section class="card">
   <div class="card-head"><h2>Used by</h2>{% if uses.len() as i64 >= crate::admin::links::DECOY_USES %}<span class="muted">newest {{ uses.len() }}</span>{% endif %}</div>
-  {% if uses.is_empty() %}<p class="empty">None of these canaries has come back.</p>{% else %}
+  {% if uses.is_empty() %}{{ e::empty("None of these canaries has come back.") }}{% else %}
   <div class="table-wrap"><table class="table"><thead><tr><th>Request</th><th>IP</th><th>Kind</th><th>Where</th><th>Δt</th></tr></thead><tbody>
   {% for r in uses %}<tr>
     <td><a href="/admin/requests/{{ r.used_request_id }}">#{{ r.used_request_id }}</a> · <span class="mono">{{ r.used_ts }}</span>{% if let Some(n) = r.used_node %} · <span class="muted">{{ n }}</span>{% endif %}</td>

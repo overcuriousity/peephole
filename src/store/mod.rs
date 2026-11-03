@@ -6,6 +6,7 @@ pub mod blocklist;
 pub mod browse;
 pub mod campaigns;
 pub mod canaries;
+pub mod chains;
 pub mod cli;
 pub mod data;
 pub mod decoys;
@@ -22,6 +23,7 @@ pub mod inspect;
 pub mod ja4h;
 pub mod links;
 pub mod maintenance;
+pub mod pieces;
 pub mod probes;
 pub mod publish;
 pub mod rdap_net;
@@ -100,6 +102,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0049_requests_ip_id.sql"),
     include_str!("migrations/0050_api_keys.sql"),
     include_str!("migrations/0051_api_key_never_used.sql"),
+    include_str!("migrations/0052_chains.sql"),
+    include_str!("migrations/0053_campaign_joiners.sql"),
 ];
 
 /// `PRAGMA application_id` of a peephole database ("peep"). Databases of

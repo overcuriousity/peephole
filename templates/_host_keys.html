@@ -1,10 +1,11 @@
+{% import "_copy.html" as c %}
 <div class="table-wrap wide"><table class="hk-table">
   <thead><tr><th>Port</th><th>Kind</th><th>Fingerprint</th><th>Detail</th><th>Other IPs</th></tr></thead>
   <tbody>
   {% for k in keys %}
     <tr{% if k.identifies() && k.other_ips > 0 %} class="hk-shared"{% endif %}><td class="mono">{{ k.port }}</td>
         <td title="{{ crate::admin::glossary::host_help(k.kind.as_str()) }}">{{ k.kind_name() }}</td>
-        <td class="mono hk-fp"><a href="{{ k.link_href() }}">{{ k.fingerprint }}</a>{% let value = k.fingerprint.as_str() %}{% let what = "fingerprint" %}{% let subtle = true %}{% include "_copy.html" %}</td>
+        <td class="mono hk-fp"><a href="{{ k.link_href() }}">{{ k.fingerprint }}</a>{{ c::copy(k.fingerprint.as_str(), "fingerprint", true) }}</td>
         <td class="hk-detail">{% if k.probe_id.is_some() %}<span class="muted">from probe{% if let Some(at) = k.probe_at %} · {{ at }}{% endif %}</span> {% endif %}{{ k.detail }}</td>
         <td class="num">{% if k.other_ips == 0 %}<span class="muted">—</span>{% else if k.identifies() %}<a class="badge badge-status" data-status="running" href="{{ k.link_href() }}" title="The same {{ k.kind_name() }} was found on other sources">{{ k.other_ips }} linked</a>{% else %}<span class="muted" title="Same software, not necessarily the same operator">{{ k.other_ips }}</span>{% endif %}</td></tr>
   {% endfor %}

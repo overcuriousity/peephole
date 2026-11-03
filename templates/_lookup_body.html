@@ -1,8 +1,10 @@
+{% import "_empty.html" as e -%}
+{% import "_copy.html" as c %}
 {# The resolved name (`names`) and one result per address (`results`) of the Lookup page; `cluster`, `offer` as there. #}
 {% if let Some(n) = names %}
 <section class="card" id="resolved">
   <div class="card-head"><h2>Resolved: <span class="mono">{{ n.name }}</span></h2>{% if let Some(note) = n.note %}<span class="muted">{{ note }}</span>{% endif %}</div>
-  {% if n.rows.is_empty() %}<p class="muted">No public address.</p>{% else %}
+  {% if n.rows.is_empty() %}{{ e::empty("No public address.") }}{% else %}
   <ul class="small">
     {% for v in n.rows %}<li>{% if v.agreed %}<a class="mono" href="/admin/investigate/lookup?ip={{ v.ip }}">{{ v.ip }}</a>{% else %}<span class="mono">{{ v.ip }}</span>{% endif %} — {{ v.verdict }}</li>{% endfor %}
   </ul>
@@ -21,7 +23,7 @@
 <section class="card lookup-result"{% if loop.first %} id="answers"{% endif %}{% if !r.fills.is_empty() %} data-fill-ip="{{ r.ip }}"{% endif %}{% if r.target.is_some() %} data-section="intel"{% endif %}>
   <div class="lookup-id">
     <div class="lookup-id-main">
-      <h2 class="lookup-ip">{{ r.ip }}{% let value = r.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h2>
+      <h2 class="lookup-ip">{{ r.ip }}{{ c::copy(r.ip.as_str(), "IP address", false) }}</h2>
       {% if let Some(t) = r.target %}{% include "_ip_meta.html" %}{% else %}<p class="meta muted">Not recorded here: not in the dataset.</p>{% endif %}
     </div>
     {% if r.target.is_some() %}<a class="btn btn-sm" href="/ip/{{ r.ip }}">in the dataset →</a>{% endif %}
@@ -35,7 +37,7 @@
   {% for (p, label) in r.bare_fills() %}<div class="intel intel-fill" data-fill="{{ p }}"><div class="intel-head"><h3>{{ label }}</h3><span class="intel-id mono">{{ p }}</span></div><p class="intel-asking" data-fill-state><span class="spin" aria-hidden="true"></span>Asking now…</p></div>{% endfor %}
   </div>
   {% let pending = r.pending() %}{% if !pending.is_empty() %}<p class="intel-pending">No result yet: {{ pending }}</p>{% endif %}
-  {% if r.grid.is_empty() && r.fills.is_empty() %}<p class="muted">No provider answered.</p>{% endif %}
+  {% if r.grid.is_empty() && r.fills.is_empty() %}{{ e::empty("No provider answered.") }}{% endif %}
   {% if r.asked || !r.charges.is_empty() || !r.declined.is_empty() %}
   <div class="lookup-notes">
     {% for (node, amount) in r.charges %}<span>{{ node }} charged {{ amount }} credits.</span>{% endfor %}
@@ -68,13 +70,13 @@
 {% endif %}
 {% if let Some(n) = r.near %}
 <section class="card"><div class="card-head"><h2>Near it</h2><span class="muted">in <a class="mono" href="/ips?q={{ n.net }}">{{ n.net }}</a>{% if let Some(a) = n.asn %} · AS{{ a }}{% endif %}</span></div>
-  {% if n.rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  {% if n.rows.is_empty() %}{{ e::empty("None recorded.") }}{% else %}
   <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
   {% for x in n.rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{% let country = x.country.clone() %}{% include "_country.html" %}</td><td>{% if let Some(a) = x.asn %}AS{{ a }}{% else %}—{% endif %}</td><td class="num">{{ x.request_count }}</td><td>{% let sev = x.max_severity %}{% include "_severity.html" %}</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
   {% if let Some(a) = n.asn %}
   <h3>Same ASN · <a href="/admin/asn/{{ a }}">AS{{ a }}</a></h3>
-  {% if n.asn_rows.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+  {% if n.asn_rows.is_empty() %}{{ e::empty("None recorded.") }}{% else %}
   <p class="muted small">{{ crate::admin::views::thousands(n.asn_count) }} recorded{% if n.asn_count > n.asn_rows.len() as i64 %}, the first {{ n.asn_rows.len() }} shown{% endif %}</p>
   <div class="table-wrap"><table><thead><tr><th>IP</th><th>Country</th><th class="num">Requests</th><th>Max sev.</th></tr></thead><tbody>
   {% for x in n.asn_rows %}<tr><td><a class="mono" href="/ip/{{ x.ip }}">{{ x.ip }}</a></td><td>{% let country = x.country.clone() %}{% include "_country.html" %}</td><td class="num">{{ x.request_count }}</td><td>{% let sev = x.max_severity %}{% include "_severity.html" %}</td></tr>{% endfor %}

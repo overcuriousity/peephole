@@ -418,7 +418,7 @@ the top level.
   "generated_at": "2026-10-20T09:00:00Z",
   "node": { "version": "0.22.0", "window_days": 0 },
   "page": "/ip/203.0.113.9",
-  "limits": { "events": 200, "members": 500, "ips": 50 },
+  "limits": { "events": 200, "members": 500, "edges": 500, "ips": 50 },
   "truncated": { "events": false, "uploads": false, "commands": false, "reuses": false },
   "totals": {},
   "…": "the kind's fields"
@@ -430,7 +430,8 @@ the top level.
 - `node.window_days`: days of history the node keeps, `0` for all.
 - `page`: the admin page the dossier describes (path only).
 - `limits`: the caps. `events` (newest Timeline events) 200, `members`
-  (campaign members) 500, `ips` 50: every other list (an ASN's busiest
+  (campaign members) 500, `edges` (campaign edges) 500, `ips` 50: every
+  other list (an ASN's busiest
   IPs; a request's `same_ip`, `same_ja4.recent`; `uploads`, `commands`,
   `canaries.reuses`).
 - `truncated`: one key per capped list of this kind, `true` when more
@@ -473,7 +474,9 @@ plus:
 - `canaries`: `{used_elsewhere, used_from, reuses:[{kind, place,
   served_request_id, served_ip, served_at, served_answer, used_request_id,
   used_ip, used_at, delta_s, same_source}]}`, reuses newest 50.
-- Capped: `truncated.events`, `uploads`, `commands`, `reuses`.
+- Capped: `truncated.events`, `uploads`, `commands`, `reuses`, `chains`.
+- `chains`: its attack chains, newest first, at most 32, as
+  [chains](#chains) describe them.
 
 ### `kind: "asn"`
 
@@ -491,6 +494,9 @@ plus:
   headers:[[name, value]], body_text, body_b64, body_len, body_truncated,
   fingerprint:{hash, count, other_ips, visitor_ids}}`. The body is what the
   page shows; `body_truncated` as there.
+  `body_text` and `body_b64` are the raw body, not masked: a private key a
+  request carried is in them in full. Treat a request dossier that carries
+  a key as holding captured key material before you share it.
 - `ip`: its address as [`GET /api/v1/ips`](#get-apiv1ipsqcursorlimit)
   lists it (null once deleted).
 - `same_ip`: other requests of the address, `[{id, at, ip, method, path,
@@ -500,30 +506,90 @@ plus:
 - `canaries`: `{served:[{kind, value}], return_host, reuses:[…]}`, reuses
   newest 50.
 - `uploads` (metadata), `webshell_cmd`, `campaign` (`{key, num}` or null).
+- `chain`: the newest [chain](#chains) it belongs to, or its own pieces if
+  it joins none (null when it has none); `other_chains` counts the rest.
+- `xray`: what the X-ray found in its body, without any layer's text:
+  `layers:[{kind, parent, depth}]`, `pieces:[{kind, role, grade, value,
+  defanged, url:{url, defanged}|null}]`, `opaque:[{reason, layer}]`.
 - Capped: `truncated.same_ip`, `same_ja4`, `reuses`.
 
 ### `kind: "campaign"`
 
 - `campaign`: `{key, num, size, first_seen, last_seen, hard_edges,
-  soft_edges, v, computed_at}`.
+  soft_edges, joiner_edges, v, computed_at}`. `joiner_edges` counts the
+  claimed `stager`, `key` and `file` edges that tie the campaign, apart from
+  `hard_edges`. Only a campaign the joiners formed has any.
 - `members`: `[{ip_id, ip, country, asn, asn_org, first_seen, last_seen,
   requests}]`, at most 500 (`truncated.members`; `totals.members` is
   the size).
 - `edges`: `[{a_id, a, b_id, b, kind, value, score, shared, fp_support,
   first_ts, last_ts, agreement}]`: only those between two carried
-  members. `truncated.edges` is `true` when the members cap left any out.
+  members, at most 500, hard and soft first. `truncated.edges` is `true`
+  when either cap left any out.
+  The `value` of a `stager` or `file` edge is defanged. A claimed edge that
+  tied nothing is not listed.
 - `shapes`: `[{text, members, df, first_seen, wave:{ips, window_start,
   detected_at}|null}]`; `calendar` as for an IP.
 - `uploads` (metadata) and `commands` (`[{command, count, ips, last_at}]`),
   50 each; `events`: the members' newest 200, each with its `ip`
   (`truncated.events`); `agent`.
-- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`.
+- Capped: `truncated.events`, `members`, `edges`, `uploads`, `commands`,
+  `chains`.
+- `chains`: the chains its members are in, newest first, at most 32.
+
+### Chains
+
+A chain is an attack in five stages: `Exploit`, `Command`, `Delivery`,
+`Payload`, `Follow-up`.
+
+```json
+{ "key": "1a2b3c4d5e6f7081", "ips": 2, "sources": 3,
+  "first_seen": "2026-10-01T00:00:00Z", "last_seen": "2026-10-02T00:00:00Z",
+  "more": 0,
+  "stages": [ { "name": "Delivery", "rows": [ {
+    "piece": "1a2b3c4d5e6f7081", "kind": "stager",
+    "value": "a.example.org", "defanged": "a[.]example[.]org",
+    "urls": [ { "url": "…", "defanged": "…" } ],
+    "label": "a[.]example[.]org", "detail": "…", "mark": "seen",
+    "joiner": true, "here": false, "page": "/admin/evidence/links/…" } ] } ] }
+```
+
+- `key` is the oldest joiner's hash, or null for what has no joiner. It
+  changes when chains merge, so it is no permanent id.
+- A piece has `value` (the text as seen, for a sandbox) and `defanged`. A
+  stager also lists its `urls` (at most 32), raw and defanged. Neither is
+  ever a link. `mark` is `seen`, `claimed`, `external`, `gap` or
+  `dead end`; `label` and `detail` are defanged. Rows that are not pieces
+  (a request, an upload's name, a gap) have a null `piece`.
+- A chain lists at most 200 pieces; `more` counts those past that.
+- Never in a `chain` or `xray` object: uploaded bytes or text, a layer's
+  decoded text, key material. A key piece is its public fingerprint. Only
+  a private key with its `BEGIN` marker is recognised: one written line by
+  line (one `echo` per line, say) has no marker, so it is no piece, and the
+  admin X-ray panes show its lines as text. A request dossier's raw body is
+  outside this rule (see [request](#kind-request)).
+- `value` and `urls[].url` are raw beside `defanged`, so a script can hand
+  them to a sandbox. These routes need a scoped token; the admin pages give
+  a raw URL only through "Copy for sandbox".
+
+### `GET /api/v1/chains?page=&ip=&campaign=`
+
+Chains, newest first, 50 a page: `{items:[{key, joiner, page, first_seen,
+last_seen, ips, sources, exploits, payload}], page, has_next}`. `joiner`
+is the name of the chain, defanged; `payload` is `seen` when uploaded text
+backs it, `external` when only a sandbox result does, else `gap`. `ip` and `campaign` narrow it as on the admin list
+(an unknown address matches nothing). Read scope.
+
+### `GET /api/v1/chains/{key}`
+
+`{chain}` as above, by its 16 hex digits. `404 not_found` when there is no
+such chain (keys change when chains merge). Read scope.
 
 ### Never in a dossier
 
 Token, key, session and pairing-code hashes and ids (`token_hash`,
-`cred_id`, `code_hash`, `passkey_json`); upload **contents** (metadata
-only, no `content` field); a request's page token and decoy input; cluster
+`cred_id`, `code_hash`, `passkey_json`); upload **contents** (metadata and
+the pieces found in a text upload, no `content` field); a request's page token and decoy input; cluster
 keys, peer addresses and node ids; credit balances, prices and config
 values. A test walks every key of every kind's dossier and fails on any of
 these.

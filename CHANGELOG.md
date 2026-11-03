@@ -3,6 +3,144 @@
 Notable changes per release. Versions follow [Semantic Versioning](https://semver.org/);
 release builds are on the [releases page](https://github.com/overcuriousity/peephole/releases).
 
+## [Unreleased]
+
+Attack chains and the body X-ray. Migration 0052 adds the pieces, their
+sightings, chains and sandbox results, and an `xray_v` column on requests
+and uploads; migration 0053 adds the joiner edges (clustering v3). No new
+setting, no protocol version bump.
+
+On first start a background task reads every stored request and text upload
+for pieces. On a copy of real data it took about 5 minutes for 320,000
+requests in a debug build. The node works meanwhile: the campaign pass runs
+on what has been read so far and once more when the first read is done, so
+chains and joiner campaigns fill in then. A later X-ray version reads every
+row again the same way, and campaigns and chains are built on partial
+sightings until it is done, so they can shift meanwhile. Campaign `#N` can change, and an
+address with no campaign can gain one, so campaign keys can shift in
+exports. A node with `retention_days` set derives pieces only from the rows
+it still holds.
+
+Accepted limits:
+- As few as two forged addresses can show two unrelated loose groups as one
+  false campaign. Its edges show as claimed, and the public dashboard does
+  not count a campaign the joiners formed.
+- A request dossier's `body_text` and `body_b64` are the raw body: a private
+  key the request carried is in them in full. A key written line by line has
+  no `BEGIN` marker and is not masked anywhere.
+
+### Added
+- The body X-ray and chains read more closely: each line of a base64 run that
+  does not read as one is tried alone, a payload split over padding-looking
+  fields is joined, and multipart boundaries are found behind a preamble.
+  What follows a private key's `END` marker is read. A key with no `END`
+  marker stays masked to the end of the text, so a fetch after it is missed
+  rather than risk showing key text. A URL handed to a function's parameter
+  that `copy()` reads is a stager; URLs in PHP arrays stay queried, as they are
+  often credit links. Decompressed layers are titled *Compressed*, `compressed`
+  in the API, as they may be gzip, zlib or deflate. `cat "$(…)"` no longer
+  counts as running the fetched output.
+- A recipe's label keeps both branches (`scp → run → else wget || curl → sh`).
+  A follow-up reads the inputs of the webshell it was sent to, not of every
+  shell in the chain. Band widths and row counts cover the chain's own
+  sources. A campaign loads its first 500 members, and its page says so past
+  that. A stager page for a host that was only queried says so, with its
+  sightings count.
+- Campaign pages open with a flow map: each attack chain as bands sized by
+  requests through Exploit, Command, Delivery, Payload and Follow-up, in
+  server-rendered SVG (light and dark, no script). Seen, claimed, external,
+  gap and dead end differ by line style and are also written out; a stage
+  groups past 12 pieces into "n more", and a table view lists every row.
+- Campaigns join on stagers, SSH keys and uploaded files as claimed edges
+  (clustering v3; migration 0053 adds `campaign_edges.merged` and
+  `campaigns.joiner_edges`). Addresses naming one stager form a campaign,
+  past the 50-address cap. Anyone can name a stager, so joiners only group
+  addresses with no campaign of their own and never merge or change a
+  campaign: an edge touching one is shown as "not merged", and the chain
+  shows the link across campaigns. Claimed edges are not counted as hard
+  evidence. A file on more than 50 addresses ties nothing, an address counts
+  for 16 values, those another address names first, then the newest, and
+  both are listed as excluded. The public
+  "Campaigns this period" tile leaves out campaigns the joiners formed. The
+  Evidence table and a dossier list the first 500 edges. Dossiers carry
+  `joiner_edges` and defanged edge values, and `limits` gains `edges`.
+- A file sent to the WP File Manager connector is answered where the attack
+  tool asks for it, `/wp-content/plugins/wp-file-manager/lib/files/<name>`,
+  not at `/uploads/<name>`, so the tool's check finds a webshell instead of a
+  404. Other upload scripts keep `/uploads/`. A new *Dead ends* tab on the
+  Chains list (`/admin/evidence/chains?tab=dead-ends`) groups by path the
+  404s an address got within a minute after its upload, defanged.
+- Sandbox results: on a stager or file page that joins a chain, an admin
+  enters the SHA-256, family, sandbox URL and a note from an external
+  sandbox. Each result fills the Payload stage of the whole chain as one row
+  marked external. The URL is shown defanged as text, never a link. Results
+  are kept on this node only, are not replicated, survive a recompute or an
+  X-ray version change, and are logged with who entered them.
+- Dossiers carry attack chains: request dossiers a `chain` and an `xray`
+  summary (layer kinds, pieces, opaque reasons, no layer text), address and
+  campaign dossiers a `chains` list. New read-scope routes
+  `GET /api/v1/chains` and `GET /api/v1/chains/{key}`. Pieces appear as
+  `value` and `defanged`, a stager's URLs raw and defanged; upload text and
+  key material never appear in a `chain` or `xray` object. A request
+  dossier's raw body is not masked (see the limits above). `dossier_v`
+  stays 1.
+- The chain strip shows an attack in five stages (Exploit, Command, Delivery,
+  Payload, Follow-up) on the request, upload, address, campaign and piece
+  pages: the same chain from any of them, with "you are here" on a source's
+  own pieces. Each row says in words whether it was seen, is only claimed, or
+  is a gap or a dead end, and joiners get an accent edge. Exploits group by
+  attacker's tag up to its first dot, uploaded text fills Payload, follow-ups
+  are read through the X-ray to the command a webshell received, and an
+  address's strip is admin only. Evidence opens on the new Chains list,
+  newest first, at `/admin/evidence/chains`.
+- Attack chains are built in the campaign pass: stagers, SSH keys and
+  uploaded files form one chain only when they appear together in sources
+  from at least two addresses and a tenth of the larger one's, so a forged
+  body fuses nothing. A file on more than 50 addresses is left out, and a
+  source naming more than 64 joiners connects none. The trap's own check whether a dropped file may
+  answer stays per request (`answers_itself`); stored rows are read with
+  `keeps_its_own_answer`, so a chain's follow-ups leave out `/` and the
+  decoy paths.
+- Links lists stagers, SSH key fingerprints, uploaded files (SHA-256),
+  shell recipes and exploit tags from the body X-ray, with graph, glossary
+  and search. Payload values are shown and copied defanged and are never
+  links; a stager's page lists its URLs with a "Copy for sandbox" button.
+  The SHA-256 pivots now open the File page; the old uploads address still
+  works.
+- Body X-ray on the request page and on the page of a text upload: the
+  original bytes beside what they hide. It opens base64, gzip, percent and
+  `\x` escapes and hex layer by layer, and shows the pieces found (stagers,
+  keys, exploit tags, webshell profiles) and the shell recipe as steps with
+  branches. Hovering or focusing a highlight marks its counterpart. Private
+  keys are withheld from the text and the hex view, and addresses in pieces
+  and steps are defanged and never links. Nothing found is fetched, run or
+  resolved.
+- Text uploads are parsed statically and shown escaped on admin pages.
+  Binaries are never parsed, and the API, dossiers and export stay
+  metadata-only.
+
+### Changed
+- Admin page titles follow the nav labels: Now (was Overview), Status (was
+  System), Members (was Cluster), Credits (was Market); the tab titles of
+  Access and Ownership drop "cluster". The two nav rows take less height. The
+  scan queue rows, the label and OWASP badges and the card-level empty states
+  each come from one template. Addresses are unchanged.
+- The request page opens with the evidence: chain strip, then the X-ray, then
+  the facts. Headers are collapsed (count and first names in the summary; a
+  `#headers` link opens them), labels are chips in the header, and facts with
+  no value (transport, JA4, JA4H) are not listed. The campaign header keeps
+  strength, size and first/last seen, with the key and compute time on a muted
+  second line. The upload page shows the X-ray before its facts. Fragment
+  links keep landing; a link into a closed `<details>` opens it.
+- Detail pages (request, IP, upload, campaign, link, scan, member, canary
+  decoy, network, AS) share one frame: a "← list" crumb above the title, in the
+  same place on each, replacing the hand-written back links. The public IP
+  page does not show it. Facts on the upload, link, member and AS pages use
+  one `facts` list style; the copy button is one macro. No URL changes.
+- The X-ray calls its query layer "Query".
+- The request page shows up to 64 KiB of a body (was 16 KiB). The dossier and
+  API `body_text` and `body_b64` grow to 64 KiB with it.
+
 ## [0.23.2] - 2026-11-01
 
 No database migration, no new setting, no protocol version bump.

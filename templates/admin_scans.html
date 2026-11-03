@@ -46,7 +46,7 @@
   <div class="card-head"><h2>Live queue</h2><span class="row"><span class="muted" data-queue-total{% if active_total <= crate::admin::scans::LIVE_ROWS %} hidden{% endif %}>newest {{ crate::admin::scans::LIVE_ROWS }} of {{ active_total }}</span><span class="live" data-live><span class="live-dot"></span><span data-live-label>connecting…</span></span></span></div>
   <div class="table-wrap wide"><table data-queue data-src="/admin/api/queue" data-limit="{{ crate::admin::scans::LIVE_ROWS }}">
     <thead><tr><th>Job</th><th>Target</th><th>Level</th><th>Status</th><th>Queued</th><th>Started</th><th>Node</th></tr></thead>
-    <tbody>{% for j in jobs %}{% include "_live_queue_row.html" %}{% endfor %}
+    <tbody>{% let live = true %}{% for j in jobs %}{% include "_queue_row.html" %}{% endfor %}
     {% if jobs.is_empty() %}<tr data-empty><td colspan="7" class="empty">Nothing queued or running.</td></tr>{% endif %}</tbody>
   </table></div>
 </section>

@@ -3,20 +3,22 @@
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("evidence", "campaigns") %}{% include "_admin_nav.html" %}
+{% let crumb_href = "/admin/evidence/campaigns" %}{% let crumb_label = "Campaigns" %}{% include "_detail_head.html" %}
 <div class="page-head"><div><h1>Campaign #{{ c.row.num }}</h1>
 <div class="meta">
   {% if agent %}<span class="badge badge-agent" title="A member's requests carry an AI-agent label">agent-driven</span>{% endif %}
   <span class="campaign-strength{% if c.row.hard_edges == 0 %} soft{% endif %}">{{ self.strength() }} · <a href="/admin/evidence/links">what counts →</a></span>
   <span>{{ c.row.size }} IPs</span>
-  <span>key <span class="mono">{{ c.row.key }}</span></span>
   <span>first seen <span class="mono">{{ crate::admin::views::minute(c.row.first_seen.as_str()) }}</span> UTC</span>
   <span>last seen <span class="mono">{{ crate::admin::views::minute(c.row.last_seen.as_str()) }}</span> UTC</span>
-  <span class="muted">computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span>
 </div>
-<p class="muted"><a href="/admin/evidence/campaigns">← All campaigns</a></p></div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
+<div class="meta meta-sub muted"><span>key <span class="mono">{{ c.row.key }}</span></span><span>computed <span class="mono">{{ crate::admin::views::minute(c.row.computed_at.as_str()) }}</span> UTC</span></div>
+</div>{% let dossier_kind = "campaign" %}{% let dossier_id = c.row.key.as_str() %}{% include "_dossier_link.html" %}</div>
 <div class="stack">
+{% include "_chain_flow.html" %}
+{% include "_chain_strip.html" %}
 <section class="card">
-  <div class="card-head"><h2>Members</h2></div>
+  <div class="card-head"><h2>Members</h2>{% if c.row.size > c.members.len() as i64 %}<span class="muted">first {{ c.members.len() }} of {{ crate::admin::views::thousands(c.row.size) }}</span>{% endif %}</div>
   <div class="table-wrap"><table class="table"><thead><tr><th>IP</th><th>Country</th><th>ASN</th><th>First seen</th><th>Last seen</th><th class="num">Requests</th></tr></thead><tbody>
   {% for m in c.members %}<tr>
     <td class="ip"><a href="/ip/{{ m.ip }}">{{ m.ip }}</a>{% if let Some(p) = props.get(m.ip.as_str()) %}{% let sentence = "" %}{% let scan_href = format!("/ip/{}#actions", m.ip) %}{% include "_ip_props.html" %}{% endif %}</td>
@@ -29,12 +31,12 @@
 </section>
 {% let campaign_key = c.row.key.clone() %}{% let small = c.members.len() <= 3 %}{% include "_campaign_graph.html" %}
 <section class="card">
-  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft · <a href="/admin/evidence/links">what counts →</a></span></div>
+  <div class="card-head"><h2>Evidence</h2><span class="muted">{{ c.row.hard_edges }} hard, {{ c.row.soft_edges }} soft{{ self.claimed_note() }} · <a href="/admin/evidence/links">what counts →</a></span></div>
   <div class="table-wrap"><table class="table stack-narrow edges"><thead><tr><th>IPs</th><th>Kind</th><th>Why</th><th>First</th><th>Last</th></tr></thead><tbody>
-  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else %}soft{% endif %}">
+  {% for v in edges %}<tr class="edge-{% if v.hard() %}hard{% else if v.claimed() %}claimed{% else %}soft{% endif %}">
     <td class="ip"><a href="/ip/{{ v.e.a }}">{{ v.e.a }}</a> ↔ <a href="/ip/{{ v.e.b }}">{{ v.e.b }}</a></td>
-    <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}</td>
-    <td class="why">{% if v.hard() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
+    <td class="kind" title="{{ crate::admin::glossary::help(v.e.kind.as_str()) }}">{{ v.kind_name }}{% if v.claimed() %} <span class="muted" title="{{ crate::admin::glossary::help("joiner") }}">claimed</span>{% endif %}</td>
+    <td class="why">{% if v.hard() || v.claimed() %}{{ v.reason }}{% if let Some((value, href)) = v.value %} <a class="mono hk-fp" href="{{ href }}">{{ value }}</a>{% endif %}{% if !v.e.merged %} <span class="badge" title="This claim tied nothing: joiners only group IPs with no campaign of their own, and never merge or change one.">not merged</span>{% endif %}{% else %}<details class="edge-detail"><summary>{{ v.reason }}</summary>
       <ul>
         <li>{{ v.score_rule() }}</li>
         <li>{{ v.agreement_rule() }}</li>
@@ -49,6 +51,7 @@
     <td class="ts first">{{ crate::admin::views::minute(v.e.first_ts.as_str()) }}</td><td class="ts last">{{ crate::admin::views::minute(v.e.last_ts.as_str()) }}</td>
   </tr>{% endfor %}
   </tbody></table></div>
+  {% if c.edges_total > edges.len() as i64 %}<p class="muted">First {{ edges.len() }} of {{ c.edges_total }} edges, claimed ones last.</p>{% endif %}
   {% include "_edge_legend.html" %}
 </section>
 <section class="card" data-section="artifacts">

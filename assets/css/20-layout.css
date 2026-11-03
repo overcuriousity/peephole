@@ -28,6 +28,9 @@
 .prose p, .prose li { line-height: 1.6; }
 .api-endpoint h2 { font-family: var(--font-mono); font-size: var(--text-base); }
 .api-endpoint pre { overflow-x: auto; padding: 0.75rem; background: var(--color-bg-elevated); border-radius: var(--radius-md); font-size: var(--text-xs); }
+.crumb { margin: 0 0 0.35rem; font-size: var(--text-sm); }
+.crumb a { color: var(--color-fg-secondary); }
+.crumb a:hover { color: var(--color-fg-primary); }
 @media (max-width: 48rem) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
   /* Two rows: brand and actions on top, the full-width nav below, so no

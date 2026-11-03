@@ -309,6 +309,13 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             derived
         }
     });
+    // Attack-chain pieces, as their own task: the first backfill can take
+    // long, and the campaign passes run on what it has read so far. It runs
+    // the campaign pass again when its first pass is done.
+    background.spawn(
+        "attack-chain pieces",
+        store::pieces::run(store.clone(), shutdown_rx.clone()),
+    );
     background.backfill("host keys", "read stored scans again", {
         let pool = store.pool.clone();
         async move { store::hostkeys::backfill(&pool, scan::hostkeys::HOSTKEYS_V).await }

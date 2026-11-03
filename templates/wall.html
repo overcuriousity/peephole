@@ -224,7 +224,7 @@
           <td class="mono">{{ r.method }}</td>
           <td class="path">{{ crate::admin::views::public_path(r.path) }}</td>
           <td class="sev">{% let sev = r.severity %}{% include "_severity.html" %}</td>
-          {% if labels %}<td class="labels"><span class="chips">{% for l in r.labels %}<span class="badge badge-label {{ crate::admin::views::label_class(l) }}">{{ l }}</span>{% endfor %}{% for o in r.owasp %}<span class="badge badge-owasp" title="{{ crate::admin::views::owasp_name(o) }}">{{ o }}</span>{% endfor %}</span></td>{% endif %}
+          {% if labels %}<td class="labels"><span class="chips">{% let lab_list = r.labels %}{% let owasp_list = r.owasp %}{% include "_labels.html" %}</span></td>{% endif %}
         </tr>
       {% endfor %}
       {% if recent.is_empty() %}<tr><td colspan="{{ 5 + labels as usize }}" class="empty">Nothing yet.</td></tr>{% endif %}

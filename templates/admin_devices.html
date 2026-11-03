@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_empty.html" as e %}
 {% block title %}peephole — devices and API keys{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("system", "devices") %}{% include "_admin_nav.html" %}
@@ -22,7 +23,7 @@
 </section>
 <section class="card">
   <div class="card-head"><h2>Paired devices</h2></div>
-  {% if devices.is_empty() %}<p class="muted">No devices paired yet.</p>{% else %}
+  {% if devices.is_empty() %}{{ e::empty("No devices paired yet.") }}{% else %}
   <div class="table-wrap"><table class="stack-narrow devices">
     <thead><tr><th>Name</th><th>Scopes</th><th>Paired by</th><th>Created (UTC)</th><th>Last seen (UTC)</th><th></th></tr></thead>
     <tbody>{% for d in devices %}
@@ -54,7 +55,7 @@
     <div><button class="btn btn-primary" type="submit">Create key</button></div>
   </form>
   {% endif %}
-  {% if keys.is_empty() %}<p class="muted">No API keys yet.</p>{% else %}
+  {% if keys.is_empty() %}{{ e::empty("No API keys yet.") }}{% else %}
   <div class="table-wrap"><table class="stack-narrow devices">
     <thead><tr><th>Label</th><th>Scopes</th><th>Created by</th><th>Created (UTC)</th><th>Last used (UTC)</th><th></th></tr></thead>
     <tbody>{% for d in keys %}
@@ -73,7 +74,7 @@
 </section>
 <section class="card">
   <div class="card-head"><h2>Recent actions</h2></div>
-  {% if actions.is_empty() %}<p class="muted">No device has started a probe or bought a scan yet.</p>{% else %}
+  {% if actions.is_empty() %}{{ e::empty("No device has started a probe or bought a scan yet.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>When</th><th>Device</th><th>Paired by</th><th>Action</th><th>Target</th><th>Credits</th><th>Job</th></tr></thead>
     <tbody>{% for a in actions %}

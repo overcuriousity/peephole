@@ -2306,6 +2306,7 @@ dependencies = [
  "ipnet",
  "maxminddb",
  "md-5",
+ "memchr",
  "multer",
  "parquet",
  "qrcode",

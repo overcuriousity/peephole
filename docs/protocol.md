@@ -444,7 +444,7 @@ disputed with every answer. The other providers show the newest result.
   relay leases it holds: relay, until when, and the price in credits per
   hour.
   The scanner table shows, per level, what one delivered result costs with
-  each scanner, the cheapest in bold. The balance itself is on the Overview
+  each scanner, the cheapest in bold. The balance itself is on Now
   and the Lookup page.
 - **Your budgets are safe.** Paid lookups take at most
   `[enrichment] on_demand_share` (a fifth by default) of each API budget,

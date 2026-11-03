@@ -1,9 +1,10 @@
 {% extends "layout.html" %}
-{% block title %}peephole — market{% endblock %}
+{% import "_empty.html" as e %}
+{% block title %}peephole — credits{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
 {% let nav = crate::admin::views::Nav::new("network", "credits") %}{% include "_admin_nav.html" %}
-<div class="page-head"><div><h1>Market</h1><p class="muted">Every figure is this node's own count.</p></div></div>
+<div class="page-head"><div><h1>Credits</h1><p class="muted">Every figure is this node's own count.</p></div></div>
 <div class="stack">
 <div class="tiles kpis market-kpis">
   <div class="tile"><span class="label">In circulation</span><div class="value">{{ totals.1 }}</div><div class="hint">credits · {{ totals.0 }} earned in 7 days</div></div>
@@ -13,7 +14,7 @@
 </div>
 <section class="card market" id="market">
   <div class="card-head"><h2>Prices</h2><span class="muted">hourly · 7 days</span></div>
-  {% if goods.is_empty() %}<p class="muted">No price history yet: prices are computed every hour, the first one shortly after the start.</p>{% else %}
+  {% if goods.is_empty() %}{{ e::empty("No price history yet: prices are computed every hour, the first one shortly after the start.") }}{% else %}
   <nav class="seg market-goods" aria-label="Good">{% for g in goods %}<a href="#market" data-pick-good="{{ g.key }}"{% if loop.first %} aria-current="true"{% endif %}>{{ g.label }}</a>{% endfor %}</nav>
   <div class="chart market-chart" data-market="{{ market_json }}" data-good="{% if let Some(g) = goods.first() %}{{ g.key }}{% endif %}" role="img" aria-label="Price over the last 7 days"></div>
   <div class="legend market-legend" aria-hidden="true"><span><i class="line own"></i>this node</span><span><i class="swatch band"></i>members, lowest to highest</span><span><i class="line median"></i>members' median</span></div>
@@ -66,7 +67,7 @@
 </section>
 {% if let Some(leases) = relays_leased %}
 <section class="card"><div class="card-head"><h2>Relays leased</h2><span class="muted">this node cannot be dialled: these relays hold its outbox</span></div>
-  {% if leases.is_empty() %}<p class="muted">No relay leased: nothing can reach this node's outbox yet.</p>{% else %}
+  {% if leases.is_empty() %}{{ e::empty("No relay leased: nothing can reach this node's outbox yet.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>Relay</th><th>Until (UTC)</th><th class="num">Price (credits / h)</th></tr></thead>
     <tbody>{% for r in leases %}<tr><td>{{ r.relay }}</td><td>{{ r.until }}</td><td class="num">{{ r.price }}</td></tr>{% endfor %}</tbody>
@@ -99,7 +100,7 @@
   </table></div>
 </section>
 <section class="card" id="ledger"><div class="card-head"><h2>Your credits</h2><span class="muted">this node: <b class="num">{{ balance }}</b> · set aside <span class="num">{{ held }}</span> in open lookups{% if let Some((total, _)) = fleet %} · all your nodes: <b class="num">{{ total }}</b>{% endif %}</span></div>
-  {% if days.is_empty() %}<p class="muted">Nothing to spend. Credits come from the daily pool, above, and from sales.</p>{% else %}
+  {% if days.is_empty() %}{{ e::empty("Nothing to spend. Credits come from the daily pool, above, and from sales.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>Earned on (UTC)</th><th class="num">Credits</th><th>Expires</th></tr></thead>
     <tbody>{% for d in days %}<tr><td class="mono">{{ d.date }}</td><td class="num">{{ d.amount }}</td><td>{{ d.expires }}</td></tr>{% endfor %}</tbody>
@@ -115,7 +116,7 @@
 {% endif %}
   <details class="ledger-more"><summary>Earned, spent, sent and received</summary>
   <div class="ledger-part"><div class="card-head"><h3>Spent</h3><span class="muted">lookups this node paid for</span></div>
-  {% if spent.is_empty() %}<p class="muted">Nothing yet.</p>{% else %}
+  {% if spent.is_empty() %}{{ e::empty("Nothing yet.") }}{% else %}
   <div class="table-wrap wide"><table>
     <thead><tr><th>When (UTC)</th><th>Answered by</th><th>Providers</th><th class="num">Offered</th><th class="num">Charged</th><th>State</th></tr></thead>
     <tbody>{% for s in spent %}<tr>
@@ -125,7 +126,7 @@
   </table></div>{% endif %}
 </div>
   <div class="ledger-part"><div class="card-head"><h3>Sent and received</h3></div>
-  {% if moved.is_empty() %}<p class="muted">No transfers.</p>{% else %}
+  {% if moved.is_empty() %}{{ e::empty("No transfers.") }}{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>When (UTC)</th><th>From</th><th>To</th><th class="num">Credits</th></tr></thead>
     <tbody>{% for m in moved %}<tr><td class="ts">{{ m.at }}</td><td>{{ m.from }}</td><td>{{ m.to }}</td><td class="num">{{ m.amount }}{% if m.short %} <span class="muted small">(less than named)</span>{% endif %}</td></tr>{% endfor %}</tbody>

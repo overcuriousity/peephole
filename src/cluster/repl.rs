@@ -1484,7 +1484,7 @@ pub(crate) async fn reset_head(conn: &mut SqliteConnection, origin: &NodeId) -> 
 }
 
 /// Setting that remembers the last [`write_off_lost`] that found anything:
-/// `"<count> <unix seconds>"`, for the Cluster page.
+/// `"<count> <unix seconds>"`, for whoever looks into a lost row.
 pub const LOST_ROWS_KEY: &str = "repl.lost_rows";
 
 /// Records written off per tombstone.

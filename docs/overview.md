@@ -71,6 +71,14 @@ exists. Campaigns are read-only and admin-only; the public dashboard shows
 only their counts. Every row says which node recorded it, by name and
 key, and which build it ran.
 
+**Attack chains** follow one attack through what the trap held: the
+exploit, the commands, how the next stage was delivered, the payload, and
+what came after it. The same chain shows on the pages of a request, an
+upload, an address, a campaign and a piece, and each stage says what was
+seen, what the attacker only claimed, and what is missing. The Chains list
+under Evidence shows them newest first. Chains are derived on each node and
+admin-only.
+
 peephole is one binary with SQLite. Fonts, scripts and the world map are
 built in; its web pages make no external requests and come in light and
 dark themes.
@@ -152,7 +160,8 @@ calendar, rank and neighbours (same /24 and ASN).
   were active, their sources in total, the largest, their ASN and country
   spread as counts and their requests per attack family. It appears only
   from three active campaigns up; which address belongs to which campaign,
-  and what tied them, is admin-only.
+  and what tied them, is admin-only. A campaign the attack-chain joiners
+  formed is not counted: those rest on claims an attacker can forge.
 - **Personas only cluster-wide**: "What each persona drew" shows, per
   persona a node presented as (WordPress, FortiGate and so on, never a
   hostname or a node), the requests per attack family over all nodes, and

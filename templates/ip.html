@@ -1,10 +1,12 @@
 {% extends "layout.html" %}
+{% import "_copy.html" as c %}
 {% block title %}peephole — {{ t.ov.ip.ip }}{% endblock %}
 {% block head %}<script src="/assets/js/charts.js?v={{ chrome.stamp }}" defer></script>{% endblock %}
 {% block content %}
+{% if t.admin.is_some() %}{% let crumb_href = "/ips" %}{% let crumb_label = "IPs" %}{% include "_detail_head.html" %}{% endif %}
 <div class="page-head ip-head">
   <div>
-    <h1>{{ t.ov.ip.ip }}{% let value = t.ov.ip.ip.as_str() %}{% let what = "IP address" %}{% let subtle = false %}{% include "_copy.html" %}</h1>
+    <h1>{{ t.ov.ip.ip }}{{ c::copy(t.ov.ip.ip.as_str(), "IP address", false) }}</h1>
     {% include "_ip_meta.html" %}
     {% if t.admin.is_some() %}<p>{% let dossier_kind = "ip" %}{% let dossier_id = t.ov.ip.ip.as_str() %}{% include "_dossier_link.html" %}</p>{% endif %}
   </div>

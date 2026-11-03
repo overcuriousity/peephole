@@ -7,6 +7,9 @@ use crate::store::links::LinkKind;
 /// The key of a path shape, beside the [`LinkKind`] keys; the campaign
 /// edge kind `paths` reads the same.
 pub const PATH_SHAPE: &str = "path-shape";
+/// The key of a claimed campaign edge (kinds `stager`, `key`, `file`), whose
+/// Links value has a line of its own.
+pub const JOINER: &str = "joiner";
 
 /// The line of a [`LinkKind`].
 pub fn kind_help(kind: LinkKind) -> &'static str {
@@ -53,16 +56,34 @@ pub fn kind_help(kind: LinkKind) -> &'static str {
         LinkKind::HttpEtag => {
             "The ETag header of a file the source's web server serves, from a counter-scan. A match: the same file, not the same operator."
         }
+        LinkKind::Stager => {
+            "The host a command told its target to fetch from and run, read from the stored requests and uploads, shown defanged. The host is what the attacker's own body claims, not a confirmed delivery. A match: likely the same operator or toolkit. Addresses only queried, never fetched by a command, are not listed."
+        }
+        LinkKind::Key => {
+            "The fingerprint of an SSH public key found in a request or upload. Private keys are never stored. A match: the same key, so one operator or one copied toolkit."
+        }
+        LinkKind::File => {
+            "SHA-256 of a file the trap received. A match: the same file, so one operator or one shared toolkit."
+        }
+        LinkKind::Recipe => {
+            "The shape of a command the X-ray read (its steps, not its arguments). A match: the same command pattern, i.e. the same tooling, not the same operator."
+        }
+        LinkKind::ExploitTag => {
+            "A tag the attacker's own request carried, shown defanged. A match: the same exploit kit or script, not necessarily the same operator."
+        }
     }
 }
 
 const PATH_SHAPE_HELP: &str = "A request path with the parts that vary per target or run (ids, hashes, random names) replaced by placeholders. Matching sets of rare shapes: the same target list or tool; campaigns join IPs on them as soft edges.";
 
-/// The line of `key`: a [`LinkKind`] key, [`PATH_SHAPE`] or `paths`; `""`
-/// for anything else.
+const JOINER_HELP: &str = "Two IPs naming one stager, SSH key or uploaded file. Anyone can name someone else's stager or upload a public webshell, so it is a claim, not proof of one operator. So joiners only group IPs with no campaign of their own, and never merge, grow, shrink or otherwise touch a campaign: an edge touching one is listed as not merged, and the chain shows the link across campaigns. Two values connect only when at least 2 addresses, and a tenth of the larger value's, name both. That protects a value, not a whole loose cloud: as few as two forged addresses can show two unrelated loose groups as one false campaign. Such a bridge shows as claimed, and the public dashboard does not count a campaign joiners formed.";
+
+/// The line of `key`: a [`LinkKind`] key, [`PATH_SHAPE`], `paths` or
+/// [`JOINER`]; `""` for anything else.
 pub fn help(key: &str) -> &'static str {
     match key {
         PATH_SHAPE | "paths" => PATH_SHAPE_HELP,
+        JOINER => JOINER_HELP,
         _ => LinkKind::parse(key).map(kind_help).unwrap_or_default(),
     }
 }
@@ -75,12 +96,15 @@ pub fn host_help(kind: &str) -> &'static str {
 }
 
 /// The visible list: `(name, line)` of every listed fingerprint, then the
-/// path shape.
+/// path shape and the claimed edge.
 pub fn entries() -> Vec<(&'static str, &'static str)> {
     LinkKind::LIST
         .into_iter()
         .map(|k| (k.name(), kind_help(k)))
-        .chain([("Path shape", PATH_SHAPE_HELP)])
+        .chain([
+            ("Path shape", PATH_SHAPE_HELP),
+            ("Claimed edge", JOINER_HELP),
+        ])
         .collect()
 }
 
@@ -100,6 +124,31 @@ mod tests {
         assert_eq!(help("nope"), "");
         assert_eq!(host_help(crate::model::hostkeys::HASSH), help("hassh"));
         assert_eq!(host_help("ssh2-enum-algos"), "");
-        assert_eq!(entries().len(), LinkKind::LIST.len() + 1);
+        assert_eq!(entries().len(), LinkKind::LIST.len() + 2);
+    }
+
+    #[test]
+    fn every_kind_has_a_glossary_line() {
+        for k in LinkKind::ALL {
+            assert!(kind_help(k).len() > 40, "{k:?}");
+        }
+        for k in ["stager", "key", "file", "recipe", "exploit-tag"] {
+            assert!(!help(k).is_empty(), "{k}");
+        }
+        let names: Vec<_> = entries().iter().map(|e| e.0).collect();
+        for n in ["Stager", "Key", "File", "Recipe", "Exploit tag"] {
+            assert!(names.contains(&n), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_claimed_edge_says_what_it_does_not_prove() {
+        let h = help(JOINER);
+        assert!(h.contains("not proof") && h.contains("not merged"), "{h}");
+        assert!(h.contains("never merge"), "{h}");
+        let k = crate::store::campaigns::K_SOFT_MERGE;
+        assert!(h.contains(&format!("at least {k} addresses")), "{h}");
+        assert!(!h.contains("two groups"), "{h}");
+        assert!(entries().iter().any(|e| e == &("Claimed edge", h)));
     }
 }

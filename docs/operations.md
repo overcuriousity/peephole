@@ -400,7 +400,7 @@ paths, user agents, JA4, methods, open ports, products, OS guesses, abuse
 scores; every row opens the matching requests or IPs), a search box for
 IPs, networks, AS numbers, requests, paths and fingerprints, per-IP pages
 with every enrichment result and counter-scan, the scan pace with the live
-queue and every finished job, a "needs attention" list on the Overview, a
+queue and every finished job, a "needs attention" list on Now, a
 Links area (every browser fingerprint, SSH host key, TLS certificate, JA4,
 JA4H, HASSH and JA4X, filterable, each with a graph of the IPs it was seen
 on and what else links them), canary reuse, the false-positive inbox,
@@ -415,9 +415,14 @@ order: two IPs that first asked for their shared rare shapes in the same
 order count like a JA4 and JA4H match, and an edge's reason then ends in
 "order agrees". Two groups of two or more IPs merge only on two soft edges
 between them, so one look-alike pair no longer chains two campaigns into
-one. Filter by country, ASN, minimum size and
-period. Below the list are the excluded values (a hard value on more than 50
-IPs is shared infrastructure, not one operator) and when the last pass ran
+one. Since clustering v3 a stager, SSH key or uploaded file two addresses
+name is a claimed edge. Joiners only group IPs with no campaign of their own
+and never merge or change a campaign: an edge touching one is listed as "not
+merged", and the chain shows the link across campaigns. Filter by country, ASN, minimum size and
+period. Below the list are the excluded values (a hard value or a file on more
+than 50 IPs is shared infrastructure, not one operator; an address counts for 16
+joiner values, those another address names first, then the newest, and one
+with more than 16 shared values is listed here too) and when the last pass ran
 and how long it took. A campaign's page shows its members, every evidence
 edge with the reason, the members' requests per day and the path shapes most
 of them asked for, with how many IPs of the whole dataset asked for each.
@@ -458,7 +463,7 @@ The public dashboard, the IP directory, IP pages, `/api/stats`, `/api/map` and
 a random 0 to `jitter_minutes` (5 + 0–5 min by default), counted from when
 this node stored it. Someone probing an address and watching the dashboard can't
 tell from the timing whether it was one of yours. Signed-in admins see
-everything at once; the live feed is on the admin Overview. A changed delay
+everything at once; the live feed is on the admin Now page. A changed delay
 applies to requests stored after the restart. Setting both to 0 publishes
 at once (logged as a warning).
 
@@ -526,10 +531,32 @@ unzip -P infected <sha256>.zip && sha256sum <sha256>.bin   # must print <sha256>
 ```
 
 Handle the `.bin` as live malware: open it in an isolated analysis VM, never
-on the node. Peephole never renders, inlines, unpacks or serves the content
-back, to the admin or on the trap: the zip is the only way out. The
-`/api/v1` upload endpoints and the dataset export carry upload metadata only.
-They never read the stored bytes (`upload_blobs`).
+on the node. Text uploads (`sniffed_type` `text` or `php`, and printable) are
+parsed statically and shown escaped on their admin page, as the body X-ray;
+nothing in them is run, fetched or resolved. Binaries are never parsed,
+rendered or unpacked: the zip is their only way out. Nothing is served back on
+the trap. The `/api/v1` upload endpoints, the dossiers and the dataset export
+carry upload metadata and the pieces found, never the text. Only the upload
+store reads the stored bytes (`upload_blobs`).
+
+**Keys in a request body.** The X-ray masks a private key it recognises by
+its `BEGIN` marker, in its panes and in the chain and `xray` objects. Two
+things it does not cover:
+
+- A request dossier's `body_text` and `body_b64` are the raw body. A key the
+  request carried is in them in full, so check a dossier before it leaves
+  the node.
+- A key written line by line (one `echo` per line, say) has no marker. It is
+  not masked anywhere and its lines show as text.
+
+**Sandbox results.** The node never fetches a payload. After you run one in
+an external sandbox, open the stager or file page (Evidence, Links) and use
+*Add result* with the SHA-256 (64 hex digits), family (64 characters), sandbox
+URL and note (2,000 characters each). The result fills the Payload stage of
+the whole chain, marked external. The URL is kept and shown as defanged text,
+never a link. Results stay on the node that holds them: they are not
+replicated or exported, and survive a recompute. A page whose sightings are
+gone still shows its results.
 
 **When the bytes are not there.** If there is no button, *Content* reads
 `content not held` followed by the reason (on the list, hover over it):
@@ -552,7 +579,7 @@ its metadata are written whatever the state. If the same content is held
 from another upload, the button appears even on a row that says dropped.
 
 The bounds are runtime settings (`peephole settings set KEY VALUE`; the
-System page shows how much is held of the ceiling):
+Status page shows how much is held of the ceiling):
 
 | Key | Default | |
 |---|---|---|
@@ -571,6 +598,14 @@ own page; a `webshell` request shows the command line it sent (from the
 query or a form body), linked to every request that sent the same command.
 A path the trap answers itself (`/`, a decoy) keeps its own answer: the
 upload is recorded and told it landed, and nothing else changes there.
+
+A file sent to the WP File Manager connector
+(`.../wp-file-manager/lib/php/connector.minimal.php`) is answered at
+`/wp-content/plugins/wp-file-manager/lib/files/<name>`, where the attack tool
+looks for it; other upload scripts answer at `/uploads/<name>`. Requests that
+still found nothing (the same address, a path ending in the file's name, a
+`404`, within 60 seconds after the upload) are listed by path under
+Evidence, Chains, *Dead ends*.
 
 ## Cluster administration
 
