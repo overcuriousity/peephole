@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-11-03
+
 ### Fixed
 - Scanners stopped earning after a node joined the cluster ("audits: bought
   2 of 12 designated"). Each joining node writes an admission of its
