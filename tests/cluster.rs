@@ -8559,17 +8559,22 @@ async fn paid_job(
     }
 }
 
-/// Date every member's admission on each of `on` two days back: the tests
-/// date their scans back, and only members admitted by a scan's done
-/// status audit it.
+/// Date every member's admission on each of `on` two days back, the first
+/// as the latest: the tests date their scans back, and only members first
+/// admitted by a scan's done status audit it.
 async fn admitted_long_ago(on: &[&TestNode]) {
     let at = peephole::cluster::hlc::to_db((now_ms() - 2 * 86_400_000) << 16);
     for n in on {
-        sqlx::query("UPDATE members SET admitted_hlc = ? WHERE admitted_hlc > 0")
-            .bind(at)
-            .execute(&n.store.pool)
-            .await
-            .unwrap();
+        for sql in [
+            "UPDATE members SET admitted_hlc = ? WHERE admitted_hlc > 0",
+            "UPDATE sponsorships SET hlc = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(at)
+                .execute(&n.store.pool)
+                .await
+                .unwrap();
+        }
         n.node.reload_members().await.unwrap();
     }
 }
