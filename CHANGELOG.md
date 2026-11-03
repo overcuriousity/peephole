@@ -5,6 +5,8 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-03
+
 Attack chains and the body X-ray. Migration 0052 adds the pieces, their
 sightings, chains and sandbox results, and an `xray_v` column on requests
 and uploads; migration 0053 adds the joiner edges (clustering v3). No new
