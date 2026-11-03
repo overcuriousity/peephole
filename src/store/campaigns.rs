@@ -185,7 +185,7 @@ impl std::fmt::Display for Report {
             return write!(f, "none");
         }
         for e in &self.excluded {
-            if e.kind == JOINER_CAP {
+            if e.kind == JOINER_CAP || e.kind == FILE_CAP {
                 write!(f, "\n  {} {}", e.kind, e.value)?;
             } else {
                 write!(f, "\n  {} {} on {} IPs", e.kind, e.value, e.ips)?;
@@ -1124,12 +1124,12 @@ fn joiner_values<'a>(
     }));
     let more = input.wide_files_total - input.wide_files.len() as i64;
     if more > 0 {
-        // `ips` counts the files here, as the joiner cap's row counts
-        // addresses. Its own kind, so the page does not link it as a file.
+        // Its own kind, so the page does not link it as a file. The count is
+        // of files, so it is in the text and `ips` is 0.
         excluded.push(Excluded {
             kind: FILE_CAP.to_string(),
-            value: format!("more files on more than {HARD_FANOUT_MAX} addresses"),
-            ips: more as usize,
+            value: format!("{more} more files on more than {HARD_FANOUT_MAX} addresses"),
+            ips: 0,
         });
     }
     let mut values = JoinerValues::new();
@@ -1178,14 +1178,10 @@ fn joiner_values<'a>(
         }
     }
     for (i, mut named) in held {
-        // Only values another address names count: one no other names forms
-        // no edge, kept or not.
-        let shared = named
-            .iter()
-            .filter(|x| values.get(&x.2).is_some_and(|ips| ips.len() >= 2))
-            .count();
+        // `values` holds only values another address names: one no other
+        // names forms no edge, kept or not, so it is not counted.
         let all = over.entry(i).or_default();
-        *all = (*all).max(shared);
+        *all = (*all).max(named.len());
         if named.len() > MAX_JOINERS_PER_IP {
             named.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
             let cut = named.split_off(MAX_JOINERS_PER_IP);
@@ -3867,7 +3863,10 @@ pub(crate) mod tests {
         let out = v2(&input);
         assert_eq!(out.excluded.len(), EXCLUDED_LISTED + 1);
         let last = out.excluded.last().unwrap();
-        assert_eq!((last.kind.as_str(), last.ips), (FILE_CAP, 8));
+        assert_eq!(
+            (last.kind.as_str(), last.value.as_str(), last.ips),
+            (FILE_CAP, "8 more files on more than 50 addresses", 0)
+        );
         input.wide_files_total = EXCLUDED_LISTED as i64;
         assert_eq!(v2(&input).excluded.len(), EXCLUDED_LISTED);
     }
