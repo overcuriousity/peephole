@@ -225,6 +225,8 @@ a.chain-label { color: var(--color-accent); }
 .xr-ln { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-accent); }
 .xr-text { max-height: 12rem; }
 .xr-pieces, .xr-steps { list-style: none; margin: 0.35rem 0 0; padding: 0; display: grid; gap: 0.3rem; }
+/* A piece or step can be one long token (a shell profile, a URL): wrap it anywhere on a narrow screen. */
+.xr-pieces > li, .xr-steps > li { min-width: 0; overflow-wrap: anywhere; }
 .xr-step small { display: inline-block; min-width: 4.5rem; color: var(--color-fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; }
 .xr-branch { font-size: var(--text-xs); color: var(--color-warning); text-transform: uppercase; letter-spacing: 0.04em; }
 .xr-opaque { margin: 0.35rem 0 0; font-size: var(--text-sm); }
