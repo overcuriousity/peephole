@@ -4,11 +4,12 @@
 //! holds, never replicated, never exported, as the canaries are
 //! ([`super::canaries`]). Decoded text is never stored, only the pieces
 //! (at most [`MAX_VALUE`] bytes each) and, for a stager, the URL it came
-//! from (at most [`MAX_URLS`] per piece), which only the sandbox view shows
-//! raw. Nothing here fetches or resolves anything.
+//! from (at most [`MAX_URLS`] per piece), which only "Copy for sandbox"
+//! and the token-scoped API give raw. Nothing here fetches or resolves
+//! anything.
 //!
-//! Extraction runs in the background ([`backfill`]), never on the write
-//! path: the trap's rows start with `xray_v = 0` and are read in batches,
+//! Extraction runs as its own background task ([`run`]), never on the
+//! write path: the trap's rows start with `xray_v = 0` and are read in batches,
 //! the parsing outside any transaction and on a blocking thread. A row's
 //! deletion (any path: admin, address, retention, a cluster tombstone)
 //! removes its sightings through the triggers of migration 0052; URLs only

@@ -157,6 +157,9 @@ recomputes as long as that member stays in it. The key is not a
 row of the export; join on it, not on the `#N` the admin pages show, which
 is a display rank. A new clustering version can split a campaign, and the
 split-off parts get new keys: join across exports made by the same version.
+Clustering v3 (0.24.0) added the claimed edges, so an address that had no
+campaign before can have one now, and the `#N` of existing campaigns can
+shift, as new campaigns are numbered among them by first seen.
 
 Path shapes are not exported either: `shapes` (with its `rule_hits`) and
 `waves` are derived on each node from the rows it holds, so they are

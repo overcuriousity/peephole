@@ -494,6 +494,9 @@ plus:
   headers:[[name, value]], body_text, body_b64, body_len, body_truncated,
   fingerprint:{hash, count, other_ips, visitor_ids}}`. The body is what the
   page shows; `body_truncated` as there.
+  `body_text` and `body_b64` are the raw body, not masked: a private key a
+  request carried is in them in full. Treat a request dossier that carries
+  a key as holding captured key material before you share it.
 - `ip`: its address as [`GET /api/v1/ips`](#get-apiv1ipsqcursorlimit)
   lists it (null once deleted).
 - `same_ip`: other requests of the address, `[{id, at, ip, method, path,
@@ -559,8 +562,15 @@ A chain is an attack in five stages: `Exploit`, `Command`, `Delivery`,
   `dead end`; `label` and `detail` are defanged. Rows that are not pieces
   (a request, an upload's name, a gap) have a null `piece`.
 - A chain lists at most 200 pieces; `more` counts those past that.
-- Never here: uploaded bytes or text, a layer's decoded text, key
-  material. A key piece is its public fingerprint.
+- Never in a `chain` or `xray` object: uploaded bytes or text, a layer's
+  decoded text, key material. A key piece is its public fingerprint. Only
+  a private key with its `BEGIN` marker is recognised: one written line by
+  line (one `echo` per line, say) has no marker, so it is no piece, and the
+  admin X-ray panes show its lines as text. A request dossier's raw body is
+  outside this rule (see [request](#kind-request)).
+- `value` and `urls[].url` are raw beside `defanged`, so a script can hand
+  them to a sandbox. These routes need a scoped token; the admin pages give
+  a raw URL only through "Copy for sandbox".
 
 ### `GET /api/v1/chains?page=&ip=&campaign=`
 
@@ -578,8 +588,8 @@ such chain (keys change when chains merge). Read scope.
 ### Never in a dossier
 
 Token, key, session and pairing-code hashes and ids (`token_hash`,
-`cred_id`, `code_hash`, `passkey_json`); upload **contents** (metadata
-only, no `content` field); a request's page token and decoy input; cluster
+`cred_id`, `code_hash`, `passkey_json`); upload **contents** (metadata and
+the pieces found in a text upload, no `content` field); a request's page token and decoy input; cluster
 keys, peer addresses and node ids; credit balances, prices and config
 values. A test walks every key of every kind's dossier and fails on any of
 these.

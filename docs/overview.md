@@ -160,7 +160,8 @@ calendar, rank and neighbours (same /24 and ASN).
   were active, their sources in total, the largest, their ASN and country
   spread as counts and their requests per attack family. It appears only
   from three active campaigns up; which address belongs to which campaign,
-  and what tied them, is admin-only.
+  and what tied them, is admin-only. A campaign the attack-chain joiners
+  formed is not counted: those rest on claims an attacker can forge.
 - **Personas only cluster-wide**: "What each persona drew" shows, per
   persona a node presented as (WordPress, FortiGate and so on, never a
   hostname or a node), the requests per attack family over all nodes, and

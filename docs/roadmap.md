@@ -44,7 +44,22 @@ Shipped in [0.20.0](../CHANGELOG.md#0200---2026-10-19).
 
 Shipped in [0.20.0](../CHANGELOG.md#0200---2026-10-19).
 
-### 4. AI discovery lures
+### 4. Attack chains and body X-ray
+
+Shipped in [0.24.0](../CHANGELOG.md#0240---2026-11-03).
+
+### 5. Header values in the X-ray
+
+- **Cost:** S–M
+- **Benefit:** medium. Some payloads ride in a header, such as Shellshock
+  in `User-Agent`, and give no pieces today.
+
+The X-ray reads the path, query and body, not the headers. It would parse
+header values as it does a query parameter, with the same limits, so a
+stager or recipe in a header joins chains. Shown in the request page's
+X-ray and the chain strip.
+
+### 6. AI discovery lures
 
 - **Cost:** M–L
 - **Benefit:** high. Agents look for machine-readable descriptions first;

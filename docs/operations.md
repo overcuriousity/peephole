@@ -535,8 +535,18 @@ parsed statically and shown escaped on their admin page, as the body X-ray;
 nothing in them is run, fetched or resolved. Binaries are never parsed,
 rendered or unpacked: the zip is their only way out. Nothing is served back on
 the trap. The `/api/v1` upload endpoints, the dossiers and the dataset export
-carry upload metadata only. Only the upload store reads the stored bytes
-(`upload_blobs`).
+carry upload metadata and the pieces found, never the text. Only the upload
+store reads the stored bytes (`upload_blobs`).
+
+**Keys in a request body.** The X-ray masks a private key it recognises by
+its `BEGIN` marker, in its panes and in the chain and `xray` objects. Two
+things it does not cover:
+
+- A request dossier's `body_text` and `body_b64` are the raw body. A key the
+  request carried is in them in full, so check a dossier before it leaves
+  the node.
+- A key written line by line (one `echo` per line, say) has no marker. It is
+  not masked anywhere and its lines show as text.
 
 **Sandbox results.** The node never fetches a payload. After you run one in
 an external sandbox, open the stager or file page (Evidence, Links) and use

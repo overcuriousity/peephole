@@ -434,8 +434,10 @@ evidence of one operator:
 
   Accepted limit: joiners group only addresses with no campaign and never
   touch an existing campaign. The tenth protects a value, not a whole loose
-  cloud, so a few forged addresses can bridge two loose clouds through a thin
-  value. Such a bridge shows as claimed in the edge list.
+  cloud. As few as two forged addresses, naming a value of each group, can
+  show two unrelated loose groups as one false campaign. Such a bridge shows
+  as claimed in the edge list, and the public dashboard does not count a
+  campaign the joiners formed.
 
 The Links page also lists what the body X-ray finds, read from this node's
 own sightings and not replicated: stagers (only those a command fetches from,
@@ -444,11 +446,18 @@ SHA-256) as identity kinds, and shell recipes and exploit tags as software
 kinds. Stagers, keys and files feed campaigns as claimed edges; recipes and
 exploit tags do not. Values from payloads are shown and copied defanged and are never links. A stager's page lists its URLs, each
 with a "Copy for sandbox" button that puts the raw URL on the clipboard for
-an external sandbox; the node never fetches it.
+an external sandbox; the node never fetches it. The API and dossiers carry
+the raw value and URLs too, beside the defanged ones, behind a scoped token.
+The X-ray masks a private key only by its `BEGIN` marker, so a key written
+line by line shows as text, and a request dossier's raw body holds any key
+in full (see [API v1](api-v1.md#kind-request)).
 
 An attack chain is a group of stagers, SSH keys and uploaded files that
-appear together in sources from at least two addresses, with what those
-sources describe. The strip reads it in five stages, built from sightings on
+appear together in sources from at least two addresses, and from a tenth of
+the addresses of the larger value, with what those sources describe. A file
+on more than 50 addresses is a public webshell and joins nothing, a source
+naming more than 64 joiners connects none, and an address counts for its
+newest 16 joiners. The strip reads it in five stages, built from sightings on
 this node:
 
 | Stage | Holds |

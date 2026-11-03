@@ -5,6 +5,28 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+Attack chains and the body X-ray. Migration 0052 adds the pieces, their
+sightings, chains and sandbox results, and an `xray_v` column on requests
+and uploads; migration 0053 adds the joiner edges (clustering v3). No new
+setting, no protocol version bump.
+
+On first start a background task reads every stored request and text upload
+for pieces. On a copy of real data it took about 5 minutes for 320,000
+requests in a debug build. The node works meanwhile: the campaign pass runs
+on what has been read so far and once more when the first read is done, so
+chains and joiner campaigns fill in then. Campaign `#N` can change, and an
+address with no campaign can gain one, so campaign keys can shift in
+exports. A node with `retention_days` set derives pieces only from the rows
+it still holds.
+
+Accepted limits:
+- As few as two forged addresses can show two unrelated loose groups as one
+  false campaign. Its edges show as claimed, and the public dashboard does
+  not count a campaign the joiners formed.
+- A request dossier's `body_text` and `body_b64` are the raw body: a private
+  key the request carried is in them in full. A key written line by line has
+  no `BEGIN` marker and is not masked anywhere.
+
 ### Added
 - The body X-ray and chains read more closely: each line of a base64 run that
   does not read as one is tried alone, a payload split over padding-looking
@@ -35,8 +57,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   campaign: an edge touching one is shown as "not merged", and the chain
   shows the link across campaigns. Claimed edges are not counted as hard
   evidence. A file on more than 50 addresses ties nothing, an address counts
-  for its newest 16 values, and both are listed as excluded. The Evidence
-  table and a dossier list the first 500 edges. Dossiers carry
+  for its newest 16 values, and both are listed as excluded. The public
+  "Campaigns this period" tile leaves out campaigns the joiners formed. The
+  Evidence table and a dossier list the first 500 edges. Dossiers carry
   `joiner_edges` and defanged edge values, and `limits` gains `edges`.
 - A file sent to the WP File Manager connector is answered where the attack
   tool asks for it, `/wp-content/plugins/wp-file-manager/lib/files/<name>`,
@@ -55,7 +78,9 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
   campaign dossiers a `chains` list. New read-scope routes
   `GET /api/v1/chains` and `GET /api/v1/chains/{key}`. Pieces appear as
   `value` and `defanged`, a stager's URLs raw and defanged; upload text and
-  key material never do. `dossier_v` stays 1.
+  key material never appear in a `chain` or `xray` object. A request
+  dossier's raw body is not masked (see the limits above). `dossier_v`
+  stays 1.
 - The chain strip shows an attack in five stages (Exploit, Command, Delivery,
   Payload, Follow-up) on the request, upload, address, campaign and piece
   pages: the same chain from any of them, with "you are here" on a source's
