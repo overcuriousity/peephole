@@ -361,6 +361,7 @@ mod tests {
             info_hlc: 0,
             last_entry_hlc: 0,
             admitted_hlc: 0,
+            first_admitted_hlc: 0,
             remote_config: false,
         }
     }

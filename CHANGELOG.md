@@ -5,6 +5,16 @@ release builds are on the [releases page](https://github.com/overcuriousity/peep
 
 ## [Unreleased]
 
+### Fixed
+- Scanners stopped earning after a node joined the cluster ("audits: bought
+  2 of 12 designated"). Each joining node writes an admission of its
+  sponsor, and the auditors of a scan counted only members whose latest
+  admission came before it, so the sponsor dropped out of the ranking of
+  every earlier scan and the audits bought from it stopped counting.
+  Arbiters then gave such scanners no jobs, and their prices fell for want
+  of sales. An auditor now counts from its first admission. Each node
+  judges this itself: upgrade every node, the arbiters first.
+
 ## [0.24.0] - 2026-11-03
 
 Attack chains and the body X-ray. Migration 0052 adds the pieces, their

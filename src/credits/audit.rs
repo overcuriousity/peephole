@@ -452,11 +452,14 @@ pub fn designated(seed: &[u8; 32]) -> bool {
 
 /// The auditors of a designated scan at `level`, best first: the active
 /// scanners of protocol 7 (of protocol 8 for level 5, which older ones do
-/// not run) other than `scanner` admitted no later than the job's done
-/// status `done_hlc`, ranked by `SHA-256(seed || key)`; the first
+/// not run) other than `scanner` first admitted no later than the job's
+/// done status `done_hlc`, ranked by `SHA-256(seed || key)`; the first
 /// [`AUDITORS`]. A member admitted later cannot join the ranking of a
-/// scan after the fact. Roles, protocol and standing are read from the
-/// member records as held now.
+/// scan after the fact. Its first admission, not its latest: each node
+/// that joins writes an admission of its sponsor, which would otherwise
+/// drop the sponsor from the ranking of every earlier scan, and with it
+/// the audits bought from it. Roles, protocol and standing are read from
+/// the member records as held now.
 pub fn auditors(
     seed: &[u8; 32],
     members: &[MemberRow],
@@ -476,7 +479,7 @@ pub fn auditors(
         .filter(|m| {
             m.active
                 && m.id != *scanner
-                && m.admitted_hlc <= done_hlc
+                && m.first_admission() <= done_hlc
                 && m.proto_max >= proto
                 && m.roles.iter().any(|r| r == "scanner")
         })
@@ -1143,6 +1146,7 @@ mod tests {
             info_hlc: 0,
             last_entry_hlc: 0,
             admitted_hlc: 0,
+            first_admitted_hlc: 0,
             remote_config: false,
         }
     }
@@ -1210,6 +1214,18 @@ mod tests {
         assert_eq!(auditors(&s, &members, &id(1), 50, 2), [id(3)]);
         let all = auditors(&s, &members, &id(1), 100, 2);
         assert!(all.contains(&id(2)) && all.contains(&id(3)), "{all:?}");
+    }
+
+    #[test]
+    fn a_member_admitted_again_stays_an_auditor_of_earlier_scans() {
+        // First admitted at 10; a node joining through it at 100 admitted
+        // it again. The scan done at 50 keeps it among its auditors.
+        let mut sponsor = scanner_member(2, 7);
+        sponsor.first_admitted_hlc = 10;
+        sponsor.admitted_hlc = 100;
+        let members = [scanner_member(1, 7), sponsor, scanner_member(3, 7)];
+        let got = auditors(&seed("job-x", 50), &members, &id(1), 50, 2);
+        assert!(got.contains(&id(2)) && got.contains(&id(3)), "{got:?}");
     }
 
     #[test]

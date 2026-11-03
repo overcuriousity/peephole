@@ -87,8 +87,15 @@ pub struct MemberRow {
     pub standing: Standing,
     /// HLC of the latest self-description (0: never described itself).
     pub info_hlc: u64,
-    /// HLC of its latest admission (0: not admitted).
+    /// HLC of its latest admission (0: not admitted). Every member_add
+    /// naming it raises this, including the one each joining node writes
+    /// for its sponsor.
     pub admitted_hlc: u64,
+    /// HLC of its earliest admission held (0: none held, a founder): the
+    /// first member_add naming it, as counted (see [`may_sponsor`]). The
+    /// records of one sponsor arrive in its log's order, so every node
+    /// holding them reads the same value.
+    pub first_admitted_hlc: u64,
     /// HLC of the newest log entry this member signed (0: none held).
     pub last_entry_hlc: u64,
     /// Unused since ownership replaced config keys; always false in new records.
@@ -108,6 +115,7 @@ type Row = (
     Option<i64>,
     i64,
     Option<i64>,
+    Option<i64>,
 );
 
 const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max,
@@ -115,7 +123,8 @@ const SELECT: &str = "SELECT id, name, address, roles_json, proto_min, proto_max
                              (SELECT l.hlc FROM repl_log l
                               WHERE l.origin = members.id AND l.sig IS NOT NULL
                                 AND l.applied != 4
-                              ORDER BY l.seq DESC LIMIT 1)
+                              ORDER BY l.seq DESC LIMIT 1),
+                             (SELECT MIN(s.hlc) FROM sponsorships s WHERE s.member = members.id)
                       FROM members";
 
 fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
@@ -136,11 +145,24 @@ fn from_row(r: Row, now_ms: u64) -> Result<MemberRow> {
         sponsor: NodeId::from_slice(&r.6)?,
         info_hlc: r.7 as u64,
         admitted_hlc: super::hlc::from_db(r.8),
+        first_admitted_hlc: super::hlc::from_db(r.12.unwrap_or(0)),
         active: standing == Standing::Active,
         standing,
         last_entry_hlc,
         remote_config: r.10 != 0,
     })
+}
+
+impl MemberRow {
+    /// When it first became a member: its earliest admission, or its
+    /// latest when none is held.
+    pub fn first_admission(&self) -> u64 {
+        if self.first_admitted_hlc > 0 {
+            self.first_admitted_hlc
+        } else {
+            self.admitted_hlc
+        }
+    }
 }
 
 /// Every member row with its standing as of now.
@@ -572,6 +594,41 @@ mod tests {
         // Exactly at the limit is still active.
         let edge = hlc(now - 30 * DAY);
         assert_eq!(standing(edge, None, edge, now), Standing::Active);
+    }
+
+    #[tokio::test]
+    async fn a_member_keeps_its_first_admission_when_admitted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::connect(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let (a, b, c) = (NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32]));
+        let mut conn = store.pool.acquire().await.unwrap();
+        let info = MemberInfo {
+            id: a,
+            name: "a".into(),
+            address: None,
+            roles: vec!["scanner".into()],
+            proto_min: 2,
+            proto_max: 9,
+            remote_config: false,
+        };
+        insert(&mut conn, &info, &b, 0, 100).await.unwrap();
+        // Admitted by b at 10, then by c (a node that joined through it)
+        // at 100.
+        for (sponsor, at) in [(b, 10i64), (c, 100)] {
+            sqlx::query("INSERT INTO sponsorships (sponsor, member, hlc) VALUES (?, ?, ?)")
+                .bind(&sponsor.0[..])
+                .bind(&a.0[..])
+                .bind(at)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        drop(conn);
+        let m = all(&store).await.unwrap().remove(0);
+        assert_eq!((m.first_admitted_hlc, m.admitted_hlc), (10, 100));
+        assert_eq!(m.first_admission(), 10);
     }
 
     #[test]
