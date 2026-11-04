@@ -86,7 +86,7 @@ zstd = "0.14"
 bytes = "1"
 tempfile = "3"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
-webauthn-rs-proto = "0.5"
+webauthn-rs-proto = "0.6"
 
 [profile.release]
 # Smaller, faster release binary. panic stays "unwind": a panicking request
